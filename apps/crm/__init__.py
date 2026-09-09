@@ -1,0 +1,1 @@
+"""CRM app package initialization."""

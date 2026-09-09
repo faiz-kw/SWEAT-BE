@@ -1,0 +1,6 @@
+from django.apps import AppConfig
+
+class CoachingConfig(AppConfig):
+    default_auto_field = 'django.db.models.BigAutoField'
+    name = 'apps.coaching'
+    verbose_name = 'Coaching Layer & Programs'
