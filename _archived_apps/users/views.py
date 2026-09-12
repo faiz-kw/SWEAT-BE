@@ -56,8 +56,10 @@ class UserViewSet(viewsets.ModelViewSet):
         user = self.request.user
         target_tenant_id = self.request.data.get('tenant_id') or self.request.data.get('tenant')
         
-        if user.is_platform_admin and target_tenant_id:
+        if user.is_platform_admin and target_tenant_id and target_tenant_id not in ['platform', 'none', 'all', '']:
             tenant = Tenant.objects.filter(id=target_tenant_id).first()
+        elif user.is_platform_admin:
+            tenant = None
         else:
             tenant = user.tenant
 
@@ -71,7 +73,16 @@ class UserViewSet(viewsets.ModelViewSet):
             ).first()
 
         user_id = serializer.validated_data.get('id') or f"USR-{uuid.uuid4().hex[:6].upper()}"
-        serializer.save(id=user_id, tenant=tenant, role_definition=role_def)
+        is_platform = (tenant is None) or ('Super' in role_name) or ('Platform' in role_name)
+        is_staff = is_platform or ('Admin' in role_name) or ('Manager' in role_name)
+        is_superuser = ('Super' in role_name)
+        serializer.save(
+            id=user_id,
+            tenant=tenant,
+            role_definition=role_def,
+            is_staff=is_staff,
+            is_superuser=is_superuser
+        )
 
     def perform_update(self, serializer):
         target_user = self.get_object()
@@ -260,8 +271,10 @@ class UserInviteView(APIView):
             data = serializer.validated_data
             target_tenant_id = request.data.get('tenant_id') or request.data.get('tenant')
             
-            if request.user.is_platform_admin and target_tenant_id:
+            if request.user.is_platform_admin and target_tenant_id and target_tenant_id not in ['platform', 'none', 'all', '']:
                 tenant = Tenant.objects.filter(id=target_tenant_id).first()
+            elif request.user.is_platform_admin:
+                tenant = None
             else:
                 tenant = request.user.tenant
 
@@ -273,17 +286,25 @@ class UserInviteView(APIView):
                 name__iexact=role_name
             ).first()
 
+            password = data.get('password') or request.data.get('password') or uuid.uuid4().hex[:12]
+            status_val = 'Active' if (data.get('password') or request.data.get('password')) else 'Invited'
+            is_platform = (tenant is None) or ('Super' in role_name) or ('Platform' in role_name)
+            is_staff = is_platform or ('Admin' in role_name) or ('Manager' in role_name)
+            is_superuser = ('Super' in role_name)
+
             user = User.objects.create_user(
                 id=user_id,
                 email=data['email'],
-                password=uuid.uuid4().hex[:12],
+                password=password,
                 first_name=data['first_name'],
                 last_name=data.get('last_name', ''),
                 phone=data.get('phone', ''),
                 role=role_name,
                 role_definition=role_def,
                 tenant=tenant,
-                status='Invited'
+                status=status_val,
+                is_staff=is_staff,
+                is_superuser=is_superuser
             )
             location_ids = data.get('location_ids', [])
             if location_ids:
@@ -294,6 +315,6 @@ class UserInviteView(APIView):
 
             return Response({
                 'user': UserSerializer(user).data,
-                'message': f"Invitation sent to {user.email}"
+                'message': f"User {user.email} created successfully ({status_val})"
             }, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)

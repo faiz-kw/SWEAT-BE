@@ -53,7 +53,7 @@ class UserSerializer(serializers.ModelSerializer):
     allowed_locations = LocationBriefSerializer(many=True, read_only=True)
     allowed_locations_list = LocationBriefSerializer(source='allowed_locations', many=True, read_only=True)
     allowed_location_ids = serializers.ListField(child=serializers.CharField(), write_only=True, required=False)
-    password = serializers.CharField(write_only=True, required=False, min_length=8)
+    password = serializers.CharField(write_only=True, required=False, allow_blank=True)
     is_superuser = serializers.BooleanField(read_only=True)
 
     class Meta:
@@ -129,4 +129,5 @@ class UserInviteSerializer(serializers.Serializer):
     phone = serializers.CharField(max_length=32, required=False, allow_blank=True)
     role = serializers.CharField(max_length=64, default='Trainer')
     location_ids = serializers.ListField(child=serializers.CharField(), required=False, default=list)
+    password = serializers.CharField(required=False, allow_blank=True)
 

@@ -1,275 +1,850 @@
 """
-Authentication Views handling Login, Refresh (RTR), Logout, Current User profile,
-and Change Password.
-HttpOnly cookies are used for refresh tokens to protect against XSS attacks.
+Authentication Views — Phase 1 Layer 1.
+
+Provides JWTs for Platform Users (Master DB) and Tenant Users (Tenant DB).
+All tokens include real role claims read from the database — no hardcoded values.
+
+Endpoints:
+  POST /api/v1/auth/login/             — UniversalLoginView (requires tenant_slug for tenant users)
+  POST /api/v1/auth/platform/login/   — PlatformLoginView
+  POST /api/v1/auth/tenant/login/     — TenantLoginView
+  POST /api/v1/auth/token/refresh/    — TokenRefreshView
+  POST /api/v1/auth/logout/           — LogoutView (blacklists refresh token)
+  GET  /api/v1/auth/me/               — MeView
 """
 
-from django.conf import settings
-from rest_framework import status, permissions, serializers
-from rest_framework.views import APIView
+import logging
+from django.utils import timezone
+from rest_framework import status, serializers
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
-from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
-from drf_spectacular.utils import extend_schema, OpenApiResponse
+from rest_framework_simplejwt.exceptions import TokenError
 
-from .serializers import (
-    CustomTokenObtainPairSerializer,
-    LoginRequestSerializer,
-    TokenRefreshResponseSerializer,
-)
-from apps.users.serializers import UserSerializer
+logger = logging.getLogger(__name__)
 
-def set_refresh_cookie(response: Response, refresh_token: str):
+
+# ---------------------------------------------------------------------------
+# Token Builders — Real claims from DB, no hardcoded values
+# ---------------------------------------------------------------------------
+
+def _build_platform_token(user):
     """
-    Sets the refresh token inside a secure, HttpOnly cookie.
-    """
-    cookie_max_age = int(settings.SIMPLE_JWT['REFRESH_TOKEN_LIFETIME'].total_seconds())
-    is_secure = not settings.DEBUG  # False in dev, True in production (HTTPS)
+    Issue a JWT for a platform user.
 
-    response.set_cookie(
-        key='refresh',
-        value=refresh_token,
-        max_age=cookie_max_age,
-        httponly=True,       # Prevents client-side JS from accessing the token
-        secure=is_secure,    # Only send over HTTPS in production
-        samesite='Lax',      # CSRF protection while allowing top-level navigation
-        path='/',            # Accessible across all API endpoints
+    Role claims are read from PlatformUserRole (Master DB).
+    If the user has no active role assignments, roles list is empty — they
+    will be blocked by platform permission checks (not silently promoted).
+
+    Claims:
+      sub        — PlatformUser UUID
+      user_type  — 'platform'
+      roles      — list of PlatformRole.code (from active PlatformUserRole records)
+      is_staff   — bool (from PlatformUser.is_staff)
+      tid        — empty string (platform users have no tenant)
+      email      — user's email
+      full_name  — user's display name
+    """
+    from apps.master.models_iam import PlatformUserRole
+
+    # Read actual role assignments from Master DB
+    active_roles = list(
+        PlatformUserRole.objects.using('default')
+        .filter(platform_user=user, is_active=True)
+        .select_related('role')
+        .values_list('role__code', flat=True)
     )
 
+    refresh = RefreshToken()
+    refresh['sub'] = str(user.id)
+    refresh['user_type'] = 'platform'
+    refresh['roles'] = active_roles         # Real roles — list, not hardcoded string
+    refresh['is_staff'] = user.is_staff
+    refresh['is_superuser'] = user.is_superuser
+    refresh['tid'] = ''                     # No tenant context for platform users
+    refresh['email'] = user.email
+    refresh['full_name'] = user.full_name
 
-class CookieTokenObtainPairView(TokenObtainPairView):
-    """
-    Login endpoint: Validates email + password, returns 15-minute access token,
-    and attaches the refresh token as an HttpOnly cookie.
-    """
-    serializer_class = CustomTokenObtainPairSerializer
-    permission_classes = [permissions.AllowAny]
-
-    @extend_schema(
-        summary="User Login",
-        description="Authenticates user and returns 15-minute JWT. Sets HttpOnly refresh token cookie.",
-        request=LoginRequestSerializer,
-        responses={
-            200: OpenApiResponse(description="Login successful, returns access token"),
-            401: OpenApiResponse(description="Invalid credentials"),
-        }
+    logger.debug(
+        'Built platform token for user=%s roles=%s',
+        user.email, active_roles,
     )
-    def post(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        try:
-            serializer.is_valid(raise_exception=True)
-        except TokenError as e:
-            raise InvalidToken(e.args[0])
-
-        tokens = serializer.validated_data
-        refresh_token = tokens.pop('refresh', None)
-
-        response = Response(tokens, status=status.HTTP_200_OK)
-
-        if refresh_token:
-            set_refresh_cookie(response, refresh_token)
-
-        return response
+    return refresh
 
 
-class CookieTokenRefreshView(TokenRefreshView):
+def _build_tenant_token(user, tenant, db_alias):
     """
-    Token refresh endpoint (RTR): Reads the HttpOnly refresh cookie,
-    issues a fresh 15-minute access token, and rotates the refresh cookie.
-    """
-    permission_classes = [permissions.AllowAny]
+    Issue a JWT for a tenant user.
 
-    @extend_schema(
-        summary="Token Refresh (RTR)",
-        description="Reads HttpOnly refresh cookie, validates it, rotates it, and returns new 15-minute access token.",
-        responses={
-            200: TokenRefreshResponseSerializer,
-            401: OpenApiResponse(description="Refresh token expired or invalid"),
-        }
+    Role claims are read from RoleAssignment (Tenant DB).
+    If the user has no active role assignments, roles list is empty — they
+    will receive 403 on any RBAC-protected endpoint.
+
+    Claims:
+      sub         — TenantUser UUID
+      user_type   — 'tenant'
+      roles       — list of Role.code (from active RoleAssignment records)
+      tid         — Tenant UUID (verified + DB-backed)
+      db_alias    — tenant DB alias (e.g. 'tenant_tenant_cult_fit')
+      email       — user email
+      full_name   — user display name
+      home_branch — UUID of user's home branch (or None)
+    """
+    from apps.tenant_core.models_rbac import RoleAssignment
+
+    # Read actual active role assignments from Tenant DB
+    active_roles = list(
+        RoleAssignment.objects.using(db_alias)
+        .filter(user=user, is_active=True)
+        .select_related('role')
+        .values_list('role__code', flat=True)
     )
-    def post(self, request, *args, **kwargs):
-        # 1. Read refresh token from HttpOnly cookie, fallback to request body if sent
-        refresh_token = request.COOKIES.get('refresh') or request.data.get('refresh')
 
-        if not refresh_token:
+    home_branch_id = (
+        str(user.home_branch.id)
+        if getattr(user, 'home_branch', None) and user.home_branch
+        else None
+    )
+
+    refresh = RefreshToken()
+    refresh['sub'] = str(user.id)
+    refresh['user_type'] = 'tenant'
+    refresh['roles'] = active_roles         # Real roles — list, not hardcoded string
+    refresh['tid'] = str(tenant.id)
+    refresh['tenant_slug'] = tenant.slug
+    refresh['db_alias'] = db_alias
+    refresh['email'] = user.email
+    refresh['full_name'] = user.full_name
+    refresh['home_branch_id'] = home_branch_id
+
+    logger.debug(
+        'Built tenant token for user=%s tenant=%s roles=%s',
+        user.email, tenant.slug, active_roles,
+    )
+    return refresh
+
+
+# ---------------------------------------------------------------------------
+# Shared Login Helper
+# ---------------------------------------------------------------------------
+
+def _register_and_resolve_tenant(tenant):
+    """
+    Given an ACTIVE Tenant object, register its DB connection and return the alias.
+    Raises ValueError if the data source is unavailable.
+    """
+    from apps.master.models_infra import TenantDataSource
+    from config.tenant_middleware import _register_tenant_connection
+    from config.routers import set_tenant_db_alias
+
+    try:
+        data_source = TenantDataSource.objects.using('default').get(
+            tenant=tenant,
+            status='ACTIVE',
+        )
+    except TenantDataSource.DoesNotExist:
+        raise ValueError('Tenant database not provisioned or not active.')
+
+    if not data_source.db_name:
+        raise ValueError('Tenant database name is not configured.')
+
+    db_alias = f"tenant_{data_source.db_name}"
+    _register_tenant_connection(db_alias, data_source.db_name)
+    set_tenant_db_alias(db_alias)
+    return db_alias
+
+
+def _build_login_response(refresh, user_type, user_data, extra=None):
+    """Build the standard login response dict with access + refresh tokens."""
+    payload = {
+        'access': str(refresh.access_token),
+        'refresh': str(refresh),
+        'user_type': user_type,
+        'user': user_data,
+    }
+    if extra:
+        payload.update(extra)
+    resp = Response(payload)
+    resp.set_cookie(
+        'refresh_token',
+        str(refresh),
+        httponly=True,
+        samesite='Lax',
+        max_age=7 * 24 * 60 * 60,
+        secure=False,  # Set to True in production (requires HTTPS)
+    )
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# View: UniversalLoginView
+# ---------------------------------------------------------------------------
+
+class UniversalLoginView(APIView):
+    """
+    POST /api/v1/auth/login/
+
+    Unified login for the web frontend.
+    Detects Platform User vs Tenant User by presence of tenant_slug.
+
+    - Without tenant_slug: attempts Platform User login (Master DB)
+    - With tenant_slug: attempts Tenant User login (specified Tenant DB only)
+
+    NOTE: The previous implementation scanned ALL active tenants when tenant_slug
+    was omitted for a tenant user. This was an O(N) unbounded query that also
+    leaked information about which tenants had a given email. That behavior has
+    been removed. Tenant login now REQUIRES tenant_slug.
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        email = request.data.get('email', '').lower().strip()
+        password = request.data.get('password', '')
+        tenant_slug = request.data.get('tenant_slug', '').lower().strip()
+
+        if not email or not password:
             return Response(
-                {"detail": "Refresh token cookie not found. Please log in again."},
-                status=status.HTTP_401_UNAUTHORIZED
+                {'error': 'Email and password are required.'},
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
-        data = {'refresh': refresh_token}
-        serializer = self.get_serializer(data=data)
+        # Route by presence of tenant_slug
+        if not tenant_slug:
+            return self._platform_login(request, email, password)
+        else:
+            return self._tenant_login(request, email, password, tenant_slug)
+
+    def _platform_login(self, request, email, password):
+        """Authenticate against Master DB platform_users table."""
+        from apps.master.models_iam import PlatformUser
 
         try:
-            serializer.is_valid(raise_exception=True)
-        except TokenError as e:
+            user = PlatformUser.objects.using('default').get(email=email)
+        except PlatformUser.DoesNotExist:
+            # Do not reveal whether email exists
             return Response(
-                {"detail": str(e)},
-                status=status.HTTP_401_UNAUTHORIZED
+                {'error': 'Invalid email or password.'},
+                status=status.HTTP_401_UNAUTHORIZED,
             )
 
-        tokens = serializer.validated_data
-        new_refresh = tokens.pop('refresh', None)
+        if not user.check_password(password):
+            return Response(
+                {'error': 'Invalid email or password.'},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
 
-        response = Response(tokens, status=status.HTTP_200_OK)
+        if user.status != 'ACTIVE':
+            return Response(
+                {'error': f'Account is {user.status}. Contact platform support.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
-        # If refresh token rotation (RTR) is enabled, set the new rotated cookie
-        if new_refresh:
-            set_refresh_cookie(response, new_refresh)
+        refresh = _build_platform_token(user)
+        _update_last_login(user, request, db='default')
 
-        return response
+        return _build_login_response(
+            refresh,
+            user_type='platform',
+            user_data={
+                'id': str(user.id),
+                'email': user.email,
+                'full_name': user.full_name,
+                'status': user.status,
+            },
+        )
+
+    def _tenant_login(self, request, email, password, tenant_slug):
+        """Authenticate against the specified tenant's dedicated DB."""
+        from apps.master.models_tenant import Tenant
+        from apps.tenant_core.models_users import TenantUser
+
+        try:
+            tenant = Tenant.objects.using('default').get(
+                slug=tenant_slug,
+                status='ACTIVE',
+            )
+        except Tenant.DoesNotExist:
+            # Do not reveal whether the slug exists — return same error
+            return Response(
+                {'error': 'Invalid email or password.'},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        try:
+            db_alias = _register_and_resolve_tenant(tenant)
+        except ValueError as e:
+            logger.error(
+                'UniversalLoginView: tenant DB unavailable for slug=%s: %s',
+                tenant_slug, e,
+            )
+            return Response(
+                {'error': 'Organization database is currently unavailable. Please try again.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        try:
+            user = TenantUser.objects.using(db_alias).get(email=email)
+        except TenantUser.DoesNotExist:
+            return Response(
+                {'error': 'Invalid email or password.'},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        if not user.check_password(password):
+            return Response(
+                {'error': 'Invalid email or password.'},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        if user.status != 'ACTIVE':
+            return Response(
+                {'error': f'Account is {user.status}. Contact your administrator.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        refresh = _build_tenant_token(user, tenant, db_alias)
+        _update_last_login(user, request, db=db_alias)
+
+        return _build_login_response(
+            refresh,
+            user_type='tenant',
+            user_data={
+                'id': str(user.id),
+                'email': user.email,
+                'full_name': user.full_name,
+                'status': user.status,
+            },
+            extra={
+                'tenant': {
+                    'id': str(tenant.id),
+                    'slug': tenant.slug,
+                    'name': tenant.name,
+                },
+            },
+        )
 
 
-class LogoutResponseSerializer(serializers.Serializer):
-    detail = serializers.CharField()
+# ---------------------------------------------------------------------------
+# View: PlatformLoginView
+# ---------------------------------------------------------------------------
+
+class PlatformLoginView(APIView):
+    """POST /api/v1/auth/platform/login/ — Explicit platform user login."""
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        email = request.data.get('email', '').lower().strip()
+        password = request.data.get('password', '')
+
+        if not email or not password:
+            return Response(
+                {'error': 'Email and password are required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        from apps.master.models_iam import PlatformUser
+
+        try:
+            user = PlatformUser.objects.using('default').get(email=email)
+        except PlatformUser.DoesNotExist:
+            return Response(
+                {'error': 'Invalid credentials.'},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        if not user.check_password(password):
+            return Response(
+                {'error': 'Invalid credentials.'},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        if user.status != 'ACTIVE':
+            return Response(
+                {'error': f'Account is {user.status}. Contact platform support.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        refresh = _build_platform_token(user)
+        _update_last_login(user, request, db='default')
+
+        return _build_login_response(
+            refresh,
+            user_type='platform',
+            user_data={
+                'id': str(user.id),
+                'email': user.email,
+                'full_name': user.full_name,
+                'status': user.status,
+            },
+        )
 
 
-class CookieTokenLogoutView(APIView):
-    """
-    Logout endpoint: Blacklists the refresh token and clears the HttpOnly cookie.
-    """
-    permission_classes = [permissions.AllowAny]
+# ---------------------------------------------------------------------------
+# View: TenantLoginView
+# ---------------------------------------------------------------------------
 
-    @extend_schema(
-        summary="User Logout",
-        description="Blacklists the current refresh token and clears the HttpOnly cookie.",
-        responses={
-            200: LogoutResponseSerializer,
-        }
-    )
-    def post(self, request, *args, **kwargs):
+class TenantLoginView(APIView):
+    """POST /api/v1/auth/tenant/login/ — Explicit tenant user login."""
+    permission_classes = [AllowAny]
 
-        refresh_token = request.COOKIES.get('refresh') or request.data.get('refresh')
+    def post(self, request):
+        email = request.data.get('email', '').lower().strip()
+        password = request.data.get('password', '')
+        tenant_slug = request.data.get('tenant_slug', '').lower().strip()
 
-        if refresh_token:
-            try:
-                token = RefreshToken(refresh_token)
-                token.blacklist()
-            except (TokenError, Exception):
-                # Token might already be expired or blacklisted, continue to clear cookie
-                pass
+        if not all([email, password, tenant_slug]):
+            return Response(
+                {'error': 'email, password and tenant_slug are required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        response = Response({"detail": "Successfully logged out."}, status=status.HTTP_200_OK)
-        response.delete_cookie(key='refresh', path='/api/v1/auth/')
-        return response
+        from apps.master.models_tenant import Tenant
+        from apps.tenant_core.models_users import TenantUser
 
+        try:
+            tenant = Tenant.objects.using('default').get(slug=tenant_slug)
+        except Tenant.DoesNotExist:
+            return Response(
+                {'error': 'Tenant not found.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if not tenant.is_accessible:
+            return Response(
+                {'error': f'Organization access is {tenant.status}. Contact your administrator.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        try:
+            db_alias = _register_and_resolve_tenant(tenant)
+        except ValueError as e:
+            logger.error(
+                'TenantLoginView: tenant DB unavailable for slug=%s: %s',
+                tenant_slug, e,
+            )
+            return Response(
+                {'error': 'Organization database is currently unavailable. Please try again.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        try:
+            user = TenantUser.objects.using(db_alias).get(email=email)
+        except TenantUser.DoesNotExist:
+            return Response(
+                {'error': 'Invalid credentials.'},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        if not user.check_password(password):
+            return Response(
+                {'error': 'Invalid credentials.'},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        if user.status != 'ACTIVE':
+            return Response(
+                {'error': f'Account is {user.status}.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        refresh = _build_tenant_token(user, tenant, db_alias)
+        _update_last_login(user, request, db=db_alias)
+
+        return _build_login_response(
+            refresh,
+            user_type='tenant',
+            user_data={
+                'id': str(user.id),
+                'email': user.email,
+                'full_name': user.full_name,
+                'status': user.status,
+            },
+            extra={
+                'tenant': {
+                    'id': str(tenant.id),
+                    'slug': tenant.slug,
+                    'name': tenant.name,
+                },
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# View: MeView
+# ---------------------------------------------------------------------------
 
 class MeView(APIView):
     """
-    Returns the authenticated user's profile, tenant permissions, and enabled modules.
-    The enabled_modules list drives the sidebar navigation filtering on the frontend.
-    """
-    permission_classes = [permissions.IsAuthenticated]
+    GET /api/v1/auth/me/
 
-    @extend_schema(
-        summary="Current User Profile",
-        description="Returns details of the currently authenticated user, including tenant enabled_modules.",
-        responses={200: UserSerializer}
-    )
+    Returns authenticated user's profile, roles, enabled modules, and branding.
+    All data is read from the database — no hardcoded values.
+    """
+    permission_classes = [IsAuthenticated]
+
     def get(self, request):
         user = request.user
-        serializer = UserSerializer(user)
-        data = serializer.data
+        auth_type = getattr(user, '_auth_type', None)
 
-        # Attach tenant's enabled_modules so the frontend can enforce
-        # module/submodule access in the sidebar and route guards.
-        # Super admins (no tenant) get None = unrestricted.
-        if user.tenant_id:
-            from apps.tenants.models import Tenant, Location, TenantBranding
-            from apps.tenants.serializers import TenantBrandingSerializer
-            from apps.users.serializers import LocationBriefSerializer
-            tenant = Tenant.objects.filter(id=user.tenant_id).first()
-            if tenant:
-                data['enabled_modules'] = tenant.enabled_modules if tenant.enabled_modules is not None else []
-                data['tenant_name'] = tenant.name
-
-                # Attach tenant's white-label branding
-                branding = TenantBranding.objects.filter(tenant=tenant).first()
-                if branding:
-                    data['branding'] = TenantBrandingSerializer(branding).data
-                else:
-                    data['branding'] = {
-                        'app_name': tenant.name,
-                        'primary_color': '#0f766e',
-                        'accent_color': '#f59e0b',
-                        'logo_url': '',
-                        'favicon_url': '',
-                        'custom_domain': '',
-                        'email_footer': ''
-                    }
-
-                # Ensure tenant admins and staff always get the latest studio branches
-                if user.role in ['Admin', 'Super Admin'] or not user.allowed_locations.exists():
-                    tenant_locs = Location.objects.filter(tenant=tenant, is_active=True)
-                    data['allowed_locations'] = LocationBriefSerializer(tenant_locs, many=True).data
-                    data['allowed_locations_list'] = data['allowed_locations']
-            else:
-                data['enabled_modules'] = []
-                data['branding'] = None
+        if auth_type == 'platform':
+            return self._platform_me(request, user)
+        elif auth_type == 'tenant':
+            return self._tenant_me(request, user)
         else:
-            # Super admin — null means unrestricted access to everything
-            data['enabled_modules'] = None
-            data['branding'] = None
-
-        return Response(data, status=status.HTTP_200_OK)
-
-
-class ChangePasswordView(APIView):
-    """
-    Change the authenticated user's password.
-    Requires current password verification before setting a new one.
-
-    POST /api/v1/auth/change-password/
-    Body: { current_password, new_password, confirm_password }
-    """
-    permission_classes = [permissions.IsAuthenticated]
-
-    @extend_schema(
-        summary="Change Password",
-        description="Validates current password then sets a new password for the authenticated user.",
-        responses={
-            200: OpenApiResponse(description="Password changed successfully"),
-            400: OpenApiResponse(description="Validation error (wrong current password or mismatch)"),
-        }
-    )
-    def post(self, request, *args, **kwargs):
-        user = request.user
-        current_password = request.data.get('current_password', '')
-        new_password = request.data.get('new_password', '')
-        confirm_password = request.data.get('confirm_password', '')
-
-        # Validate current password
-        if not user.check_password(current_password):
             return Response(
-                {'detail': 'Current password is incorrect.'},
-                status=status.HTTP_400_BAD_REQUEST
+                {'error': 'Unable to determine user type from token.'},
+                status=status.HTTP_401_UNAUTHORIZED,
             )
 
-        # Validate new password fields
-        if not new_password:
-            return Response(
-                {'detail': 'New password cannot be empty.'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+    def _platform_me(self, request, user):
+        """Build /me response for a platform team member."""
+        from apps.master.models_iam import PlatformUserRole
 
-        if new_password != confirm_password:
-            return Response(
-                {'detail': 'New passwords do not match.'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        if len(new_password) < 3:
-            return Response(
-                {'detail': 'Password must be at least 3 characters.'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Set the new password
-        user.set_password(new_password)
-        user.save(update_fields=['password'])
-
-        return Response(
-            {'detail': 'Password changed successfully.'},
-            status=status.HTTP_200_OK
+        active_roles = list(
+            PlatformUserRole.objects.using('default')
+            .filter(platform_user=user, is_active=True)
+            .select_related('role')
+            .values('role__code', 'role__name')
         )
+
+        return Response({
+            'id': str(user.id),
+            'email': user.email,
+            'first_name': user.first_name,
+            'last_name': user.last_name,
+            'full_name': user.full_name,
+            'user_type': 'platform',
+            'roles': [{'code': r['role__code'], 'name': r['role__name']} for r in active_roles],
+            'is_staff': user.is_staff,
+            'is_superuser': user.is_superuser,
+            'tenant_id': None,
+            'tenant_name': None,
+            'active_branch_id': None,
+            'enabled_modules': None,  # Platform users see all tenant modules via admin
+            'allowed_branches': [],
+            'branding': None,
+        })
+
+    def _tenant_me(self, request, user):
+        """Build /me response for a tenant end-user."""
+        from apps.master.models_tenant import Tenant
+        from apps.tenant_core.models_rbac import RoleAssignment
+
+        tenant_id = getattr(user, '_tenant_id', None)
+        db_alias = getattr(user, '_db_alias', None)
+
+        # Ensure tenant router is set for this response (may have been reset)
+        if db_alias:
+            from config.routers import set_tenant_db_alias
+            set_tenant_db_alias(db_alias)
+
+        # Load tenant details from Master DB
+        tenant_data = {}
+        enabled_modules = []
+        branding = None
+
+        if tenant_id:
+            try:
+                tenant = Tenant.objects.using('default').select_related(
+                    'branding'
+                ).filter(id=tenant_id).first()
+
+                if tenant:
+                    tenant_data = {
+                        'id': str(tenant.id),
+                        'slug': tenant.slug,
+                        'name': tenant.name,
+                    }
+                    # Enabled modules come from master TenantModule — real data
+                    enabled_modules = list(
+                        tenant.enabled_modules_set
+                        .filter(is_enabled=True)
+                        .select_related('module')
+                        .values_list('module__code', flat=True)
+                    )
+                    # Branding from master DB
+                    if hasattr(tenant, 'branding') and tenant.branding:
+                        b = tenant.branding
+                        branding = {
+                            'primary_color': b.primary_color,
+                            'accent_color': b.accent_color,
+                            'logo_url': b.logo_url,
+                            'app_name': b.app_name,
+                        }
+            except Exception as e:
+                logger.error('MeView: Error loading tenant context for tid=%s: %s', tenant_id, e)
+
+        # Load active role assignments from Tenant DB
+        active_roles = []
+        allowed_branches = []
+
+        if db_alias:
+            try:
+                assignments = (
+                    RoleAssignment.objects.using(db_alias)
+                    .filter(user=user, is_active=True)
+                    .select_related('role', 'branch')
+                )
+                for ra in assignments:
+                    active_roles.append({
+                        'code': ra.role.code,
+                        'name': ra.role.name,
+                        'scope': ra.role.scope,
+                        'branch_id': str(ra.branch.id) if ra.branch else None,
+                        'branch_name': ra.branch.name if ra.branch else None,
+                    })
+                    if ra.branch:
+                        allowed_branches.append({
+                            'id': str(ra.branch.id),
+                            'name': ra.branch.name,
+                            'code': ra.branch.code,
+                        })
+            except Exception as e:
+                logger.error('MeView: Error loading role assignments from db_alias=%s: %s', db_alias, e)
+
+        # Home branch details from Tenant DB
+        home_branch_data = None
+        try:
+            hb = getattr(user, 'home_branch', None)
+            if hb:
+                home_branch_data = {
+                    'id': str(hb.id),
+                    'name': hb.name,
+                    'code': hb.code,
+                    'address': getattr(hb, 'address', ''),
+                    'phone': getattr(hb, 'phone', ''),
+                    'status': getattr(hb, 'status', ''),
+                }
+        except Exception:
+            pass
+
+        return Response({
+            'id': str(user.id),
+            'email': user.email,
+            'first_name': user.first_name,
+            'last_name': user.last_name,
+            'full_name': user.full_name,
+            'user_type': 'tenant',
+            'roles': active_roles,                     # Real role assignments from DB
+            'is_staff': False,
+            'is_superuser': False,
+            'tenant_id': str(tenant_id) if tenant_id else None,
+            'tenant_name': tenant_data.get('name') if tenant_data else None,
+            'tenant': tenant_data,
+            'home_branch': home_branch_data,
+            'enabled_modules': enabled_modules,        # Real module enablement from Master DB
+            'allowed_branches': allowed_branches,
+            'branding': branding,
+        })
+
+
+# ---------------------------------------------------------------------------
+# Serializer: PerformanceOSTokenRefreshSerializer
+# ---------------------------------------------------------------------------
+
+class PerformanceOSTokenRefreshSerializer(serializers.Serializer):
+    """
+    Tenant-aware Token Refresh Serializer.
+    
+    SimpleJWT's default TokenRefreshSerializer hardcodes get_user_model().objects.get(id=user_id)
+    against the Master DB. In our multi-tenant architecture:
+      - 'platform' tokens map to PlatformUser in the Master DB ('default')
+      - 'tenant' tokens map to TenantUser in the tenant's dedicated DB (db_alias)
+    
+    This serializer validates the user in the correct database based on the 'user_type'
+    claim, and then performs full Refresh Token Rotation (RTR) and blacklisting.
+    """
+    refresh = serializers.CharField()
+    access = serializers.CharField(read_only=True)
+    token_class = RefreshToken
+
+    def validate(self, attrs: dict) -> dict:
+        from rest_framework_simplejwt.settings import api_settings
+        from rest_framework.exceptions import AuthenticationFailed
+
+        refresh = self.token_class(attrs["refresh"])
+        user_type = refresh.payload.get('user_type')
+        user_id = refresh.payload.get(api_settings.USER_ID_CLAIM)
+
+        if user_type == 'tenant':
+            from apps.tenant_core.models_users import TenantUser
+            from config.tenant_middleware import _register_tenant_connection
+            from config.routers import set_tenant_db_alias
+            from apps.master.models_infra import TenantDataSource
+
+            db_alias = refresh.payload.get('db_alias')
+            tid = refresh.payload.get('tid')
+
+            if not db_alias and tid:
+                ds = TenantDataSource.objects.using('default').filter(tenant_id=tid, status='ACTIVE').first()
+                if ds and ds.db_name:
+                    db_alias = f"tenant_{ds.db_name}"
+
+            if db_alias:
+                # Ensure tenant connection is registered in thread
+                raw_db_name = db_alias.replace('tenant_', '', 1) if db_alias.startswith('tenant_') else db_alias
+                _register_tenant_connection(db_alias, raw_db_name)
+                try:
+                    user = TenantUser.objects.using(db_alias).get(id=user_id)
+                    if user.status != 'ACTIVE':
+                        raise AuthenticationFailed('User account is not active.')
+                except TenantUser.DoesNotExist:
+                    raise AuthenticationFailed('Tenant user not found.')
+        else:
+            from apps.master.models_iam import PlatformUser
+            try:
+                user = PlatformUser.objects.using('default').get(id=user_id)
+                if user.status != 'ACTIVE':
+                    raise AuthenticationFailed('Platform user account is not active.')
+            except PlatformUser.DoesNotExist:
+                raise AuthenticationFailed('Platform user not found.')
+
+        data = {"access": str(refresh.access_token)}
+
+        if api_settings.ROTATE_REFRESH_TOKENS:
+            if api_settings.BLACKLIST_AFTER_ROTATION:
+                try:
+                    refresh.blacklist()
+                except AttributeError:
+                    pass
+
+            refresh.set_jti()
+            refresh.set_exp()
+            refresh.set_iat()
+            refresh.outstand()
+
+            data["refresh"] = str(refresh)
+
+        return data
+
+
+# ---------------------------------------------------------------------------
+# View: TokenRefreshView
+# ---------------------------------------------------------------------------
+
+class TokenRefreshView(APIView):
+    """
+    POST /api/v1/auth/token/refresh/ — RTR: rotate refresh token and issue new access token.
+
+    Uses PerformanceOSTokenRefreshSerializer to enforce:
+      - Validation against expiration, blacklist, and invalid signatures
+      - Automatic blacklisting of old refresh token when ROTATE_REFRESH_TOKENS and BLACKLIST_AFTER_ROTATION are True
+      - Multi-tenant user validation against correct database (PlatformUser vs TenantUser)
+      - Generation of new rotated refresh token with new JTI and fresh expiration
+      - Inclusion in OutstandingToken table via refresh.outstand()
+      - Rejection of reused old refresh tokens with 401 Unauthorized
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
+
+        refresh_token_str = request.data.get('refresh') or request.COOKIES.get('refresh_token')
+
+        if not refresh_token_str:
+            return Response(
+                {'error': 'Refresh token is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = PerformanceOSTokenRefreshSerializer(data={'refresh': refresh_token_str})
+        try:
+            serializer.is_valid(raise_exception=True)
+        except TokenError as e:
+            logger.debug(
+                'TokenRefreshView: Token validation/blacklist failed — %s | correlation_id=%s',
+                type(e).__name__,
+                getattr(request, 'correlation_id', '-'),
+            )
+            return Response(
+                {'error': 'Invalid or expired refresh token.', 'detail': str(e)},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        except Exception as e:
+            logger.debug(
+                'TokenRefreshView: Refresh validation failed — %s | correlation_id=%s',
+                e,
+                getattr(request, 'correlation_id', '-'),
+            )
+            return Response(
+                {'error': 'Invalid or expired refresh token.', 'detail': str(e)},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        validated_data = serializer.validated_data
+        new_access_str = validated_data['access']
+        new_refresh_str = validated_data.get('refresh') or refresh_token_str
+
+        resp = Response({
+            'access': new_access_str,
+            'refresh': new_refresh_str,
+        }, status=status.HTTP_200_OK)
+
+        resp.set_cookie(
+            'refresh_token',
+            new_refresh_str,
+            httponly=True,
+            samesite='Lax',
+            max_age=7 * 24 * 60 * 60,   # mirrors JWT_REFRESH_DAYS = 7
+            secure=False,               # Set to True in production (requires HTTPS)
+        )
+        logger.debug(
+            'TokenRefreshView: RTR complete — new access+refresh issued | correlation_id=%s',
+            getattr(request, 'correlation_id', '-'),
+        )
+        return resp
+
+
+# ---------------------------------------------------------------------------
+# View: LogoutView
+# ---------------------------------------------------------------------------
+
+class LogoutView(APIView):
+    """
+    POST /api/v1/auth/logout/
+
+    Blacklists the refresh token in the database (via simplejwt token_blacklist app)
+    then clears the HttpOnly cookie.
+
+    This ensures that even if a refresh token is stolen after logout, it
+    cannot be used to obtain a new access token.
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        refresh_token_str = request.data.get('refresh') or request.COOKIES.get('refresh_token')
+
+        if refresh_token_str:
+            try:
+                refresh = RefreshToken(refresh_token_str)
+                refresh.blacklist()
+                logger.debug(
+                    'LogoutView: Blacklisted refresh token | correlation_id=%s',
+                    getattr(request, 'correlation_id', '-'),
+                )
+            except TokenError:
+                # Already expired or blacklisted — not an error, still clear the cookie
+                logger.debug('LogoutView: Refresh token was already expired/blacklisted at logout.')
+            except Exception as e:
+                # Unexpected error — log but don't fail logout
+                logger.error('LogoutView: Unexpected error blacklisting token: %s', e)
+
+        resp = Response({'message': 'Logged out successfully.'})
+        resp.delete_cookie('refresh_token')
+        return resp
+
+
+# ---------------------------------------------------------------------------
+# Shared Helper
+# ---------------------------------------------------------------------------
+
+def _update_last_login(user, request, db: str) -> None:
+    """Update last_login_at and last_login_ip for any user type."""
+    try:
+        user.last_login_at = timezone.now()
+        user.last_login_ip = request.META.get('REMOTE_ADDR')
+        user.save(using=db, update_fields=['last_login_at', 'last_login_ip'])
+    except Exception as e:
+        # Non-critical — don't fail login because of a timestamp update error
+        logger.warning('_update_last_login: Failed to update login timestamp: %s', e)

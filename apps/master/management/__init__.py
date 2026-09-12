@@ -1,0 +1,1 @@
+"""Master app management package."""

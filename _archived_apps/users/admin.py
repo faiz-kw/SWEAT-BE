@@ -11,13 +11,31 @@ class RolePermissionInline(admin.TabularInline):
     fields = ('permission', 'granted')
 
 
+class UserScopeListFilter(admin.SimpleListFilter):
+    title = 'User Scope (Platform vs Tenant)'
+    parameter_name = 'user_scope'
+
+    def lookups(self, request, model_admin):
+        return (
+            ('platform', '🌐 SaaS Platform Users (Global HQ)'),
+            ('tenant', '🏢 Tenant Users (Gym Staff)'),
+        )
+
+    def queryset(self, request, queryset):
+        if self.value() == 'platform':
+            return queryset.filter(tenant__isnull=True)
+        if self.value() == 'tenant':
+            return queryset.filter(tenant__isnull=False)
+        return queryset
+
+
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
     list_display = (
-        'id', 'user_badge', 'role_badge', 'tenant_badge', 
+        'id', 'user_badge', 'scope_badge', 'role_badge', 'tenant_badge', 
         'active_loc_display', 'status_badge', 'is_active', 'is_staff', 'date_joined'
     )
-    list_filter = ('role', 'status', 'is_active', 'is_staff', 'is_superuser', 'tenant', 'date_joined')
+    list_filter = (UserScopeListFilter, 'role', 'status', 'is_active', 'is_staff', 'is_superuser', 'tenant', 'date_joined')
     search_fields = ('id', 'email', 'first_name', 'last_name', 'phone', 'tenant__name')
     ordering = ('email',)
     readonly_fields = ('date_joined', 'last_login')
@@ -53,10 +71,17 @@ class UserAdmin(BaseUserAdmin):
         return format_html(f'<b>{name}</b><br><span style="color: #64748b; font-size: 11px;">{obj.email}</span>')
     user_badge.short_description = 'User Profile'
 
+    def scope_badge(self, obj):
+        if not obj.tenant or obj.is_platform_admin:
+            return format_html('<span style="background: #581c87; color: #f3e8ff; padding: 2px 7px; border-radius: 5px; font-weight: bold; font-size: 11px;">🌐 Platform</span>')
+        return format_html('<span style="background: #065f46; color: #d1fae5; padding: 2px 7px; border-radius: 5px; font-weight: bold; font-size: 11px;">🏢 Tenant Staff</span>')
+    scope_badge.short_description = 'Scope'
+
     def role_badge(self, obj):
         colors = {
             'Super Admin': 'background: #dc2626; color: white;',
-            'Studio Owner / Admin': 'background: #7c3aed; color: white;',
+            'Platform Administrator': 'background: #7c3aed; color: white;',
+            'Studio Owner / Admin': 'background: #0284c7; color: white;',
             'Studio Manager': 'background: #2563eb; color: white;',
             'Sales': 'background: #059669; color: white;',
             'Personal Trainer / Coach': 'background: #0891b2; color: white;',
@@ -69,9 +94,9 @@ class UserAdmin(BaseUserAdmin):
 
     def tenant_badge(self, obj):
         if not obj.tenant:
-            return format_html('<span style="color: #94a3b8; font-style: italic;">(Platform Super Admin)</span>')
-        return format_html(f'<b>{obj.tenant.name}</b>')
-    tenant_badge.short_description = 'Tenant'
+            return format_html('<span style="color: #a855f7; font-weight: 600;">🌐 Global Platform HQ</span>')
+        return format_html(f'<span style="color: #0d9488; font-weight: 600;">🏢 {obj.tenant.name}</span>')
+    tenant_badge.short_description = 'Tenant / Organization'
 
     def active_loc_display(self, obj):
         return obj.active_location.name if obj.active_location else '-'
