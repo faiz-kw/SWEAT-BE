@@ -25,7 +25,7 @@ import threading
 from pathlib import Path
 
 # Set up Django environment
-BACKEND_DIR = Path(__file__).resolve().parent
+BACKEND_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND_DIR))
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
 
