@@ -43,21 +43,60 @@ class DepartmentSerializer(serializers.ModelSerializer):
 
 
 class TenantUserSerializer(serializers.ModelSerializer):
+    ALLOWED_TRANSITIONS = {
+        'INVITED': {'ACTIVE', 'INACTIVE', 'DEACTIVATED'},
+        'ACTIVE': {'INACTIVE', 'SUSPENDED', 'BLOCKED', 'DEACTIVATED'},
+        'INACTIVE': {'ACTIVE', 'DEACTIVATED'},
+        'SUSPENDED': {'ACTIVE', 'DEACTIVATED'},
+        'BLOCKED': {'ACTIVE', 'DEACTIVATED'},
+        'DEACTIVATED': {'ACTIVE'},
+    }
+
     class Meta:
         model = TenantUser
-        fields = ['id', 'organization', 'email', 'first_name', 'last_name', 'phone',
-                  'status', 'home_branch', 'last_login_at', 'created_at']
-        read_only_fields = ['id', 'last_login_at', 'created_at']
+        fields = [
+            'id', 'organization', 'email', 'first_name', 'last_name', 'phone',
+            'status', 'is_login_allowed', 'home_branch', 'deactivated_at',
+            'deactivated_by', 'deactivation_reason', 'suspended_until',
+            'last_login_at', 'created_at',
+        ]
+        read_only_fields = ['id', 'last_login_at', 'created_at', 'deactivated_at', 'deactivated_by']
 
     def update(self, instance, validated_data):
         from django.db import transaction
+        from django.utils import timezone
         from apps.master.quota import QuotaChecker, QuotaExceededError, QuotaConfigurationError
         from config.routers import get_tenant_db_alias
         from .models_org import Organization
+        from .models_users import TenantUser
 
         db_alias = self.context.get('db_alias') or get_tenant_db_alias()
         new_status = validated_data.get('status')
         old_status = instance.status
+
+        # Enforce state transition matrix if status is changing
+        if new_status and new_status != old_status:
+            allowed = self.ALLOWED_TRANSITIONS.get(old_status, set())
+            if new_status not in allowed:
+                raise serializers.ValidationError({
+                    'status': f"Invalid lifecycle transition from '{old_status}' to '{new_status}'."
+                })
+
+            # Handle DEACTIVATED transition audit fields
+            if new_status == 'DEACTIVATED':
+                validated_data['deactivated_at'] = timezone.now()
+                request = self.context.get('request')
+                if request and hasattr(request, 'user') and hasattr(request.user, 'id'):
+                    try:
+                        actor = TenantUser.objects.using(db_alias).filter(id=request.user.id).first()
+                        if actor:
+                            validated_data['deactivated_by'] = actor
+                    except Exception:
+                        pass
+
+            # Handle SUSPENDED -> ACTIVE explicit transition
+            if new_status == 'ACTIVE' and old_status == 'SUSPENDED':
+                validated_data['suspended_until'] = None
 
         # If activating a previously non-counted user, check quota
         if new_status in ('ACTIVE', 'INVITED') and old_status not in ('ACTIVE', 'INVITED'):

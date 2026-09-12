@@ -64,6 +64,16 @@ class TenantDataSource(models.Model):
     def __str__(self):
         return f"{self.tenant.slug} → {self.database_name or self.db_name} [{self.status}]"
 
+    @property
+    def database_host(self) -> str:
+        """Read-only property alias for db_host (Sprint 14 reconciliation)."""
+        return self.db_host
+
+    @property
+    def database_port(self) -> int:
+        """Read-only property alias for db_port (Sprint 14 reconciliation)."""
+        return self.db_port
+
     def save(self, *args, **kwargs):
         if not self.database_name and self.db_name:
             self.database_name = self.db_name

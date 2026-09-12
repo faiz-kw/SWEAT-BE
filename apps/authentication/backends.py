@@ -246,6 +246,11 @@ class TenantJWTAuthentication(BaseAuthentication):
                 f'User account is {user.status}. Contact your administrator.'
             )
 
+        if not user.is_login_allowed:
+            raise AuthenticationFailed(
+                'User login is disabled. Contact your administrator.'
+            )
+
         # Attach authentication context — consumed by RBAC permission classes
         user._auth_type = 'tenant'
         user._tenant_id = tenant_id

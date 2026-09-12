@@ -59,6 +59,8 @@ class TenantUser(models.Model):
         ('ACTIVE', 'Active'),
         ('INACTIVE', 'Inactive'),
         ('SUSPENDED', 'Suspended'),
+        ('BLOCKED', 'Blocked'),
+        ('DEACTIVATED', 'Deactivated'),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -78,6 +80,7 @@ class TenantUser(models.Model):
     password_hash = models.TextField(default='')
     user_type = models.CharField(max_length=30, default='STAFF')
     status = models.CharField(max_length=30, choices=STATUS, default='INVITED')
+    is_login_allowed = models.BooleanField(default=True)
     is_mfa_enabled = models.BooleanField(default=False)
     mfa_secret = models.CharField(max_length=128, blank=True, default='')
     email_verified_at = models.DateTimeField(null=True, blank=True)
@@ -86,6 +89,17 @@ class TenantUser(models.Model):
     last_login_ip = models.GenericIPAddressField(null=True, blank=True)
     invited_at = models.DateTimeField(null=True, blank=True)
     activated_at = models.DateTimeField(null=True, blank=True)
+    deactivated_at = models.DateTimeField(null=True, blank=True)
+    deactivated_by = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        db_column='deactivated_by',
+        related_name='deactivated_users',
+    )
+    deactivation_reason = models.TextField(null=True, blank=True)
+    suspended_until = models.DateTimeField(null=True, blank=True)
     # Default home branch — set during user creation; doesn't change on branch deactivation
     home_branch = models.ForeignKey(
         Branch, on_delete=models.SET_NULL, null=True, blank=True,
@@ -114,7 +128,7 @@ class TenantUser(models.Model):
 
     @property
     def is_accessible(self):
-        return self.status == 'ACTIVE'
+        return self.status == 'ACTIVE' and self.is_login_allowed
 
     @property
     def is_authenticated(self):

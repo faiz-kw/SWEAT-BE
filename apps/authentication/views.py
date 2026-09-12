@@ -303,6 +303,12 @@ class UniversalLoginView(APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
+        if not user.is_login_allowed:
+            return Response(
+                {'error': 'Account login is disabled. Contact your administrator.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         refresh = _build_tenant_token(user, tenant, db_alias)
         _update_last_login(user, request, db=db_alias)
 
@@ -445,6 +451,12 @@ class TenantLoginView(APIView):
         if user.status != 'ACTIVE':
             return Response(
                 {'error': f'Account is {user.status}.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if not user.is_login_allowed:
+            return Response(
+                {'error': 'Account login is disabled.'},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
