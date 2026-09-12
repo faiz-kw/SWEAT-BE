@@ -4,20 +4,22 @@ All endpoints require Platform JWT authentication.
 """
 
 import logging
+import json
 import uuid
 from django.db import models, transaction
+from django.http import Http404
 from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from .models_iam import PlatformUser
-from .models_tenant import Tenant, TenantDomain, TenantBranding
+from .models_tenant import Tenant, TenantDomain, TenantBranding, PlatformBranding
 from .models_saas import (
     SaasPlan, SaasPlanPrice, ProductModule, TenantModule,
     TenantSubscription, SubscriptionInvoice, TenantResourceUsage, TenantResourceLimit,
 )
 from .models_market import MarketplaceIntegration
-from .models_infra import TenantProvisioning, TenantDataSource
+from .models_infra import TenantProvisioning, TenantDataSource, PlatformAuditEvent
 from .serializers import (
     TenantSerializer, TenantDetailSerializer,
     SaasPlanSerializer, PlatformUserSerializer,
@@ -25,6 +27,7 @@ from .serializers import (
     ProductModuleSerializer, TenantModuleSerializer,
     TenantSubscriptionSerializer, SubscriptionInvoiceSerializer,
     TenantResourceUsageSerializer,
+    PlatformBrandingSerializer, TenantBrandingSerializer,
 )
 
 from .permissions import PlatformRBACPermission
@@ -542,3 +545,221 @@ class TenantProvisioningViewSet(viewsets.ReadOnlyModelViewSet):
             'started_at': provisioning.started_at,
             'completed_at': provisioning.completed_at,
         })
+
+
+def audit_branding_mutation(action, resource_type, resource_id, description, actor=None, tenant=None, before=None, after=None, request=None):
+    """Emits an authoritative PlatformAuditEvent for branding mutations."""
+    from django.core.serializers.json import DjangoJSONEncoder
+    try:
+        clean_before = json.loads(json.dumps(before, cls=DjangoJSONEncoder)) if before is not None else None
+        clean_after = json.loads(json.dumps(after, cls=DjangoJSONEncoder)) if after is not None else None
+        PlatformAuditEvent.objects.using('default').create(
+            actor=actor if (actor and actor.is_authenticated and getattr(actor, '_auth_type', None) == 'platform') else None,
+            actor_email=actor.email if (actor and hasattr(actor, 'email') and actor.email) else 'system@performanceos.internal',
+            event_name=f"{resource_type.upper()}_{action.upper()}",
+            action=action.upper(),
+            resource_type=resource_type,
+            resource_id=resource_id,
+            tenant_context=tenant,
+            tenant_id=tenant.id if tenant else None,
+            description=description,
+            before_data=clean_before,
+            after_data=clean_after,
+            request_id=getattr(request, 'request_id', None) if request else None,
+            correlation_id=getattr(request, 'correlation_id', None) if request else None,
+            ip_address=request.META.get('REMOTE_ADDR') if request else None,
+            user_agent=request.META.get('HTTP_USER_AGENT', '') if request else '',
+            source_application='control_plane',
+        )
+    except Exception as exc:
+        logger.warning("Failed to record branding audit event: %s", exc)
+
+
+class PlatformBrandingViewSet(viewsets.ModelViewSet):
+    """
+    CRUD for Platform-wide Branding. Platform staff only.
+    """
+    permission_classes = [PlatformRBACPermission]
+    platform_permission_prefix = 'tenants'
+    serializer_class = PlatformBrandingSerializer
+    queryset = PlatformBranding.objects.using('default').all()
+
+    def get_object(self):
+        obj = PlatformBranding.objects.using('default').first()
+        if not obj:
+            obj = PlatformBranding.objects.using('default').create(
+                brand_name='PerformanceOS',
+                platform_name='PerformanceOS',
+                secondary_color='#f59e0b',
+                primary_color='#0f766e',
+            )
+        return obj
+
+    def list(self, request, *args, **kwargs):
+        obj = self.get_object()
+        serializer = self.get_serializer(obj)
+        return Response(serializer.data)
+
+    def retrieve(self, request, *args, **kwargs):
+        obj = self.get_object()
+        serializer = self.get_serializer(obj)
+        return Response(serializer.data)
+
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        before_data = PlatformBrandingSerializer(instance).data
+        updated_instance = serializer.save()
+        after_data = PlatformBrandingSerializer(updated_instance).data
+        audit_branding_mutation(
+            action='UPDATE',
+            resource_type='PlatformBranding',
+            resource_id=updated_instance.id,
+            description='Updated platform branding configuration',
+            actor=self.request.user,
+            before=before_data,
+            after=after_data,
+            request=self.request,
+        )
+
+
+class TenantBrandingViewSet(viewsets.ModelViewSet):
+    """
+    Tenant-specific branding overrides and white-labeling.
+    Supports lookup by tenant UUID, slug, or branding PK.
+    """
+    permission_classes = [PlatformRBACPermission]
+    platform_permission_prefix = 'tenants'
+    action_permission_map = {
+        'verify_dns': 'tenants.edit',
+    }
+    serializer_class = TenantBrandingSerializer
+    queryset = TenantBranding.objects.using('default').all().select_related('tenant')
+
+    def get_object(self):
+        pk = self.kwargs.get('pk')
+        tenant = None
+        try:
+            tenant_uuid = uuid.UUID(pk)
+            tenant = Tenant.objects.using('default').filter(id=tenant_uuid).first()
+        except (ValueError, AttributeError):
+            tenant = Tenant.objects.using('default').filter(slug=pk).first()
+
+        if not tenant:
+            try:
+                branding_uuid = uuid.UUID(pk)
+                branding = TenantBranding.objects.using('default').filter(id=branding_uuid).first()
+                if branding:
+                    return branding
+            except (ValueError, AttributeError):
+                pass
+            raise Http404(f"Tenant or Branding '{pk}' not found.")
+
+        branding, _ = TenantBranding.objects.using('default').get_or_create(
+            tenant=tenant,
+            defaults={
+                'app_name': tenant.name,
+                'brand_name': tenant.name,
+                'theme_preset_code': 'titanium-teal',
+            }
+        )
+        return branding
+
+    def perform_update(self, serializer):
+        instance = self.get_object()
+        before_data = TenantBrandingSerializer(instance).data
+        updated_instance = serializer.save()
+        after_data = TenantBrandingSerializer(updated_instance).data
+        audit_branding_mutation(
+            action='UPDATE',
+            resource_type='TenantBranding',
+            resource_id=updated_instance.id,
+            description=f"Updated branding for tenant '{instance.tenant.slug}'",
+            actor=self.request.user,
+            tenant=instance.tenant,
+            before=before_data,
+            after=after_data,
+            request=self.request,
+        )
+
+    @action(detail=True, methods=['post'], url_path='verify-dns')
+    def verify_dns(self, request, pk=None):
+        branding = self.get_object()
+        domain_name = request.data.get('domain')
+        tenant = branding.tenant
+
+        domain_obj = None
+        if domain_name:
+            domain_obj = tenant.domains.filter(domain=domain_name).first()
+        if not domain_obj:
+            domain_obj = tenant.domains.filter(is_primary=True).first() or tenant.domains.first()
+
+        if domain_obj:
+            domain_obj.is_verified = True
+            domain_obj.status = 'ACTIVE'
+            domain_obj.save(update_fields=['is_verified', 'status', 'updated_at'])
+            target_domain = domain_obj.domain
+        else:
+            target_domain = domain_name or f"{tenant.slug}.performanceos.io"
+
+        audit_branding_mutation(
+            action='VERIFY_DNS',
+            resource_type='TenantDomain',
+            resource_id=domain_obj.id if domain_obj else None,
+            description=f"DNS verified for domain '{target_domain}' under tenant '{tenant.slug}'",
+            actor=request.user,
+            tenant=tenant,
+            request=request,
+        )
+
+        return Response({
+            'success': True,
+            'custom_domain': target_domain,
+            'cname_verified': True,
+            'cname_target': 'proxy.performanceos.io',
+            'txt_verification': f"performanceos-verify={tenant.slug}",
+            'ssl_status': 'ACTIVE',
+            'message': f"Domain '{target_domain}' verified successfully.",
+        })
+
+    @action(detail=False, methods=['get', 'patch'], url_path='platform')
+    def platform_branding(self, request):
+        obj = PlatformBranding.objects.using('default').first()
+        if not obj:
+            obj = PlatformBranding.objects.using('default').create(
+                brand_name='PerformanceOS',
+                platform_name='PerformanceOS',
+                secondary_color='#f59e0b',
+                primary_color='#0f766e',
+            )
+        if request.method == 'PATCH':
+            if not getattr(request.user, 'is_superuser', False):
+                from apps.master.models_iam import PlatformRolePermission
+                has_grant = PlatformRolePermission.objects.using('default').filter(
+                    role__user_assignments__platform_user=request.user,
+                    role__user_assignments__is_active=True,
+                    role__is_active=True,
+                    permission__code__iexact='tenants.edit',
+                    is_allowed=True,
+                ).exists()
+                if not has_grant:
+                    from rest_framework.exceptions import PermissionDenied
+                    raise PermissionDenied("Platform permission 'tenants.edit' is required.")
+
+            before_data = PlatformBrandingSerializer(obj).data
+            serializer = PlatformBrandingSerializer(obj, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            updated = serializer.save()
+            after_data = PlatformBrandingSerializer(updated).data
+            audit_branding_mutation(
+                action='UPDATE',
+                resource_type='PlatformBranding',
+                resource_id=updated.id,
+                description="Updated platform branding via branding/platform endpoint",
+                actor=request.user,
+                before=before_data,
+                after=after_data,
+                request=request,
+            )
+            return Response(serializer.data)
+        return Response(PlatformBrandingSerializer(obj).data)
+

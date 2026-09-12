@@ -6,6 +6,7 @@ from .views import (
     ProductModuleViewSet, TenantModuleViewSet,
     TenantSubscriptionViewSet, SubscriptionInvoiceViewSet,
     TenantResourceUsageViewSet, BillingWebhookView,
+    TenantBrandingViewSet, PlatformBrandingViewSet,
 )
 
 router = DefaultRouter()
@@ -21,6 +22,8 @@ router.register(r'marketplace', MarketplaceIntegrationViewSet, basename='marketp
 router.register(r'provisioning', TenantProvisioningViewSet, basename='provisioning')
 router.register(r'modules', ProductModuleViewSet, basename='module')
 router.register(r'billing/webhook', BillingWebhookView, basename='billing-webhook')
+router.register(r'branding', TenantBrandingViewSet, basename='tenant-branding')
+router.register(r'platform-branding', PlatformBrandingViewSet, basename='platform-branding')
 
 app_name = 'master'
 

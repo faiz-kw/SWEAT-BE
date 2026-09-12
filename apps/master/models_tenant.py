@@ -94,7 +94,7 @@ class TenantDomain(models.Model):
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    tenant = models.ForeignKey(Tenant, on_delete=models.PROTECT, related_name='domains')
+    tenant = models.ForeignKey(Tenant, on_delete=models.RESTRICT, related_name='domains')
     domain = models.CharField(max_length=255, unique=True, help_text='Hostname (e.g. elevate.performanceos.io)')
     domain_type = models.CharField(max_length=30, choices=DOMAIN_TYPE, default='PLATFORM')
     is_primary = models.BooleanField(default=False)
@@ -121,11 +121,19 @@ class PlatformBranding(models.Model):
     Applied when no tenant context is active.
     """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    brand_name = models.CharField(max_length=200, default='PerformanceOS')
     platform_name = models.CharField(max_length=200, default='PerformanceOS')
     logo_url = models.TextField(blank=True, default='')
     favicon_url = models.TextField(blank=True, default='')
     primary_color = models.CharField(max_length=20, default='#0f766e')
+    secondary_color = models.CharField(max_length=20, null=True, blank=True, default='#f59e0b')
     accent_color = models.CharField(max_length=20, default='#f59e0b')
+    login_title = models.CharField(max_length=250, null=True, blank=True)
+    support_phone = models.CharField(max_length=50, null=True, blank=True)
+    logo_storage_key = models.TextField(null=True, blank=True)
+    favicon_storage_key = models.TextField(null=True, blank=True)
+    login_logo_key = models.TextField(null=True, blank=True)
+    login_background_key = models.TextField(null=True, blank=True)
     login_background_url = models.TextField(blank=True, default='')
     support_email = models.EmailField(blank=True, default='')
     support_url = models.TextField(blank=True, default='')
@@ -138,7 +146,41 @@ class PlatformBranding(models.Model):
         db_table = 'platform_branding'
 
     def __str__(self):
-        return f"Platform Branding — {self.platform_name}"
+        return f"Platform Branding — {self.brand_name or self.platform_name}"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._orig_brand_name = self.brand_name
+        self._orig_platform_name = self.platform_name
+        self._orig_secondary_color = self.secondary_color
+        self._orig_accent_color = self.accent_color
+
+    def save(self, *args, **kwargs):
+        if hasattr(self, '_orig_brand_name'):
+            if self.brand_name != self._orig_brand_name:
+                self.platform_name = self.brand_name or ''
+            elif self.platform_name != self._orig_platform_name:
+                self.brand_name = self.platform_name
+        if not self.brand_name and self.platform_name:
+            self.brand_name = self.platform_name
+        elif not self.platform_name and self.brand_name:
+            self.platform_name = self.brand_name
+
+        if hasattr(self, '_orig_secondary_color'):
+            if self.secondary_color != self._orig_secondary_color:
+                self.accent_color = self.secondary_color or ''
+            elif self.accent_color != self._orig_accent_color:
+                self.secondary_color = self.accent_color
+        if not self.secondary_color and self.accent_color:
+            self.secondary_color = self.accent_color
+        elif not self.accent_color and self.secondary_color:
+            self.accent_color = self.secondary_color
+
+        super().save(*args, **kwargs)
+        self._orig_brand_name = self.brand_name
+        self._orig_platform_name = self.platform_name
+        self._orig_secondary_color = self.secondary_color
+        self._orig_accent_color = self.accent_color
 
 
 class TenantBranding(models.Model):
@@ -152,13 +194,23 @@ class TenantBranding(models.Model):
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    tenant = models.OneToOneField(Tenant, on_delete=models.CASCADE, related_name='branding')
-    branding_mode = models.CharField(max_length=20, choices=BRANDING_MODE, default='PLATFORM')
+    tenant = models.OneToOneField(Tenant, on_delete=models.RESTRICT, related_name='branding')
+    branding_mode = models.CharField(max_length=30, choices=BRANDING_MODE, default='PLATFORM')
+    brand_name = models.CharField(max_length=200, null=True, blank=True)
     app_name = models.CharField(max_length=200, blank=True, default='')
     logo_url = models.TextField(blank=True, default='')
     favicon_url = models.TextField(blank=True, default='')
     primary_color = models.CharField(max_length=20, blank=True, default='')
+    secondary_color = models.CharField(max_length=20, null=True, blank=True)
     accent_color = models.CharField(max_length=20, blank=True, default='')
+    theme_preset_code = models.CharField(max_length=100, null=True, blank=True, default='titanium-teal')
+    theme_tokens = models.JSONField(null=True, blank=True)
+    support_phone = models.CharField(max_length=50, null=True, blank=True)
+    logo_storage_key = models.TextField(null=True, blank=True)
+    favicon_storage_key = models.TextField(null=True, blank=True)
+    login_logo_key = models.TextField(null=True, blank=True)
+    login_background_key = models.TextField(null=True, blank=True)
+    email_logo_key = models.TextField(null=True, blank=True)
     login_background_url = models.TextField(blank=True, default='')
     login_tagline = models.CharField(max_length=300, blank=True, default='')
     support_email = models.EmailField(blank=True, default='')
@@ -171,3 +223,40 @@ class TenantBranding(models.Model):
 
     def __str__(self):
         return f"Branding — {self.tenant.name} ({self.branding_mode})"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._orig_brand_name = self.brand_name
+        self._orig_app_name = self.app_name
+        self._orig_secondary_color = self.secondary_color
+        self._orig_accent_color = self.accent_color
+
+    def save(self, *args, **kwargs):
+        if hasattr(self, '_orig_brand_name'):
+            if self.brand_name != self._orig_brand_name:
+                self.app_name = self.brand_name or ''
+            elif self.app_name != self._orig_app_name:
+                self.brand_name = self.app_name
+        if not self.brand_name and self.app_name:
+            self.brand_name = self.app_name
+        elif not self.app_name and self.brand_name:
+            self.app_name = self.brand_name
+
+        if hasattr(self, '_orig_secondary_color'):
+            if self.secondary_color != self._orig_secondary_color:
+                self.accent_color = self.secondary_color or ''
+            elif self.accent_color != self._orig_accent_color:
+                self.secondary_color = self.accent_color
+        if not self.secondary_color and self.accent_color:
+            self.secondary_color = self.accent_color
+        elif not self.accent_color and self.secondary_color:
+            self.secondary_color = self.accent_color
+
+        if not self.theme_preset_code:
+            self.theme_preset_code = 'titanium-teal'
+        super().save(*args, **kwargs)
+        self._orig_brand_name = self.brand_name
+        self._orig_app_name = self.app_name
+        self._orig_secondary_color = self.secondary_color
+        self._orig_accent_color = self.accent_color
+

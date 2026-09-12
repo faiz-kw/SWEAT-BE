@@ -37,6 +37,7 @@ class MarketplaceIntegration(models.Model):
     description = models.TextField(blank=True, default='')
     configuration_schema = models.JSONField(null=True, blank=True)
     icon_text = models.CharField(max_length=10, blank=True, default='')
+    logo_storage_key = models.TextField(null=True, blank=True)
     developer = models.CharField(max_length=200, blank=True, default='')
     docs_url = models.TextField(blank=True, default='')
     price_monthly = models.DecimalField(max_digits=10, decimal_places=2, default=0)

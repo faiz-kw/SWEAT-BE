@@ -173,14 +173,15 @@ class Sprint9MasterControlPlaneTestCase(TestCase):
             measured_at=now,
             last_calculated_at=now,
             is_platform_billable=True,
-            period_start=None,  # Preserved nullable snapshot semantics
-            period_end=None
+            # In Sprint 15, period_start & period_end are hardened to NOT NULL (Class A) with default backfill from measured_at
+            period_start=now,
+            period_end=now
         )
         self.assertEqual(usage.usage_value, Decimal('120.5000'))
         self.assertEqual(usage.current_value, 120)  # Legacy BigInt representation
         self.assertEqual(usage.last_calculated_at, now)  # Property check
-        self.assertIsNone(usage.period_start)
-        self.assertIsNone(usage.period_end)
+        self.assertIsNotNone(usage.period_start)
+        self.assertIsNotNone(usage.period_end)
 
         # Alert
         alert = TenantUsageAlert.objects.create(

@@ -391,8 +391,8 @@ class TenantResourceUsage(models.Model):
     metric = models.ForeignKey(ResourceMetric, on_delete=models.RESTRICT)
     current_value = models.BigIntegerField(default=0)
     usage_value = models.DecimalField(max_digits=20, decimal_places=4, default=0.0000)
-    period_start = models.DateTimeField(blank=True, null=True)
-    period_end = models.DateTimeField(blank=True, null=True)
+    period_start = models.DateTimeField(default=timezone.now)
+    period_end = models.DateTimeField(default=timezone.now)
     measured_at = models.DateTimeField(default=timezone.now)
     billing_period_start = models.DateField(null=True, blank=True)
     billing_period_end = models.DateField(null=True, blank=True)
@@ -415,6 +415,10 @@ class TenantResourceUsage(models.Model):
             self.current_value = int(self.usage_value)
         if not self.measured_at and self.last_calculated_at:
             self.measured_at = self.last_calculated_at
+        if not self.period_start and self.measured_at:
+            self.period_start = self.measured_at
+        if not self.period_end and self.measured_at:
+            self.period_end = self.measured_at
         super().save(*args, **kwargs)
 
 
@@ -717,7 +721,7 @@ class SubscriptionDunningEvent(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     tenant = models.ForeignKey(Tenant, on_delete=models.RESTRICT, null=True, related_name='dunning_events')
     subscription = models.ForeignKey(TenantSubscription, on_delete=models.RESTRICT, related_name='dunning_events')
-    invoice = models.ForeignKey(SubscriptionInvoice, on_delete=models.RESTRICT, null=True, blank=True, related_name='dunning_events')
+    invoice = models.ForeignKey(SubscriptionInvoice, on_delete=models.SET_NULL, null=True, blank=True, related_name='dunning_events')
     payment = models.ForeignKey(SubscriptionPayment, on_delete=models.PROTECT, null=True, blank=True)
     event_type = models.CharField(max_length=50, choices=EVENT_TYPE)
     attempt_number = models.IntegerField(default=1)

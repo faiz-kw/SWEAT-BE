@@ -5,7 +5,7 @@ Master app serializers.
 from decimal import Decimal
 from rest_framework import serializers
 from .models_iam import PlatformUser, PlatformRole
-from .models_tenant import Tenant, TenantDomain, TenantBranding
+from .models_tenant import Tenant, TenantDomain, TenantBranding, PlatformBranding
 from .models_saas import (
     SaasPlan, SaasPlanPrice, ProductModule, TenantSubscription,
     TenantModule, SubscriptionInvoice, SubscriptionInvoiceItem, TenantResourceUsage, ResourceMetric,
@@ -142,7 +142,7 @@ class MarketplaceIntegrationSerializer(serializers.ModelSerializer):
     class Meta:
         model = MarketplaceIntegration
         fields = ['id', 'name', 'code', 'integration_type', 'provider', 'description',
-                  'icon_text', 'is_free', 'price_monthly', 'is_popular', 'status']
+                  'icon_text', 'logo_storage_key', 'is_free', 'price_monthly', 'is_popular', 'status']
 
 
 class TenantDataSourceSerializer(serializers.ModelSerializer):
@@ -320,4 +320,52 @@ class TenantResourceUsageSerializer(serializers.ModelSerializer):
             'last_calculated_at', 'is_platform_billable',
         ]
         read_only_fields = ['id', 'last_calculated_at']
+
+
+class PlatformBrandingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PlatformBranding
+        fields = [
+            'id', 'brand_name', 'platform_name',
+            'logo_url', 'favicon_url',
+            'primary_color', 'secondary_color', 'accent_color',
+            'login_title', 'support_phone', 'support_email', 'support_url',
+            'logo_storage_key', 'favicon_storage_key',
+            'login_logo_key', 'login_background_key', 'login_background_url',
+            'is_active', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+
+class TenantBrandingSerializer(serializers.ModelSerializer):
+    tenant_slug = serializers.CharField(source='tenant.slug', read_only=True)
+    tenant_name = serializers.CharField(source='tenant.name', read_only=True)
+    custom_domain = serializers.SerializerMethodField()
+    cname_verified = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TenantBranding
+        fields = [
+            'id', 'tenant', 'tenant_slug', 'tenant_name', 'branding_mode',
+            'brand_name', 'app_name',
+            'logo_url', 'favicon_url',
+            'primary_color', 'secondary_color', 'accent_color',
+            'theme_preset_code', 'theme_tokens',
+            'support_phone', 'support_email',
+            'logo_storage_key', 'favicon_storage_key',
+            'login_logo_key', 'login_background_key', 'email_logo_key',
+            'login_background_url', 'login_tagline',
+            'custom_domain', 'cname_verified',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'tenant_slug', 'tenant_name', 'custom_domain', 'cname_verified', 'created_at', 'updated_at']
+
+    def get_custom_domain(self, obj):
+        domain = obj.tenant.domains.filter(is_primary=True).first() or obj.tenant.domains.first()
+        return domain.domain if domain else ''
+
+    def get_cname_verified(self, obj):
+        domain = obj.tenant.domains.filter(is_primary=True).first() or obj.tenant.domains.first()
+        return domain.is_verified if domain else False
+
 

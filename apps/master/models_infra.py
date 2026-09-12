@@ -155,7 +155,7 @@ class TenantDataSourceHealth(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     tenant = models.ForeignKey(Tenant, on_delete=models.RESTRICT, null=True, blank=True, related_name='health_checks')
     data_source = models.ForeignKey(TenantDataSource, on_delete=models.CASCADE, related_name='health_checks')
-    status = models.CharField(max_length=20, choices=HEALTH_STATUS, default='HEALTHY')
+    status = models.CharField(max_length=30, choices=HEALTH_STATUS, default='HEALTHY')
     response_time_ms = models.IntegerField(null=True, blank=True)
     detected_schema_version = models.CharField(max_length=50, null=True, blank=True)
     error_code = models.CharField(max_length=100, null=True, blank=True)
