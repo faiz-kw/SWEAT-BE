@@ -229,18 +229,35 @@ SIMPLE_JWT = {
 }
 
 # ---------------------------------------------------------------------------
-# CORS — Never allow all origins; always whitelist explicitly
+# CORS — Whitelist explicitly; allow all localhost ports in DEBUG
 # ---------------------------------------------------------------------------
-CORS_ALLOW_ALL_ORIGINS = False  # NEVER set to True
+CORS_ALLOW_ALL_ORIGINS = False
 CORS_ALLOW_CREDENTIALS = True
 
 # Read allowed origins from env — comma-separated list
 _cors_origins_env = os.getenv(
     'CORS_ALLOWED_ORIGINS',
-    'http://localhost:5173,http://127.0.0.1:5173' if DEBUG else ''
+    (
+        'http://localhost:5173,http://127.0.0.1:5173,'
+        'http://localhost:5174,http://127.0.0.1:5174,'
+        'http://localhost:5175,http://127.0.0.1:5175,'
+        'http://localhost:3000,http://127.0.0.1:3000'
+    ) if DEBUG else ''
 )
 CORS_ALLOWED_ORIGINS = [
     o.strip() for o in _cors_origins_env.split(',') if o.strip()
+]
+
+if DEBUG:
+    CORS_ALLOWED_ORIGIN_REGEXES = [
+        r"^http://(localhost|127\.0\.0\.1)(:\d+)?$",
+    ]
+
+from corsheaders.defaults import default_headers
+
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    'x-tenant-slug',
+    'x-correlation-id',
 ]
 
 if not CORS_ALLOWED_ORIGINS and not DEBUG:
@@ -254,7 +271,10 @@ if not CORS_ALLOWED_ORIGINS and not DEBUG:
 # CSRF trusted origins — read from env, with dev fallback
 _csrf_origins_env = os.getenv(
     'CSRF_TRUSTED_ORIGINS',
-    'http://localhost:5173,http://localhost:5174,http://localhost:3000' if DEBUG else ''
+    (
+        'http://localhost:5173,http://localhost:5174,http://localhost:5175,http://localhost:3000,'
+        'http://127.0.0.1:5173,http://127.0.0.1:5174,http://127.0.0.1:5175,http://127.0.0.1:3000'
+    ) if DEBUG else ''
 )
 CSRF_TRUSTED_ORIGINS = [
     o.strip() for o in _csrf_origins_env.split(',') if o.strip()
