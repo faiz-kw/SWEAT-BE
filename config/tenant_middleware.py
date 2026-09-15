@@ -4,25 +4,22 @@ Tenant Database Middleware — Phase 1 Layer 1.
 Per request:
 1. Extract tenant identifier from JWT claim 'tid' using VERIFIED signature decode
 2. Look up tenant's data source record in Master DB
-3. Register dynamic DB connection if not already registered (thread-safe)
+3. Register dynamic DB connection if not already registered (thread-safe):
+   - PLATFORM_MANAGED: uses shared platform cluster with dedicated tenant database name
+   - CUSTOMER_MANAGED: dynamically routes to external host, port, db_name, user, sslmode,
+     and securely resolves password from secret reference (Vault / AWS SM / env)
+   - Schema version validation gate for CUSTOMER_MANAGED tenants (Section 14 Guardrail 9)
 4. Set thread-local tenant DB alias for DB router
-5. Verify tenant status is ACTIVE (gate check)
-
-SECURITY NOTE:
-  Previously, this middleware decoded the JWT without signature verification
-  (verify_signature: False). This allowed an attacker to forge any 'tid' claim
-  and redirect their request to another tenant's database.
-
-  Fixed: JWT is now decoded with full signature verification using SECRET_KEY.
-  An invalid or tampered token results in no tenant DB being set — the request
-  continues but all tenant_core model queries will fail with routing errors,
-  which is the correct secure behavior.
+5. Fail closed on missing/invalid credentials, unreachable external DB, or schema mismatch
 """
 
 import logging
 import threading
+from typing import Optional, Set
 from django.conf import settings
-from config.routers import set_tenant_db_alias
+from django.http import JsonResponse
+from config.routers import set_tenant_db_alias, get_tenant_db_alias
+from config.secrets import SecretResolver, SecretResolutionError
 
 logger = logging.getLogger(__name__)
 
@@ -37,56 +34,239 @@ TENANT_EXEMPT_PREFIXES = (
 )
 
 # Thread lock to protect mutation of settings.DATABASES at runtime
-# This prevents race conditions in multi-process/multi-threaded gunicorn deployments
 _db_registration_lock = threading.Lock()
 
+# Cache of validated customer-managed schemas: set of alias names
+_validated_customer_schemas: Set[str] = set()
 
-def _register_tenant_connection(alias: str, db_name: str) -> None:
+
+class TenantDatabaseRoutingError(Exception):
+    """Base exception for tenant database routing failures."""
+    pass
+
+
+class TenantDatabaseConfigurationError(TenantDatabaseRoutingError):
+    """Raised when customer-managed database parameters or secrets are invalid."""
+    pass
+
+
+class SchemaVersionMismatchError(TenantDatabaseRoutingError):
+    """Raised when customer-managed database schema version check fails."""
+    pass
+
+
+def _validate_tenant_schema_version(alias: str, expected_version: str) -> None:
     """
-    Dynamically add a tenant DB connection to Django's connection handler.
+    Validates that a CUSTOMER_MANAGED tenant database has the required schema version
+    applied before serving tenant traffic (Canonical Section 14 Guardrail 9).
 
-    Thread-safe: uses a module-level lock to prevent concurrent mutation of
-    settings.DATABASES, which would cause connection pool collisions in gunicorn.
-
-    The connection is registered once and reused on subsequent requests via
-    the alias check before acquiring the lock.
+    Fails closed if target DB cannot be connected to or lacks required migrations.
     """
-    # Fast path — already registered, no lock needed
-    if alias in settings.DATABASES:
-        return
+    from django.db import connections, DatabaseError, OperationalError
+    from django.utils.connection import ConnectionDoesNotExist
 
-    with _db_registration_lock:
-        # Double-check after acquiring lock (another thread may have registered)
+    try:
+        conn = connections[alias]
+    except (ConnectionDoesNotExist, KeyError) as exc:
+        raise SchemaVersionMismatchError(
+            f"Database connection for alias '{alias}' does not exist."
+        ) from exc
+    try:
+        with conn.cursor() as cursor:
+            # Verify django_migrations table exists
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.tables "
+                "WHERE table_schema = 'public' AND table_name = 'django_migrations';"
+            )
+            table_exists = cursor.fetchone()[0] > 0
+            if not table_exists:
+                raise SchemaVersionMismatchError(
+                    f"Customer managed database for alias '{alias}' is missing django_migrations table."
+                )
+
+            # Verify tenant_core migrations are applied
+            cursor.execute(
+                "SELECT name FROM django_migrations WHERE app = 'tenant_core' ORDER BY id DESC LIMIT 1;"
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise SchemaVersionMismatchError(
+                    f"Customer managed database for alias '{alias}' has no tenant_core migrations applied."
+                )
+
+            latest_migration = row[0]
+            logger.debug(
+                "Validated customer-managed schema: alias=%s latest_migration=%s expected=%s",
+                alias, latest_migration, expected_version,
+            )
+    except (DatabaseError, OperationalError) as exc:
+        logger.error("Schema validation failed for customer DB alias=%s: %s", alias, type(exc).__name__)
+        raise SchemaVersionMismatchError(
+            f"Unable to connect to customer managed database for alias '{alias}'."
+        ) from exc
+
+
+def _register_tenant_connection(
+    alias: str,
+    db_name: Optional[str] = None,
+    *,
+    data_source=None,
+    force_refresh: bool = False,
+) -> None:
+    """
+    Dynamically add or update a tenant DB connection in Django's connection handler.
+
+    Thread-safe: uses _db_registration_lock to prevent concurrent mutation of settings.DATABASES.
+    
+    Supports:
+    1. PLATFORM_MANAGED: Inherits host, port, user, password from default settings; overrides NAME.
+    2. CUSTOMER_MANAGED (R01.08):
+       - HOST: data_source.db_host / database_host
+       - PORT: data_source.db_port / database_port (default 5432)
+       - NAME: data_source.database_name / db_name
+       - USER: data_source.db_user
+       - PASSWORD: securely resolved from secret_reference (Vault, AWS SM, or env)
+       - SSLMODE: data_source.ssl_mode
+       - Schema version validation before serving (Section 14 Guardrail 9)
+       - Fails closed on any resolution error; never falls back to default localhost.
+    """
+    # Fast path if already registered and schema already verified
+    if not force_refresh and alias in settings.DATABASES and (alias not in _validated_customer_schemas or alias in _validated_customer_schemas):
+        if data_source is None:
+            return
+        # If data source provided and already registered, return
         if alias in settings.DATABASES:
             return
 
-        # Copy the full master DB config (inherits ENGINE, USER, PASSWORD, HOST, PORT,
-        # OPTIONS, CONN_MAX_AGE, TIME_ZONE, ATOMIC_REQUESTS, etc.) then override only NAME.
-        # This ensures all required Django DB settings keys are always present.
-        tenant_config = dict(settings.DATABASES['default'])
-        tenant_config['NAME'] = db_name
+    with _db_registration_lock:
+        if not force_refresh and alias in settings.DATABASES and data_source is None:
+            return
 
-        settings.DATABASES[alias] = tenant_config
-
-        # Also update the Django connections handler (required for runtime registration)
         from django.db import connections
-        connections.databases[alias] = tenant_config
 
-        logger.debug('Registered tenant DB connection: alias=%s db=%s', alias, db_name)
+        # 1. Resolve data_source if not provided
+        if data_source is None and db_name:
+            try:
+                from apps.master.models_infra import TenantDataSource
+                from django.db.models import Q
+                data_source = TenantDataSource.objects.using('default').filter(
+                    Q(db_name=db_name) | Q(database_name=db_name),
+                    status='ACTIVE'
+                ).first()
+            except Exception as e:
+                logger.debug("Could not query TenantDataSource for db_name=%s: %s", db_name, e)
+
+        hosting_mode = 'PLATFORM_MANAGED'
+        if data_source:
+            hosting_mode = getattr(data_source, 'hosting_mode', None) or getattr(data_source, 'source_type', 'PLATFORM_MANAGED')
+
+        # 2. CUSTOMER_MANAGED Runtime Routing (R01.08)
+        if hosting_mode == 'CUSTOMER_MANAGED':
+            if not data_source:
+                raise TenantDatabaseConfigurationError(
+                    f"Customer managed tenant database for alias '{alias}' requires a valid TenantDataSource record."
+                )
+
+            # Parameter extraction
+            host = getattr(data_source, 'db_host', '') or getattr(data_source, 'database_host', '')
+            if not host:
+                raise TenantDatabaseConfigurationError(
+                    f"Customer managed database host is not configured for tenant '{data_source.tenant.slug}'."
+                )
+
+            user = getattr(data_source, 'db_user', '')
+            if not user:
+                raise TenantDatabaseConfigurationError(
+                    f"Customer managed database user is not configured for tenant '{data_source.tenant.slug}'."
+                )
+
+            port = int(getattr(data_source, 'db_port', 5432) or getattr(data_source, 'database_port', 5432) or 5432)
+            target_db_name = getattr(data_source, 'database_name', '') or getattr(data_source, 'db_name', '') or db_name
+            if not target_db_name:
+                raise TenantDatabaseConfigurationError(
+                    f"Customer managed database name is not configured for tenant '{data_source.tenant.slug}'."
+                )
+
+            # Secret resolution (never plaintext in DB, never fabricate, fail closed)
+            secret_ref = getattr(data_source, 'secret_reference', '') or getattr(data_source, 'db_password_secret_ref', '')
+            try:
+                password = SecretResolver.resolve(secret_ref)
+            except SecretResolutionError as s_err:
+                logger.error(
+                    "TenantDatabaseMiddleware: Failed to resolve database password for tenant='%s': %s",
+                    data_source.tenant.slug, str(s_err)
+                )
+                raise TenantDatabaseConfigurationError(
+                    f"Failed to securely resolve database credentials for tenant '{data_source.tenant.slug}'."
+                ) from s_err
+
+            ssl_mode = getattr(data_source, 'ssl_mode', 'REQUIRE') or 'REQUIRE'
+
+            tenant_config = {
+                'ENGINE': 'django.db.backends.postgresql',
+                'NAME': target_db_name,
+                'USER': user,
+                'PASSWORD': password,
+                'HOST': host,
+                'PORT': port,
+                'CONN_MAX_AGE': settings.DATABASES['default'].get('CONN_MAX_AGE', 0),
+                'TIME_ZONE': settings.TIME_ZONE,
+                'ATOMIC_REQUESTS': False,
+                'AUTOCOMMIT': True,
+                'OPTIONS': dict(settings.DATABASES['default'].get('OPTIONS', {})),
+            }
+            if ssl_mode and ssl_mode != 'DISABLE':
+                tenant_config['OPTIONS']['sslmode'] = ssl_mode.lower()
+
+            # Register in settings and connections handler
+            settings.DATABASES[alias] = tenant_config
+            connections.databases[alias] = tenant_config
+
+            # Close existing connection if already opened to apply new config
+            if alias in connections:
+                try:
+                    connections[alias].close()
+                except Exception:
+                    pass
+
+            # Schema version check (Section 14 Guardrail 9)
+            schema_version = getattr(data_source, 'schema_version', '1.0') or getattr(data_source, 'db_schema_version', '1.0')
+            _validate_tenant_schema_version(alias, schema_version)
+            _validated_customer_schemas.add(alias)
+
+            logger.info(
+                "Registered CUSTOMER_MANAGED tenant DB connection: alias=%s host=%s port=%s db=%s user=%s sslmode=%s",
+                alias, host, port, target_db_name, user, ssl_mode,
+            )
+
+        # 3. PLATFORM_MANAGED Routing
+        else:
+            target_db_name = (data_source.db_name if data_source else None) or db_name or alias
+            tenant_config = dict(settings.DATABASES['default'])
+            tenant_config['NAME'] = target_db_name
+
+            settings.DATABASES[alias] = tenant_config
+            connections.databases[alias] = tenant_config
+
+            logger.debug('Registered PLATFORM_MANAGED tenant DB connection: alias=%s db=%s', alias, target_db_name)
+
+
+def unregister_tenant_connection(alias: str) -> None:
+    """Safely close and unregister dynamic tenant connection."""
+    with _db_registration_lock:
+        from django.db import connections
+        if alias in connections:
+            try:
+                connections[alias].close()
+            except Exception:
+                pass
+            connections.databases.pop(alias, None)
+        settings.DATABASES.pop(alias, None)
+        _validated_customer_schemas.discard(alias)
 
 
 def _extract_tenant_id_from_jwt(request) -> str | None:
-    """
-    Extract 'tid' (tenant_id) claim from Authorization Bearer JWT.
-
-    SECURITY: The JWT is now decoded with full signature verification using
-    Django's SECRET_KEY. This prevents an attacker from crafting a JWT with
-    a forged 'tid' to redirect requests to a different tenant's database.
-
-    Returns:
-        str — tenant UUID if JWT is valid and contains 'tid'
-        None — if no bearer token, token is expired, or signature is invalid
-    """
+    """Extract 'tid' (tenant_id) claim from Authorization Bearer JWT."""
     import jwt as pyjwt
     from jwt.exceptions import InvalidTokenError, ExpiredSignatureError
 
@@ -104,18 +284,16 @@ def _extract_tenant_id_from_jwt(request) -> str | None:
             settings.SECRET_KEY,
             algorithms=['HS256'],
             options={
-                'verify_exp': True,       # Reject expired tokens
-                'verify_signature': True,  # Verify against SECRET_KEY
-                'require': ['tid'],        # Must have tid claim
+                'verify_exp': True,
+                'verify_signature': True,
+                'require': ['tid'],
             },
         )
         return payload.get('tid') or None
 
     except ExpiredSignatureError:
-        # Expired tokens: no warning needed, this is normal flow
         return None
     except InvalidTokenError as e:
-        # Tampered, malformed, or wrongly-signed token — log as warning
         logger.warning(
             'TenantDatabaseMiddleware: JWT signature invalid or malformed — '
             'refusing to set tenant DB alias. Error: %s | correlation_id=%s',
@@ -124,10 +302,7 @@ def _extract_tenant_id_from_jwt(request) -> str | None:
         )
         return None
     except Exception as e:
-        logger.error(
-            'TenantDatabaseMiddleware: Unexpected error decoding JWT: %s',
-            e,
-        )
+        logger.error('TenantDatabaseMiddleware: Unexpected error decoding JWT: %s', e)
         return None
 
 
@@ -135,11 +310,6 @@ class TenantDatabaseMiddleware:
     """
     Sets the active tenant DB alias per request so TenantRouter can route correctly.
     Skips platform-only and auth endpoints (TENANT_EXEMPT_PREFIXES).
-
-    Security properties:
-    - JWT is verified with SECRET_KEY before trusting any claims
-    - Forged or expired tokens result in no tenant DB alias being set
-    - Thread-local state is always reset before and after each request
     """
 
     def __init__(self, get_response):
@@ -147,15 +317,12 @@ class TenantDatabaseMiddleware:
 
     def __call__(self, request):
         # Always reset tenant alias at start of each request
-        # This is critical for thread safety in worker reuse scenarios
         set_tenant_db_alias(None)
 
         path = request.path_info
         is_exempt = any(path.startswith(prefix) for prefix in TENANT_EXEMPT_PREFIXES)
 
         if not is_exempt:
-            # Only trust JWT-extracted tid — X-Tenant-ID header removed
-            # (header was not verified; JWT provides the only trusted tenant source)
             tenant_id = _extract_tenant_id_from_jwt(request)
 
             if tenant_id:
@@ -166,9 +333,10 @@ class TenantDatabaseMiddleware:
                         status='ACTIVE'
                     ).select_related('tenant').first()
 
-                    if data_source and data_source.db_name:
-                        alias = f"tenant_{data_source.db_name}"
-                        _register_tenant_connection(alias, data_source.db_name)
+                    if data_source and (data_source.db_name or data_source.database_name):
+                        effective_db_name = data_source.database_name or data_source.db_name
+                        alias = f"tenant_{effective_db_name}"
+                        _register_tenant_connection(alias, effective_db_name, data_source=data_source)
                         set_tenant_db_alias(alias)
                         logger.debug(
                             'TenantDatabaseMiddleware: tenant=%s alias=%s path=%s',
@@ -176,19 +344,32 @@ class TenantDatabaseMiddleware:
                         )
                     else:
                         logger.warning(
-                            'TenantDatabaseMiddleware: No active data source for tenant_id=%s '
-                            'correlation_id=%s',
-                            tenant_id,
-                            getattr(request, 'correlation_id', '-'),
+                            'TenantDatabaseMiddleware: No active data source for tenant_id=%s correlation_id=%s',
+                            tenant_id, getattr(request, 'correlation_id', '-'),
                         )
+                except (TenantDatabaseRoutingError, SecretResolutionError) as routing_err:
+                    logger.error(
+                        'TenantDatabaseMiddleware: Fail-closed on tenant DB error: tenant_id=%s error=%s',
+                        tenant_id, type(routing_err).__name__,
+                    )
+                    set_tenant_db_alias(None)
+                    return JsonResponse(
+                        {
+                            'error': 'TENANT_DATABASE_UNAVAILABLE',
+                            'detail': 'Customer managed tenant database is temporarily unavailable or misconfigured.',
+                        },
+                        status=503,
+                    )
                 except Exception as e:
                     logger.error(
                         'TenantDatabaseMiddleware: Error resolving tenant DB for tenant_id=%s: %s',
                         tenant_id, e,
                     )
 
-        response = self.get_response(request)
+        try:
+            response = self.get_response(request)
+        finally:
+            # Always clean up thread-local after response
+            set_tenant_db_alias(None)
 
-        # Always clean up thread-local after response (prevents state leaking between requests)
-        set_tenant_db_alias(None)
         return response

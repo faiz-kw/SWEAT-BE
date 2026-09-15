@@ -28,7 +28,8 @@ The backend implements a **Database-per-Tenant** multi-tenant isolation model wi
 ```
 backend/
 ├── manage.py                 # Django management CLI
-├── requirements.txt          # Python dependencies
+├── requirements.txt          # Python dependencies (Production)
+├── requirements-dev.txt      # Development & testing dependencies (fakeredis, etc.)
 ├── .env.example              # Development environment variables template
 ├── .gitignore                # Git ignore specifications
 ├── apps/
@@ -46,6 +47,18 @@ backend/
 ├── tests/                    # Authoritative regression test suite (344 tests)
 ├── scripts/                  # Development & runtime verification utilities
 └── _archived_apps/           # Historical monolithic prototypes (archived)
+```
+
+---
+
+## Environment Setup
+
+```bash
+# Production environment
+pip install -r requirements.txt
+
+# Development / testing environment
+pip install -r requirements-dev.txt
 ```
 
 ---

@@ -360,6 +360,7 @@ def renew_due_subscriptions_async(self):
     """
     Scheduled job: finds active subscriptions due for renewal and triggers renewal & invoice generation.
     """
+    from django.utils import timezone
     from apps.master.models_saas import TenantSubscription
     from apps.master.billing.services import SubscriptionLifecycleService
     now = timezone.now()
@@ -377,3 +378,148 @@ def renew_due_subscriptions_async(self):
             results.append({'subscription_id': str(sub.id), 'status': 'ERROR', 'error': str(exc)})
 
     return {'renewed_count': len(results), 'results': results}
+
+
+@shared_task(
+    bind=True,
+    name='apps.master.tasks.sync_all_tenant_resource_usage_async',
+    acks_late=True,
+)
+def sync_all_tenant_resource_usage_async(self) -> dict:
+    """
+    Scheduled operational task: aggregates active resource usage across all active tenants.
+    Emits SYSTEM_JOB PlatformAuditEvent.
+    """
+    import time
+    from django.utils import timezone
+    from apps.master.metering import sync_tenant_resource_usage
+    from apps.master.models_tenant import Tenant
+    from apps.master.models_infra import PlatformAuditEvent
+
+    logger.info("Starting scheduled resource usage sync across all active tenants.")
+    start_time = time.time()
+    results = sync_tenant_resource_usage()
+    duration = time.time() - start_time
+
+    # Record Platform Audit Event under SYSTEM_JOB actor context
+    try:
+        PlatformAuditEvent.objects.using('default').create(
+            actor_email='system@scheduler',
+            action='RESOURCE_USAGE_SYNCED',
+            resource_type='TenantResourceUsage',
+            resource_id=None,
+            description=(
+                f"Periodic resource usage aggregated: {results.get('succeeded', 0)} succeeded, "
+                f"{results.get('failed', 0)} failed in {duration:.2f}s."
+            ),
+        )
+    except Exception as audit_err:
+        logger.warning("Failed to emit audit event for resource usage sync: %s", audit_err)
+
+    return results
+
+
+@shared_task(
+    bind=True,
+    name='apps.master.tasks.check_all_tenant_databases_health_async',
+    acks_late=True,
+)
+def check_all_tenant_databases_health_async(self) -> dict:
+    """
+    Scheduled operational task: evaluates connection health and latency for all tenant data sources.
+    Records TenantDataSourceHealth records on Master DB.
+    """
+    import time
+    from django.utils import timezone
+    from django.db import connections
+    from apps.master.models_infra import TenantDataSource, TenantDataSourceHealth
+    from config.tenant_middleware import _register_tenant_connection, unregister_tenant_connection
+
+    data_sources = TenantDataSource.objects.using('default').filter(status='ACTIVE').select_related('tenant')
+    checked = 0
+    healthy = 0
+    degraded = 0
+
+    for ds in data_sources:
+        checked += 1
+        db_name = ds.database_name or ds.db_name
+        if not db_name:
+            continue
+
+        alias = f"tenant_{db_name}"
+        t0 = time.time()
+        try:
+            _register_tenant_connection(alias, db_name, data_source=ds, force_refresh=False)
+            conn = connections[alias]
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT 1;")
+                cursor.fetchone()
+            latency_ms = max(1, int((time.time() - t0) * 1000))
+            status_val = 'HEALTHY' if latency_ms < 500 else 'DEGRADED'
+            err_msg = ''
+            if status_val == 'HEALTHY':
+                healthy += 1
+            else:
+                degraded += 1
+        except Exception as exc:
+            latency_ms = max(1, int((time.time() - t0) * 1000))
+            status_val = 'UNREACHABLE'
+            err_msg = str(exc)[:500]
+            logger.warning("Database health check failed for tenant %s: %s", ds.tenant.slug, exc)
+        finally:
+            if alias != 'tenant_test':
+                try:
+                    if alias in connections:
+                        connections[alias].close()
+                except Exception:
+                    pass
+                unregister_tenant_connection(alias)
+
+        # Record health check record on Master DB
+        TenantDataSourceHealth.objects.using('default').create(
+            tenant=ds.tenant,
+            data_source=ds,
+            status=status_val,
+            response_time_ms=latency_ms,
+            error_message=err_msg,
+            checked_at=timezone.now(),
+        )
+
+        # Update last_health_check_at on DataSource
+        ds.last_health_check_at = timezone.now()
+        ds.save(using='default', update_fields=['last_health_check_at', 'updated_at'])
+
+    return {
+        'total_checked': checked,
+        'healthy': healthy,
+        'degraded': degraded,
+    }
+
+
+@shared_task(
+    bind=True,
+    name='apps.master.tasks.sync_tenant_catalogs_async',
+    acks_late=True,
+)
+def sync_tenant_catalogs_async(self) -> dict:
+    """
+    Scheduled operational task: synchronizes module and submodule catalogs into all active tenant databases.
+    """
+    from django.core.management import call_command
+    from apps.master.models_infra import PlatformAuditEvent
+
+    logger.info("Starting scheduled catalog synchronization across tenant databases.")
+    try:
+        call_command('sync_tenant_catalog', all=True)
+        PlatformAuditEvent.objects.using('default').create(
+            actor_email='system@scheduler',
+            action='TENANT_CATALOGS_SYNCED',
+            resource_type='ModuleCatalog',
+            resource_id=None,
+            description="Periodic tenant catalog synchronization completed successfully.",
+        )
+        return {'status': 'SUCCESS', 'message': 'Tenant catalogs synchronized.'}
+    except Exception as exc:
+        logger.exception("Error during scheduled tenant catalog synchronization: %s", exc)
+        return {'status': 'FAILED', 'error': str(exc)}
+

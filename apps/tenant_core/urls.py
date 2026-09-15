@@ -8,7 +8,7 @@ from .views import (
     OrganizationSettingsViewSet, BranchSettingsViewSet,
     NotificationTemplateViewSet, TenantAuditEventViewSet,
     BranchWorkingHoursViewSet, BranchOperatingExceptionViewSet,
-    VerifyAccessView,
+    VerifyAccessView, TenantDatabaseHealthView,
 )
 from .views_storage import (
     FileViewSet,
@@ -16,6 +16,12 @@ from .views_storage import (
     StoragePresignDownloadView,
     StoragePresignUploadView,
 )
+from .views_privacy import (
+    ProcessingPurposeViewSet,
+    ConsentRecordViewSet,
+    PrivacyRequestViewSet,
+)
+from .views_integrations import TenantIntegrationViewSet
 
 router = DefaultRouter()
 router.register(r'organizations', OrganizationViewSet, basename='organization')
@@ -40,14 +46,18 @@ router.register(r'branch-operating-exceptions', BranchOperatingExceptionViewSet,
 router.register(r'notification-templates', NotificationTemplateViewSet, basename='notification-template')
 router.register(r'audit-events', TenantAuditEventViewSet, basename='audit-event')
 router.register(r'files', FileViewSet, basename='file')
+router.register(r'processing-purposes', ProcessingPurposeViewSet, basename='processing-purpose')
+router.register(r'consent-records', ConsentRecordViewSet, basename='consent-record')
+router.register(r'privacy-requests', PrivacyRequestViewSet, basename='privacy-request')
+router.register(r'integrations', TenantIntegrationViewSet, basename='integration')
 
 app_name = 'tenant_core'
 
 urlpatterns = [
+    path('database-health/', TenantDatabaseHealthView.as_view(), name='tenant-database-health'),
     path('verify-access/', VerifyAccessView.as_view(), name='verify-access'),
     path('storage/presign-upload/', StoragePresignUploadView.as_view(), name='storage-presign-upload'),
     path('storage/confirm-upload/', StorageConfirmUploadView.as_view(), name='storage-confirm-upload'),
     path('storage/presign-download/<uuid:id>/', StoragePresignDownloadView.as_view(), name='storage-presign-download'),
     path('', include(router.urls)),
 ]
-

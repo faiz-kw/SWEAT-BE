@@ -405,6 +405,27 @@ else:
     CELERY_TASK_ALWAYS_EAGER = False
     CELERY_TASK_EAGER_PROPAGATES = False
 
+# Periodic task schedule (Celery Beat)
+CELERY_BEAT_SCHEDULE = {
+    'master-collect-resource-usage': {
+        'task': 'apps.master.tasks.sync_all_tenant_resource_usage_async',
+        'schedule': float(os.getenv('CELERY_SCHEDULE_USAGE_SECONDS', '600.0')),  # every 10 min
+    },
+    'master-check-database-health': {
+        'task': 'apps.master.tasks.check_all_tenant_databases_health_async',
+        'schedule': float(os.getenv('CELERY_SCHEDULE_HEALTH_SECONDS', '300.0')),  # every 5 min
+    },
+    'master-sync-product-catalog': {
+        'task': 'apps.master.tasks.sync_tenant_catalogs_async',
+        'schedule': float(os.getenv('CELERY_SCHEDULE_CATALOG_SECONDS', '86400.0')),  # daily
+    },
+    'master-renew-due-subscriptions': {
+        'task': 'apps.master.tasks.renew_due_subscriptions_async',
+        'schedule': float(os.getenv('CELERY_SCHEDULE_RENEWALS_SECONDS', '3600.0')),  # hourly
+    },
+}
+
+
 
 # ---------------------------------------------------------------------------
 # Zata.ai S3-Compatible Private Object Storage (Sprint 7)

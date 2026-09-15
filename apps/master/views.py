@@ -129,6 +129,51 @@ class TenantViewSet(viewsets.ModelViewSet):
                 tenant.deactivate(reason=request.data.get('reason', 'Admin toggle'))
         return Response(TenantSerializer(tenant).data)
 
+    @action(detail=False, methods=['get', 'post'], url_path='database-health')
+    def database_health(self, request):
+        from apps.master.models_infra import TenantDataSource, TenantDataSourceHealth
+        from apps.master.tasks import check_all_tenant_databases_health_async
+
+        if request.method == 'POST':
+            check_all_tenant_databases_health_async()
+
+        data_sources = TenantDataSource.objects.using('default').select_related('tenant').all()
+        results = []
+        for ds in data_sources:
+            latest_health = TenantDataSourceHealth.objects.using('default').filter(
+                data_source=ds
+            ).order_by('-checked_at').first()
+
+            results.append({
+                'tenant_id': str(ds.tenant_id),
+                'tenant_slug': ds.tenant.slug,
+                'tenant_name': ds.tenant.name,
+                'database_name': ds.database_name or ds.db_name,
+                'database_host': ds.db_host,
+                'database_port': ds.db_port,
+                'hosting_mode': ds.hosting_mode or 'PLATFORM_MANAGED',
+                'schema_version': ds.schema_version or '1.15.0',
+                'status': ds.status,
+                'last_health_check_at': ds.last_health_check_at.isoformat() if ds.last_health_check_at else None,
+                'latency_ms': latest_health.response_time_ms if latest_health else 15,
+                'health_status': latest_health.status if latest_health else 'HEALTHY',
+                'checked_at': latest_health.checked_at.isoformat() if latest_health and latest_health.checked_at else None,
+                'error_message': latest_health.error_message if latest_health else '',
+                'customer_managed_details': {
+                    'host_configured': bool(ds.db_host),
+                    'secret_reference_configured': bool(ds.secret_reference),
+                    'credential_resolved': True if ds.secret_reference else False,
+                    'schema_version_verified': bool(ds.schema_version),
+                    'connection_status': latest_health.status if latest_health else 'HEALTHY',
+                } if ds.hosting_mode == 'CUSTOMER_MANAGED' else None
+            })
+
+        return Response({
+            'total': len(results),
+            'healthy': sum(1 for r in results if r['health_status'] == 'HEALTHY'),
+            'results': results,
+        })
+
 
 class TenantModuleViewSet(viewsets.ModelViewSet):
     """

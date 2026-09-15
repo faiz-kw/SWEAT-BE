@@ -729,6 +729,51 @@ class VerifyAccessView(APIView):
         }, status=status_code)
 
 
+class TenantDatabaseHealthView(APIView):
+    """
+    Live connection test & latency measurement for the active tenant database.
+    Zero secrets exposed.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        return self._measure(request)
+
+    def post(self, request):
+        return self._measure(request)
+
+    def _measure(self, request):
+        import time
+        from django.db import connections
+        from django.utils import timezone
+        from config.routers import get_tenant_db_alias
+
+        db_alias = get_tenant_db_alias() or 'default'
+        t0 = time.time()
+        status_val = 'HEALTHY'
+        err = ''
+        try:
+            conn = connections[db_alias]
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT 1;")
+                cursor.fetchone()
+            latency_ms = max(1, int((time.time() - t0) * 1000))
+            if latency_ms > 500:
+                status_val = 'DEGRADED'
+        except Exception as exc:
+            latency_ms = max(1, int((time.time() - t0) * 1000))
+            status_val = 'UNREACHABLE'
+            err = str(exc)[:200]
+
+        return Response({
+            'tenant_db_alias': db_alias,
+            'status': status_val,
+            'latency_ms': latency_ms,
+            'checked_at': timezone.now().isoformat(),
+            'error': err,
+        })
+
+
 class BranchWorkingHoursViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
     """
     Branch recurring weekly working hours (Mon-Sun).

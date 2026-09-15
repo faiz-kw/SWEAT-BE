@@ -100,7 +100,7 @@ def tenant_database_context(tenant_id: Union[str, uuid.UUID]):
 
 
     # Register dynamic connection in thread-safe registry
-    _register_tenant_connection(alias, db_name)
+    _register_tenant_connection(alias, db_name, data_source=data_source)
 
     # 4. Context Execution & Guaranteed Cleanup
     previous_alias = get_tenant_db_alias()
