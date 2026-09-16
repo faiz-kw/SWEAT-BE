@@ -452,8 +452,23 @@ class TenantProvisioningEngine:
 
     def _step12_create_org_admin(self, db_alias, org, branch, payload, provisioning):
         from apps.tenant_core.models_users import TenantUser, UserBranch
+        from django.contrib.auth.password_validation import validate_password
+        from django.core.exceptions import ValidationError as DjangoValidationError
+
         user = TenantUser.objects.using(db_alias).filter(email=payload['admin_email']).first()
         if not user:
+            raw_password = payload['admin_password']
+
+            # Enforce Django AUTH_PASSWORD_VALIDATORS before any hashing or DB write.
+            # This is the last-mile defence: applies regardless of whether the caller
+            # is the HTTP view, a Celery worker, or a management command.
+            try:
+                validate_password(raw_password)
+            except DjangoValidationError as exc:
+                raise ProvisioningError(
+                    f"Admin password does not meet policy: {'; '.join(exc.messages)}"
+                ) from exc
+
             user = TenantUser(
                 organization=org,
                 email=payload['admin_email'],
@@ -464,7 +479,7 @@ class TenantProvisioningEngine:
                 activated_at=timezone.now(),
                 home_branch=branch,
             )
-            user.set_password(payload['admin_password'])
+            user.set_password(raw_password)
             user.save(using=db_alias)
 
         UserBranch.objects.using(db_alias).get_or_create(

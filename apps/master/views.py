@@ -526,6 +526,20 @@ class TenantProvisioningViewSet(viewsets.ReadOnlyModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        # Validate admin_password against Django AUTH_PASSWORD_VALIDATORS early,
+        # at the HTTP layer, before queueing a Celery task.  Weak passwords get
+        # an immediate 400 with clear field-level errors rather than a delayed
+        # provisioning FAILED state deep inside the worker.
+        from django.contrib.auth.password_validation import validate_password
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        try:
+            validate_password(request.data['admin_password'])
+        except DjangoValidationError as exc:
+            return Response(
+                {'error': 'admin_password does not meet password policy.', 'detail': list(exc.messages)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         brand_name = request.data['brand_name']
         slug = request.data.get('slug') or brand_name.lower().replace(' ', '-')
 

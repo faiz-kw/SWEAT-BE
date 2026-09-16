@@ -21,6 +21,26 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
+from apps.authentication.security import (
+    set_refresh_cookie,
+    delete_refresh_cookie,
+    revoke_all_user_sessions,
+    is_token_revoked,
+    check_login_lockout,
+    record_login_failure,
+    reset_login_lockout,
+    generate_totp_secret,
+    get_totp_uri,
+    verify_totp_code,
+    create_mfa_challenge,
+    consume_mfa_challenge,
+    get_mfa_challenge,
+)
+from apps.authentication.throttles import (
+    LoginRateThrottle,
+    MFARateThrottle,
+    TokenRefreshRateThrottle,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -155,25 +175,17 @@ def _register_and_resolve_tenant(tenant):
     return db_alias
 
 
-def _build_login_response(refresh, user_type, user_data, extra=None):
-    """Build the standard login response dict with access + refresh tokens."""
+def _build_login_response(refresh, user_type, user_data, extra=None, request=None):
+    """Build the standard login response dict with access token and HttpOnly refresh cookie."""
     payload = {
         'access': str(refresh.access_token),
-        'refresh': str(refresh),
         'user_type': user_type,
         'user': user_data,
     }
     if extra:
         payload.update(extra)
     resp = Response(payload)
-    resp.set_cookie(
-        'refresh_token',
-        str(refresh),
-        httponly=True,
-        samesite='Lax',
-        max_age=7 * 24 * 60 * 60,
-        secure=False,  # Set to True in production (requires HTTPS)
-    )
+    set_refresh_cookie(resp, str(refresh), request=request)
     return resp
 
 
@@ -197,6 +209,7 @@ class UniversalLoginView(APIView):
     been removed. Tenant login now REQUIRES tenant_slug.
     """
     permission_classes = [AllowAny]
+    throttle_classes = [LoginRateThrottle]
 
     def post(self, request):
         email = request.data.get('email', '').lower().strip()
@@ -217,28 +230,60 @@ class UniversalLoginView(APIView):
 
     def _platform_login(self, request, email, password):
         """Authenticate against Master DB platform_users table."""
+        # Check brute force lockout
+        is_locked, remaining = check_login_lockout(request, email, tenant_id=None)
+        if is_locked:
+            return Response(
+                {'error': f'Too many failed login attempts. Account temporarily locked. Try again in {remaining} seconds.'},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
         from apps.master.models_iam import PlatformUser
 
         try:
             user = PlatformUser.objects.using('default').get(email=email)
         except PlatformUser.DoesNotExist:
-            # Do not reveal whether email exists
+            record_login_failure(request, email, tenant_id=None)
             return Response(
                 {'error': 'Invalid email or password.'},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
         if not user.check_password(password):
+            is_locked, rem = record_login_failure(request, email, tenant_id=None)
+            if is_locked:
+                return Response(
+                    {'error': f'Too many failed login attempts. Account temporarily locked. Try again in {rem} seconds.'},
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                )
             return Response(
                 {'error': 'Invalid email or password.'},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
         if user.status != 'ACTIVE':
+            reset_login_lockout(request, email, tenant_id=None)
             return Response(
                 {'error': f'Account is {user.status}. Contact platform support.'},
                 status=status.HTTP_403_FORBIDDEN,
             )
+
+        # Successful password verification — reset lockout
+        reset_login_lockout(request, email, tenant_id=None)
+
+        # MFA Challenge Gate
+        if getattr(user, 'is_mfa_enabled', False):
+            challenge_token = create_mfa_challenge(
+                user_id=str(user.id),
+                user_type='platform',
+                email=user.email,
+            )
+            return Response({
+                'mfa_required': True,
+                'challenge_token': challenge_token,
+                'method': 'totp',
+                'message': 'MFA verification required. Please enter your 6-digit TOTP code.',
+            }, status=status.HTTP_200_OK)
 
         refresh = _build_platform_token(user)
         _update_last_login(user, request, db='default')
@@ -252,6 +297,7 @@ class UniversalLoginView(APIView):
                 'full_name': user.full_name,
                 'status': user.status,
             },
+            request=request,
         )
 
     def _tenant_login(self, request, email, password, tenant_slug):
@@ -271,6 +317,16 @@ class UniversalLoginView(APIView):
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
+        tenant_id_str = str(tenant.id)
+
+        # Check brute force lockout
+        is_locked, remaining = check_login_lockout(request, email, tenant_id=tenant_id_str)
+        if is_locked:
+            return Response(
+                {'error': f'Too many failed login attempts. Account temporarily locked. Try again in {remaining} seconds.'},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
         try:
             db_alias = _register_and_resolve_tenant(tenant)
         except ValueError as e:
@@ -286,28 +342,61 @@ class UniversalLoginView(APIView):
         try:
             user = TenantUser.objects.using(db_alias).get(email=email)
         except TenantUser.DoesNotExist:
+            record_login_failure(request, email, tenant_id=tenant_id_str)
             return Response(
                 {'error': 'Invalid email or password.'},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
         if not user.check_password(password):
+            is_locked, rem = record_login_failure(request, email, tenant_id=tenant_id_str)
+            if is_locked:
+                return Response(
+                    {'error': f'Too many failed login attempts. Account temporarily locked. Try again in {rem} seconds.'},
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                )
             return Response(
                 {'error': 'Invalid email or password.'},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
         if user.status != 'ACTIVE':
+            reset_login_lockout(request, email, tenant_id=tenant_id_str)
             return Response(
                 {'error': f'Account is {user.status}. Contact your administrator.'},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
         if not user.is_login_allowed:
+            reset_login_lockout(request, email, tenant_id=tenant_id_str)
             return Response(
                 {'error': 'Account login is disabled. Contact your administrator.'},
                 status=status.HTTP_403_FORBIDDEN,
             )
+
+        # Successful password verification — reset lockout
+        reset_login_lockout(request, email, tenant_id=tenant_id_str)
+
+        # MFA Challenge Gate: check user flag or tenant security policy
+        from apps.tenant_core.views_security_policy import get_tenant_security_policy
+        sec_policy = get_tenant_security_policy(db_alias)
+        is_mfa_req = getattr(user, 'is_mfa_enabled', False) or (sec_policy and sec_policy.get('mfa_required'))
+
+        if is_mfa_req:
+            challenge_token = create_mfa_challenge(
+                user_id=str(user.id),
+                user_type='tenant',
+                email=user.email,
+                db_alias=db_alias,
+                tenant_id=str(tenant.id),
+                tenant_slug=tenant.slug,
+            )
+            return Response({
+                'mfa_required': True,
+                'challenge_token': challenge_token,
+                'method': 'totp',
+                'message': 'MFA verification required. Please enter your 6-digit TOTP code.',
+            }, status=status.HTTP_200_OK)
 
         refresh = _build_tenant_token(user, tenant, db_alias)
         _update_last_login(user, request, db=db_alias)
@@ -328,6 +417,7 @@ class UniversalLoginView(APIView):
                     'name': tenant.name,
                 },
             },
+            request=request,
         )
 
 
@@ -338,6 +428,7 @@ class UniversalLoginView(APIView):
 class PlatformLoginView(APIView):
     """POST /api/v1/auth/platform/login/ — Explicit platform user login."""
     permission_classes = [AllowAny]
+    throttle_classes = [LoginRateThrottle]
 
     def post(self, request):
         email = request.data.get('email', '').lower().strip()
@@ -349,27 +440,60 @@ class PlatformLoginView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # Check brute force lockout
+        is_locked, remaining = check_login_lockout(request, email, tenant_id=None)
+        if is_locked:
+            return Response(
+                {'error': f'Too many failed login attempts. Account temporarily locked. Try again in {remaining} seconds.'},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
         from apps.master.models_iam import PlatformUser
 
         try:
             user = PlatformUser.objects.using('default').get(email=email)
         except PlatformUser.DoesNotExist:
+            record_login_failure(request, email, tenant_id=None)
             return Response(
                 {'error': 'Invalid credentials.'},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
         if not user.check_password(password):
+            is_locked, rem = record_login_failure(request, email, tenant_id=None)
+            if is_locked:
+                return Response(
+                    {'error': f'Too many failed login attempts. Account temporarily locked. Try again in {rem} seconds.'},
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                )
             return Response(
                 {'error': 'Invalid credentials.'},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
         if user.status != 'ACTIVE':
+            reset_login_lockout(request, email, tenant_id=None)
             return Response(
                 {'error': f'Account is {user.status}. Contact platform support.'},
                 status=status.HTTP_403_FORBIDDEN,
             )
+
+        # Successful password verification — reset lockout
+        reset_login_lockout(request, email, tenant_id=None)
+
+        # MFA Challenge Gate
+        if getattr(user, 'is_mfa_enabled', False):
+            challenge_token = create_mfa_challenge(
+                user_id=str(user.id),
+                user_type='platform',
+                email=user.email,
+            )
+            return Response({
+                'mfa_required': True,
+                'challenge_token': challenge_token,
+                'method': 'totp',
+                'message': 'MFA verification required. Please enter your 6-digit TOTP code.',
+            }, status=status.HTTP_200_OK)
 
         refresh = _build_platform_token(user)
         _update_last_login(user, request, db='default')
@@ -383,6 +507,7 @@ class PlatformLoginView(APIView):
                 'full_name': user.full_name,
                 'status': user.status,
             },
+            request=request,
         )
 
 
@@ -393,6 +518,7 @@ class PlatformLoginView(APIView):
 class TenantLoginView(APIView):
     """POST /api/v1/auth/tenant/login/ — Explicit tenant user login."""
     permission_classes = [AllowAny]
+    throttle_classes = [LoginRateThrottle]
 
     def post(self, request):
         email = request.data.get('email', '').lower().strip()
@@ -422,6 +548,16 @@ class TenantLoginView(APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
+        tenant_id_str = str(tenant.id)
+
+        # Check brute force lockout
+        is_locked, remaining = check_login_lockout(request, email, tenant_id=tenant_id_str)
+        if is_locked:
+            return Response(
+                {'error': f'Too many failed login attempts. Account temporarily locked. Try again in {remaining} seconds.'},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
         try:
             db_alias = _register_and_resolve_tenant(tenant)
         except ValueError as e:
@@ -437,28 +573,61 @@ class TenantLoginView(APIView):
         try:
             user = TenantUser.objects.using(db_alias).get(email=email)
         except TenantUser.DoesNotExist:
+            record_login_failure(request, email, tenant_id=tenant_id_str)
             return Response(
                 {'error': 'Invalid credentials.'},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
         if not user.check_password(password):
+            is_locked, rem = record_login_failure(request, email, tenant_id=tenant_id_str)
+            if is_locked:
+                return Response(
+                    {'error': f'Too many failed login attempts. Account temporarily locked. Try again in {rem} seconds.'},
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                )
             return Response(
                 {'error': 'Invalid credentials.'},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
         if user.status != 'ACTIVE':
+            reset_login_lockout(request, email, tenant_id=tenant_id_str)
             return Response(
                 {'error': f'Account is {user.status}.'},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
         if not user.is_login_allowed:
+            reset_login_lockout(request, email, tenant_id=tenant_id_str)
             return Response(
                 {'error': 'Account login is disabled.'},
                 status=status.HTTP_403_FORBIDDEN,
             )
+
+        # Successful password verification — reset lockout
+        reset_login_lockout(request, email, tenant_id=tenant_id_str)
+
+        # MFA Challenge Gate
+        from apps.tenant_core.views_security_policy import get_tenant_security_policy
+        sec_policy = get_tenant_security_policy(db_alias)
+        is_mfa_req = getattr(user, 'is_mfa_enabled', False) or (sec_policy and sec_policy.get('mfa_required'))
+
+        if is_mfa_req:
+            challenge_token = create_mfa_challenge(
+                user_id=str(user.id),
+                user_type='tenant',
+                email=user.email,
+                db_alias=db_alias,
+                tenant_id=str(tenant.id),
+                tenant_slug=tenant.slug,
+            )
+            return Response({
+                'mfa_required': True,
+                'challenge_token': challenge_token,
+                'method': 'totp',
+                'message': 'MFA verification required. Please enter your 6-digit TOTP code.',
+            }, status=status.HTTP_200_OK)
 
         refresh = _build_tenant_token(user, tenant, db_alias)
         _update_last_login(user, request, db=db_alias)
@@ -479,6 +648,7 @@ class TenantLoginView(APIView):
                     'name': tenant.name,
                 },
             },
+            request=request,
         )
 
 
@@ -712,6 +882,11 @@ class PerformanceOSTokenRefreshSerializer(serializers.Serializer):
             except PlatformUser.DoesNotExist:
                 raise AuthenticationFailed('Platform user not found.')
 
+        # Check if user's sessions have been revoked
+        token_iat = refresh.payload.get('iat')
+        if is_token_revoked(str(user_id), token_iat):
+            raise AuthenticationFailed('Token has been revoked. Please log in again.')
+
         data = {"access": str(refresh.access_token)}
 
         if api_settings.ROTATE_REFRESH_TOKENS:
@@ -748,9 +923,11 @@ class TokenRefreshView(APIView):
       - Rejection of reused old refresh tokens with 401 Unauthorized
     """
     permission_classes = [AllowAny]
+    throttle_classes = [TokenRefreshRateThrottle]
 
     def post(self, request):
         from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
+        from rest_framework.exceptions import AuthenticationFailed
 
         refresh_token_str = request.data.get('refresh') or request.COOKIES.get('refresh_token')
 
@@ -763,7 +940,7 @@ class TokenRefreshView(APIView):
         serializer = PerformanceOSTokenRefreshSerializer(data={'refresh': refresh_token_str})
         try:
             serializer.is_valid(raise_exception=True)
-        except TokenError as e:
+        except (TokenError, InvalidToken) as e:
             logger.debug(
                 'TokenRefreshView: Token validation/blacklist failed — %s | correlation_id=%s',
                 type(e).__name__,
@@ -771,6 +948,16 @@ class TokenRefreshView(APIView):
             )
             return Response(
                 {'error': 'Invalid or expired refresh token.', 'detail': str(e)},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        except AuthenticationFailed as e:
+            logger.debug(
+                'TokenRefreshView: AuthenticationFailed — %s | correlation_id=%s',
+                e,
+                getattr(request, 'correlation_id', '-'),
+            )
+            return Response(
+                {'error': 'Authentication failed.', 'detail': str(e)},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
         except Exception as e:
@@ -790,19 +977,11 @@ class TokenRefreshView(APIView):
 
         resp = Response({
             'access': new_access_str,
-            'refresh': new_refresh_str,
         }, status=status.HTTP_200_OK)
 
-        resp.set_cookie(
-            'refresh_token',
-            new_refresh_str,
-            httponly=True,
-            samesite='Lax',
-            max_age=7 * 24 * 60 * 60,   # mirrors JWT_REFRESH_DAYS = 7
-            secure=False,               # Set to True in production (requires HTTPS)
-        )
+        set_refresh_cookie(resp, new_refresh_str, request=request)
         logger.debug(
-            'TokenRefreshView: RTR complete — new access+refresh issued | correlation_id=%s',
+            'TokenRefreshView: RTR complete — new access issued | correlation_id=%s',
             getattr(request, 'correlation_id', '-'),
         )
         return resp
@@ -843,8 +1022,338 @@ class LogoutView(APIView):
                 logger.error('LogoutView: Unexpected error blacklisting token: %s', e)
 
         resp = Response({'message': 'Logged out successfully.'})
-        resp.delete_cookie('refresh_token')
+        delete_refresh_cookie(resp)
         return resp
+
+
+# ---------------------------------------------------------------------------
+# View: SessionRevocationView
+# ---------------------------------------------------------------------------
+
+class SessionRevocationView(APIView):
+    """
+    POST /api/v1/auth/sessions/revoke-all/
+    POST /api/v1/auth/revoke-sessions/
+
+    Revokes all active sessions for the authenticated user (or target user if authorized admin).
+    Uses SimpleJWT blacklist and Redis revocation watermark for instant token invalidation.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        target_user_id = request.data.get('target_user_id') or str(user.id)
+        user_type = getattr(user, '_auth_type', 'tenant')
+        db_alias = getattr(user, '_db_alias', None)
+
+        if target_user_id != str(user.id):
+            if user_type == 'platform':
+                if not (user.is_staff or user.is_superuser):
+                    return Response({'error': 'Permission denied.'}, status=status.HTTP_403_FORBIDDEN)
+            else:
+                roles = getattr(user, '_roles', [])
+                if 'TENANT_ADMIN' not in roles:
+                    return Response({'error': 'Permission denied.'}, status=status.HTTP_403_FORBIDDEN)
+                from apps.tenant_core.models_users import TenantUser
+                if not TenantUser.objects.using(db_alias).filter(id=target_user_id).exists():
+                    return Response({'error': 'Target user not found in this organization.'}, status=status.HTTP_404_NOT_FOUND)
+
+        count = revoke_all_user_sessions(
+            user_id=target_user_id,
+            revoked_by_id=str(user.id),
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_type=user_type,
+            db_alias=db_alias,
+        )
+
+        resp = Response({
+            'message': 'All active sessions have been revoked successfully.',
+            'revoked_count': count,
+        }, status=status.HTTP_200_OK)
+
+        if target_user_id == str(user.id):
+            delete_refresh_cookie(resp)
+
+        return resp
+
+
+# ---------------------------------------------------------------------------
+# View: MFAVerifyView
+# ---------------------------------------------------------------------------
+
+class MFAVerifyView(APIView):
+    """
+    POST /api/v1/auth/mfa/verify/
+
+    Verifies a TOTP code against an active MFA challenge token.
+    Issues real JWT access and refresh tokens upon successful verification.
+    """
+    permission_classes = [AllowAny]
+    throttle_classes = [MFARateThrottle]
+
+    def post(self, request):
+        challenge_token = request.data.get('challenge_token')
+        code = request.data.get('code')
+
+        if not challenge_token or not code:
+            return Response(
+                {'error': 'challenge_token and code are required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        challenge_data = get_mfa_challenge(challenge_token)
+        if not challenge_data:
+            return Response(
+                {'error': 'Invalid or expired MFA challenge token.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user_id = challenge_data.get('user_id')
+        user_type = challenge_data.get('user_type')
+        db_alias = challenge_data.get('db_alias')
+        tenant_id = challenge_data.get('tenant_id')
+        tenant_slug = challenge_data.get('tenant_slug')
+
+        if user_type == 'platform':
+            from apps.master.models_iam import PlatformUser
+            try:
+                user = PlatformUser.objects.using('default').get(id=user_id)
+            except PlatformUser.DoesNotExist:
+                return Response({'error': 'User not found.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+            if user.status != 'ACTIVE':
+                return Response({'error': f'Account is {user.status}.'}, status=status.HTTP_403_FORBIDDEN)
+
+            if not verify_totp_code(user.mfa_secret, code):
+                return Response({'error': 'Invalid MFA verification code.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Consume challenge token on verified success
+            consume_mfa_challenge(challenge_token)
+
+            refresh = _build_platform_token(user)
+            _update_last_login(user, request, db='default')
+            return _build_login_response(
+                refresh,
+                user_type='platform',
+                user_data={
+                    'id': str(user.id),
+                    'email': user.email,
+                    'full_name': user.full_name,
+                    'status': user.status,
+                },
+                request=request,
+            )
+
+        elif user_type == 'tenant':
+            from apps.master.models_tenant import Tenant
+            from apps.tenant_core.models_users import TenantUser
+            from apps.tenant_core.audit import emit_audit_event
+
+            try:
+                tenant = Tenant.objects.using('default').get(id=tenant_id)
+                user = TenantUser.objects.using(db_alias).get(id=user_id)
+            except Exception:
+                return Response({'error': 'User or organization not found.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+            if user.status != 'ACTIVE' or not user.is_login_allowed:
+                return Response({'error': 'Account is not active or login is disabled.'}, status=status.HTTP_403_FORBIDDEN)
+
+            if not verify_totp_code(user.mfa_secret, code):
+                try:
+                    emit_audit_event(
+                        actor_id=str(user.id),
+                        actor_email=user.email,
+                        actor_roles=[],
+                        action='SECURITY.MFA_FAILED',
+                        target_type='TenantUser',
+                        target_id=str(user.id),
+                        db_alias=db_alias,
+                        request=request,
+                        metadata={'reason': 'Invalid TOTP code'},
+                    )
+                except Exception:
+                    pass
+                return Response({'error': 'Invalid MFA verification code.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            try:
+                emit_audit_event(
+                    actor_id=str(user.id),
+                    actor_email=user.email,
+                    actor_roles=[],
+                    action='SECURITY.MFA_VERIFIED',
+                    target_type='TenantUser',
+                    target_id=str(user.id),
+                    db_alias=db_alias,
+                    request=request,
+                )
+            except Exception:
+                pass
+
+            # Consume challenge token on verified success
+            consume_mfa_challenge(challenge_token)
+
+            refresh = _build_tenant_token(user, tenant, db_alias)
+            _update_last_login(user, request, db=db_alias)
+            return _build_login_response(
+                refresh,
+                user_type='tenant',
+                user_data={
+                    'id': str(user.id),
+                    'email': user.email,
+                    'full_name': user.full_name,
+                    'status': user.status,
+                },
+                extra={
+                    'tenant': {
+                        'id': str(tenant.id),
+                        'slug': tenant.slug,
+                        'name': tenant.name,
+                    },
+                },
+                request=request,
+            )
+
+
+# ---------------------------------------------------------------------------
+# View: MFAEnrollView
+# ---------------------------------------------------------------------------
+
+class MFAEnrollView(APIView):
+    """
+    POST /api/v1/auth/mfa/enroll/
+    Generates a new TOTP secret and otpauth URI for enrolling in 2FA.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        import redis
+        from django.conf import settings
+
+        user = request.user
+        secret = generate_totp_secret()
+        uri = get_totp_uri(secret, user.email, issuer="PerformanceOS")
+
+        try:
+            r = redis.from_url(getattr(settings, 'REDIS_URL', 'redis://127.0.0.1:6379/0'))
+            r.set(f"auth:mfa_pending:{user.id}", secret, ex=600)
+        except Exception:
+            pass
+
+        return Response({
+            'secret': secret,
+            'otpauth_url': uri,
+        }, status=status.HTTP_200_OK)
+
+
+# ---------------------------------------------------------------------------
+# View: MFAEnableView
+# ---------------------------------------------------------------------------
+
+class MFAEnableView(APIView):
+    """
+    POST /api/v1/auth/mfa/enable/
+    Verifies code against pending or submitted secret and enables MFA on the account.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        import redis
+        from django.conf import settings
+
+        user = request.user
+        code = request.data.get('code')
+        secret = request.data.get('secret')
+
+        if not code:
+            return Response({'error': 'Verification code is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not secret:
+            try:
+                r = redis.from_url(getattr(settings, 'REDIS_URL', 'redis://127.0.0.1:6379/0'))
+                cached_secret = r.get(f"auth:mfa_pending:{user.id}")
+                if cached_secret:
+                    secret = cached_secret.decode('utf-8')
+            except Exception:
+                pass
+
+        if not secret:
+            return Response({'error': 'MFA secret not found or expired. Please re-enroll.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not verify_totp_code(secret, code):
+            return Response({'error': 'Invalid verification code.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user.mfa_secret = secret
+        user.is_mfa_enabled = True
+        db = getattr(user, '_db_alias', 'default')
+        user.save(using=db, update_fields=['mfa_secret', 'is_mfa_enabled'])
+
+        if getattr(user, '_auth_type', None) == 'tenant':
+            from apps.tenant_core.audit import emit_audit_event
+            try:
+                emit_audit_event(
+                    actor_id=str(user.id),
+                    actor_email=user.email,
+                    actor_roles=getattr(user, '_roles', []),
+                    action='SECURITY.MFA_ENABLED',
+                    target_type='TenantUser',
+                    target_id=str(user.id),
+                    db_alias=db,
+                    request=request,
+                )
+            except Exception:
+                pass
+
+        return Response({'message': 'MFA has been successfully enabled.'}, status=status.HTTP_200_OK)
+
+
+# ---------------------------------------------------------------------------
+# View: MFADisableView
+# ---------------------------------------------------------------------------
+
+class MFADisableView(APIView):
+    """
+    POST /api/v1/auth/mfa/disable/
+    Disables MFA for the user after validating password.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        password = request.data.get('password')
+        code = request.data.get('code')
+
+        if not password:
+            return Response({'error': 'Password is required to disable MFA.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not user.check_password(password):
+            return Response({'error': 'Invalid password.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if user.is_mfa_enabled and code:
+            if not verify_totp_code(user.mfa_secret, code):
+                return Response({'error': 'Invalid verification code.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user.is_mfa_enabled = False
+        user.mfa_secret = ''
+        db = getattr(user, '_db_alias', 'default')
+        user.save(using=db, update_fields=['mfa_secret', 'is_mfa_enabled'])
+
+        if getattr(user, '_auth_type', None) == 'tenant':
+            from apps.tenant_core.audit import emit_audit_event
+            try:
+                emit_audit_event(
+                    actor_id=str(user.id),
+                    actor_email=user.email,
+                    actor_roles=getattr(user, '_roles', []),
+                    action='SECURITY.MFA_DISABLED',
+                    target_type='TenantUser',
+                    target_id=str(user.id),
+                    db_alias=db,
+                    request=request,
+                )
+            except Exception:
+                pass
+
+        return Response({'message': 'MFA has been disabled.'}, status=status.HTTP_200_OK)
 
 
 # ---------------------------------------------------------------------------

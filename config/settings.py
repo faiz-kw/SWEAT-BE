@@ -204,7 +204,18 @@ REST_FRAMEWORK = {
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 50,
     'EXCEPTION_HANDLER': 'rest_framework.views.exception_handler',
+    # ---------------------------------------------------------------------------
+    # DRF Throttle rates — Redis-independent per-IP fallback rate limiting.
+    # Applied by apps/authentication/throttles.py on login, MFA, and refresh views.
+    # These values can be overridden via environment variables; see settings below.
+    # ---------------------------------------------------------------------------
+    'DEFAULT_THROTTLE_RATES': {
+        'auth_login':   os.getenv('THROTTLE_RATE_LOGIN',   '10/minute'),
+        'auth_mfa':     os.getenv('THROTTLE_RATE_MFA',     '5/minute'),
+        'auth_refresh': os.getenv('THROTTLE_RATE_REFRESH', '20/minute'),
+    },
 }
+
 
 # ---------------------------------------------------------------------------
 # SimpleJWT
@@ -401,6 +412,15 @@ TENANT_MIGRATION_CONCURRENCY_LIMIT = int(os.getenv('TENANT_MIGRATION_CONCURRENCY
 if 'test' in sys.argv:
     CELERY_TASK_ALWAYS_EAGER = True
     CELERY_TASK_EAGER_PROPAGATES = True
+    # Throttle rates must be permissive in tests: all 352 tests run from the same
+    # loopback IP in-process, sharing the LocMemCache throttle counter.  Without this
+    # override, sequential login tests trip the 10/min limit and return 429 instead of
+    # the expected status code.  This mirrors the CELERY_TASK_ALWAYS_EAGER pattern.
+    REST_FRAMEWORK['DEFAULT_THROTTLE_RATES'] = {
+        'auth_login':   '10000/minute',
+        'auth_mfa':     '10000/minute',
+        'auth_refresh': '10000/minute',
+    }
 else:
     CELERY_TASK_ALWAYS_EAGER = False
     CELERY_TASK_EAGER_PROPAGATES = False
