@@ -34,6 +34,17 @@ if not DEBUG:
             'FATAL: SECRET_KEY appears to be an insecure development key. '
             'Set a strong, unique SECRET_KEY in production.'
         )
+
+if not DEBUG:
+    # Production security defaults (enforced when DEBUG is False)
+    SECURE_SSL_REDIRECT = os.getenv('SECURE_SSL_REDIRECT', 'True').lower() in ('true', '1', 't')
+    SESSION_COOKIE_SECURE = os.getenv('SESSION_COOKIE_SECURE', 'True').lower() in ('true', '1', 't')
+    CSRF_COOKIE_SECURE = os.getenv('CSRF_COOKIE_SECURE', 'True').lower() in ('true', '1', 't')
+    SECURE_HSTS_SECONDS = int(os.getenv('SECURE_HSTS_SECONDS', '31536000'))
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+    SECURE_BROWSER_XSS_FILTER = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
 else:
     # In development: fall back to a dev default but warn loudly
     if not SECRET_KEY:

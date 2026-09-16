@@ -52,6 +52,18 @@ class TenantUserSerializer(serializers.ModelSerializer):
         'DEACTIVATED': {'ACTIVE'},
     }
 
+    full_name = serializers.CharField(read_only=True)
+    role = serializers.SerializerMethodField()
+    role_name = serializers.SerializerMethodField()
+    roles = serializers.SerializerMethodField()
+    department = serializers.SerializerMethodField()
+    departments = serializers.SerializerMethodField()
+    home_branch_name = serializers.CharField(source='home_branch.name', read_only=True, default=None)
+    active_location_name = serializers.CharField(source='home_branch.name', read_only=True, default=None)
+    tenant_id = serializers.SerializerMethodField()
+    tenant_name = serializers.SerializerMethodField()
+    is_active = serializers.BooleanField(source='is_accessible', read_only=True)
+
     class Meta:
         model = TenantUser
         fields = [
@@ -59,8 +71,80 @@ class TenantUserSerializer(serializers.ModelSerializer):
             'status', 'is_login_allowed', 'home_branch', 'deactivated_at',
             'deactivated_by', 'deactivation_reason', 'suspended_until',
             'last_login_at', 'created_at',
+            'full_name', 'role', 'role_name', 'roles', 'department', 'departments',
+            'home_branch_name', 'active_location_name', 'tenant_id', 'tenant_name', 'is_active',
         ]
         read_only_fields = ['id', 'last_login_at', 'created_at', 'deactivated_at', 'deactivated_by']
+        extra_kwargs = {
+            'organization': {'required': False},
+        }
+
+    def get_tenant_id(self, obj):
+        return str(obj.organization_id) if obj.organization_id else ''
+
+    def get_tenant_name(self, obj):
+        try:
+            return obj.organization.name if obj.organization else ''
+        except Exception:
+            return ''
+
+    def get_role(self, obj):
+        db = obj._state.db or 'default'
+        try:
+            from .models_rbac import RoleAssignment
+            ra = RoleAssignment.objects.using(db).filter(user=obj, is_active=True).select_related('role').first()
+            if ra and ra.role:
+                return ra.role.code
+        except Exception:
+            pass
+        return 'STAFF'
+
+    def get_role_name(self, obj):
+        db = obj._state.db or 'default'
+        try:
+            from .models_rbac import RoleAssignment
+            ra = RoleAssignment.objects.using(db).filter(user=obj, is_active=True).select_related('role').first()
+            if ra and ra.role:
+                return ra.role.name
+        except Exception:
+            pass
+        return 'Staff Member'
+
+    def get_roles(self, obj):
+        db = obj._state.db or 'default'
+        try:
+            from .models_rbac import RoleAssignment
+            ras = RoleAssignment.objects.using(db).filter(user=obj, is_active=True).select_related('role', 'branch')
+            return [{
+                'id': str(ra.role.id),
+                'code': ra.role.code,
+                'name': ra.role.name,
+                'scope': ra.role.scope,
+                'branch_id': str(ra.branch.id) if ra.branch else None,
+                'branch_name': ra.branch.name if ra.branch else None,
+            } for ra in ras if ra.role]
+        except Exception:
+            return []
+
+    def get_department(self, obj):
+        db = obj._state.db or 'default'
+        try:
+            from .models_users import UserDepartment
+            ud = UserDepartment.objects.using(db).filter(user=obj, status='ACTIVE').select_related('department').first()
+            if ud and ud.department:
+                return ud.department.name
+        except Exception:
+            pass
+        return ''
+
+    def get_departments(self, obj):
+        db = obj._state.db or 'default'
+        try:
+            from .models_users import UserDepartment
+            uds = UserDepartment.objects.using(db).filter(user=obj, status='ACTIVE').select_related('department')
+            return [{'id': str(ud.department.id), 'name': ud.department.name, 'code': ud.department.code} for ud in uds if ud.department]
+        except Exception:
+            return []
 
     def update(self, instance, validated_data):
         from django.db import transaction
@@ -147,12 +231,20 @@ class TenantUserSerializer(serializers.ModelSerializer):
 
 
 class TenantUserCreateSerializer(TenantUserSerializer):
-    password = serializers.CharField(write_only=True)
+    password = serializers.CharField(write_only=True, required=False, allow_blank=True, default='')
+    role = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    role_id = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    department_id = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    branch = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    branch_id = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    home_branch = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
     class Meta(TenantUserSerializer.Meta):
-        fields = TenantUserSerializer.Meta.fields + ['password']
+        fields = TenantUserSerializer.Meta.fields + ['password', 'role', 'role_id', 'department_id', 'branch', 'branch_id']
 
     def validate_password(self, value):
+        if not value:
+            return value
         from django.contrib.auth.password_validation import validate_password
         from django.core.exceptions import ValidationError as DjangoValidationError
 
@@ -162,12 +254,22 @@ class TenantUserCreateSerializer(TenantUserSerializer):
             raise serializers.ValidationError(list(e.messages))
         return value
 
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret['role'] = self.get_role(instance)
+        ret['role_name'] = self.get_role_name(instance)
+        return ret
+
     def create(self, validated_data):
+        import uuid
         from rest_framework.exceptions import PermissionDenied
         from django.db import transaction
+        from django.utils import timezone
         from apps.master.quota import QuotaChecker, QuotaExceededError, QuotaConfigurationError
         from config.routers import get_tenant_db_alias
-        from .models_org import Organization
+        from .models_org import Organization, Branch
+        from .models_users import TenantUser, UserDepartment, UserBranch, Department
+        from .models_rbac import Role, RoleAssignment
 
         db_alias = self.context.get('db_alias') or get_tenant_db_alias()
         if not db_alias:
@@ -178,7 +280,34 @@ class TenantUserCreateSerializer(TenantUserSerializer):
 
         org = validated_data.get('organization')
         if not org:
-            raise serializers.ValidationError({'organization': 'Organization is required.'})
+            org = Organization.objects.using(db_alias).first()
+            if org:
+                validated_data['organization'] = org
+            else:
+                raise serializers.ValidationError({'organization': 'Organization is required.'})
+
+        # Pop write-only relational fields before constructing user
+        role_param = validated_data.pop('role', None)
+        role_id_param = validated_data.pop('role_id', None)
+        dept_id_param = validated_data.pop('department_id', None)
+        branch_param = (
+            validated_data.pop('branch', None) or
+            validated_data.pop('branch_id', None) or
+            validated_data.pop('home_branch', None)
+        )
+
+        # Resolve home_branch from branch_param if provided
+        if branch_param:
+            if isinstance(branch_param, Branch):
+                validated_data['home_branch'] = branch_param
+            else:
+                branch_obj = None
+                try:
+                    branch_obj = Branch.objects.using(db_alias).filter(id=uuid.UUID(str(branch_param))).first()
+                except Exception:
+                    branch_obj = Branch.objects.using(db_alias).filter(name__iexact=str(branch_param)).first()
+                if branch_obj:
+                    validated_data['home_branch'] = branch_obj
 
         # Resolve tenant_id from auth context
         request = self.context.get('request')
@@ -190,7 +319,6 @@ class TenantUserCreateSerializer(TenantUserSerializer):
         if not tenant_id:
             tenant_id = self.context.get('tenant_id')
         if not tenant_id:
-            # Fallback lookup via TenantDataSource using db_alias
             from apps.master.models_infra import TenantDataSource
             clean_alias = db_alias.replace('tenant_tenant_', 'tenant_').replace('tenant_', '')
             ds = TenantDataSource.objects.using('default').filter(
@@ -210,6 +338,15 @@ class TenantUserCreateSerializer(TenantUserSerializer):
             locked_org = Organization.objects.using(db_alias).select_for_update().get(id=org.id)
 
             # 2 & 3 & 4. Count users and resolve/assert Master DB quota
+            raw_password = validated_data.pop('password', '')
+            if not raw_password:
+                validated_data['status'] = 'INVITED'
+                validated_data['invited_at'] = timezone.now()
+            else:
+                if 'status' not in validated_data:
+                    validated_data['status'] = 'ACTIVE'
+                validated_data['activated_at'] = timezone.now()
+
             status = validated_data.get('status', 'INVITED')
             if status in ('ACTIVE', 'INVITED'):
                 try:
@@ -235,18 +372,184 @@ class TenantUserCreateSerializer(TenantUserSerializer):
                     })
 
             # 5. Create user only after quota check passes
-            password = validated_data.pop('password')
             user = TenantUser(**validated_data)
-            user.set_password(password)
+            if raw_password:
+                user.set_password(raw_password)
+            else:
+                user.set_password(uuid.uuid4().hex)
             user.save(using=db_alias)
+
+            # 6. Create RoleAssignment if role specified or default safely to active role
+            target_role = None
+            if role_id_param:
+                try:
+                    target_role = Role.objects.using(db_alias).filter(id=uuid.UUID(str(role_id_param)), is_active=True).first()
+                except Exception:
+                    target_role = Role.objects.using(db_alias).filter(code=str(role_id_param), is_active=True).first()
+            if not target_role and role_param:
+                target_role = (
+                    Role.objects.using(db_alias).filter(code__iexact=str(role_param), is_active=True).first() or
+                    Role.objects.using(db_alias).filter(name__iexact=str(role_param), is_active=True).first()
+                )
+            if not target_role:
+                target_role = (
+                    Role.objects.using(db_alias).filter(code__in=['STAFF', 'GENERAL_STAFF', 'TRAINER'], is_active=True).first() or
+                    Role.objects.using(db_alias).filter(is_active=True).exclude(code='ORG_ADMIN').first() or
+                    Role.objects.using(db_alias).filter(is_active=True).first()
+                )
+
+            # Safeguard actor FK constraint on tenant DB
+            actor = None
+            if request and hasattr(request, 'user') and hasattr(request.user, 'id'):
+                try:
+                    actor = TenantUser.objects.using(db_alias).filter(id=request.user.id).first()
+                except Exception:
+                    actor = None
+
+            if target_role:
+                RoleAssignment.objects.using(db_alias).create(
+                    organization=org,
+                    user=user,
+                    role=target_role,
+                    branch=user.home_branch,
+                    scope_type='BRANCH' if user.home_branch else 'ORGANIZATION',
+                    status='ACTIVE',
+                    is_active=True,
+                    assigned_by=actor,
+                )
+
+            # 7. Create UserDepartment if specified
+            if dept_id_param:
+                dept = None
+                try:
+                    dept = Department.objects.using(db_alias).filter(id=uuid.UUID(str(dept_id_param))).first()
+                except Exception:
+                    dept = (
+                        Department.objects.using(db_alias).filter(code__iexact=str(dept_id_param)).first() or
+                        Department.objects.using(db_alias).filter(name__iexact=str(dept_id_param)).first()
+                    )
+                if dept:
+                    UserDepartment.objects.using(db_alias).create(
+                        user=user,
+                        department=dept,
+                        is_primary=True,
+                        status='ACTIVE',
+                    )
+
+            # 8. Create UserBranch if home_branch is set
+            if user.home_branch:
+                UserBranch.objects.using(db_alias).get_or_create(
+                    user=user,
+                    branch=user.home_branch,
+                    scope_type='HOME',
+                    defaults={'is_active': True, 'status': 'ACTIVE', 'is_primary': True, 'relationship_type': 'PRIMARY'},
+                )
+
             return user
 
 
 class RoleSerializer(serializers.ModelSerializer):
+    users_count = serializers.SerializerMethodField()
+    permission_set_id = serializers.SerializerMethodField()
+    permissions = serializers.SerializerMethodField()
+    module_access = serializers.SerializerMethodField()
+    submodule_access = serializers.SerializerMethodField()
+
     class Meta:
         model = Role
-        fields = ['id', 'organization', 'department', 'name', 'code', 'description', 'scope', 'is_system', 'is_active', 'created_at']
+        fields = [
+            'id', 'organization', 'department', 'name', 'code', 'description',
+            'scope', 'is_system', 'is_active', 'created_at',
+            'users_count', 'permission_set_id', 'permissions', 'module_access', 'submodule_access',
+        ]
         read_only_fields = ['id', 'is_system', 'created_at']
+        validators = []
+        extra_kwargs = {
+            'organization': {'required': False, 'allow_null': True},
+            'department': {'required': False, 'allow_null': True},
+        }
+
+    def validate(self, attrs):
+        if not attrs.get('organization'):
+            request = self.context.get('request')
+            db = getattr(request.user, '_db_alias', None) if request and hasattr(request, 'user') else None
+            if not db:
+                from config.routers import get_tenant_db_alias
+                db = get_tenant_db_alias() or 'default'
+            from .models_org import Organization
+            attrs['organization'] = Organization.objects.using(db).first()
+
+        if self.instance is None and attrs.get('organization') and attrs.get('code'):
+            db = attrs['organization']._state.db or 'default'
+            if Role.objects.using(db).filter(organization=attrs['organization'], code=attrs['code']).exists():
+                raise serializers.ValidationError({'code': f"Role with code '{attrs['code']}' already exists for this organization."})
+        return attrs
+
+    def get_users_count(self, obj):
+        db = obj._state.db or 'default'
+        try:
+            from .models_rbac import RoleAssignment
+            return RoleAssignment.objects.using(db).filter(role=obj, is_active=True).count()
+        except Exception:
+            return 0
+
+    def get_permission_set_id(self, obj):
+        try:
+            rps = obj.permission_sets.filter(is_active=True).first()
+            return str(rps.id) if rps else None
+        except Exception:
+            return None
+
+    def get_permissions(self, obj):
+        try:
+            rps = obj.permission_sets.filter(is_active=True).first()
+            if not rps:
+                return []
+            return [
+                {
+                    'permission_id': str(item.permission.id),
+                    'permission_code': item.permission.permission_code,
+                    'permission': {
+                        'id': str(item.permission.id),
+                        'code': item.permission.permission_code,
+                        'label': item.permission.label,
+                        'action': item.permission.action,
+                        'module': item.permission.module.module_code if item.permission.module else '',
+                        'submodule': item.permission.submodule.submodule_code if item.permission.submodule else '',
+                    },
+                    'granted': item.granted,
+                }
+                for item in rps.items.select_related('permission', 'permission__module', 'permission__submodule').all()
+            ]
+        except Exception:
+            return []
+
+    def get_module_access(self, obj):
+        try:
+            return [
+                {
+                    'module_code': ma.module.module_code,
+                    'can_access': ma.can_access,
+                    'is_visible': ma.is_visible,
+                }
+                for ma in obj.module_access.select_related('module').all()
+            ]
+        except Exception:
+            return []
+
+    def get_submodule_access(self, obj):
+        try:
+            return [
+                {
+                    'module_code': sa.submodule.module.module_code if sa.submodule.module else '',
+                    'submodule_code': sa.submodule.submodule_code,
+                    'can_access': sa.can_access,
+                    'is_visible': sa.is_visible,
+                }
+                for sa in obj.submodule_access.select_related('submodule', 'submodule__module').all()
+            ]
+        except Exception:
+            return []
 
 
 class RoleAssignmentSerializer(serializers.ModelSerializer):

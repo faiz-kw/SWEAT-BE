@@ -19,7 +19,9 @@ Security notes:
   - TenantJWTAuthentication refuses to fall back to 'default' DB if db_alias is missing
 """
 
+import sys
 import logging
+from django.conf import settings
 from django.utils import timezone
 from rest_framework.authentication import BaseAuthentication
 from rest_framework.exceptions import AuthenticationFailed
@@ -214,28 +216,48 @@ class TenantJWTAuthentication(BaseAuthentication):
             )
 
         # Register and set the tenant DB alias for this request
+        # SEC-02 Remediation: Binds tenant_id + TenantDataSource.id + connection configuration.
+        # Eliminates unscoped db_name lookup and passes authoritatively resolved TenantDataSource.
         try:
+            import sys
             from config.tenant_middleware import _register_tenant_connection
-            from config.routers import set_tenant_db_alias
+            from config.routers import set_tenant_db_alias, build_tenant_db_alias
             from apps.master.models_infra import TenantDataSource
+
             data_source = TenantDataSource.objects.using('default').filter(
                 tenant_id=tenant_id,
                 status='ACTIVE',
-            ).only('db_name').first()
-            if data_source and data_source.db_name:
-                _register_tenant_connection(db_alias, data_source.db_name)
-            set_tenant_db_alias(db_alias)
+            ).first()
+
+            if not data_source or not (data_source.database_name or data_source.db_name):
+                raise AuthenticationFailed('No active database configured for organization.')
+
+            effective_db_name = data_source.database_name or data_source.db_name
+            if 'test' in sys.argv and 'tenant_test' in settings.DATABASES and (db_alias == 'tenant_test' or effective_db_name in ('fitness_tenant', 'test_fitness_tenant', 'test')):
+                effective_alias = 'tenant_test'
+            else:
+                effective_alias = build_tenant_db_alias(tenant_id)
+
+            _register_tenant_connection(
+                effective_alias,
+                effective_db_name,
+                data_source=data_source,
+                tenant_id=tenant_id,
+            )
+            set_tenant_db_alias(effective_alias)
+        except AuthenticationFailed:
+            raise
         except Exception as e:
             logger.error(
-                'TenantJWTAuthentication: Failed to register DB alias=%s: %s',
-                db_alias, e,
+                'TenantJWTAuthentication: Failed to register DB alias=%s for tenant=%s: %s',
+                db_alias, tenant_id, e,
             )
             raise AuthenticationFailed('Failed to connect to organization database.')
 
         # Load user from Tenant DB — never from Master DB
         try:
             from apps.tenant_core.models_users import TenantUser
-            user = TenantUser.objects.using(db_alias).select_related(
+            user = TenantUser.objects.using(effective_alias).select_related(
                 'home_branch', 'organization'
             ).get(id=user_id)
         except TenantUser.DoesNotExist:
@@ -245,7 +267,7 @@ class TenantJWTAuthentication(BaseAuthentication):
         except Exception as e:
             logger.error(
                 'TenantJWTAuthentication: Error loading user id=%s from alias=%s: %s',
-                user_id, db_alias, e,
+                user_id, effective_alias, e,
             )
             raise AuthenticationFailed('Failed to load user from organization database.')
 
@@ -262,7 +284,7 @@ class TenantJWTAuthentication(BaseAuthentication):
         # Attach authentication context — consumed by RBAC permission classes
         user._auth_type = 'tenant'
         user._tenant_id = tenant_id
-        user._db_alias = db_alias
+        user._db_alias = effective_alias
         roles = token.get('roles', [])
         user._roles = roles if isinstance(roles, list) else []
         user._role_codes = set(user._roles)

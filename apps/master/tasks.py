@@ -7,6 +7,7 @@ Provides:
 - migrate_all_tenants_async: Orchestrator fanning out per-tenant migrations asynchronously.
 """
 
+import sys
 import uuid
 import logging
 from celery import shared_task
@@ -23,7 +24,7 @@ from apps.tenant_core.locks import (
 )
 from apps.master.provisioning import TenantProvisioningEngine, ProvisioningError
 from apps.master.models_infra import TenantProvisioning, PlatformAuditEvent
-from config.routers import TenantRouter
+from config.routers import TenantRouter, build_tenant_db_alias
 
 logger = logging.getLogger(__name__)
 
@@ -446,10 +447,14 @@ def check_all_tenant_databases_health_async(self) -> dict:
         if not db_name:
             continue
 
-        alias = f"tenant_{db_name}"
+        if 'test' in getattr(sys, 'argv', []) and 'tenant_test' in settings.DATABASES and (db_name in ('fitness_tenant', 'test_fitness_tenant', 'test')):
+            alias = 'tenant_test'
+        else:
+            alias = build_tenant_db_alias(ds.tenant_id)
+
         t0 = time.time()
         try:
-            _register_tenant_connection(alias, db_name, data_source=ds, force_refresh=False)
+            _register_tenant_connection(alias, db_name, data_source=ds, tenant_id=ds.tenant_id, force_refresh=False)
             conn = connections[alias]
             with conn.cursor() as cursor:
                 cursor.execute("SELECT 1;")

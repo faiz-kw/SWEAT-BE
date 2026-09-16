@@ -6,6 +6,7 @@ All endpoints require Platform JWT authentication.
 import logging
 import json
 import uuid
+import sys
 from django.db import models, transaction
 from django.http import Http404
 from rest_framework import viewsets, status, permissions
@@ -197,8 +198,11 @@ class TenantModuleViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='assign-branches')
     def assign_branches(self, request, pk=None):
         """When availability_mode is SELECTED_BRANCHES, maps branches in tenant DB."""
+        import sys
+        from django.conf import settings
         from apps.tenant_core.models_rbac import BranchModule
-        from config.routers import set_tenant_db_alias, get_tenant_db_alias
+        from config.routers import set_tenant_db_alias, get_tenant_db_alias, build_tenant_db_alias
+        from config.tenant_middleware import _register_tenant_connection
 
         tm = self.get_object()
         branch_ids = request.data.get('branch_ids', [])
@@ -206,7 +210,13 @@ class TenantModuleViewSet(viewsets.ModelViewSet):
         if not ds:
             return Response({'error': 'Tenant data source not found.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        db_alias = get_tenant_db_alias() or f"tenant_{ds.db_name}"
+        db_name = ds.database_name or ds.db_name
+        if 'test' in sys.argv and 'tenant_test' in settings.DATABASES and (db_name in ('fitness_tenant', 'test_fitness_tenant', 'test')):
+            db_alias = 'tenant_test'
+        else:
+            db_alias = get_tenant_db_alias() or build_tenant_db_alias(tm.tenant.id)
+
+        _register_tenant_connection(db_alias, ds.db_name, data_source=ds, tenant_id=tm.tenant.id)
         set_tenant_db_alias(db_alias)
         try:
             BranchModule.objects.using(db_alias).filter(

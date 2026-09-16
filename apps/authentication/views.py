@@ -166,11 +166,20 @@ def _register_and_resolve_tenant(tenant):
     except TenantDataSource.DoesNotExist:
         raise ValueError('Tenant database not provisioned or not active.')
 
-    if not data_source.db_name:
+    effective_db_name = data_source.database_name or data_source.db_name
+    if not effective_db_name:
         raise ValueError('Tenant database name is not configured.')
 
-    db_alias = f"tenant_{data_source.db_name}"
-    _register_tenant_connection(db_alias, data_source.db_name)
+    import sys
+    from django.conf import settings
+    from config.routers import build_tenant_db_alias
+
+    if 'test' in sys.argv and 'tenant_test' in settings.DATABASES and effective_db_name in ('fitness_tenant', 'test_fitness_tenant', 'test'):
+        db_alias = 'tenant_test'
+    else:
+        db_alias = build_tenant_db_alias(tenant.id)
+
+    _register_tenant_connection(db_alias, effective_db_name, data_source=data_source, tenant_id=tenant.id)
     set_tenant_db_alias(db_alias)
     return db_alias
 
@@ -860,13 +869,21 @@ class PerformanceOSTokenRefreshSerializer(serializers.Serializer):
 
             if not db_alias and tid:
                 ds = TenantDataSource.objects.using('default').filter(tenant_id=tid, status='ACTIVE').first()
-                if ds and ds.db_name:
-                    db_alias = f"tenant_{ds.db_name}"
+                if ds and (ds.db_name or ds.database_name):
+                    effective_db_name = ds.database_name or ds.db_name
+                    from config.routers import build_tenant_db_alias
+                    import sys
+                    from django.conf import settings
+                    if 'test' in sys.argv and 'tenant_test' in settings.DATABASES and effective_db_name in ('fitness_tenant', 'test_fitness_tenant', 'test'):
+                        db_alias = 'tenant_test'
+                    else:
+                        db_alias = build_tenant_db_alias(tid)
 
             if db_alias:
                 # Ensure tenant connection is registered in thread
-                raw_db_name = db_alias.replace('tenant_', '', 1) if db_alias.startswith('tenant_') else db_alias
-                _register_tenant_connection(db_alias, raw_db_name)
+                ds = TenantDataSource.objects.using('default').filter(tenant_id=tid, status='ACTIVE').first() if tid else None
+                effective_db_name = (ds.database_name or ds.db_name) if ds else (db_alias.replace('tenant_', '', 1) if db_alias.startswith('tenant_') else db_alias)
+                _register_tenant_connection(db_alias, effective_db_name, data_source=ds, tenant_id=tid)
                 try:
                     user = TenantUser.objects.using(db_alias).get(id=user_id)
                     if user.status != 'ACTIVE':

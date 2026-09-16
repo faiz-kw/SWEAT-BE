@@ -11,6 +11,7 @@ Usage:
 
 import sys
 import logging
+from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.core.management import call_command
 from django.db import connections
@@ -19,7 +20,7 @@ from django.db.migrations.loader import MigrationLoader
 from apps.master.models_tenant import Tenant
 from apps.master.models_infra import TenantDataSource
 from config.tenant_middleware import _register_tenant_connection
-from config.routers import TenantRouter
+from config.routers import TenantRouter, build_tenant_db_alias
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +129,11 @@ class Command(BaseCommand):
                 results['skipped'].append({'tenant': tenant.slug, 'reason': reason})
                 continue
 
-            db_alias = f"tenant_{data_source.db_name}"
+            db_name = data_source.database_name or data_source.db_name
+            if 'test' in sys.argv and 'tenant_test' in settings.DATABASES and (db_name in ('fitness_tenant', 'test_fitness_tenant', 'test')):
+                db_alias = 'tenant_test'
+            else:
+                db_alias = build_tenant_db_alias(tenant.id)
 
             # Strict Master DB protection check
             if db_alias == 'default' or not db_alias.startswith('tenant_'):
@@ -148,7 +153,7 @@ class Command(BaseCommand):
                 continue
 
             # Dynamically register tenant connection
-            _register_tenant_connection(db_alias, data_source.db_name)
+            _register_tenant_connection(db_alias, data_source.db_name, data_source=data_source, tenant_id=tenant.id)
 
             if dry_run:
                 try:

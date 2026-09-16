@@ -362,7 +362,7 @@ class PrivacyDsrWorkflowsTestCase(TestCase):
         )
 
         # Run async task (eager in test runner)
-        result = process_dsr_export_task(str(req.id), db_alias='tenant_test')
+        result = process_dsr_export_task(str(self.tenant.id), str(req.id))
         self.assertEqual(result['status'], 'COMPLETED')
 
         req.refresh_from_db()
@@ -405,7 +405,7 @@ class PrivacyDsrWorkflowsTestCase(TestCase):
         )
 
         # Run async erasure task
-        result = process_dsr_erasure_task(str(req.id), db_alias='tenant_test')
+        result = process_dsr_erasure_task(str(self.tenant.id), str(req.id))
         self.assertEqual(result['status'], 'COMPLETED')
 
         req.refresh_from_db()

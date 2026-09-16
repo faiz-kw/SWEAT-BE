@@ -77,7 +77,9 @@ class TenantDataSource(models.Model):
     def save(self, *args, **kwargs):
         if not self.database_name and self.db_name:
             self.database_name = self.db_name
-        elif self.database_name:
+        elif not self.db_name and self.database_name:
+            self.db_name = self.database_name
+        elif not self._state.adding and self.database_name:
             self.db_name = self.database_name
 
         if not self.hosting_mode and self.source_type:

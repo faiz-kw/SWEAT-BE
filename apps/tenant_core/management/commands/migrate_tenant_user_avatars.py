@@ -38,6 +38,7 @@ from apps.tenant_core.models_infra import File
 from apps.tenant_core.models_users import TenantUser
 from apps.tenant_core.storage import ZataS3StorageService, StorageError
 from config.tenant_middleware import _register_tenant_connection
+from config.routers import build_tenant_db_alias
 
 logger = logging.getLogger('apps.tenant_core.avatar_migration')
 
@@ -186,8 +187,8 @@ class Command(BaseCommand):
         if data_sources:
             for ds in data_sources:
                 tenant = ds.tenant
-                alias = f"tenant_{ds.db_name}"
-                _register_tenant_connection(alias, ds.db_name)
+                alias = build_tenant_db_alias(tenant.id)
+                _register_tenant_connection(alias, ds.db_name, data_source=ds, tenant_id=tenant.id)
                 tenant_targets.append((alias, str(tenant.id), tenant.slug, ds.db_name))
         elif tenant_slug and (tenant_slug in getattr(settings, 'DATABASES', {})):
             # Direct database alias support (e.g. test environments)

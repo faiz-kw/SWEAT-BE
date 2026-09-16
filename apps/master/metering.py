@@ -27,6 +27,10 @@ from config.tenant_middleware import _register_tenant_connection
 logger = logging.getLogger(__name__)
 
 
+from config.routers import build_tenant_db_alias
+import sys
+
+
 def resolve_tenant_db_alias(tenant: Tenant) -> Optional[str]:
     """
     Safely resolves and registers the database alias for a given tenant.
@@ -40,11 +44,13 @@ def resolve_tenant_db_alias(tenant: Tenant) -> Optional[str]:
     if not data_source or not data_source.db_name:
         return None
 
-    alias = f"tenant_{data_source.db_name}"
-    if alias not in settings.DATABASES and data_source.db_name in settings.DATABASES:
-        return data_source.db_name
+    db_name = data_source.database_name or data_source.db_name
+    if 'test' in sys.argv and 'tenant_test' in settings.DATABASES and db_name in ('fitness_tenant', 'test_fitness_tenant', 'test'):
+        alias = 'tenant_test'
+    else:
+        alias = build_tenant_db_alias(tenant.id)
 
-    _register_tenant_connection(alias, data_source.db_name)
+    _register_tenant_connection(alias, db_name, data_source=data_source, tenant_id=tenant.id)
     return alias
 
 

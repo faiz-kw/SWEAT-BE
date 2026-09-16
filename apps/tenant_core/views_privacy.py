@@ -231,13 +231,20 @@ class PrivacyRequestViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        tenant_id = getattr(request, 'tenant_id', None) or getattr(request.user, 'tenant_id', None)
+        if not tenant_id:
+            return Response(
+                {'error': 'MISSING_TENANT_CONTEXT', 'detail': 'Active tenant context is required for DSR execution.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         from .tasks import process_dsr_export_task, process_dsr_erasure_task
 
         if instance.request_type in ('ACCESS', 'PORTABILITY'):
-            task = process_dsr_export_task.delay(str(instance.id), db_alias=db_alias)
+            task = process_dsr_export_task.delay(str(tenant_id), str(instance.id))
             task_name = 'process_dsr_export_task'
         elif instance.request_type == 'ERASURE':
-            task = process_dsr_erasure_task.delay(str(instance.id), db_alias=db_alias)
+            task = process_dsr_erasure_task.delay(str(tenant_id), str(instance.id))
             task_name = 'process_dsr_erasure_task'
         else:
             # Rectification, Restriction, Objection - marked resolved by admin action

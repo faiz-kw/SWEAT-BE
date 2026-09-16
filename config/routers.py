@@ -9,8 +9,27 @@ Routing rules:
 
 import threading
 
+import uuid
+from typing import Union
+
 # Thread-local storage for active tenant DB alias per-request
 _thread_local = threading.local()
+
+
+def build_tenant_db_alias(tenant_id: Union[str, uuid.UUID]) -> str:
+    """
+    Build deterministic, tenant-unique database alias bound to tenant identity.
+    Guarantees logical database isolation across tenants even if external database
+    names collide on customer-managed databases.
+    Format: tenant_<normalized_uuid_hex>
+    """
+    if not tenant_id:
+        raise ValueError("tenant_id must not be empty.")
+    if isinstance(tenant_id, uuid.UUID):
+        normalized = tenant_id.hex
+    else:
+        normalized = uuid.UUID(str(tenant_id).strip()).hex
+    return f"tenant_{normalized}"
 
 
 def get_tenant_db_alias() -> str | None:

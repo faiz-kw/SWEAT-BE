@@ -5,12 +5,15 @@ Usage:
     python manage.py sync_tenant_catalog --tenant=cult-fit
 """
 
+import sys
 import logging
+from django.conf import settings
 from django.core.management.base import BaseCommand
 from apps.master.models_tenant import Tenant
 from apps.master.models_infra import TenantDataSource
 from apps.master.provisioning import sync_tenant_catalog_and_rbac
 from config.tenant_middleware import _register_tenant_connection
+from config.routers import build_tenant_db_alias
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +47,13 @@ class Command(BaseCommand):
                 self.stderr.write(f"Skipping {tenant.slug}: No TenantDataSource found.")
                 continue
 
-            db_alias = f"tenant_{data_source.db_name}"
-            _register_tenant_connection(db_alias, data_source.db_name)
+            db_name = data_source.database_name or data_source.db_name
+            if 'test' in sys.argv and 'tenant_test' in settings.DATABASES and (db_name in ('fitness_tenant', 'test_fitness_tenant', 'test')):
+                db_alias = 'tenant_test'
+            else:
+                db_alias = build_tenant_db_alias(tenant.id)
+
+            _register_tenant_connection(db_alias, db_name, data_source=data_source, tenant_id=tenant.id)
 
             self.stdout.write(f"Syncing catalog for tenant '{tenant.slug}' (alias={db_alias})...")
             try:

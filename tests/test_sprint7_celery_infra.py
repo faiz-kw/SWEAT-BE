@@ -348,9 +348,10 @@ class TenantWorkerDatabaseContextPhase7BTest(TestCase):
         self.assertIsNone(get_tenant_db_alias())
 
         # Worker executes Task 2 for Tenant B
+        from config.routers import build_tenant_db_alias
         with tenant_database_context(self.tenant_b.id) as alias_2:
             self.assertEqual(get_tenant_db_alias(), alias_2)
-            self.assertEqual(alias_2, 'tenant_tenant_beta_db')
+            self.assertEqual(alias_2, build_tenant_db_alias(self.tenant_b.id))
 
         # After both tasks, state is clean
         self.assertIsNone(get_tenant_db_alias())

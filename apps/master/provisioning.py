@@ -9,11 +9,13 @@ Usage:
 
 import logging
 import uuid
+import sys
 import psycopg2
 from django.conf import settings
 from django.db import transaction, connections
 from django.utils import timezone
 from django.core.management import call_command
+from config.routers import build_tenant_db_alias
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +113,10 @@ class TenantProvisioningEngine:
 
             # ── Step 6: Provision Dedicated PostgreSQL Database ───────────────
             db_name = self._step6_provision_database(tenant, data_source, provisioning)
-            db_alias = f"tenant_{db_name}"
+            if 'test' in sys.argv and 'tenant_test' in settings.DATABASES and (db_name in ('fitness_tenant', 'test_fitness_tenant', 'test')):
+                db_alias = 'tenant_test'
+            else:
+                db_alias = build_tenant_db_alias(tenant.id)
 
             # ── Steps 7-13: Tenant DB Operations (explicit routing context) ──
             from config.routers import set_tenant_db_alias, get_tenant_db_alias
@@ -326,7 +331,10 @@ class TenantProvisioningEngine:
     def _step6_provision_database(self, tenant, data_source, provisioning):
         """Create the dedicated PostgreSQL database and run tenant schema migrations."""
         db_name = data_source.db_name
-        db_alias = f"tenant_{db_name}"
+        if 'test' in sys.argv and 'tenant_test' in settings.DATABASES and (db_name in ('fitness_tenant', 'test_fitness_tenant', 'test')):
+            db_alias = 'tenant_test'
+        else:
+            db_alias = build_tenant_db_alias(tenant.id)
 
         # Create database via raw psycopg2 (autocommit required for CREATE DATABASE)
         conn = _get_pg_connection()
@@ -343,7 +351,7 @@ class TenantProvisioningEngine:
 
         # Register the new DB in Django settings
         from config.tenant_middleware import _register_tenant_connection
-        _register_tenant_connection(db_alias, db_name)
+        _register_tenant_connection(db_alias, db_name, data_source=data_source, tenant_id=tenant.id)
 
         # Run tenant_core migrations against the new database
         call_command('migrate', '--database', db_alias, 'tenant_core', verbosity=0)

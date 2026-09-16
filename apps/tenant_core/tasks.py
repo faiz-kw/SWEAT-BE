@@ -11,12 +11,15 @@ import json
 import logging
 from celery import shared_task
 from django.utils import timezone
+from django.db.models import Q
 from django.core.serializers.json import DjangoJSONEncoder
 
 from .models_privacy import PrivacyRequest, ConsentRecord, TenantAuditEvent
 from .models_users import TenantUser
 from .models_infra import File
 from .audit import emit_audit_event
+from apps.tenant_core.context import tenant_database_context
+from config.routers import TenantRoutingError
 
 logger = logging.getLogger(__name__)
 
@@ -28,118 +31,136 @@ logger = logging.getLogger(__name__)
     default_retry_delay=10,
     acks_late=True,
 )
-def process_dsr_export_task(self, privacy_request_id: str, db_alias: str = 'default') -> dict:
+def process_dsr_export_task(self, tenant_id: str = None, privacy_request_id: str = None, **kwargs) -> dict:
     """
     Executes DSR Right of Access / Data Portability export workflow asynchronously.
+    Requires trusted tenant_id and privacy_request_id.
+    Strictly establishes tenant_database_context and fails closed if missing or invalid.
     """
-    logger.info("Starting DSR export task for request '%s' on alias '%s'", privacy_request_id, db_alias)
+    if not tenant_id or not privacy_request_id:
+        logger.error("DSR export task failed closed: tenant_id and privacy_request_id are mandatory.")
+        return {'status': 'FAILED', 'error': 'tenant_id and privacy_request_id are required'}
+
+    if kwargs.get('db_alias') == 'default':
+        logger.error("DSR export task rejected: Tenant operations must never execute against Master DB ('default').")
+        return {'status': 'FAILED', 'error': "Tenant tasks cannot execute on 'default' database."}
+
+    from .context import tenant_database_context
+    from config.routers import TenantRoutingError
 
     try:
-        req = PrivacyRequest.objects.using(db_alias).select_related('user').get(id=privacy_request_id)
-    except PrivacyRequest.DoesNotExist:
-        logger.error("PrivacyRequest '%s' not found on DB alias '%s'", privacy_request_id, db_alias)
-        return {'status': 'FAILED', 'error': 'PrivacyRequest not found'}
+        with tenant_database_context(tenant_id) as db_alias:
+            logger.info("Starting DSR export task for tenant '%s', request '%s' on alias '%s'", tenant_id, privacy_request_id, db_alias)
 
-    req.status = 'IN_PROGRESS'
-    req.save(using=db_alias, update_fields=['status', 'updated_at'])
+            try:
+                req = PrivacyRequest.objects.using(db_alias).select_related('user').get(id=privacy_request_id)
+            except PrivacyRequest.DoesNotExist:
+                logger.error("PrivacyRequest '%s' not found on DB alias '%s' for tenant '%s'", privacy_request_id, db_alias, tenant_id)
+                return {'status': 'FAILED', 'error': 'PrivacyRequest not found'}
 
-    user = req.user
+            req.status = 'IN_PROGRESS'
+            req.save(using=db_alias, update_fields=['status', 'updated_at'])
 
-    # 1. Compile all personal data categories from tenant database
-    user_data = {
-        'id': str(user.id),
-        'email': user.email,
-        'first_name': user.first_name,
-        'last_name': user.last_name,
-        'phone': user.phone,
-        'status': user.status,
-        'is_login_allowed': user.is_login_allowed,
-        'created_at': user.created_at.isoformat() if user.created_at else None,
-        'home_branch_id': str(user.home_branch_id) if user.home_branch_id else None,
-    }
+            user = req.user
 
-    consents = list(
-        ConsentRecord.objects.using(db_alias).filter(user=user).values(
-            'id', 'purpose__code', 'purpose__name', 'status', 'notice_version',
-            'granted_at', 'withdrawn_at', 'capture_source', 'created_at'
-        )
-    )
+            # 1. Compile all personal data categories from tenant database
+            user_data = {
+                'id': str(user.id),
+                'email': user.email,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+                'phone': user.phone,
+                'status': user.status,
+                'is_login_allowed': user.is_login_allowed,
+                'created_at': user.created_at.isoformat() if user.created_at else None,
+                'home_branch_id': str(user.home_branch_id) if user.home_branch_id else None,
+            }
 
-    audit_logs = list(
-        TenantAuditEvent.objects.using(db_alias).filter(actor=user).values(
-            'id', 'action', 'resource_type', 'resource_id', 'created_at'
-        )[:200]
-    )
+            consents = list(
+                ConsentRecord.objects.using(db_alias).filter(user=user).values(
+                    'id', 'purpose__code', 'purpose__name', 'status', 'notice_version',
+                    'granted_at', 'withdrawn_at', 'capture_source', 'created_at'
+                )
+            )
 
-    export_payload = {
-        'export_metadata': {
-            'privacy_request_id': str(req.id),
-            'request_type': req.request_type,
-            'generated_at': timezone.now().isoformat(),
-            'user_id': str(user.id),
-        },
-        'user_profile': user_data,
-        'consent_records': consents,
-        'audit_activity_summary': audit_logs,
-    }
+            audit_logs = list(
+                TenantAuditEvent.objects.using(db_alias).filter(actor=user).values(
+                    'id', 'action', 'resource_type', 'resource_id', 'created_at'
+                )[:200]
+            )
 
-    payload_json = json.dumps(export_payload, cls=DjangoJSONEncoder, indent=2)
-    payload_bytes = payload_json.encode('utf-8')
+            export_payload = {
+                'export_metadata': {
+                    'privacy_request_id': str(req.id),
+                    'request_type': req.request_type,
+                    'generated_at': timezone.now().isoformat(),
+                    'user_id': str(user.id),
+                },
+                'user_profile': user_data,
+                'consent_records': consents,
+                'audit_activity_summary': audit_logs,
+            }
 
-    # 2. Store export file record in File table
-    file_id = uuid.uuid4()
-    object_key = f"tenants/privacy_exports/{user.id}/{req.id}.json"
+            payload_json = json.dumps(export_payload, cls=DjangoJSONEncoder, indent=2)
+            payload_bytes = payload_json.encode('utf-8')
 
-    file_obj = File.objects.using(db_alias).create(
-        id=file_id,
-        owner_type='TenantUser',
-        owner_id=user.id,
-        file_name=f"privacy_export_{user.id}_{req.id}.json",
-        original_file_name=f"privacy_export_{user.id}.json",
-        storage_provider='ZATA_S3',
-        bucket_reference='zata-private-storage',
-        object_key=object_key,
-        mime_type='application/json',
-        file_size=len(payload_bytes),
-        checksum=str(hash(payload_bytes)),
-        classification='CONFIDENTIAL',
-        uploaded_by=user,
-    )
+            # 2. Store export file record in File table
+            file_id = uuid.uuid4()
+            object_key = f"tenants/privacy_exports/{user.id}/{req.id}.json"
 
-    # 3. Update PrivacyRequest to COMPLETED with resolution and evidence
-    now = timezone.now()
-    req.status = 'COMPLETED'
-    req.completed_at = now
-    req.resolution = 'Personal data export package generated successfully.'
-    req.evidence = {
-        'file_id': str(file_obj.id),
-        'object_key': object_key,
-        'file_size_bytes': len(payload_bytes),
-        'consents_count': len(consents),
-        'audit_events_count': len(audit_logs),
-    }
-    req.save(using=db_alias, update_fields=['status', 'completed_at', 'resolution', 'evidence', 'updated_at'])
+            file_obj = File.objects.using(db_alias).create(
+                id=file_id,
+                owner_type='TenantUser',
+                owner_id=user.id,
+                file_name=f"privacy_export_{user.id}_{req.id}.json",
+                original_file_name=f"privacy_export_{user.id}.json",
+                storage_provider='ZATA_S3',
+                bucket_reference='zata-private-storage',
+                object_key=object_key,
+                mime_type='application/json',
+                file_size=len(payload_bytes),
+                checksum=str(hash(payload_bytes)),
+                classification='CONFIDENTIAL',
+                uploaded_by=user,
+            )
 
-    # 4. Emit auditable event
-    try:
-        emit_audit_event(
-            action='DSR_EXPORT_COMPLETED',
-            resource_type='PrivacyRequest',
-            resource_id=req.id,
-            actor_type='SYSTEM_JOB',
-            after_state={'status': 'COMPLETED', 'file_id': str(file_obj.id)},
-            description=f"DSR {req.request_type} export completed asynchronously for user {user.email}.",
-            db_alias=db_alias,
-        )
-    except Exception as e:
-        logger.warning("Failed to emit audit event for DSR export: %s", e)
+            # 3. Update PrivacyRequest to COMPLETED with resolution and evidence
+            now = timezone.now()
+            req.status = 'COMPLETED'
+            req.completed_at = now
+            req.resolution = 'Personal data export package generated successfully.'
+            req.evidence = {
+                'file_id': str(file_obj.id),
+                'object_key': object_key,
+                'file_size_bytes': len(payload_bytes),
+                'consents_count': len(consents),
+                'audit_events_count': len(audit_logs),
+            }
+            req.save(using=db_alias, update_fields=['status', 'completed_at', 'resolution', 'evidence', 'updated_at'])
 
-    logger.info("Successfully completed DSR export for request '%s'", req.id)
-    return {
-        'status': 'COMPLETED',
-        'privacy_request_id': str(req.id),
-        'file_id': str(file_obj.id),
-    }
+            # 4. Emit auditable event
+            try:
+                emit_audit_event(
+                    action='DSR_EXPORT_COMPLETED',
+                    resource_type='PrivacyRequest',
+                    resource_id=req.id,
+                    actor_type='SYSTEM_JOB',
+                    after_state={'status': 'COMPLETED', 'file_id': str(file_obj.id)},
+                    description=f"DSR {req.request_type} export completed asynchronously for user {user.email}.",
+                    db_alias=db_alias,
+                )
+            except Exception as e:
+                logger.warning("Failed to emit audit event for DSR export: %s", e)
+
+            logger.info("Successfully completed DSR export for request '%s'", req.id)
+            return {
+                'status': 'COMPLETED',
+                'privacy_request_id': str(req.id),
+                'file_id': str(file_obj.id),
+            }
+    except TenantRoutingError as tre:
+        logger.error("DSR export task failed to resolve tenant database context for tenant '%s': %s", tenant_id, tre)
+        return {'status': 'FAILED', 'error': str(tre)}
 
 
 @shared_task(
@@ -149,75 +170,153 @@ def process_dsr_export_task(self, privacy_request_id: str, db_alias: str = 'defa
     default_retry_delay=10,
     acks_late=True,
 )
-def process_dsr_erasure_task(self, privacy_request_id: str, db_alias: str = 'default') -> dict:
+def process_dsr_erasure_task(self, tenant_id: str = None, privacy_request_id: str = None, **kwargs) -> dict:
     """
     Executes DSR Right to Erasure / Deletion workflow asynchronously.
-    Irreversibly anonymizes user PII while preserving required immutable legal audit history.
+    Requires trusted tenant_id and privacy_request_id.
+    Strictly establishes tenant_database_context and fails closed if missing or invalid.
     """
-    logger.info("Starting DSR erasure task for request '%s' on alias '%s'", privacy_request_id, db_alias)
+    if not tenant_id or not privacy_request_id:
+        logger.error("DSR erasure task failed closed: tenant_id and privacy_request_id are mandatory.")
+        return {'status': 'FAILED', 'error': 'tenant_id and privacy_request_id are required'}
+
+    if kwargs.get('db_alias') == 'default':
+        logger.error("DSR erasure task rejected: Tenant operations must never execute against Master DB ('default').")
+        return {'status': 'FAILED', 'error': "Tenant tasks cannot execute on 'default' database."}
+
+    from .context import tenant_database_context
+    from config.routers import TenantRoutingError
 
     try:
-        req = PrivacyRequest.objects.using(db_alias).select_related('user').get(id=privacy_request_id)
-    except PrivacyRequest.DoesNotExist:
-        logger.error("PrivacyRequest '%s' not found on DB alias '%s'", privacy_request_id, db_alias)
-        return {'status': 'FAILED', 'error': 'PrivacyRequest not found'}
+        with tenant_database_context(tenant_id) as db_alias:
+            logger.info("Starting DSR erasure task for tenant '%s', request '%s' on alias '%s'", tenant_id, privacy_request_id, db_alias)
 
-    req.status = 'IN_PROGRESS'
-    req.save(using=db_alias, update_fields=['status', 'updated_at'])
+            try:
+                req = PrivacyRequest.objects.using(db_alias).select_related('user').get(id=privacy_request_id)
+            except PrivacyRequest.DoesNotExist:
+                logger.error("PrivacyRequest '%s' not found on DB alias '%s' for tenant '%s'", privacy_request_id, db_alias, tenant_id)
+                return {'status': 'FAILED', 'error': 'PrivacyRequest not found'}
 
-    user = req.user
-    original_email = user.email
+            req.status = 'IN_PROGRESS'
+            req.save(using=db_alias, update_fields=['status', 'updated_at'])
 
-    # 1. Pseudonymize / Anonymize user PII
-    pseudonym = uuid.uuid4().hex[:8]
-    user.email = f"anonymized_{pseudonym}@privacy.deleted"
-    user.first_name = "Anonymized"
-    user.last_name = "User"
-    user.phone = ""
-    user.avatar_url = ""
-    user.is_login_allowed = False
-    user.status = 'INACTIVE'
-    user.save(using=db_alias, update_fields=[
-        'email', 'first_name', 'last_name', 'phone', 'avatar_url',
-        'is_login_allowed', 'status', 'updated_at'
-    ])
+            user = req.user
+            original_email = user.email
 
-    # 2. Update ConsentRecords for this user
-    ConsentRecord.objects.using(db_alias).filter(user=user, status='GRANTED').update(
-        status='WITHDRAWN',
-        withdrawn_at=timezone.now(),
-        notes='Automatically withdrawn upon DSR erasure request execution.'
-    )
+            # 1. Pseudonymize / Anonymize user PII
+            pseudonym = uuid.uuid4().hex[:8]
+            user.email = f"anonymized_{pseudonym}@privacy.deleted"
+            user.first_name = "Anonymized"
+            user.last_name = "User"
+            user.phone = ""
+            user.avatar_url = ""
+            user.is_login_allowed = False
+            user.status = 'INACTIVE'
+            user.save(using=db_alias, update_fields=[
+                'email', 'first_name', 'last_name', 'phone', 'avatar_url',
+                'is_login_allowed', 'status', 'updated_at'
+            ])
 
-    # 3. Complete PrivacyRequest
-    now = timezone.now()
-    req.status = 'COMPLETED'
-    req.completed_at = now
-    req.resolution = 'Personal data irreversibly anonymized, consents revoked, and user deactivated in compliance with erasure request.'
-    req.evidence = {
-        'original_email_redacted': f"{original_email[:2]}***@{original_email.split('@')[-1]}" if '@' in original_email else '***',
-        'anonymized_pseudonym': pseudonym,
-        'completed_at': now.isoformat(),
-    }
-    req.save(using=db_alias, update_fields=['status', 'completed_at', 'resolution', 'evidence', 'updated_at'])
+            # 2. Update ConsentRecords for this user
+            ConsentRecord.objects.using(db_alias).filter(user=user, status='GRANTED').update(
+                status='WITHDRAWN',
+                withdrawn_at=timezone.now(),
+                notes='Automatically withdrawn upon DSR erasure request execution.'
+            )
 
-    # 4. Emit audit event
+            # 3. Complete PrivacyRequest
+            now = timezone.now()
+            req.status = 'COMPLETED'
+            req.completed_at = now
+            req.resolution = 'Personal data irreversibly anonymized, consents revoked, and user deactivated in compliance with erasure request.'
+            req.evidence = {
+                'original_email_redacted': f"{original_email[:2]}***@{original_email.split('@')[-1]}" if '@' in original_email else '***',
+                'anonymized_pseudonym': pseudonym,
+                'completed_at': now.isoformat(),
+            }
+            req.save(using=db_alias, update_fields=['status', 'completed_at', 'resolution', 'evidence', 'updated_at'])
+
+            # 4. Emit audit event
+            try:
+                emit_audit_event(
+                    action='DSR_ERASURE_COMPLETED',
+                    resource_type='PrivacyRequest',
+                    resource_id=req.id,
+                    actor_type='SYSTEM_JOB',
+                    after_state={'status': 'COMPLETED', 'user_id': str(user.id)},
+                    description=f"DSR Erasure anonymized user {pseudonym}.",
+                    db_alias=db_alias,
+                )
+            except Exception as e:
+                logger.warning("Failed to emit audit event for DSR erasure: %s", e)
+
+            logger.info("Successfully completed DSR erasure for request '%s'", req.id)
+            return {
+                'status': 'COMPLETED',
+                'privacy_request_id': str(req.id),
+                'user_id': str(user.id),
+            }
+    except TenantRoutingError as tre:
+        logger.error("DSR erasure task failed to resolve tenant database context for tenant '%s': %s", tenant_id, tre)
+        return {'status': 'FAILED', 'error': str(tre)}
+
+
+@shared_task(bind=True, acks_late=True, max_retries=3)
+def process_domain_outbox_events_task(self, tenant_id: str, limit: int = 50, **kwargs):
+    """
+    Scans and dispatches pending DomainOutboxEvents within the specified tenant DB.
+    Guarantees retry-safe, decoupled asynchronous event delivery.
+    """
+    if not tenant_id:
+        return {'status': 'FAILED', 'error': 'tenant_id is required'}
+
     try:
-        emit_audit_event(
-            action='DSR_ERASURE_COMPLETED',
-            resource_type='PrivacyRequest',
-            resource_id=req.id,
-            actor_type='SYSTEM_JOB',
-            after_state={'status': 'COMPLETED', 'user_id': str(user.id)},
-            description=f"DSR Erasure anonymized user {pseudonym}.",
-            db_alias=db_alias,
-        )
-    except Exception as e:
-        logger.warning("Failed to emit audit event for DSR erasure: %s", e)
+        with tenant_database_context(tenant_id) as db_alias:
+            from .models_audit_outbox import DomainOutboxEvent
 
-    logger.info("Successfully completed DSR erasure for request '%s'", req.id)
-    return {
-        'status': 'COMPLETED',
-        'privacy_request_id': str(req.id),
-        'user_id': str(user.id),
-    }
+            now = timezone.now()
+            events = DomainOutboxEvent.objects.using(db_alias).filter(
+                Q(status='PENDING') |
+                Q(status='FAILED', next_attempt_at__lte=now)
+            ).order_by('created_at')[:limit]
+
+            published = 0
+            failed = 0
+
+            for event in events:
+                event.status = 'PROCESSING'
+                event.save(using=db_alias, update_fields=['status', 'updated_at'])
+
+                try:
+                    # In Layer 2, external handlers (email/sms/webhook/push) subscribe to event types
+                    logger.info(
+                        "Dispatched domain outbox event %s (%s) for aggregate %s:%s",
+                        event.id, event.event_type, event.aggregate_type, event.aggregate_id
+                    )
+                    event.status = 'PUBLISHED'
+                    event.published_at = timezone.now()
+                    event.save(using=db_alias, update_fields=['status', 'published_at', 'updated_at'])
+                    published += 1
+                except Exception as exc:
+                    logger.error("Failed to dispatch outbox event %s: %s", event.id, exc)
+                    event.attempt_count += 1
+                    event.last_error = str(exc)
+                    if event.attempt_count >= 5:
+                        event.status = 'FAILED'
+                    else:
+                        backoff = 2 ** event.attempt_count * 10
+                        event.next_attempt_at = timezone.now() + timedelta(seconds=backoff)
+                        event.status = 'FAILED'
+                    event.save(using=db_alias, update_fields=['attempt_count', 'last_error', 'next_attempt_at', 'status', 'updated_at'])
+                    failed += 1
+
+            return {
+                'status': 'COMPLETED',
+                'tenant_id': str(tenant_id),
+                'published': published,
+                'failed': failed,
+            }
+    except TenantRoutingError as tre:
+        logger.error("Outbox task failed to resolve tenant context for tenant '%s': %s", tenant_id, tre)
+        return {'status': 'FAILED', 'error': str(tre)}
+

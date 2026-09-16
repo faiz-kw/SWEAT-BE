@@ -288,6 +288,72 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
             return TenantUserCreateSerializer
         return TenantUserSerializer
 
+    def perform_update(self, serializer):
+        super().perform_update(serializer)
+        instance = serializer.instance
+        db = self.get_db()
+        data = self.request.data
+        from .models_rbac import Role, RoleAssignment
+        from .models_users import UserDepartment, Department, UserBranch
+        from .models_org import Branch
+
+        # Update role assignment if provided
+        role_id = data.get('role_id') or data.get('role')
+        if role_id:
+            role_obj = None
+            import uuid
+            try:
+                role_obj = Role.objects.using(db).filter(id=uuid.UUID(str(role_id))).first()
+            except Exception:
+                role_obj = Role.objects.using(db).filter(code=str(role_id)).first()
+            
+            if role_obj:
+                RoleAssignment.objects.using(db).filter(user=instance, is_active=True).update(is_active=False)
+                RoleAssignment.objects.using(db).create(
+                    organization=instance.organization,
+                    user=instance,
+                    role=role_obj,
+                    branch=instance.home_branch,
+                    scope_type='BRANCH' if instance.home_branch else 'ORGANIZATION',
+                    status='ACTIVE',
+                    is_active=True
+                )
+
+        # Update department if provided
+        dept_id = data.get('department_id') or data.get('department')
+        if dept_id:
+            dept_obj = None
+            try:
+                dept_obj = Department.objects.using(db).filter(id=dept_id).first()
+            except Exception:
+                dept_obj = Department.objects.using(db).filter(code=dept_id).first()
+            if dept_obj:
+                UserDepartment.objects.using(db).filter(user=instance, status='ACTIVE').update(status='INACTIVE')
+                UserDepartment.objects.using(db).create(
+                    user=instance,
+                    department=dept_obj,
+                    is_primary=True,
+                    status='ACTIVE'
+                )
+
+        # Update home branch if provided
+        branch_id = data.get('home_branch') or data.get('branch_id') or data.get('branch')
+        if branch_id:
+            br_obj = None
+            try:
+                br_obj = Branch.objects.using(db).filter(id=uuid.UUID(str(branch_id))).first()
+            except Exception:
+                br_obj = Branch.objects.using(db).filter(name__iexact=str(branch_id)).first()
+            if br_obj:
+                instance.home_branch = br_obj
+                instance.save(using=db, update_fields=['home_branch'])
+                UserBranch.objects.using(db).filter(user=instance, scope_type='HOME').update(scope_type='ADDITIONAL', is_primary=False)
+                UserBranch.objects.using(db).update_or_create(
+                    user=instance,
+                    branch=br_obj,
+                    defaults={'scope_type': 'HOME', 'is_primary': True, 'relationship_type': 'PRIMARY', 'status': 'ACTIVE', 'is_active': True}
+                )
+
 
 class RoleViewSet(TenantDBMixin, viewsets.ModelViewSet):
     """
@@ -303,7 +369,29 @@ class RoleViewSet(TenantDBMixin, viewsets.ModelViewSet):
     queryset = Role.objects.all()
 
     def get_queryset(self):
-        return super().get_queryset().filter(is_active=True)
+        qs = super().get_queryset()
+        include_inactive = self.request.query_params.get('include_inactive')
+        if include_inactive in ('true', '1'):
+            return qs
+        return qs.filter(is_active=True)
+
+    def perform_create(self, serializer):
+        db = self.get_db()
+        from .models_org import Organization
+        from .models_rbac import RolePermissionSet
+        org = Organization.objects.using(db).first()
+        serializer.validated_data['organization'] = org
+        super().perform_create(serializer)
+        role = serializer.instance
+        # Ensure default RolePermissionSet exists for the role
+        RolePermissionSet.objects.using(db).get_or_create(
+            role=role,
+            defaults={
+                'name': f"{role.name} Permissions",
+                'organization': org,
+                'status': 'ACTIVE',
+            }
+        )
 
     def perform_update(self, serializer):
         instance = serializer.instance
@@ -315,12 +403,129 @@ class RoleViewSet(TenantDBMixin, viewsets.ModelViewSet):
                 raise PermissionDenied('System role scope is immutable.')
             if 'is_system' in data and not data['is_system']:
                 raise PermissionDenied('System role flag is immutable.')
+            if 'is_active' in data and not data['is_active']:
+                raise PermissionDenied('System roles cannot be deactivated.')
         super().perform_update(serializer)
 
     def perform_destroy(self, instance):
         if instance.is_system:
             raise PermissionDenied('System roles cannot be deleted.')
-        super().perform_destroy(instance)
+        db = self.get_db()
+        from .models_rbac import RoleAssignment
+        if RoleAssignment.objects.using(db).filter(role=instance, is_active=True).exists():
+            raise PermissionDenied('Cannot delete role with active user assignments. Deactivate the role instead.')
+        # Perform soft-delete by deactivating to preserve audit history
+        instance.is_active = False
+        instance.save(using=db)
+
+    @action(detail=True, methods=['post', 'put'], url_path='update-permissions')
+    def update_permissions(self, request, pk=None):
+        """
+        Atomic update of role's permissions and module/submodule access.
+        Enforces core.roles.edit or core.permissions.manage.
+        """
+        role = self.get_object()
+        db = self.get_db()
+
+        if role.is_system:
+            return Response(
+                {'error': 'System roles cannot be modified.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        from .models_rbac import (
+            RolePermissionSet, RolePermissionSetItem, Permission,
+            RoleModuleAccess, RoleSubmoduleAccess, ModuleCatalog, SubmoduleCatalog
+        )
+        from .models_org import Organization
+        from django.db import transaction
+
+        org = role.organization or Organization.objects.using(db).first()
+        permission_set, _ = RolePermissionSet.objects.using(db).get_or_create(
+            role=role,
+            defaults={
+                'name': f"{role.name} Permissions",
+                'organization': org,
+                'status': 'ACTIVE',
+            }
+        )
+
+        permissions_data = request.data.get('permissions', [])
+        module_access_data = request.data.get('module_access', [])
+        submodule_access_data = request.data.get('submodule_access', [])
+
+        try:
+            with transaction.atomic(using=db):
+                # 1. Update module access if provided
+                for item in module_access_data:
+                    m_code = item.get('module_code')
+                    can_access = bool(item.get('is_allowed', item.get('can_access', True)))
+                    mod_obj = ModuleCatalog.objects.using(db).filter(module_code=m_code, is_enabled=True).first()
+                    if not mod_obj:
+                        raise ValueError(f"Module code '{m_code}' not found or not enabled.")
+                    RoleModuleAccess.objects.using(db).update_or_create(
+                        role=role,
+                        module=mod_obj,
+                        defaults={'permission_set': permission_set, 'can_access': can_access, 'is_visible': can_access}
+                    )
+
+                # 2. Update submodule access if provided
+                for item in submodule_access_data:
+                    sm_code = item.get('submodule_code')
+                    m_code = item.get('module_code')
+                    can_access = bool(item.get('is_allowed', item.get('can_access', True)))
+                    sm_filter = {'submodule_code': sm_code, 'module__is_enabled': True}
+                    if m_code:
+                        sm_filter['module__module_code'] = m_code
+                    sm_obj = SubmoduleCatalog.objects.using(db).filter(**sm_filter).first()
+                    if not sm_obj:
+                        raise ValueError(f"Submodule code '{sm_code}' not found or module not enabled.")
+                    RoleSubmoduleAccess.objects.using(db).update_or_create(
+                        role=role,
+                        submodule=sm_obj,
+                        defaults={'permission_set': permission_set, 'can_access': can_access, 'is_visible': can_access}
+                    )
+
+                # 3. Update permissions
+                for item in permissions_data:
+                    p_id = item.get('permission_id')
+                    p_code = item.get('permission_code')
+                    granted = bool(item.get('granted', item.get('is_granted', True)))
+                    perm_obj = None
+                    if p_id:
+                        perm_obj = Permission.objects.using(db).filter(id=p_id, module__is_enabled=True).first()
+                    elif p_code:
+                        perm_obj = Permission.objects.using(db).filter(permission_code=p_code, module__is_enabled=True).first()
+                    
+                    if not perm_obj:
+                        raise ValueError(f"Permission '{p_id or p_code}' not found or module not enabled.")
+
+                    # Also ensure the corresponding module and submodule are enabled for this role
+                    if granted:
+                        RoleModuleAccess.objects.using(db).update_or_create(
+                            role=role,
+                            module=perm_obj.module,
+                            defaults={'permission_set': permission_set, 'can_access': True, 'is_visible': True}
+                        )
+                        RoleSubmoduleAccess.objects.using(db).update_or_create(
+                            role=role,
+                            submodule=perm_obj.submodule,
+                            defaults={'permission_set': permission_set, 'can_access': True, 'is_visible': True}
+                        )
+
+                    RolePermissionSetItem.objects.using(db).update_or_create(
+                        permission_set=permission_set,
+                        permission=perm_obj,
+                        defaults={'granted': granted}
+                    )
+
+            # Return refreshed role data
+            serializer = self.get_serializer(role)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        except ValueError as ve:
+            return Response({'error': str(ve)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class RoleAssignmentViewSet(TenantDBMixin, viewsets.ModelViewSet):
@@ -540,7 +745,7 @@ class PermissionViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
     queryset = Permission.objects.all().select_related('module', 'submodule')
 
     def get_queryset(self):
-        qs = super().get_queryset().filter(is_active=True)
+        qs = super().get_queryset().filter(is_active=True, module__is_enabled=True)
         mod_code = self.request.query_params.get('module') or self.request.query_params.get('module_code')
         if mod_code:
             qs = qs.filter(module__module_code=mod_code)

@@ -20,6 +20,9 @@ from config.routers import (
 )
 from config.tenant_middleware import _register_tenant_connection
 
+# Alias for convenience across services
+get_current_tenant_db_alias = get_tenant_db_alias
+
 logger = logging.getLogger(__name__)
 
 
@@ -78,14 +81,15 @@ def tenant_database_context(tenant_id: Union[str, uuid.UUID]):
             f"Tenant context resolution failed: No active TenantDataSource configured for tenant '{tenant_uuid}'."
         )
 
-    db_name = data_source.db_name
+    effective_db_name = data_source.database_name or data_source.db_name
+    from config.routers import build_tenant_db_alias
 
     # 3. Dynamic Connection & Alias Resolution
     # In test runner environment, map test tenant database aliases cleanly
-    if 'test' in sys_argv() and 'tenant_test' in settings.DATABASES and db_name in ('fitness_tenant', 'test_fitness_tenant'):
+    if 'test' in sys_argv() and 'tenant_test' in settings.DATABASES and effective_db_name in ('fitness_tenant', 'test_fitness_tenant', 'test'):
         alias = 'tenant_test'
     else:
-        alias = f"tenant_{db_name}"
+        alias = build_tenant_db_alias(tenant_uuid)
 
     # Master DB protection assertion
     master_db_names = {
@@ -93,14 +97,13 @@ def tenant_database_context(tenant_id: Union[str, uuid.UUID]):
         'fitness_master',
         'test_fitness_master',
     }
-    if alias == 'default' or db_name in master_db_names:
+    if alias == 'default' or effective_db_name in master_db_names:
         raise TenantRoutingError(
             "Tenant context resolution failed: Tenant database alias resolved to Master DB ('default'). Fail closed."
         )
 
-
     # Register dynamic connection in thread-safe registry
-    _register_tenant_connection(alias, db_name, data_source=data_source)
+    _register_tenant_connection(alias, effective_db_name, data_source=data_source, tenant_id=tenant_uuid)
 
     # 4. Context Execution & Guaranteed Cleanup
     previous_alias = get_tenant_db_alias()
