@@ -62,7 +62,8 @@ class TenantLoginTests(TestCase):
         data = response.json()
         self.assertEqual(data.get('user_type'), 'platform')
         self.assertIn('access', data)
-        self.assertIn('refresh', data)
+        self.assertNotIn('refresh', data)
+        self.assertIn('refresh_token', response.cookies)
 
     def test_tenant_login_wrong_slug_rejected(self):
         """Wrong tenant_slug -> 401 Unauthorized without leaking tenant existence."""
@@ -140,10 +141,10 @@ class RefreshTokenRotationTests(TestCase):
         self.assertEqual(res1.status_code, status.HTTP_200_OK)
         data1 = res1.json()
         self.assertIn('access', data1)
-        self.assertIn('refresh', data1)
-        rotated_refresh_str = data1['refresh']
-        self.assertNotEqual(self.initial_refresh_str, rotated_refresh_str)
+        self.assertNotIn('refresh', data1)
         self.assertIn('refresh_token', res1.cookies)
+        rotated_refresh_str = res1.cookies['refresh_token'].value
+        self.assertNotEqual(self.initial_refresh_str, rotated_refresh_str)
 
         # Step 2: reuse old refresh token -> 401 Unauthorized
         res2 = self.client.post(
@@ -163,8 +164,9 @@ class RefreshTokenRotationTests(TestCase):
         self.assertEqual(res3.status_code, status.HTTP_200_OK)
         data3 = res3.json()
         self.assertIn('access', data3)
-        self.assertIn('refresh', data3)
-        newest_refresh_str = data3['refresh']
+        self.assertNotIn('refresh', data3)
+        self.assertIn('refresh_token', res3.cookies)
+        newest_refresh_str = res3.cookies['refresh_token'].value
 
         # Step 4: logout -> refresh token rejected
         res4 = self.client.post(

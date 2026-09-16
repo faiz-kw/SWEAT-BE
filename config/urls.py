@@ -11,6 +11,7 @@ from drf_spectacular.views import (
     SpectacularRedocView,
 )
 from apps.master.views import BillingWebhookView
+from apps.tenant_core.views_security_policy import SecurityPolicyView
 
 # Django admin branding
 admin.site.site_header = "PerformanceOS • Platform Control Panel"
@@ -31,6 +32,7 @@ urlpatterns = [
     # Tenant Admin — Org/Branch/User/RBAC management (scoped to tenant DB)
     path('api/v1/admin/', include('apps.tenant_core.urls')),
     path('api/v1/tenant/', include(('apps.tenant_core.urls', 'tenant_core'), namespace='tenant_scoped')),
+    path('api/v1/admin-config/security-policy/current/', SecurityPolicyView.as_view(), name='admin-config-security-policy'),
 
     # OpenAPI 3.1 Schema & Interactive Docs
     path('api/schema/', SpectacularAPIView.as_view(), name='schema'),

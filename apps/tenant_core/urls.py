@@ -22,6 +22,7 @@ from .views_privacy import (
     PrivacyRequestViewSet,
 )
 from .views_integrations import TenantIntegrationViewSet
+from .views_security_policy import SecurityPolicyView
 
 router = DefaultRouter()
 router.register(r'organizations', OrganizationViewSet, basename='organization')
@@ -56,6 +57,7 @@ app_name = 'tenant_core'
 urlpatterns = [
     path('database-health/', TenantDatabaseHealthView.as_view(), name='tenant-database-health'),
     path('verify-access/', VerifyAccessView.as_view(), name='verify-access'),
+    path('security-policy/current/', SecurityPolicyView.as_view(), name='tenant-security-policy'),
     path('storage/presign-upload/', StoragePresignUploadView.as_view(), name='storage-presign-upload'),
     path('storage/confirm-upload/', StorageConfirmUploadView.as_view(), name='storage-confirm-upload'),
     path('storage/presign-download/<uuid:id>/', StoragePresignDownloadView.as_view(), name='storage-presign-download'),

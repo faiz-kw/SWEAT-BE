@@ -60,6 +60,10 @@ class PlatformJWTAuthentication(BaseAuthentication):
         if not user_id:
             raise AuthenticationFailed('Invalid platform token: missing sub claim.')
 
+        from apps.authentication.security import is_token_revoked
+        if is_token_revoked(str(user_id), token.get('iat')):
+            raise AuthenticationFailed('Token has been revoked. Please log in again.')
+
         try:
             from apps.master.models_iam import PlatformUser
             user = PlatformUser.objects.using('default').get(id=user_id)
@@ -144,6 +148,10 @@ class TenantJWTAuthentication(BaseAuthentication):
             raise AuthenticationFailed(
                 'Invalid tenant token: missing db_alias claim. Please log in again.'
             )
+
+        from apps.authentication.security import is_token_revoked
+        if is_token_revoked(str(user_id), token.get('iat')):
+            raise AuthenticationFailed('Token has been revoked. Please log in again.')
 
         # Re-verify tenant is still ACTIVE or TRIALING (status gate on every request)
         try:

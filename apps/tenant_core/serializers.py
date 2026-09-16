@@ -152,6 +152,16 @@ class TenantUserCreateSerializer(TenantUserSerializer):
     class Meta(TenantUserSerializer.Meta):
         fields = TenantUserSerializer.Meta.fields + ['password']
 
+    def validate_password(self, value):
+        from django.contrib.auth.password_validation import validate_password
+        from django.core.exceptions import ValidationError as DjangoValidationError
+
+        try:
+            validate_password(value)
+        except DjangoValidationError as e:
+            raise serializers.ValidationError(list(e.messages))
+        return value
+
     def create(self, validated_data):
         from rest_framework.exceptions import PermissionDenied
         from django.db import transaction

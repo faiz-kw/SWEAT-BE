@@ -1,7 +1,9 @@
 from django.urls import path
 from .views import (
     UniversalLoginView, PlatformLoginView, TenantLoginView,
-    TokenRefreshView, MeView, LogoutView
+    TokenRefreshView, MeView, LogoutView,
+    SessionRevocationView, MFAVerifyView, MFAEnrollView,
+    MFAEnableView, MFADisableView,
 )
 
 app_name = 'authentication'
@@ -18,4 +20,12 @@ urlpatterns = [
     # Session / Me profile
     path('me/', MeView.as_view(), name='auth-me'),
     path('logout/', LogoutView.as_view(), name='logout'),
+    # Session Revocation
+    path('sessions/revoke-all/', SessionRevocationView.as_view(), name='sessions-revoke-all'),
+    path('revoke-sessions/', SessionRevocationView.as_view(), name='revoke-sessions'),
+    # MFA Authentication & Enrollment
+    path('mfa/verify/', MFAVerifyView.as_view(), name='mfa-verify'),
+    path('mfa/enroll/', MFAEnrollView.as_view(), name='mfa-enroll'),
+    path('mfa/enable/', MFAEnableView.as_view(), name='mfa-enable'),
+    path('mfa/disable/', MFADisableView.as_view(), name='mfa-disable'),
 ]
