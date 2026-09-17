@@ -96,7 +96,7 @@ class TenantLoginTests(TestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
         data = response.json()
-        self.assertEqual(data.get('error'), 'Invalid email or password.')
+        self.assertEqual(data.get('error'), 'Invalid username/email or password.')
 
     def test_empty_credentials_rejected(self):
         """Missing email or password returns 400 Bad Request."""
