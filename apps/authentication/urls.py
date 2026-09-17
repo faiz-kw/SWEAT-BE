@@ -4,6 +4,7 @@ from .views import (
     TokenRefreshView, MeView, LogoutView,
     SessionRevocationView, MFAVerifyView, MFAEnrollView,
     MFAEnableView, MFADisableView,
+    PasswordResetRequestView, PasswordResetConfirmView,
 )
 
 app_name = 'authentication'
@@ -28,4 +29,7 @@ urlpatterns = [
     path('mfa/enroll/', MFAEnrollView.as_view(), name='mfa-enroll'),
     path('mfa/enable/', MFAEnableView.as_view(), name='mfa-enable'),
     path('mfa/disable/', MFADisableView.as_view(), name='mfa-disable'),
+    # Password Reset
+    path('password/reset-request/', PasswordResetRequestView.as_view(), name='password-reset-request'),
+    path('password/reset-confirm/', PasswordResetConfirmView.as_view(), name='password-reset-confirm'),
 ]

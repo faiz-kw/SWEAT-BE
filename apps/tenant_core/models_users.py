@@ -65,6 +65,7 @@ class TenantUser(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     organization = models.ForeignKey(Organization, on_delete=models.RESTRICT, related_name='users')
+    username = models.CharField(max_length=150, unique=True, null=True, blank=True)
     email = models.EmailField(max_length=320, unique=True)
     phone = models.CharField(max_length=30, blank=True, default='', null=True)
     first_name = models.CharField(max_length=100)
@@ -141,7 +142,18 @@ class TenantUser(models.Model):
     def save(self, *args, **kwargs):
         if not self.display_name:
             self.display_name = self.full_name
+        from apps.master.services_auth_directory import check_identifier_available
+        from django.core.exceptions import ValidationError
+        if self.email and not check_identifier_available(self.email, exclude_subject_id=self.id):
+            raise ValidationError({'email': 'This username or email is already registered.'})
+        if getattr(self, 'username', None) and not check_identifier_available(self.username, exclude_subject_id=self.id):
+            raise ValidationError({'username': 'This username or email is already registered.'})
         super().save(*args, **kwargs)
+        try:
+            from apps.master.services_auth_directory import sync_tenant_user_identity
+            sync_tenant_user_identity(self, db=kwargs.get('using') or self._state.db)
+        except Exception:
+            pass
 
 
 class UserBranch(models.Model):

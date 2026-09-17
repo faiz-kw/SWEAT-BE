@@ -530,7 +530,14 @@ class BranchModule(models.Model):
     def save(self, *args, **kwargs):
         if not self.module_id and self.module_code:
             from .models_rbac import ModuleCatalog
-            db = kwargs.get('using') or self._state.db or 'default'
+            from config.routers import get_tenant_db_alias
+            db = (
+                kwargs.get('using')
+                or self._state.db
+                or (getattr(getattr(self, 'branch', None), '_state', None) and self.branch._state.db)
+                or get_tenant_db_alias()
+                or 'default'
+            )
             try:
                 mod = ModuleCatalog.objects.using(db).filter(
                     models.Q(code=self.module_code) | models.Q(module_code=self.module_code)
@@ -541,13 +548,15 @@ class BranchModule(models.Model):
                         defaults={
                             'module_code': self.module_code,
                             'name': self.module_code.title(),
-                            'is_core': False,
+                            'source_module_id': uuid.uuid4(),
+                            'is_enabled': True,
                         }
                     )
                 if mod:
                     self.module = mod
-            except Exception:
-                pass
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning("Failed to link ModuleCatalog in BranchModule.save: %s", e)
         elif self.module_id and not self.module_code:
             self.module_code = getattr(self.module, 'code', None) or getattr(self.module, 'module_code', '')
 

@@ -133,9 +133,27 @@ class ProductModuleSerializer(serializers.ModelSerializer):
 class PlatformUserSerializer(serializers.ModelSerializer):
     class Meta:
         model = PlatformUser
-        fields = ['id', 'email', 'first_name', 'last_name', 'phone', 'status', 'is_staff', 'created_at']
+        fields = ['id', 'username', 'email', 'first_name', 'last_name', 'phone', 'status', 'is_staff', 'created_at']
         read_only_fields = ['id', 'created_at']
         extra_kwargs = {'password': {'write_only': True}}
+
+    def validate(self, attrs):
+        from apps.master.services_auth_directory import check_identifier_available
+        subject_id = self.instance.id if self.instance else None
+
+        email = attrs.get('email')
+        if email and not check_identifier_available(email, exclude_subject_id=subject_id):
+            raise serializers.ValidationError({
+                'email': 'This username or email is already registered.'
+            })
+
+        username = attrs.get('username')
+        if username and not check_identifier_available(username, exclude_subject_id=subject_id):
+            raise serializers.ValidationError({
+                'username': 'This username or email is already registered.'
+            })
+
+        return super().validate(attrs)
 
 
 class MarketplaceIntegrationSerializer(serializers.ModelSerializer):

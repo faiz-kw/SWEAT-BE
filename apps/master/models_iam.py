@@ -19,6 +19,7 @@ class PlatformUser(AbstractBaseUser, PermissionsMixin):
     Stored in Master DB. NOT tenant end-users.
     """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    username = models.CharField(max_length=150, unique=True, null=True, blank=True)
     email = models.EmailField(max_length=320, unique=True)
     phone = models.CharField(max_length=30, blank=True, null=True, default='')
     first_name = models.CharField(max_length=100)
@@ -63,6 +64,20 @@ class PlatformUser(AbstractBaseUser, PermissionsMixin):
     @property
     def full_name(self):
         return f"{self.first_name} {self.last_name}".strip()
+
+    def save(self, *args, **kwargs):
+        from .services_auth_directory import check_identifier_available
+        from django.core.exceptions import ValidationError
+        if self.email and not check_identifier_available(self.email, exclude_subject_id=self.id):
+            raise ValidationError({'email': 'This username or email is already registered.'})
+        if getattr(self, 'username', None) and not check_identifier_available(self.username, exclude_subject_id=self.id):
+            raise ValidationError({'username': 'This username or email is already registered.'})
+        super().save(*args, **kwargs)
+        try:
+            from .services_auth_directory import sync_platform_user_identity
+            sync_platform_user_identity(self)
+        except Exception:
+            pass
 
 
 class PlatformDepartment(models.Model):
@@ -746,3 +761,55 @@ class PlatformUserRole(models.Model):
 
     def __str__(self):
         return f"{self.user.email} → {self.role.code}"
+
+
+class AuthenticationIdentity(models.Model):
+    """
+    Universal Authentication Routing Directory (Master/Control DB only).
+    Routes an identifier (email or username) to either:
+      - A PlatformUser in Master DB ('default')
+      - A TenantUser in the tenant's dedicated DB (via tenant_id)
+    NEVER stores passwords, password hashes, or tenant DB secrets.
+    """
+    IDENTIFIER_TYPES = [
+        ('EMAIL', 'Email Address'),
+        ('USERNAME', 'Username'),
+    ]
+    ACCOUNT_TYPES = [
+        ('PLATFORM', 'Platform User'),
+        ('TENANT', 'Tenant User'),
+    ]
+    STATUS_CHOICES = [
+        ('ACTIVE', 'Active'),
+        ('INACTIVE', 'Inactive'),
+        ('INVITED', 'Invited'),
+        ('SUSPENDED', 'Suspended'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    # HMAC-SHA256 hex digest of normalized identifier
+    lookup_hash = models.CharField(max_length=64, unique=True, db_index=True)
+    identifier_type = models.CharField(max_length=20, choices=IDENTIFIER_TYPES, default='EMAIL')
+    identifier = models.CharField(max_length=320, db_index=True)
+    account_type = models.CharField(max_length=20, choices=ACCOUNT_TYPES)
+    # Subject UUID: PlatformUser.id or TenantUser.id
+    subject_id = models.UUIDField(db_index=True)
+    # Tenant UUID: None for Platform users; Tenant.id for Tenant users
+    tenant_id = models.UUIDField(null=True, blank=True, db_index=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='ACTIVE')
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        app_label = 'master'
+        db_table = 'authentication_identities'
+        indexes = [
+            models.Index(fields=['lookup_hash'], name='idx_auth_ident_hash'),
+            models.Index(fields=['account_type', 'subject_id'], name='idx_auth_ident_subj'),
+            models.Index(fields=['tenant_id', 'status'], name='idx_auth_ident_tenant'),
+            models.Index(fields=['identifier'], name='idx_auth_ident_val'),
+        ]
+
+    def __str__(self):
+        return f"{self.identifier} ({self.account_type}) [{self.status}]"
+

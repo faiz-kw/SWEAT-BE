@@ -7,7 +7,7 @@ from .models_iam import (
     PlatformUser, PlatformDepartment, PlatformUserDepartment,
     PlatformRole, PlatformModule, PlatformSubmodule, PlatformPermission,
     PlatformRoleModuleAccess, PlatformRoleSubmoduleAccess,
-    PlatformRolePermission, PlatformUserRole,
+    PlatformRolePermission, PlatformUserRole, AuthenticationIdentity,
 )
 
 from .models_tenant import (
@@ -38,7 +38,7 @@ __all__ = [
     'PlatformUser', 'PlatformDepartment', 'PlatformUserDepartment',
     'PlatformRole', 'PlatformModule', 'PlatformSubmodule', 'PlatformPermission',
     'PlatformRoleModuleAccess', 'PlatformRoleSubmoduleAccess',
-    'PlatformRolePermission', 'PlatformUserRole',
+    'PlatformRolePermission', 'PlatformUserRole', 'AuthenticationIdentity',
     # Tenant Registry
     'Tenant', 'TenantDomain', 'PlatformBranding', 'TenantBranding',
     # SaaS

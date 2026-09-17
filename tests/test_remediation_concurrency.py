@@ -511,7 +511,7 @@ class HighConcurrencyRemediationTests(TransactionTestCase):
     Real PostgreSQL transactional concurrency tests for Blocker 6.
     Uses real database threads and row locks (select_for_update).
     """
-    databases = {'tenant_test'}
+    databases = {'default', 'tenant_test'}
 
     def setUp(self):
         super().setUp()

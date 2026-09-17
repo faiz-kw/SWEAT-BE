@@ -146,6 +146,24 @@ class TenantUserSerializer(serializers.ModelSerializer):
         except Exception:
             return []
 
+    def validate(self, attrs):
+        from apps.master.services_auth_directory import check_identifier_available
+        subject_id = self.instance.id if self.instance else None
+
+        email = attrs.get('email')
+        if email and not check_identifier_available(email, exclude_subject_id=subject_id):
+            raise serializers.ValidationError({
+                'email': 'This username or email is already registered.'
+            })
+
+        username = attrs.get('username')
+        if username and not check_identifier_available(username, exclude_subject_id=subject_id):
+            raise serializers.ValidationError({
+                'username': 'This username or email is already registered.'
+            })
+
+        return super().validate(attrs)
+
     def update(self, instance, validated_data):
         from django.db import transaction
         from django.utils import timezone
