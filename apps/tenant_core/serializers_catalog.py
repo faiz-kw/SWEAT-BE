@@ -5,7 +5,7 @@ DRF Serializers for Layer 2: Module C (Terms) & Module D (Programs / Packages / 
 from rest_framework import serializers
 from .models_catalog import (
     TermsDocument, TermsDocumentVersion, TermsAcceptance,
-    ProgramCategory, Program, Package, PackageVersion,
+    ProgramCategory, ProgramType, Program, Package, PackageVersion,
     PackagePrice, PackageBranchAvailability, PackageEntitlementDefinition,
 )
 
@@ -74,6 +74,21 @@ class TermsAcceptanceSerializer(serializers.ModelSerializer):
 # MODULE D: CATALOG SERIALIZERS
 # ============================================================================
 
+class ProgramTypeSerializer(serializers.ModelSerializer):
+    programs_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProgramType
+        fields = [
+            'id', 'organization', 'code', 'name', 'description',
+            'display_order', 'status', 'programs_count', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
+
+    def get_programs_count(self, obj):
+        return obj.programs.count()
+
+
 class ProgramCategorySerializer(serializers.ModelSerializer):
     programs_count = serializers.SerializerMethodField()
 
@@ -91,6 +106,8 @@ class ProgramCategorySerializer(serializers.ModelSerializer):
 
 class ProgramSerializer(serializers.ModelSerializer):
     category_name = serializers.CharField(source='category.name', read_only=True)
+    program_type_name = serializers.CharField(source='program_type.name', read_only=True)
+    program_type_code = serializers.CharField(source='program_type.code', read_only=True)
     packages_count = serializers.SerializerMethodField()
 
     class Meta:
@@ -98,6 +115,7 @@ class ProgramSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'organization', 'category', 'category_name',
             'code', 'name', 'description', 'program_type',
+            'program_type_name', 'program_type_code',
             'trial_allowed', 'status', 'packages_count', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
@@ -105,20 +123,47 @@ class ProgramSerializer(serializers.ModelSerializer):
     def get_packages_count(self, obj):
         return obj.packages.count()
 
+    def to_internal_value(self, data):
+        ret = super().to_internal_value(data)
+        raw_pt = data.get('program_type')
+        if raw_pt and isinstance(raw_pt, str):
+            import uuid
+            try:
+                uuid.UUID(raw_pt)
+            except ValueError:
+                # String code e.g. 'MEMBERSHIP' or 'PILATES'
+                req = self.context.get('request')
+                org = getattr(req, 'organization', None) or (self.instance.organization if self.instance else None)
+                if not org and req and hasattr(req, 'user'):
+                    org = getattr(req.user, 'organization', None)
+                if org:
+                    from .models_catalog import ProgramType
+                    alias = getattr(getattr(req, 'user', None), '_db_alias', None) or 'default'
+                    pt, _ = ProgramType.objects.using(alias).get_or_create(
+                        organization=org,
+                        code=raw_pt.upper().strip(),
+                        defaults={'name': raw_pt.replace('_', ' ').title(), 'status': 'ACTIVE'}
+                    )
+                    ret['program_type'] = pt
+        return ret
+
 
 class PackagePriceSerializer(serializers.ModelSerializer):
     branch_name = serializers.CharField(source='branch.name', read_only=True)
+    sale_price = serializers.DecimalField(source='base_price', max_digits=14, decimal_places=2, read_only=True)
+    tax_percentage = serializers.DecimalField(source='tax_percent', max_digits=6, decimal_places=3, read_only=True)
     total_price = serializers.DecimalField(max_digits=14, decimal_places=2, read_only=True)
 
     class Meta:
         model = PackagePrice
         fields = [
             'id', 'package_version', 'branch', 'branch_name',
-            'currency', 'base_price', 'tax_percent', 'total_price',
+            'currency', 'base_price', 'sale_price', 'display_price',
+            'prices_include_tax', 'tax_percent', 'tax_percentage', 'total_price',
             'effective_from', 'effective_until', 'status',
             'created_by_user', 'created_at', 'updated_at',
         ]
-        read_only_fields = ['id', 'created_by_user', 'total_price', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_by_user', 'sale_price', 'tax_percentage', 'total_price', 'created_at', 'updated_at']
 
 
 class PackageBranchAvailabilitySerializer(serializers.ModelSerializer):
@@ -139,7 +184,7 @@ class PackageEntitlementDefinitionSerializer(serializers.ModelSerializer):
         model = PackageEntitlementDefinition
         fields = [
             'id', 'package_version', 'entitlement_type', 'allocated_units',
-            'is_unlimited', 'validity_days', 'reference_type', 'reference_id',
+            'is_unlimited', 'extra_unit_price', 'validity_days', 'reference_type', 'reference_id',
             'configuration', 'status', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
@@ -156,7 +201,9 @@ class PackageVersionSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'package', 'package_code', 'package_name', 'version_number',
             'name_snapshot', 'description_snapshot', 'duration_value', 'duration_unit',
-            'validity_days', 'is_trial_package', 'effective_from', 'effective_until',
+            'total_days', 'validity_days', 'is_trial_package', 'is_trial',
+            'only_for_trial', 'show_on_web', 'show_on_app',
+            'effective_from', 'effective_until', 'published_at',
             'status', 'prices', 'entitlement_definitions',
             'created_by_user', 'created_at', 'updated_at',
         ]
@@ -164,6 +211,7 @@ class PackageVersionSerializer(serializers.ModelSerializer):
 
 
 class PackageSerializer(serializers.ModelSerializer):
+    program = serializers.PrimaryKeyRelatedField(queryset=Program.objects.all(), required=False, allow_null=True)
     program_name = serializers.CharField(source='program.name', read_only=True)
     latest_version = serializers.SerializerMethodField()
     active_version = serializers.SerializerMethodField()
@@ -177,6 +225,27 @@ class PackageSerializer(serializers.ModelSerializer):
             'branch_availabilities', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
+
+    def to_internal_value(self, data):
+        data = data.copy()
+        if 'program' not in data or not data['program']:
+            req = self.context.get('request')
+            alias = getattr(getattr(req, 'user', None), '_db_alias', None) or 'default'
+            org = getattr(req, 'organization', None) or (getattr(req.user, 'organization', None) if req and hasattr(req, 'user') else None)
+            if org:
+                from .models_catalog import Program
+                prog = Program.objects.using(alias).filter(organization=org).first()
+                if not prog:
+                    from .services_catalog import PackageCatalogService
+                    prog = PackageCatalogService.create_program(
+                        organization=org,
+                        code='DEFAULT',
+                        name='Default Program',
+                        status='ACTIVE',
+                        db_alias=alias,
+                    )
+                data['program'] = str(prog.id)
+        return super().to_internal_value(data)
 
     def get_latest_version(self, obj):
         latest = obj.versions.order_by('-version_number').first()

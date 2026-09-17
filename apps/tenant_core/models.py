@@ -38,7 +38,7 @@ from .models_crm import (
 
 from .models_catalog import (
     TermsDocument, TermsDocumentVersion, TermsAcceptance,
-    ProgramCategory, Program, Package, PackageVersion,
+    ProgramCategory, ProgramType, Program, Package, PackageVersion,
     PackagePrice, PackageBranchAvailability, PackageEntitlementDefinition,
 )
 
@@ -60,7 +60,7 @@ __all__ = [
     'ModuleCatalog', 'SubmoduleCatalog', 'Permission', 'Role',
     'RolePermissionSet', 'RoleModuleAccess', 'RoleSubmoduleAccess',
     'RolePermissionSetItem', 'RoleAssignment', 'BranchModule',
-    # Governance
+    # Govern
     'OrganizationSettings', 'BranchSettings', 'NotificationTemplate',
     # Privacy
     'ProcessingPurpose', 'ConsentRecord', 'PrivacyRequest', 'TenantAuditEvent',
@@ -79,7 +79,7 @@ __all__ = [
     # Module C: Terms & Legal
     'TermsDocument', 'TermsDocumentVersion', 'TermsAcceptance',
     # Module D: Programs, Packages & Catalog
-    'ProgramCategory', 'Program', 'Package', 'PackageVersion',
+    'ProgramCategory', 'ProgramType', 'Program', 'Package', 'PackageVersion',
     'PackagePrice', 'PackageBranchAvailability', 'PackageEntitlementDefinition',
     # Module E: Group Classes, Scheduling, Content Studio & Demand Planning
     'ClassCategory', 'ClassTemplate', 'ClassPrice', 'ClassBranchAvailability',

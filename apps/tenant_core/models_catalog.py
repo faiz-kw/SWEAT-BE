@@ -18,6 +18,7 @@ Module D:
 
 import uuid
 from decimal import Decimal
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils import timezone
 
@@ -184,19 +185,44 @@ class ProgramCategory(models.Model):
         return self.name
 
 
+class ProgramType(models.Model):
+    """
+    Configurable program type per organization (e.g. Pilates, PT, Bootcamp, Transformation).
+    No hardcoded enums.
+    """
+    STATUS_CHOICES = [
+        ('ACTIVE', 'Active'),
+        ('INACTIVE', 'Inactive'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey(
+        'Organization', on_delete=models.PROTECT, related_name='program_types'
+    )
+    code = models.CharField(max_length=100)
+    name = models.CharField(max_length=150)
+    description = models.TextField(null=True, blank=True)
+    display_order = models.IntegerField(default=0)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='ACTIVE')
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'program_types'
+        unique_together = [('organization', 'code')]
+        indexes = [
+            models.Index(fields=['organization', 'status', 'display_order'], name='idx_progtyp_org_st_ord'),
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.code})"
+
+
 class Program(models.Model):
     """
     Business program under which packages/classes may be organized.
+    Contains only stable program metadata.
     """
-    PROGRAM_TYPE_CHOICES = [
-        ('MEMBERSHIP', 'Membership'),
-        ('FITNESS', 'Fitness'),
-        ('PERSONAL_TRAINING', 'Personal Training'),
-        ('PILATES', 'Pilates'),
-        ('ONLINE', 'Online'),
-        ('HYBRID', 'Hybrid'),
-        ('OTHER', 'Other'),
-    ]
     STATUS_CHOICES = [
         ('DRAFT', 'Draft'),
         ('ACTIVE', 'Active'),
@@ -211,14 +237,22 @@ class Program(models.Model):
     category = models.ForeignKey(
         ProgramCategory, on_delete=models.SET_NULL, null=True, blank=True, related_name='programs'
     )
+    program_type = models.ForeignKey(
+        ProgramType, db_column='program_type_id', on_delete=models.SET_NULL, null=True, blank=True, related_name='programs'
+    )
+    legacy_program_type = models.CharField(db_column='program_type', max_length=40, default='MEMBERSHIP')
     code = models.CharField(max_length=100)
     name = models.CharField(max_length=200)
     description = models.TextField(null=True, blank=True)
-    program_type = models.CharField(max_length=40, choices=PROGRAM_TYPE_CHOICES, default='MEMBERSHIP')
     trial_allowed = models.BooleanField(default=False)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='ACTIVE')
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
+
+    def save(self, *args, **kwargs):
+        if not self.legacy_program_type:
+            self.legacy_program_type = self.program_type.code if self.program_type else 'MEMBERSHIP'
+        super().save(*args, **kwargs)
 
     class Meta:
         db_table = 'programs'
@@ -226,6 +260,7 @@ class Program(models.Model):
         indexes = [
             models.Index(fields=['organization', 'status'], name='idx_prog_org_status'),
             models.Index(fields=['category', 'status'], name='idx_prog_cat_status'),
+            models.Index(fields=['program_type', 'status'], name='idx_prog_type_status'),
         ]
 
     def __str__(self):
@@ -235,6 +270,7 @@ class Program(models.Model):
 class Package(models.Model):
     """
     Stable package/plan identity; commercial terms live in immutable PackageVersions.
+    packages.program_id is strictly required.
     """
     STATUS_CHOICES = [
         ('DRAFT', 'Draft'),
@@ -248,7 +284,7 @@ class Package(models.Model):
         'Organization', on_delete=models.PROTECT, related_name='packages'
     )
     program = models.ForeignKey(
-        Program, on_delete=models.PROTECT, null=True, blank=True, related_name='packages'
+        Program, on_delete=models.PROTECT, null=False, blank=False, related_name='packages'
     )
     code = models.CharField(max_length=100)
     name = models.CharField(max_length=200)
@@ -258,7 +294,7 @@ class Package(models.Model):
 
     class Meta:
         db_table = 'packages'
-        unique_together = [('organization', 'code')]
+        unique_together = [('program', 'code'), ('organization', 'code')]
         indexes = [
             models.Index(fields=['organization', 'status'], name='idx_pkg_org_status'),
             models.Index(fields=['program', 'status'], name='idx_pkg_prog_status'),
@@ -295,11 +331,17 @@ class PackageVersion(models.Model):
     description_snapshot = models.TextField(null=True, blank=True)
     duration_value = models.PositiveIntegerField()
     duration_unit = models.CharField(max_length=20, choices=DURATION_UNIT_CHOICES)
+    total_days = models.PositiveIntegerField(default=30)
     validity_days = models.PositiveIntegerField(null=True, blank=True)
     is_trial_package = models.BooleanField(default=False)
+    is_trial = models.BooleanField(default=False)
+    only_for_trial = models.BooleanField(default=False)
+    show_on_web = models.BooleanField(default=True)
+    show_on_app = models.BooleanField(default=True)
     effective_from = models.DateTimeField()
     effective_until = models.DateTimeField(null=True, blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='DRAFT')
+    published_at = models.DateTimeField(null=True, blank=True)
     created_by_user = models.ForeignKey(
         'TenantUser', on_delete=models.PROTECT, related_name='created_package_versions'
     )
@@ -312,6 +354,61 @@ class PackageVersion(models.Model):
         indexes = [
             models.Index(fields=['package', 'status', 'effective_from'], name='idx_pkgver_pkg_st_eff'),
         ]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(total_days__gt=0),
+                name='chk_package_version_total_days_gt_zero'
+            )
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.total_days is not None and self.total_days <= 0:
+            raise ValidationError({'total_days': "total_days must be greater than 0."})
+        if self.effective_from and self.effective_until and self.effective_until <= self.effective_from:
+            raise ValidationError({'effective_until': "effective_until must be after effective_from."})
+
+    def save(self, *args, **kwargs):
+        # Sync trial flags
+        if self.is_trial:
+            self.is_trial_package = True
+        elif self.is_trial_package:
+            self.is_trial = True
+
+        # Sync total_days if default or not set
+        if self.duration_value and (not self.total_days or self.total_days == 30):
+            if self.duration_unit == 'DAY':
+                self.total_days = self.duration_value
+            elif self.duration_unit == 'WEEK':
+                self.total_days = self.duration_value * 7
+            elif self.duration_unit == 'MONTH':
+                self.total_days = self.duration_value * 30
+            elif self.duration_unit == 'YEAR':
+                self.total_days = self.duration_value * 365
+
+        # Check published_at
+        if self.status == 'ACTIVE' and not self.published_at:
+            self.published_at = timezone.now()
+
+        # Enforce immutability of ACTIVE / RETIRED package versions
+        if not self._state.adding and self.pk:
+            db = kwargs.get('using') or self._state.db or 'default'
+            orig = PackageVersion.objects.using(db).filter(pk=self.pk).first()
+            if orig and orig.status in ('ACTIVE', 'RETIRED'):
+                immutable_fields = [
+                    'package_id', 'version_number', 'name_snapshot',
+                    'duration_value', 'duration_unit', 'total_days',
+                    'is_trial', 'only_for_trial'
+                ]
+                for f in immutable_fields:
+                    if getattr(self, f) != getattr(orig, f):
+                        raise ValidationError(
+                            f"PackageVersion '{self.version_number}' is {orig.status} and immutable. "
+                            f"Field '{f}' cannot be modified. Create a new version instead."
+                        )
+
+        self.clean()
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.package.code} v{self.version_number} ({self.status})"
@@ -336,6 +433,8 @@ class PackagePrice(models.Model):
     )
     currency = models.CharField(max_length=3, default='INR')
     base_price = models.DecimalField(max_digits=14, decimal_places=2)
+    display_price = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    prices_include_tax = models.BooleanField(default=False)
     tax_percent = models.DecimalField(max_digits=6, decimal_places=3, default=Decimal('0.000'))
     effective_from = models.DateTimeField()
     effective_until = models.DateTimeField(null=True, blank=True)
@@ -359,7 +458,17 @@ class PackagePrice(models.Model):
         ]
 
     @property
+    def sale_price(self) -> Decimal:
+        return self.base_price
+
+    @property
+    def tax_percentage(self) -> Decimal:
+        return self.tax_percent
+
+    @property
     def total_price(self) -> Decimal:
+        if self.prices_include_tax:
+            return self.base_price.quantize(Decimal('0.01'))
         tax_multiplier = Decimal('1.0') + (self.tax_percent / Decimal('100.0'))
         return (self.base_price * tax_multiplier).quantize(Decimal('0.01'))
 
@@ -428,6 +537,7 @@ class PackageEntitlementDefinition(models.Model):
     entitlement_type = models.CharField(max_length=50, choices=ENTITLEMENT_TYPE_CHOICES)
     allocated_units = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     is_unlimited = models.BooleanField(default=False)
+    extra_unit_price = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal('0.00'), null=True, blank=True)
     validity_days = models.PositiveIntegerField(null=True, blank=True)
     reference_type = models.CharField(max_length=100, null=True, blank=True, help_text="Scoped entity type e.g. ClassTemplate")
     reference_id = models.UUIDField(null=True, blank=True, help_text="Scoped entity ID")

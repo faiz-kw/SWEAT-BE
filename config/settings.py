@@ -180,6 +180,11 @@ DATABASE_ROUTERS = ['config.routers.MasterRouter', 'config.routers.TenantRouter'
 # ---------------------------------------------------------------------------
 AUTH_USER_MODEL = 'master.PlatformUser'
 
+AUTHENTICATION_BACKENDS = [
+    'apps.authentication.backends.EmailOrUsernameModelBackend',
+    'django.contrib.auth.backends.ModelBackend',
+]
+
 AUTH_PASSWORD_VALIDATORS = [
     {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
     {'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator', 'OPTIONS': {'min_length': 10}},

@@ -60,6 +60,7 @@ from .views_catalog import (
     TermsDocumentVersionViewSet,
     TermsAcceptanceViewSet,
     ProgramCategoryViewSet,
+    ProgramTypeViewSet,
     ProgramViewSet,
     PackageViewSet,
     PackageVersionViewSet,
@@ -210,6 +211,7 @@ router.register(r'terms-documents', TermsDocumentViewSet, basename='terms-docume
 router.register(r'terms-document-versions', TermsDocumentVersionViewSet, basename='terms-document-version')
 router.register(r'terms-acceptances', TermsAcceptanceViewSet, basename='terms-acceptance')
 router.register(r'program-categories', ProgramCategoryViewSet, basename='program-category')
+router.register(r'program-types', ProgramTypeViewSet, basename='program-type')
 router.register(r'programs', ProgramViewSet, basename='program')
 router.register(r'packages', PackageViewSet, basename='package')
 router.register(r'package-versions', PackageVersionViewSet, basename='package-version')

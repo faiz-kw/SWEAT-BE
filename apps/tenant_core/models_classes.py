@@ -343,6 +343,8 @@ class PackageClassAccessRule(models.Model):
         ('INCLUDED', 'Included in Package'),
         ('EXCLUDED', 'Explicitly Excluded'),
         ('DISCOUNTED', 'Discounted Rate'),
+        ('ADD_ON', 'Add-On'),
+        ('PAY_PER_USE', 'Pay Per Use'),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

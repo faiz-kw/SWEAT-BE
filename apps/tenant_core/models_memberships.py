@@ -25,6 +25,7 @@ Key Rules Enforced:
 import uuid
 from decimal import Decimal
 from typing import Optional
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils import timezone
 from .models_org import Organization, Branch
@@ -67,6 +68,14 @@ class Membership(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    def save(self, *args, **kwargs):
+        if not self._state.adding and self.pk:
+            db = kwargs.get('using') or self._state.db or 'default'
+            orig = Membership.objects.using(db).filter(pk=self.pk).first()
+            if orig and orig.purchase_branch_id != self.purchase_branch_id:
+                raise ValidationError("purchase_branch is immutable and cannot be modified.")
+        super().save(*args, **kwargs)
+
     class Meta:
         db_table = 'memberships'
         ordering = ['-created_at']
@@ -78,6 +87,7 @@ class Membership(models.Model):
 class MembershipContractSnapshot(models.Model):
     """
     Immutable snapshot of the commercial agreement and purchased entitlement definitions.
+    NO UPDATE, NO DELETE backend protection.
     """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     membership = models.OneToOneField(Membership, on_delete=models.PROTECT, related_name='contract_snapshot')
@@ -102,6 +112,14 @@ class MembershipContractSnapshot(models.Model):
     source_order = models.ForeignKey(Order, on_delete=models.PROTECT, null=True, blank=True, related_name='+')
     source_order_item = models.ForeignKey(OrderItem, on_delete=models.PROTECT, null=True, blank=True, related_name='+')
     created_at = models.DateTimeField(auto_now_add=True)
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding and self.pk:
+            raise ValidationError("MembershipContractSnapshot is immutable and cannot be updated.")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("MembershipContractSnapshot is immutable and cannot be deleted.")
 
     class Meta:
         db_table = 'membership_contract_snapshots'
