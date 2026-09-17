@@ -11,6 +11,7 @@ Usage:
 """
 
 import logging
+from django.conf import settings
 from django.core.management.base import BaseCommand
 from apps.master.models_iam import PlatformUser, AuthenticationIdentity
 from apps.master.models_infra import TenantDataSource
