@@ -788,7 +788,7 @@ class AuthenticationIdentity(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     # HMAC-SHA256 hex digest of normalized identifier
-    lookup_hash = models.CharField(max_length=64, unique=True, db_index=True)
+    lookup_hash = models.CharField(max_length=64, db_index=True)
     identifier_type = models.CharField(max_length=20, choices=IDENTIFIER_TYPES, default='EMAIL')
     identifier = models.CharField(max_length=320, db_index=True)
     account_type = models.CharField(max_length=20, choices=ACCOUNT_TYPES)
@@ -803,6 +803,10 @@ class AuthenticationIdentity(models.Model):
     class Meta:
         app_label = 'master'
         db_table = 'authentication_identities'
+        constraints = [
+            models.UniqueConstraint(fields=['lookup_hash'], condition=models.Q(account_type='PLATFORM'), name='auth_platform_identifier_unique'),
+            models.UniqueConstraint(fields=['tenant_id', 'lookup_hash'], condition=models.Q(account_type='TENANT'), name='auth_tenant_identifier_unique'),
+        ]
         indexes = [
             models.Index(fields=['lookup_hash'], name='idx_auth_ident_hash'),
             models.Index(fields=['account_type', 'subject_id'], name='idx_auth_ident_subj'),

@@ -2,7 +2,7 @@
 Universal Authentication Routing Directory Services (Master DB only).
 
 Provides O(1) identifier resolution, privacy-preserving lookup hashes,
-global uniqueness validation across platform & all tenants, and cross-database
+organization-scoped uniqueness validation, and cross-database
 lifecycle synchronization.
 """
 
@@ -45,29 +45,47 @@ def infer_identifier_type(identifier: str) -> str:
     return 'EMAIL' if '@' in identifier else 'USERNAME'
 
 
-def resolve_identity(identifier: str):
+def resolve_identity(identifier: str, account_type=None, tenant_id=None):
     """
     Resolve an incoming login identifier (email or username) to its AuthenticationIdentity.
-    Returns None if not found.
+    Returns None if not found or ambiguous without an explicit scope.
     Queries exclusively from Master DB ('default').
     """
     if not identifier:
         return None
     from apps.master.models_iam import AuthenticationIdentity
     lookup_hash = compute_lookup_hash(identifier)
-    return AuthenticationIdentity.objects.using('default').filter(lookup_hash=lookup_hash).first()
+    qs = AuthenticationIdentity.objects.using('default').filter(lookup_hash=lookup_hash)
+    if account_type:
+        qs = qs.filter(account_type=account_type, tenant_id=tenant_id)
+    matches = list(qs[:2])
+    return matches[0] if len(matches) == 1 else None
 
 
-def check_identifier_available(identifier: str, exclude_subject_id: Optional[uuid.UUID] = None) -> bool:
+def check_identifier_available(identifier: str, exclude_subject_id: Optional[uuid.UUID] = None, account_type='PLATFORM', db=None) -> bool:
     """
-    Check if a normalized identifier is available globally across platform and all tenants.
+    Check identifier availability within the selected login scope.
     """
     if not identifier:
         return True
+    if account_type == 'TENANT':
+        from apps.tenant_core.models_users import TenantUser
+        from config.routers import get_tenant_db_alias
+        from django.db.models import Q
+        alias = db or get_tenant_db_alias()
+        if not alias or alias == 'default':
+            raise ValidationError('An organization database is required.')
+        qs = TenantUser.objects.using(alias).filter(
+            Q(email__iexact=normalize_identifier(identifier)) |
+            Q(username__iexact=normalize_identifier(identifier))
+        )
+        if exclude_subject_id:
+            qs = qs.exclude(pk=exclude_subject_id)
+        return not qs.exists()
     try:
         from apps.master.models_iam import AuthenticationIdentity
         lookup_hash = compute_lookup_hash(identifier)
-        qs = AuthenticationIdentity.objects.using('default').filter(lookup_hash=lookup_hash)
+        qs = AuthenticationIdentity.objects.using('default').filter(lookup_hash=lookup_hash, account_type='PLATFORM', tenant_id=None)
         if exclude_subject_id:
             qs = qs.exclude(subject_id=exclude_subject_id)
         return not qs.exists()
@@ -87,7 +105,7 @@ def register_identity(
 ):
     """
     Register or update an identity in the Universal Authentication Directory.
-    Enforces global uniqueness across the entire system.
+    Enforces uniqueness within the platform or selected organization.
     """
     from apps.master.models_iam import AuthenticationIdentity
 
@@ -98,8 +116,12 @@ def register_identity(
     lookup_hash = compute_lookup_hash(clean_val)
     id_type = identifier_type or infer_identifier_type(clean_val)
 
-    # Check for collisions with different users
-    existing = AuthenticationIdentity.objects.using('default').filter(lookup_hash=lookup_hash).first()
+    if account_type == 'TENANT' and not tenant_id:
+        raise ValidationError('An organization is required for tenant identities.')
+    if account_type == 'PLATFORM' and tenant_id is not None:
+        raise ValidationError('Platform identities cannot belong to an organization.')
+    # Check for collisions within this login scope.
+    existing = AuthenticationIdentity.objects.using('default').filter(lookup_hash=lookup_hash, account_type=account_type, tenant_id=tenant_id).first()
     if existing:
         if str(existing.subject_id) != str(subject_id) or existing.account_type != account_type:
             raise ValidationError('This username or email is already registered.')
@@ -203,7 +225,6 @@ def sync_tenant_user_identity(user, tenant_id=None, db: Optional[str] = None):
     """
     try:
         from apps.master.models_iam import AuthenticationIdentity
-        from apps.master.models_tenant import Tenant
         from apps.master.models_infra import TenantDataSource
 
         # 1. Resolve tenant_id
@@ -234,9 +255,7 @@ def sync_tenant_user_identity(user, tenant_id=None, db: Optional[str] = None):
                 resolved_tenant_id = ds.tenant_id
 
         if not resolved_tenant_id:
-            t = Tenant.objects.using('default').filter(status='ACTIVE').first()
-            if t:
-                resolved_tenant_id = t.id
+            raise ValidationError('Cannot determine organization for login identity.')
 
         tenant_id = resolved_tenant_id
 
@@ -280,7 +299,7 @@ def sync_tenant_user_identity(user, tenant_id=None, db: Optional[str] = None):
         if current_identities:
             AuthenticationIdentity.objects.using('default').filter(
                 subject_id=user.id,
-                account_type='TENANT'
+                account_type='TENANT', tenant_id=tenant_id
             ).exclude(lookup_hash__in=current_identities).delete()
 
     except Exception as e:

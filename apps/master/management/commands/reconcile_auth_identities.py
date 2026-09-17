@@ -11,6 +11,7 @@ Usage:
 """
 
 import logging
+from django.conf import settings
 from django.core.management.base import BaseCommand
 from apps.master.models_iam import PlatformUser, AuthenticationIdentity
 from apps.master.models_infra import TenantDataSource
@@ -47,7 +48,7 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS("MODE: EXECUTE CHANGES"))
         self.stdout.write(self.style.NOTICE("=" * 60))
 
-        # Expected map: lookup_hash -> dict of record info
+        # Expected map: (account type, tenant ID, lookup hash) -> record info
         expected = {}
         duplicates = []
 
@@ -65,7 +66,7 @@ class Command(BaseCommand):
 
             for ident, id_type in identifiers:
                 norm = normalize_identifier(ident)
-                h = compute_lookup_hash(norm)
+                h = ('PLATFORM', None, compute_lookup_hash(norm))
                 rec = {
                     'identifier': norm,
                     'identifier_type': id_type,
@@ -111,7 +112,7 @@ class Command(BaseCommand):
 
                     for ident, id_type in identifiers:
                         norm = normalize_identifier(ident)
-                        h = compute_lookup_hash(norm)
+                        h = ('TENANT', tenant.id, compute_lookup_hash(norm))
                         rec = {
                             'identifier': norm,
                             'identifier_type': id_type,
@@ -141,7 +142,7 @@ class Command(BaseCommand):
 
         # 4. Compare with existing AuthenticationIdentity records in Master DB
         existing_identities = {
-            ai.lookup_hash: ai
+            (ai.account_type, ai.tenant_id, ai.lookup_hash): ai
             for ai in AuthenticationIdentity.objects.using('default').all()
         }
         self.stdout.write(f"\nExisting Directory Records in Master DB: {len(existing_identities)}")
@@ -171,7 +172,7 @@ class Command(BaseCommand):
             for h in missing_hashes:
                 exp = expected[h]
                 AuthenticationIdentity.objects.using('default').create(
-                    lookup_hash=h,
+                    lookup_hash=h[2],
                     identifier=exp['identifier'],
                     identifier_type=exp['identifier_type'],
                     account_type=exp['account_type'],

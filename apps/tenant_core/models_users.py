@@ -144,9 +144,9 @@ class TenantUser(models.Model):
             self.display_name = self.full_name
         from apps.master.services_auth_directory import check_identifier_available
         from django.core.exceptions import ValidationError
-        if self.email and not check_identifier_available(self.email, exclude_subject_id=self.id):
+        if self.email and not check_identifier_available(self.email, exclude_subject_id=self.id, account_type='TENANT', db=kwargs.get('using') or self._state.db):
             raise ValidationError({'email': 'This username or email is already registered.'})
-        if getattr(self, 'username', None) and not check_identifier_available(self.username, exclude_subject_id=self.id):
+        if getattr(self, 'username', None) and not check_identifier_available(self.username, exclude_subject_id=self.id, account_type='TENANT', db=kwargs.get('using') or self._state.db):
             raise ValidationError({'username': 'This username or email is already registered.'})
         super().save(*args, **kwargs)
         try:

@@ -246,12 +246,9 @@ class UniversalLoginView(APIView):
         "tenant_slug": "..." (optional)
       }
 
-    Routes through the control-plane AuthenticationIdentity directory in Master DB:
-    - O(1) identifier lookup via deterministic HMAC hash.
-    - Zero tenant DB scanning.
-    - Zero password storage in the directory.
-    - Automatic database routing (Master DB for platform; dedicated tenant DB for tenant).
-    - Strict fail-closed tenant and user status verification.
+    Tenant users supply their organization slug; credentials are verified in that
+    organization's database. A blank slug checks only master-database superadmins.
+    Passwords are never stored in the routing directory.
     """
     permission_classes = [AllowAny]
     throttle_classes = [LoginRateThrottle]
@@ -276,31 +273,51 @@ class UniversalLoginView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # 1. Look up via Universal Authentication Directory in Master DB
-        identity = resolve_identity(identifier)
+        if not tenant_slug:
+            # Blank organization code is exclusively a master-database superadmin login.
+            from apps.master.models_iam import PlatformUser
+            from django.db.models import Q
+            from types import SimpleNamespace
+            user = PlatformUser.objects.using('default').filter(
+                Q(email__iexact=identifier) | Q(username__iexact=identifier),
+                is_superuser=True,
+            ).first()
+            if user:
+                response = self._platform_login(
+                    request, SimpleNamespace(subject_id=user.id), identifier, password,
+                )
+                if response.status_code not in (401, 403):
+                    return response
+            else:
+                locked, remaining = check_login_lockout(request, identifier, tenant_id=None)
+                if locked:
+                    return Response({'error': f'Too many failed login attempts. Try again in {remaining} seconds.'}, status=429)
+                record_login_failure(request, identifier, tenant_id=None)
+            return Response({
+                'code': 'organization_required',
+                'error': "Please enter your organization code to sign in. If you don't have a code or your account hasn't been activated, contact your organization administrator.",
+            }, status=status.HTTP_400_BAD_REQUEST)
 
-        # 2. Backward compatibility fallback: if identity not found in directory, but tenant_slug provided,
-        # try tenant DB directly and self-heal / backfill into AuthenticationIdentity
-        if not identity and tenant_slug:
-            tenant = Tenant.objects.using('default').filter(slug=tenant_slug, status='ACTIVE').first()
-            if tenant:
-                try:
-                    db_alias = _register_and_resolve_tenant(tenant)
-                    from apps.tenant_core.models_users import TenantUser
-                    from django.db.models import Q
-                    t_user = TenantUser.objects.using(db_alias).filter(
-                        Q(email__iexact=identifier) | Q(username__iexact=identifier)
-                    ).first()
-                    if t_user:
-                        from apps.master.services_auth_directory import sync_tenant_user_identity
-                        sync_tenant_user_identity(t_user, db=db_alias)
-                        identity = resolve_identity(identifier)
-                except Exception as e:
-                    logger.debug("Failed fallback lookup for tenant_slug=%s: %s", tenant_slug, e)
+        tenant = Tenant.objects.using('default').filter(slug=tenant_slug, status='ACTIVE').first()
+        identity = resolve_identity(identifier, account_type='TENANT', tenant_id=tenant.id) if tenant else None
+        if not identity and tenant:
+            try:
+                db_alias = _register_and_resolve_tenant(tenant)
+                from apps.tenant_core.models_users import TenantUser
+                from django.db.models import Q
+                t_user = TenantUser.objects.using(db_alias).filter(
+                    Q(email__iexact=identifier) | Q(username__iexact=identifier)
+                ).first()
+                if t_user:
+                    from apps.master.services_auth_directory import sync_tenant_user_identity
+                    sync_tenant_user_identity(t_user, tenant_id=tenant.id, db=db_alias)
+                    identity = resolve_identity(identifier, account_type='TENANT', tenant_id=tenant.id)
+            except Exception as e:
+                logger.debug("Failed fallback lookup for tenant_slug=%s: %s", tenant_slug, e)
 
         # 3. If identity still not found -> generic authentication failure (no enumeration)
         if not identity:
-            record_login_failure(request, identifier, tenant_id=None)
+            record_login_failure(request, identifier, tenant_id=str(tenant.id) if tenant else None)
             return Response(
                 {'error': 'Invalid username/email or password.'},
                 status=status.HTTP_401_UNAUTHORIZED,
@@ -318,10 +335,8 @@ class UniversalLoginView(APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        # 5. Route to appropriate database
-        if identity.account_type == 'PLATFORM':
-            return self._platform_login(request, identity, identifier, password)
-        elif identity.account_type == 'TENANT':
+        # Only identities within the selected tenant may reach this path.
+        if identity.account_type == 'TENANT':
             return self._tenant_login(request, identity, identifier, password, tenant_slug=tenant_slug)
         else:
             return Response(
@@ -341,7 +356,7 @@ class UniversalLoginView(APIView):
             )
 
         user = PlatformUser.objects.using('default').filter(id=identity.subject_id).first()
-        if not user:
+        if not user or not user.is_superuser:
             record_login_failure(request, identifier, tenant_id=None)
             return Response(
                 {'error': 'Invalid username/email or password.'},

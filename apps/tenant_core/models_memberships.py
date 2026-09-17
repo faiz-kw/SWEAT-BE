@@ -24,6 +24,7 @@ Key Rules Enforced:
 
 import uuid
 from decimal import Decimal
+from typing import Optional
 from django.db import models
 from django.utils import timezone
 from .models_org import Organization, Branch

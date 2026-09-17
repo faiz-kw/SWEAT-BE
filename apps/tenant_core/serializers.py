@@ -151,13 +151,13 @@ class TenantUserSerializer(serializers.ModelSerializer):
         subject_id = self.instance.id if self.instance else None
 
         email = attrs.get('email')
-        if email and not check_identifier_available(email, exclude_subject_id=subject_id):
+        if email and not check_identifier_available(email, exclude_subject_id=subject_id, account_type='TENANT', db=self.context.get('db_alias') or getattr(getattr(self.instance, '_state', None), 'db', None)):
             raise serializers.ValidationError({
                 'email': 'This username or email is already registered.'
             })
 
         username = attrs.get('username')
-        if username and not check_identifier_available(username, exclude_subject_id=subject_id):
+        if username and not check_identifier_available(username, exclude_subject_id=subject_id, account_type='TENANT', db=self.context.get('db_alias') or getattr(getattr(self.instance, '_state', None), 'db', None)):
             raise serializers.ValidationError({
                 'username': 'This username or email is already registered.'
             })
