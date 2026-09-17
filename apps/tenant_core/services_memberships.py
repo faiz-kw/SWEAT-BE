@@ -50,7 +50,6 @@ class MembershipLifecycleService:
     """
 
     @classmethod
-    @transaction.atomic
     def activate_membership_from_order(
         cls,
         order: Order,
@@ -63,186 +62,196 @@ class MembershipLifecycleService:
         Activates a new membership, creates immutable contract snapshot, and initializes entitlements.
         """
         alias = db_alias or get_current_tenant_db_alias() or 'default'
+        with transaction.atomic(using=alias):
+            # Lock order to serialize concurrent activation attempts
+            order = Order.objects.using(alias).select_for_update().get(id=order.id)
 
-        if not order.user_profile:
-            raise ValidationError("Order must have a member UserProfile to activate a membership.")
+            # Idempotency: duplicate activation cannot create multiple active contracts
+            existing = Membership.objects.using(alias).filter(
+                source_order_item=order_item,
+                status='ACTIVE'
+            ).first()
+            if existing:
+                return existing
 
-        if not order_item.package or not order_item.package_version:
-            raise ValidationError("OrderItem must be a PACKAGE with package_version.")
+            if not order.user_profile:
+                raise ValidationError("Order must have a member UserProfile to activate a membership.")
 
-        package = order_item.package
-        package_version = order_item.package_version
-        package_price = order_item.package_price
+            if not order_item.package or not order_item.package_version:
+                raise ValidationError("OrderItem must be a PACKAGE with package_version.")
 
-        # Calculate start and end dates
-        start = start_date or timezone.now().date()
-        duration_value = package_version.duration_value or 1
-        duration_unit = package_version.duration_unit or 'MONTH'
+            package = order_item.package
+            package_version = order_item.package_version
+            package_price = order_item.package_price
 
-        if duration_unit == 'DAY':
-            end = start + timedelta(days=duration_value)
-        elif duration_unit == 'WEEK':
-            end = start + timedelta(weeks=duration_value)
-        elif duration_unit == 'MONTH':
-            end = start + timedelta(days=duration_value * 30)
-        elif duration_unit == 'YEAR':
-            end = start + timedelta(days=duration_value * 365)
-        else:
-            end = start + timedelta(days=30)
+            # Calculate start and end dates
+            start = start_date or timezone.now().date()
+            duration_value = package_version.duration_value or 1
+            duration_unit = package_version.duration_unit or 'MONTH'
 
-        membership_number = f"MEM-{uuid.uuid4().hex[:8].upper()}"
+            if duration_unit == 'DAY':
+                end = start + timedelta(days=duration_value)
+            elif duration_unit == 'WEEK':
+                end = start + timedelta(weeks=duration_value)
+            elif duration_unit == 'MONTH':
+                end = start + timedelta(days=duration_value * 30)
+            elif duration_unit == 'YEAR':
+                end = start + timedelta(days=duration_value * 365)
+            else:
+                end = start + timedelta(days=30)
 
-        membership = Membership.objects.using(alias).create(
-            user_profile=order.user_profile,
-            program=package.program,
-            package=package,
-            package_version=package_version,
-            package_price=package_price,
-            source_order=order,
-            source_order_item=order_item,
-            purchase_branch=order.branch,
-            home_branch=order.branch,
-            membership_number=membership_number,
-            start_date=start,
-            end_date=end,
-            status='ACTIVE',
-            activated_at=timezone.now(),
-        )
+            membership_number = f"MEM-{uuid.uuid4().hex[:8].upper()}"
 
-        # Snapshot entitlements definition
-        entitlements_def_qs = PackageEntitlementDefinition.objects.using(alias).filter(
-            package_version=package_version
-        )
-        entitlements_data = []
-        for ed in entitlements_def_qs:
-            entitlements_data.append({
-                'id': str(ed.id),
-                'entitlement_type': ed.entitlement_type,
-                'reference_type': ed.reference_type,
-                'reference_id': str(ed.reference_id) if ed.reference_id else None,
-                'allocated_units': str(ed.allocated_units) if ed.allocated_units else None,
-                'is_unlimited': ed.is_unlimited,
-            })
-
-        # Create Immutable Contract Snapshot
-        contract_snapshot = MembershipContractSnapshot.objects.using(alias).create(
-            membership=membership,
-            package=package,
-            package_version=package_version,
-            package_price=package_price,
-            package_name_snapshot=order_item.item_name_snapshot or package.name,
-            purchase_price=order_item.unit_price_snapshot,
-            discount_amount=order_item.discount_amount,
-            tax_amount=order_item.tax_amount,
-            final_amount=order_item.total_amount,
-            currency=order.currency,
-            duration_value=duration_value,
-            duration_unit=duration_unit,
-            start_date=start,
-            end_date=end,
-            entitlements_snapshot=entitlements_data,
-            purchase_branch=order.branch,
-            source_order=order,
-            source_order_item=order_item,
-        )
-
-        # Instantiate Entitlements & Initial Ledger entries
-        now_dt = timezone.now()
-        end_dt = timezone.make_aware(datetime.combine(end, datetime.max.time()))
-
-        for ed in entitlements_def_qs:
-            ent = MembershipEntitlement.objects.using(alias).create(
-                membership=membership,
-                source_definition=ed,
-                entitlement_type=ed.entitlement_type,
-                reference_type=ed.reference_type,
-                reference_id=ed.reference_id,
-                allocated_units=ed.allocated_units,
-                consumed_units=Decimal('0.00'),
-                is_unlimited=ed.is_unlimited,
-                valid_from=now_dt,
-                valid_until=end_dt,
+            membership = Membership.objects.using(alias).create(
+                user_profile=order.user_profile,
+                program=package.program,
+                package=package,
+                package_version=package_version,
+                package_price=package_price,
+                source_order=order,
+                source_order_item=order_item,
+                purchase_branch=order.branch,
+                home_branch=order.branch,
+                membership_number=membership_number,
+                start_date=start,
+                end_date=end,
                 status='ACTIVE',
+                activated_at=timezone.now(),
             )
 
-            # Record ledger row
-            alloc_units = ed.allocated_units if not ed.is_unlimited else Decimal('999999.00')
-            MembershipEntitlementLedger.objects.using(alias).create(
-                membership_entitlement=ent,
-                transaction_type='ALLOCATION',
-                units=alloc_units,
-                reason_code='INITIAL_PURCHASE',
-                reason_text=f"Initial allocation from contract {contract_snapshot.id}",
-                balance_after=alloc_units,
-                created_by_user=created_by_user,
+            # Snapshot entitlements definition
+            entitlements_def_qs = PackageEntitlementDefinition.objects.using(alias).filter(
+                package_version=package_version
+            )
+            entitlements_data = []
+            for ed in entitlements_def_qs:
+                entitlements_data.append({
+                    'id': str(ed.id),
+                    'entitlement_type': ed.entitlement_type,
+                    'reference_type': ed.reference_type,
+                    'reference_id': str(ed.reference_id) if ed.reference_id else None,
+                    'allocated_units': str(ed.allocated_units) if ed.allocated_units else None,
+                    'is_unlimited': ed.is_unlimited,
+                })
+
+            # Create Immutable Contract Snapshot
+            contract_snapshot = MembershipContractSnapshot.objects.using(alias).create(
+                membership=membership,
+                package=package,
+                package_version=package_version,
+                package_price=package_price,
+                package_name_snapshot=order_item.item_name_snapshot or package.name,
+                purchase_price=order_item.unit_price_snapshot,
+                discount_amount=order_item.discount_amount,
+                tax_amount=order_item.tax_amount,
+                final_amount=order_item.total_amount,
+                currency=order.currency,
+                duration_value=duration_value,
+                duration_unit=duration_unit,
+                start_date=start,
+                end_date=end,
+                entitlements_snapshot=entitlements_data,
+                purchase_branch=order.branch,
+                source_order=order,
+                source_order_item=order_item,
             )
 
-        # Append Branch History
-        MembershipBranchHistory.objects.using(alias).create(
-            membership=membership,
-            to_branch=order.branch,
-            change_type='INITIAL',
-            reason="Membership purchase at home branch",
-            changed_by_user=created_by_user,
-        )
+            # Instantiate Entitlements & Initial Ledger entries
+            now_dt = timezone.now()
+            end_dt = timezone.make_aware(datetime.combine(end, datetime.max.time()))
 
-        # Append Status History
-        MembershipStatusHistory.objects.using(alias).create(
-            membership=membership,
-            from_status=None,
-            to_status='ACTIVE',
-            reason_code='PURCHASE_ACTIVATION',
-            reason_text=f"Activated via Order {order.order_number}",
-            changed_by_user=created_by_user,
-        )
+            for ed in entitlements_def_qs:
+                ent = MembershipEntitlement.objects.using(alias).create(
+                    membership=membership,
+                    source_definition=ed,
+                    entitlement_type=ed.entitlement_type,
+                    reference_type=ed.reference_type,
+                    reference_id=ed.reference_id,
+                    allocated_units=ed.allocated_units,
+                    consumed_units=Decimal('0.00'),
+                    is_unlimited=ed.is_unlimited,
+                    valid_from=now_dt,
+                    valid_until=end_dt,
+                    status='ACTIVE',
+                )
 
-        # Append Package History
-        MembershipPackageHistory.objects.using(alias).create(
-            membership=membership,
-            to_package=package,
-            to_package_version=package_version,
-            change_type='UPGRADE',
-            order=order,
-            changed_by_user=created_by_user,
-            reason="Initial package activation",
-        )
+                # Record ledger row
+                alloc_units = ed.allocated_units if not ed.is_unlimited else Decimal('999999.00')
+                MembershipEntitlementLedger.objects.using(alias).create(
+                    membership_entitlement=ent,
+                    transaction_type='ALLOCATION',
+                    units=alloc_units,
+                    reason_code='INITIAL_PURCHASE',
+                    reason_text=f"Initial allocation from contract {contract_snapshot.id}",
+                    balance_after=alloc_units,
+                    created_by_user=created_by_user,
+                )
 
-        # Auditing & Outbox
-        record_business_audit(
-            organization=order.branch.organization,
-            module='membership',
-            action_code='MEMBERSHIP_ACTIVATED',
-            entity_type='Membership',
-            entity_id=membership.id,
-            branch=order.branch,
-            actor_user=created_by_user,
-            metadata={
-                'membership_number': membership.membership_number,
-                'package_id': str(package.id),
-                'order_id': str(order.id),
-            },
-            db_alias=alias,
-        )
+            # Append Branch History
+            MembershipBranchHistory.objects.using(alias).create(
+                membership=membership,
+                to_branch=order.branch,
+                change_type='INITIAL',
+                reason="Membership purchase at home branch",
+                changed_by_user=created_by_user,
+            )
 
-        enqueue_outbox_event(
-            organization=order.branch.organization,
-            event_type='membership.activated',
-            aggregate_type='Membership',
-            aggregate_id=membership.id,
-            payload={
-                'membership_id': str(membership.id),
-                'membership_number': membership.membership_number,
-                'user_profile_id': str(order.user_profile_id),
-                'start_date': str(start),
-                'end_date': str(end),
-            },
-            db_alias=alias,
-        )
+            # Append Status History
+            MembershipStatusHistory.objects.using(alias).create(
+                membership=membership,
+                from_status=None,
+                to_status='ACTIVE',
+                reason_code='PURCHASE_ACTIVATION',
+                reason_text=f"Activated via Order {order.order_number}",
+                changed_by_user=created_by_user,
+            )
 
-        return membership
+            # Append Package History
+            MembershipPackageHistory.objects.using(alias).create(
+                membership=membership,
+                to_package=package,
+                to_package_version=package_version,
+                change_type='UPGRADE',
+                order=order,
+                changed_by_user=created_by_user,
+                reason="Initial package activation",
+            )
+
+            # Auditing & Outbox
+            record_business_audit(
+                organization=order.branch.organization,
+                module='membership',
+                action_code='MEMBERSHIP_ACTIVATED',
+                entity_type='Membership',
+                entity_id=membership.id,
+                branch=order.branch,
+                actor_user=created_by_user,
+                metadata={
+                    'membership_number': membership.membership_number,
+                    'package_id': str(package.id),
+                    'order_id': str(order.id),
+                },
+                db_alias=alias,
+            )
+
+            enqueue_outbox_event(
+                organization=order.branch.organization,
+                event_type='membership.activated',
+                aggregate_type='Membership',
+                aggregate_id=membership.id,
+                payload={
+                    'membership_id': str(membership.id),
+                    'membership_number': membership.membership_number,
+                    'user_profile_id': str(order.user_profile_id),
+                    'start_date': str(start),
+                    'end_date': str(end),
+                },
+                db_alias=alias,
+            )
+
+            return membership
 
     @classmethod
-    @transaction.atomic
     def consume_entitlement(
         cls,
         membership: Membership,
@@ -257,46 +266,46 @@ class MembershipLifecycleService:
         Consumes units from an active membership entitlement and appends an immutable ledger record.
         """
         alias = db_alias or get_current_tenant_db_alias() or 'default'
+        with transaction.atomic(using=alias):
+            if membership.status != 'ACTIVE':
+                raise ValidationError(f"Cannot consume sessions: Membership is {membership.status}.")
 
-        if membership.status != 'ACTIVE':
-            raise ValidationError(f"Cannot consume sessions: Membership is {membership.status}.")
+            ent = MembershipEntitlement.objects.using(alias).select_for_update().filter(
+                membership=membership,
+                entitlement_type=entitlement_type,
+                status='ACTIVE',
+            ).first()
 
-        ent = MembershipEntitlement.objects.using(alias).filter(
-            membership=membership,
-            entitlement_type=entitlement_type,
-            status='ACTIVE',
-        ).first()
+            if not ent:
+                raise ValidationError(f"No active entitlement of type '{entitlement_type}' found on this membership.")
 
-        if not ent:
-            raise ValidationError(f"No active entitlement of type '{entitlement_type}' found on this membership.")
+            if not ent.is_unlimited:
+                remaining = ent.remaining_units
+                if remaining is not None and remaining < units:
+                    raise ValidationError(f"Insufficient entitlement units. Required: {units}, Remaining: {remaining}.")
 
-        if not ent.is_unlimited:
-            remaining = ent.remaining_units
-            if remaining is not None and remaining < units:
-                raise ValidationError(f"Insufficient entitlement units. Required: {units}, Remaining: {remaining}.")
+                ent.consumed_units += units
+                if ent.allocated_units and ent.consumed_units >= ent.allocated_units:
+                    ent.status = 'EXHAUSTED'
+                ent.save(using=alias, update_fields=['consumed_units', 'status', 'updated_at'])
+                balance_after = ent.remaining_units
+            else:
+                ent.consumed_units += units
+                ent.save(using=alias, update_fields=['consumed_units', 'updated_at'])
+                balance_after = Decimal('999999.00')
 
-            ent.consumed_units += units
-            if ent.allocated_units and ent.consumed_units >= ent.allocated_units:
-                ent.status = 'EXHAUSTED'
-            ent.save(using=alias, update_fields=['consumed_units', 'status', 'updated_at'])
-            balance_after = ent.remaining_units
-        else:
-            ent.consumed_units += units
-            ent.save(using=alias, update_fields=['consumed_units', 'updated_at'])
-            balance_after = Decimal('999999.00')
+            ledger = MembershipEntitlementLedger.objects.using(alias).create(
+                membership_entitlement=ent,
+                transaction_type='CONSUMPTION',
+                units=-units,
+                booking_id=booking_id,
+                reason_code='BOOKING_CONSUMPTION',
+                reason_text=reason_text or f"Consumed {units} unit(s) for booking {booking_id}",
+                balance_after=balance_after,
+                created_by_user=created_by_user,
+            )
 
-        ledger = MembershipEntitlementLedger.objects.using(alias).create(
-            membership_entitlement=ent,
-            transaction_type='CONSUMPTION',
-            units=-units,
-            booking_id=booking_id,
-            reason_code='BOOKING_CONSUMPTION',
-            reason_text=reason_text or f"Consumed {units} unit(s) for booking {booking_id}",
-            balance_after=balance_after,
-            created_by_user=created_by_user,
-        )
-
-        return ledger
+            return ledger
 
     @classmethod
     @transaction.atomic

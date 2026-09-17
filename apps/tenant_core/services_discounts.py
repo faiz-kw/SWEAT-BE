@@ -33,6 +33,7 @@ from .models_org import Branch
 from .models_users import TenantUser
 from .models_commerce import Order
 from .services_reliability import record_business_audit, enqueue_outbox_event
+from .context import get_current_tenant_db_alias
 
 logger = logging.getLogger(__name__)
 
@@ -237,76 +238,89 @@ class DiscountCouponEngineService:
         return matching_offers
 
     @classmethod
-    @transaction.atomic
     def redeem_coupon(
         cls,
         order: Order,
         code_str: str,
         user_profile: UserProfile,
         created_by_user=None,
+        db_alias: Optional[str] = None,
     ) -> DiscountRedemption:
         """
         Atomically validate and record coupon redemption on an order.
         """
-        val_result = cls.validate_coupon(
-            code_str=code_str,
-            user_profile=user_profile,
-            order_subtotal=order.subtotal,
-            branch=order.branch,
-        )
-        if not val_result['is_valid']:
-            raise ValidationError(val_result['reason'])
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        with transaction.atomic(using=alias):
+            val_result = cls.validate_coupon(
+                code_str=code_str,
+                user_profile=user_profile,
+                order_subtotal=order.subtotal,
+                branch=order.branch,
+            )
+            if not val_result['is_valid']:
+                raise ValidationError(val_result['reason'])
 
-        discount_amount = Decimal(val_result['discount_amount'])
-        discount_code = DiscountCode.objects.get(id=val_result['code_id'])
-        campaign = discount_code.campaign
+            discount_amount = Decimal(val_result['discount_amount'])
+            discount_code = DiscountCode.objects.using(alias).get(id=val_result['code_id'])
+            # Lock campaign to serialize concurrent redemptions against usage limits
+            campaign = DiscountCampaign.objects.using(alias).select_for_update().get(id=discount_code.campaign_id)
+            if campaign.usage_limit is not None:
+                total_redemptions = DiscountRedemption.objects.using(alias).filter(campaign=campaign).count()
+                if total_redemptions >= campaign.usage_limit:
+                    raise ValidationError("Coupon usage limit has been reached.")
+            if campaign.per_user_limit is not None and user_profile:
+                user_redemptions = DiscountRedemption.objects.using(alias).filter(campaign=campaign, user_profile=user_profile).count()
+                if user_redemptions >= campaign.per_user_limit:
+                    raise ValidationError("You have reached your redemption limit for this coupon.")
 
-        redemption = DiscountRedemption.objects.create(
-            discount_code=discount_code,
-            campaign=campaign,
-            user_profile=user_profile,
-            order=order,
-            discount_amount=discount_amount,
-            eligibility_snapshot=val_result,
-        )
+            redemption = DiscountRedemption.objects.using(alias).create(
+                discount_code=discount_code,
+                campaign=campaign,
+                user_profile=user_profile,
+                order=order,
+                discount_amount=discount_amount,
+                eligibility_snapshot=val_result,
+            )
 
-        # Update order discount_amount and total_amount
-        order.discount_amount = discount_amount
-        tax_pct = Decimal('0.18')
-        if order.subtotal > Decimal('0.00'):
-            tax_pct = (order.tax_amount / order.subtotal).quantize(Decimal('0.0001'))
+            # Update order discount_amount and total_amount
+            order.discount_amount = discount_amount
+            tax_pct = Decimal('0.18')
+            if order.subtotal > Decimal('0.00'):
+                tax_pct = (order.tax_amount / order.subtotal).quantize(Decimal('0.0001'))
 
-        net_after_discount = max(Decimal('0.00'), order.subtotal - discount_amount - getattr(order, 'reward_amount', Decimal('0.00')))
-        order.tax_amount = (net_after_discount * tax_pct).quantize(Decimal('0.01'))
-        order.total_amount = net_after_discount + order.tax_amount
-        order.save(update_fields=['discount_amount', 'tax_amount', 'total_amount', 'updated_at'])
+            net_after_discount = max(Decimal('0.00'), order.subtotal - discount_amount - getattr(order, 'reward_amount', Decimal('0.00')))
+            order.tax_amount = (net_after_discount * tax_pct).quantize(Decimal('0.01'))
+            order.total_amount = net_after_discount + order.tax_amount
+            order.save(using=alias, update_fields=['discount_amount', 'tax_amount', 'total_amount', 'updated_at'])
 
-        record_business_audit(
-            organization=order.branch.organization,
-            module='commerce',
-            action_code='COUPON_REDEEMED',
-            entity_type='DiscountRedemption',
-            entity_id=redemption.id,
-            branch=order.branch,
-            actor_user=created_by_user if isinstance(created_by_user, TenantUser) else None,
-            metadata={
-                'order_id': str(order.id),
-                'code': discount_code.code,
-                'discount_amount': str(discount_amount),
-            },
-        )
+            record_business_audit(
+                organization=order.branch.organization,
+                module='commerce',
+                action_code='COUPON_REDEEMED',
+                entity_type='DiscountRedemption',
+                entity_id=redemption.id,
+                branch=order.branch,
+                actor_user=created_by_user if isinstance(created_by_user, TenantUser) else None,
+                metadata={
+                    'order_id': str(order.id),
+                    'code': discount_code.code,
+                    'discount_amount': str(discount_amount),
+                },
+                db_alias=alias,
+            )
 
-        enqueue_outbox_event(
-            organization=order.branch.organization,
-            event_type='commerce.coupon.redeemed',
-            aggregate_type='Order',
-            aggregate_id=order.id,
-            payload={
-                'redemption_id': str(redemption.id),
-                'code': discount_code.code,
-                'discount_amount': str(discount_amount),
-                'order_id': str(order.id),
-            },
-        )
+            enqueue_outbox_event(
+                organization=order.branch.organization,
+                event_type='commerce.coupon.redeemed',
+                aggregate_type='Order',
+                aggregate_id=order.id,
+                payload={
+                    'redemption_id': str(redemption.id),
+                    'code': discount_code.code,
+                    'discount_amount': str(discount_amount),
+                    'order_id': str(order.id),
+                },
+                db_alias=alias,
+            )
 
-        return redemption
+            return redemption

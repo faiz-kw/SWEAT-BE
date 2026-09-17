@@ -24,12 +24,12 @@ from .models_crm import UserProfile
 from .models_memberships import Membership, MembershipEntitlement
 from .services_reliability import record_business_audit, enqueue_outbox_event
 from .services_memberships import MembershipLifecycleService
+from .context import get_current_tenant_db_alias
 
 
 class BookingWaitlistAttendanceService:
 
     @classmethod
-    @transaction.atomic
     def create_booking(
         cls,
         user_profile: UserProfile,
@@ -38,182 +38,195 @@ class BookingWaitlistAttendanceService:
         booking_source: str = 'WEB',
         membership: Membership = None,
         created_by_user=None,
+        db_alias: str = None,
     ) -> Booking:
-        organization = occurrence.class_template.category.organization
-        branch = occurrence.branch
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        with transaction.atomic(using=alias):
+            organization = occurrence.class_template.category.organization
+            branch = occurrence.branch
 
-        # 1. Prevent duplicate active booking
-        existing = Booking.objects.filter(
-            user_profile=user_profile,
-            occurrence=occurrence,
-            status__in=['RESERVED', 'WAITLISTED', 'CONFIRMED']
-        ).first()
-        if existing:
-            raise ValidationError(f"User already has an active booking ({existing.booking_number}) for this class occurrence.")
+            # Lock occurrence to serialize concurrent booking and capacity allocation
+            occurrence = ClassOccurrence.objects.using(alias).select_for_update().get(id=occurrence.id)
 
-        # 2. Check Attendance Policy & Member State
-        attendance_policy = AttendancePolicySet.objects.filter(
-            organization=organization,
-            status='ACTIVE'
-        ).first()
-
-        member_state = None
-        if attendance_policy:
-            member_state, _ = MemberAttendanceState.objects.get_or_create(
+            # 1. Prevent duplicate active booking
+            existing = Booking.objects.using(alias).filter(
                 user_profile=user_profile,
-                attendance_policy_set=attendance_policy,
-                defaults={
-                    'current_max_advance_bookings': attendance_policy.normal_max_advance_bookings,
-                    'booking_mode': 'NORMAL'
-                }
-            )
-            # Check restriction
-            if member_state.booking_mode == 'SINGLE_BOOKING':
-                active_advance = Booking.objects.filter(
+                occurrence=occurrence,
+                status__in=['RESERVED', 'WAITLISTED', 'CONFIRMED']
+            ).first()
+            if existing:
+                raise ValidationError(f"User already has an active booking ({existing.booking_number}) for this class occurrence.")
+
+            # 2. Check Attendance Policy & Member State
+            attendance_policy = AttendancePolicySet.objects.using(alias).filter(
+                organization=organization,
+                status='ACTIVE'
+            ).first()
+
+            member_state = None
+            if attendance_policy:
+                member_state = MemberAttendanceState.objects.using(alias).filter(
                     user_profile=user_profile,
-                    status__in=['CONFIRMED', 'RESERVED'],
-                    occurrence__start_at__gt=timezone.now()
-                ).count()
-                if active_advance >= member_state.current_max_advance_bookings:
-                    raise ValidationError(
-                        f"Booking restricted due to previous no-shows. Maximum active advance bookings allowed: {member_state.current_max_advance_bookings}."
-                    )
-
-        # 3. Check Booking Policy
-        booking_policy = BookingPolicySet.objects.filter(
-            organization=organization,
-            status='ACTIVE'
-        ).first()
-
-        # Generate unique booking number
-        booking_number = f"BK-{timezone.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
-
-        # 4. Check Occurrence Capacity dynamically
-        enrolled_count = Booking.objects.filter(
-            occurrence=occurrence,
-            status__in=['CONFIRMED', 'RESERVED', 'COMPLETED']
-        ).count()
-        is_capacity_available = enrolled_count < occurrence.capacity
-
-        if is_capacity_available:
-            # Consume entitlement if member booking
-            entitlement = None
-            if booking_type == 'MEMBER':
-                if not membership:
-                    # Find active membership with available entitlement
-                    membership = Membership.objects.filter(
+                    attendance_policy_set=attendance_policy,
+                ).first()
+                if not member_state:
+                    member_state = MemberAttendanceState(
                         user_profile=user_profile,
-                        status='ACTIVE',
-                        end_date__gte=timezone.now().date()
-                    ).first()
-                if membership:
-                    ent = membership.entitlements.filter(status='ACTIVE').filter(
-                        models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
-                    ).first()
-                    if not ent:
-                        raise ValidationError("No membership entitlement sessions available.")
-                    MembershipLifecycleService.consume_entitlement(
-                        membership=membership,
-                        entitlement_type=ent.entitlement_type,
-                        units=Decimal('1.00'),
-                        reason_text="Class booking reservation",
-                        created_by_user=created_by_user
+                        attendance_policy_set=attendance_policy,
+                        current_max_advance_bookings=attendance_policy.normal_max_advance_bookings,
+                        booking_mode='NORMAL'
                     )
-                    entitlement = ent
+                    member_state.save(using=alias)
+                # Check restriction
+                if member_state.booking_mode == 'SINGLE_BOOKING':
+                    active_advance = Booking.objects.using(alias).filter(
+                        user_profile=user_profile,
+                        status__in=['CONFIRMED', 'RESERVED'],
+                        occurrence__start_at__gt=timezone.now()
+                    ).count()
+                    if active_advance >= member_state.current_max_advance_bookings:
+                        raise ValidationError(
+                            f"Booking restricted due to previous no-shows. Maximum active advance bookings allowed: {member_state.current_max_advance_bookings}."
+                        )
 
-            booking = Booking.objects.create(
-                booking_number=booking_number,
-                user_profile=user_profile,
-                membership=membership,
-                entitlement=entitlement,
-                occurrence=occurrence,
-                branch=branch,
-                booking_type=booking_type,
-                booking_source=booking_source,
-                status='CONFIRMED',
-                booked_at=timezone.now(),
-                created_by_user=created_by_user,
-            )
-
-            BookingStatusHistory.objects.create(
-                booking=booking,
-                from_status=None,
-                to_status='CONFIRMED',
-                reason_code='INITIAL_BOOKING',
-                reason_text='Confirmed booking created with session entitlement allocation',
-                changed_by_user=created_by_user,
-                changed_at=timezone.now()
-            )
-
-            record_business_audit(
+            # 3. Check Booking Policy
+            booking_policy = BookingPolicySet.objects.using(alias).filter(
                 organization=organization,
-                module='BOOKINGS',
-                action_code='BOOKING_CONFIRMED',
-                entity_type='Booking',
-                entity_id=booking.id,
-                branch=branch,
-                actor_user=created_by_user,
-                metadata={'booking_number': booking_number, 'occurrence_id': str(occurrence.id)}
-            )
+                status='ACTIVE'
+            ).first()
 
-            enqueue_outbox_event(
-                organization=organization,
-                event_type='BOOKING_CONFIRMED',
-                aggregate_type='Booking',
-                aggregate_id=booking.id,
-                payload={'booking_number': booking_number, 'user_id': str(user_profile.id), 'occurrence_id': str(occurrence.id)}
-            )
+            # Generate unique booking number
+            booking_number = f"BK-{timezone.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
 
-            return booking
-
-        else:
-            # Capacity is full: evaluate waitlist
-            allow_waitlist = booking_policy.allow_waitlist if booking_policy else True
-            waitlist_cap = booking_policy.waitlist_capacity if (booking_policy and booking_policy.waitlist_capacity) else 20
-
-            current_waitlist_count = Booking.objects.filter(occurrence=occurrence, status='WAITLISTED').count()
-            if not allow_waitlist or current_waitlist_count >= waitlist_cap:
-                raise ValidationError("Class occurrence capacity and waitlist are completely full.")
-
-            next_position = current_waitlist_count + 1
-
-            booking = Booking.objects.create(
-                booking_number=booking_number,
-                user_profile=user_profile,
-                membership=membership,
-                entitlement=None,
+            # 4. Check Occurrence Capacity dynamically
+            enrolled_count = Booking.objects.using(alias).filter(
                 occurrence=occurrence,
-                branch=branch,
-                booking_type=booking_type,
-                booking_source=booking_source,
-                status='WAITLISTED',
-                waitlist_position=next_position,
-                booked_at=timezone.now(),
-                created_by_user=created_by_user,
-            )
+                status__in=['CONFIRMED', 'RESERVED', 'COMPLETED']
+            ).count()
+            is_capacity_available = enrolled_count < occurrence.capacity
 
-            BookingStatusHistory.objects.create(
-                booking=booking,
-                from_status=None,
-                to_status='WAITLISTED',
-                reason_code='WAITLIST_JOINED',
-                reason_text=f'Joined waitlist at position {next_position}',
-                changed_by_user=created_by_user,
-                changed_at=timezone.now()
-            )
+            if is_capacity_available:
+                # Consume entitlement if member booking
+                entitlement = None
+                if booking_type == 'MEMBER':
+                    if not membership:
+                        # Find active membership with available entitlement
+                        membership = Membership.objects.using(alias).filter(
+                            user_profile=user_profile,
+                            status='ACTIVE',
+                            end_date__gte=timezone.now().date()
+                        ).first()
+                    if membership:
+                        ent = membership.entitlements.using(alias).filter(status='ACTIVE').filter(
+                            models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
+                        ).first()
+                        if not ent:
+                            raise ValidationError("No membership entitlement sessions available.")
+                        MembershipLifecycleService.consume_entitlement(
+                            membership=membership,
+                            entitlement_type=ent.entitlement_type,
+                            units=Decimal('1.00'),
+                            reason_text="Class booking reservation",
+                            created_by_user=created_by_user,
+                            db_alias=alias,
+                        )
+                        entitlement = ent
 
-            BookingWaitlistEvent.objects.create(
-                booking=booking,
-                occurrence=occurrence,
-                event_type='JOINED',
-                new_position=next_position,
-                reason='Class capacity full at booking time',
-                triggered_by_type='USER' if created_by_user else 'SYSTEM',
-                triggered_by_user=created_by_user,
-                created_at=timezone.now()
-            )
+                booking = Booking.objects.using(alias).create(
+                    booking_number=booking_number,
+                    user_profile=user_profile,
+                    membership=membership,
+                    entitlement=entitlement,
+                    occurrence=occurrence,
+                    branch=branch,
+                    booking_type=booking_type,
+                    booking_source=booking_source,
+                    status='CONFIRMED',
+                    booked_at=timezone.now(),
+                    created_by_user=created_by_user,
+                )
 
-            return booking
+                BookingStatusHistory.objects.using(alias).create(
+                    booking=booking,
+                    from_status=None,
+                    to_status='CONFIRMED',
+                    reason_code='INITIAL_BOOKING',
+                    reason_text='Confirmed booking created with session entitlement allocation',
+                    changed_by_user=created_by_user,
+                    changed_at=timezone.now()
+                )
+
+                record_business_audit(
+                    organization=organization,
+                    module='BOOKINGS',
+                    action_code='BOOKING_CONFIRMED',
+                    entity_type='Booking',
+                    entity_id=booking.id,
+                    branch=branch,
+                    actor_user=created_by_user,
+                    metadata={'booking_number': booking_number, 'occurrence_id': str(occurrence.id)},
+                    db_alias=alias,
+                )
+
+                enqueue_outbox_event(
+                    organization=organization,
+                    event_type='BOOKING_CONFIRMED',
+                    aggregate_type='Booking',
+                    aggregate_id=booking.id,
+                    payload={'booking_number': booking_number, 'user_id': str(user_profile.id), 'occurrence_id': str(occurrence.id)},
+                    db_alias=alias,
+                )
+
+                return booking
+
+            else:
+                # Capacity is full: evaluate waitlist
+                allow_waitlist = booking_policy.allow_waitlist if booking_policy else True
+                waitlist_cap = booking_policy.waitlist_capacity if (booking_policy and booking_policy.waitlist_capacity) else 20
+
+                current_waitlist_count = Booking.objects.using(alias).filter(occurrence=occurrence, status='WAITLISTED').count()
+                if not allow_waitlist or current_waitlist_count >= waitlist_cap:
+                    raise ValidationError("Class occurrence capacity and waitlist are completely full.")
+
+                next_position = current_waitlist_count + 1
+
+                booking = Booking.objects.using(alias).create(
+                    booking_number=booking_number,
+                    user_profile=user_profile,
+                    membership=membership,
+                    entitlement=None,
+                    occurrence=occurrence,
+                    branch=branch,
+                    booking_type=booking_type,
+                    booking_source=booking_source,
+                    status='WAITLISTED',
+                    waitlist_position=next_position,
+                    booked_at=timezone.now(),
+                    created_by_user=created_by_user,
+                )
+
+                BookingStatusHistory.objects.using(alias).create(
+                    booking=booking,
+                    from_status=None,
+                    to_status='WAITLISTED',
+                    reason_code='WAITLIST_JOINED',
+                    reason_text=f'Joined waitlist at position {next_position}',
+                    changed_by_user=created_by_user,
+                    changed_at=timezone.now()
+                )
+
+                BookingWaitlistEvent.objects.using(alias).create(
+                    booking=booking,
+                    occurrence=occurrence,
+                    event_type='JOINED',
+                    new_position=next_position,
+                    reason='Class capacity full at booking time',
+                    triggered_by_type='USER' if created_by_user else 'SYSTEM',
+                    triggered_by_user=created_by_user,
+                    created_at=timezone.now()
+                )
+
+                return booking
 
     @classmethod
     @transaction.atomic
@@ -355,89 +368,92 @@ class BookingWaitlistAttendanceService:
         return cancellation_record
 
     @classmethod
-    @transaction.atomic
-    def auto_promote_from_waitlist(cls, occurrence: ClassOccurrence) -> Booking:
-        enrolled_count = Booking.objects.filter(
-            occurrence=occurrence,
-            status__in=['CONFIRMED', 'RESERVED', 'COMPLETED']
-        ).count()
-        if enrolled_count >= occurrence.capacity:
-            return None
+    def auto_promote_from_waitlist(cls, occurrence: ClassOccurrence, db_alias: str = None) -> Booking:
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        with transaction.atomic(using=alias):
+            occurrence = ClassOccurrence.objects.using(alias).select_for_update().get(id=occurrence.id)
+            enrolled_count = Booking.objects.using(alias).filter(
+                occurrence=occurrence,
+                status__in=['CONFIRMED', 'RESERVED', 'COMPLETED']
+            ).count()
+            if enrolled_count >= occurrence.capacity:
+                return None
 
-        top_waitlisted = Booking.objects.filter(
-            occurrence=occurrence,
-            status='WAITLISTED'
-        ).order_by('waitlist_position', 'booked_at').first()
+            top_waitlisted = Booking.objects.using(alias).select_for_update().filter(
+                occurrence=occurrence,
+                status='WAITLISTED'
+            ).order_by('waitlist_position', 'booked_at').first()
 
-        if not top_waitlisted:
-            return None
+            if not top_waitlisted:
+                return None
 
-        # Check & consume entitlement
-        membership = top_waitlisted.membership
-        entitlement = None
-        if top_waitlisted.booking_type == 'MEMBER':
-            if not membership:
-                membership = Membership.objects.filter(
-                    user_profile=top_waitlisted.user_profile,
-                    status='ACTIVE',
-                    end_date__gte=timezone.now().date()
-                ).first()
-            if membership:
-                ent = membership.entitlements.filter(status='ACTIVE').filter(
-                    models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
-                ).first()
-                if ent:
-                    MembershipLifecycleService.consume_entitlement(
-                        membership=membership,
-                        entitlement_type=ent.entitlement_type,
-                        units=Decimal('1.00'),
-                        booking_id=top_waitlisted.id,
-                        reason_text="Promoted from waitlist to confirmed",
-                        created_by_user=None
-                    )
-                    entitlement = ent
+            # Check & consume entitlement
+            membership = top_waitlisted.membership
+            entitlement = None
+            if top_waitlisted.booking_type == 'MEMBER':
+                if not membership:
+                    membership = Membership.objects.using(alias).filter(
+                        user_profile=top_waitlisted.user_profile,
+                        status='ACTIVE',
+                        end_date__gte=timezone.now().date()
+                    ).first()
+                if membership:
+                    ent = membership.entitlements.filter(status='ACTIVE').filter(
+                        models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
+                    ).first()
+                    if ent:
+                        MembershipLifecycleService.consume_entitlement(
+                            membership=membership,
+                            entitlement_type=ent.entitlement_type,
+                            units=Decimal('1.00'),
+                            booking_id=top_waitlisted.id,
+                            reason_text="Promoted from waitlist to confirmed",
+                            created_by_user=None,
+                            db_alias=alias,
+                        )
+                        entitlement = ent
 
-        old_position = top_waitlisted.waitlist_position
-        top_waitlisted.status = 'CONFIRMED'
-        top_waitlisted.waitlist_position = None
-        top_waitlisted.membership = membership
-        top_waitlisted.entitlement = entitlement
-        top_waitlisted.save()
+            old_position = top_waitlisted.waitlist_position
+            top_waitlisted.status = 'CONFIRMED'
+            top_waitlisted.waitlist_position = None
+            top_waitlisted.membership = membership
+            top_waitlisted.entitlement = entitlement
+            top_waitlisted.save(using=alias)
 
-        BookingWaitlistEvent.objects.create(
-            booking=top_waitlisted,
-            occurrence=occurrence,
-            event_type='PROMOTED',
-            old_position=old_position,
-            new_position=None,
-            reason='Auto-promoted from waitlist into open class spot',
-            triggered_by_type='SYSTEM',
-            created_at=timezone.now()
-        )
+            BookingWaitlistEvent.objects.using(alias).create(
+                booking=top_waitlisted,
+                occurrence=occurrence,
+                event_type='PROMOTED',
+                old_position=old_position,
+                new_position=None,
+                reason='Auto-promoted from waitlist into open class spot',
+                triggered_by_type='SYSTEM',
+                created_at=timezone.now()
+            )
 
-        BookingStatusHistory.objects.create(
-            booking=top_waitlisted,
-            from_status='WAITLISTED',
-            to_status='CONFIRMED',
-            reason_code='AUTO_PROMOTION',
-            reason_text='Promoted into open slot after cancellation',
-            changed_by_user=None,
-            changed_at=timezone.now()
-        )
+            BookingStatusHistory.objects.using(alias).create(
+                booking=top_waitlisted,
+                from_status='WAITLISTED',
+                to_status='CONFIRMED',
+                reason_code='AUTO_PROMOTION',
+                reason_text='Promoted into open slot after cancellation',
+                changed_by_user=None,
+                changed_at=timezone.now()
+            )
 
-        # Shift remaining waitlisted bookings down
-        remaining = Booking.objects.filter(
-            occurrence=occurrence,
-            status='WAITLISTED'
-        ).order_by('waitlist_position')
-        new_pos = 1
-        for b in remaining:
-            if b.waitlist_position != new_pos:
-                b.waitlist_position = new_pos
-                b.save(update_fields=['waitlist_position'])
-            new_pos += 1
+            # Shift remaining waitlisted bookings down
+            remaining = Booking.objects.using(alias).filter(
+                occurrence=occurrence,
+                status='WAITLISTED'
+            ).order_by('waitlist_position')
+            new_pos = 1
+            for b in remaining:
+                if b.waitlist_position != new_pos:
+                    b.waitlist_position = new_pos
+                    b.save(using=alias, update_fields=['waitlist_position'])
+                new_pos += 1
 
-        return top_waitlisted
+            return top_waitlisted
 
     @classmethod
     @transaction.atomic

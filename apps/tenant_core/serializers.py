@@ -379,24 +379,37 @@ class TenantUserCreateSerializer(TenantUserSerializer):
                 user.set_password(uuid.uuid4().hex)
             user.save(using=db_alias)
 
-            # 6. Create RoleAssignment if role specified or default safely to active role
+            # 6. Create RoleAssignment if role specified — STRICT: No silent fallback
             target_role = None
             if role_id_param:
                 try:
-                    target_role = Role.objects.using(db_alias).filter(id=uuid.UUID(str(role_id_param)), is_active=True).first()
+                    target_role = Role.objects.using(db_alias).filter(
+                        id=uuid.UUID(str(role_id_param)),
+                        organization=org,
+                        is_active=True,
+                        status='ACTIVE',
+                    ).first()
                 except Exception:
-                    target_role = Role.objects.using(db_alias).filter(code=str(role_id_param), is_active=True).first()
-            if not target_role and role_param:
+                    target_role = Role.objects.using(db_alias).filter(
+                        code=str(role_id_param),
+                        organization=org,
+                        is_active=True,
+                        status='ACTIVE',
+                    ).first()
+                if not target_role:
+                    raise serializers.ValidationError({
+                        'role_id': f"Active role '{role_id_param}' not found in current organization."
+                    })
+
+            elif role_param:
                 target_role = (
-                    Role.objects.using(db_alias).filter(code__iexact=str(role_param), is_active=True).first() or
-                    Role.objects.using(db_alias).filter(name__iexact=str(role_param), is_active=True).first()
+                    Role.objects.using(db_alias).filter(code__iexact=str(role_param), organization=org, is_active=True, status='ACTIVE').first() or
+                    Role.objects.using(db_alias).filter(name__iexact=str(role_param), organization=org, is_active=True, status='ACTIVE').first()
                 )
-            if not target_role:
-                target_role = (
-                    Role.objects.using(db_alias).filter(code__in=['STAFF', 'GENERAL_STAFF', 'TRAINER'], is_active=True).first() or
-                    Role.objects.using(db_alias).filter(is_active=True).exclude(code='ORG_ADMIN').first() or
-                    Role.objects.using(db_alias).filter(is_active=True).first()
-                )
+                if not target_role:
+                    raise serializers.ValidationError({
+                        'role': f"Active role '{role_param}' not found in current organization."
+                    })
 
             # Safeguard actor FK constraint on tenant DB
             actor = None

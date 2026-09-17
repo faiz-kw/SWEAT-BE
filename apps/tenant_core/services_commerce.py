@@ -183,7 +183,6 @@ class CommerceService:
         return order
 
     @classmethod
-    @transaction.atomic
     def record_payment(
         cls,
         order_id: str,
@@ -201,131 +200,116 @@ class CommerceService:
         If payment completes the balance, marks order as PAID and automatically issues MemberInvoice.
         """
         alias = db_alias or 'default'
+        with transaction.atomic(using=alias):
+            order = Order.objects.using(alias).select_for_update().get(id=order_id)
+            if order.status in ['CANCELLED', 'REFUNDED']:
+                raise ValidationError(f"Cannot accept payment for order with status {order.status}.")
 
-        # 1. Idempotency check
-        if idempotency_key:
-            existing_txn = PaymentTransaction.objects.using(alias).filter(
-                idempotency_key=idempotency_key,
-                status='SUCCESS',
-            ).first()
-            if existing_txn:
-                invoice = MemberInvoice.objects.using(alias).filter(order_id=order_id).first()
-                return existing_txn, invoice
+            # 1. Idempotency check inside lock (protects against concurrent duplicate webhooks)
+            if idempotency_key:
+                existing_txn = PaymentTransaction.objects.using(alias).filter(
+                    idempotency_key=idempotency_key,
+                    status='SUCCESS',
+                ).first()
+                if existing_txn:
+                    invoice = MemberInvoice.objects.using(alias).filter(order=order).first()
+                    return existing_txn, invoice
 
-        order = Order.objects.using(alias).select_for_update().get(id=order_id)
-        if order.status in ['CANCELLED', 'REFUNDED']:
-            raise ValidationError(f"Cannot accept payment for order with status {order.status}.")
+            if provider_transaction_id:
+                existing_txn = PaymentTransaction.objects.using(alias).filter(
+                    provider_transaction_id=provider_transaction_id,
+                    status='SUCCESS',
+                ).first()
+                if existing_txn:
+                    invoice = MemberInvoice.objects.using(alias).filter(order=order).first()
+                    return existing_txn, invoice
 
-        amt = Decimal(str(amount))
-        if amt <= Decimal('0.00'):
-            raise ValidationError("Payment amount must be greater than zero.")
+            amt = Decimal(str(amount))
+            if amt <= Decimal('0.00'):
+                raise ValidationError("Payment amount must be greater than zero.")
 
-        # Create payment record
-        txn = PaymentTransaction(
-            order=order,
-            user_profile=order.user_profile,
-            provider=provider,
-            payment_method=payment_method,
-            provider_transaction_id=provider_transaction_id,
-            idempotency_key=idempotency_key,
-            amount=amt,
-            currency=order.currency,
-            status='SUCCESS',
-            paid_at=timezone.now(),
-            metadata=metadata or {},
-        )
-        txn.save(using=alias)
-
-        # Compute total paid
-        successful_payments = PaymentTransaction.objects.using(alias).filter(
-            order=order,
-            status='SUCCESS',
-        )
-        total_paid = sum(p.amount for p in successful_payments)
-
-        invoice = None
-        if total_paid >= order.total_amount:
-            order.status = 'PAID'
-            order.save(using=alias)
-
-            # Issue MemberInvoice
-            invoice_number = f"INV-{uuid.uuid4().hex[:8].upper()}"
-            invoice = MemberInvoice(
-                invoice_number=invoice_number,
+            # Create payment record
+            txn = PaymentTransaction(
                 order=order,
                 user_profile=order.user_profile,
-                branch=order.branch,
-                subtotal=order.subtotal,
-                discount_amount=order.discount_amount,
-                reward_amount=order.reward_amount,
-                tax_amount=order.tax_amount,
-                total_amount=order.total_amount,
+                provider=provider,
+                payment_method=payment_method,
+                provider_transaction_id=provider_transaction_id,
+                idempotency_key=idempotency_key,
+                amount=amt,
                 currency=order.currency,
-                status='PAID',
-                issued_at=timezone.now(),
+                status='SUCCESS',
+                paid_at=timezone.now(),
+                metadata=metadata or {},
             )
-            invoice.save(using=alias)
+            txn.save(using=alias)
+
+            # Compute total paid
+            successful_payments = PaymentTransaction.objects.using(alias).filter(
+                order=order,
+                status='SUCCESS',
+            )
+            total_paid = sum(p.amount for p in successful_payments)
+
+            invoice = None
+            if total_paid >= order.total_amount:
+                order.status = 'PAID'
+                order.save(using=alias)
+
+                # Issue MemberInvoice
+                invoice_number = f"INV-{uuid.uuid4().hex[:8].upper()}"
+                invoice = MemberInvoice(
+                    invoice_number=invoice_number,
+                    order=order,
+                    user_profile=order.user_profile,
+                    branch=order.branch,
+                    subtotal=order.subtotal,
+                    discount_amount=order.discount_amount,
+                    reward_amount=order.reward_amount,
+                    tax_amount=order.tax_amount,
+                    total_amount=order.total_amount,
+                    status='PAID',
+                    issued_at=timezone.now(),
+                )
+                invoice.save(using=alias)
+            else:
+                order.status = 'PARTIALLY_PAID'
+                order.save(using=alias)
 
             record_business_audit(
                 organization=order.branch.organization,
                 branch=order.branch,
                 module='commerce',
-                action_code='INVOICE_ISSUED',
-                entity_type='MemberInvoice',
-                entity_id=invoice.id,
+                action_code='PAYMENT_RECORDED',
+                entity_type='PaymentTransaction',
+                entity_id=txn.id,
                 actor_user=actor,
-                event_description=f"Issued invoice {invoice.invoice_number} for Order {order.order_number}",
-                after_data={'invoice_number': invoice.invoice_number, 'amount': str(invoice.total_amount)},
+                metadata={
+                    'order_id': str(order.id),
+                    'amount': str(amt),
+                    'provider': provider,
+                    'status': txn.status,
+                },
                 db_alias=alias,
             )
 
             enqueue_outbox_event(
                 organization=order.branch.organization,
-                event_type='INVOICE_ISSUED',
-                aggregate_type='MemberInvoice',
-                aggregate_id=str(invoice.id),
-                payload={'invoice_number': invoice.invoice_number, 'order_id': str(order.id)},
+                event_type='commerce.payment_recorded',
+                aggregate_type='PaymentTransaction',
+                aggregate_id=txn.id,
+                payload={
+                    'payment_id': str(txn.id),
+                    'order_id': str(order.id),
+                    'amount': str(amt),
+                    'status': txn.status,
+                },
                 db_alias=alias,
             )
-        else:
-            order.status = 'PARTIALLY_PAID'
-            order.save(using=alias)
 
-        record_business_audit(
-            organization=order.branch.organization,
-            branch=order.branch,
-            module='commerce',
-            action_code='PAYMENT_RECORDED',
-            entity_type='PaymentTransaction',
-            entity_id=txn.id,
-            actor_user=actor,
-            event_description=f"Recorded payment of {amt} {order.currency} via {provider} for Order {order.order_number}",
-            after_data={
-                'order_id': str(order.id),
-                'amount': str(amt),
-                'provider': provider,
-                'order_status': order.status,
-            },
-            db_alias=alias,
-        )
-
-        enqueue_outbox_event(
-            organization=order.branch.organization,
-            event_type='PAYMENT_SUCCESS',
-            aggregate_type='PaymentTransaction',
-            aggregate_id=str(txn.id),
-            payload={
-                'order_id': str(order.id),
-                'amount': str(amt),
-                'order_status': order.status,
-            },
-            db_alias=alias,
-        )
-
-        return txn, invoice
+            return txn, invoice
 
     @classmethod
-    @transaction.atomic
     def process_refund(
         cls,
         payment_transaction_id: str,
@@ -337,65 +321,79 @@ class CommerceService:
         db_alias: Optional[str] = None,
     ) -> Refund:
         alias = db_alias or 'default'
-        txn = PaymentTransaction.objects.using(alias).select_for_update().get(id=payment_transaction_id)
-        if txn.status != 'SUCCESS':
-            raise ValidationError(f"Cannot refund a payment transaction with status {txn.status}.")
+        with transaction.atomic(using=alias):
+            txn = PaymentTransaction.objects.using(alias).select_for_update().get(id=payment_transaction_id)
+            if txn.status not in ['SUCCESS', 'PARTIALLY_REFUNDED']:
+                raise ValidationError(f"Cannot refund a payment transaction with status {txn.status}.")
 
-        refund_amt = Decimal(str(amount))
-        if refund_amt <= Decimal('0.00') or refund_amt > txn.amount:
-            raise ValidationError(f"Refund amount must be between 0.01 and transaction amount ({txn.amount}).")
+            refund_amt = Decimal(str(amount))
+            if refund_amt <= Decimal('0.00'):
+                raise ValidationError("Refund amount must be greater than 0.")
 
-        refund = Refund(
-            payment_transaction=txn,
-            order=txn.order,
-            amount=refund_amt,
-            reason_code=reason_code,
-            reason_text=reason_text,
-            provider_reference=provider_reference,
-            status='SUCCESS',
-            requested_by_user=actor,
-            approved_by_user=actor,
-        )
-        refund.save(using=alias)
+            existing_refunds = Refund.objects.using(alias).filter(payment_transaction=txn, status='SUCCESS')
+            already_refunded = sum(r.amount for r in existing_refunds)
+            if already_refunded + refund_amt > txn.amount:
+                raise ValidationError(
+                    f"Total refund amount ({already_refunded + refund_amt}) cannot exceed captured transaction amount ({txn.amount})."
+                )
 
-        txn.status = 'REFUNDED'
-        txn.save(using=alias)
+            refund = Refund(
+                payment_transaction=txn,
+                order=txn.order,
+                amount=refund_amt,
+                reason_code=reason_code,
+                reason_text=reason_text,
+                provider_reference=provider_reference,
+                status='SUCCESS',
+                requested_by_user=actor,
+                approved_by_user=actor,
+            )
+            refund.save(using=alias)
 
-        order = txn.order
-        order.status = 'REFUNDED'
-        order.save(using=alias)
+            total_refunded_now = already_refunded + refund_amt
+            if total_refunded_now >= txn.amount:
+                txn.status = 'REFUNDED'
+                order_status = 'REFUNDED'
+            else:
+                txn.status = 'PARTIALLY_REFUNDED'
+                order_status = 'PARTIALLY_REFUNDED'
+            txn.save(using=alias)
 
-        record_business_audit(
-            organization=order.branch.organization,
-            branch=order.branch,
-            module='commerce',
-            action_code='REFUND_PROCESSED',
-            entity_type='Refund',
-            entity_id=refund.id,
-            actor_user=actor,
-            event_description=f"Processed refund of {refund_amt} for Order {order.order_number}",
-            after_data={
-                'order_id': str(order.id),
-                'amount': str(refund_amt),
-                'reason': reason_text,
-            },
-            db_alias=alias,
-        )
+            order = txn.order
+            order.status = order_status
+            order.save(using=alias)
 
-        enqueue_outbox_event(
-            organization=order.branch.organization,
-            event_type='REFUND_PROCESSED',
-            aggregate_type='Refund',
-            aggregate_id=str(refund.id),
-            payload={
-                'order_id': str(order.id),
-                'refund_id': str(refund.id),
-                'amount': str(refund_amt),
-            },
-            db_alias=alias,
-        )
+            record_business_audit(
+                organization=order.branch.organization,
+                branch=order.branch,
+                module='commerce',
+                action_code='REFUND_PROCESSED',
+                entity_type='Refund',
+                entity_id=refund.id,
+                actor_user=actor,
+                event_description=f"Processed refund of {refund_amt} for Order {order.order_number}",
+                after_data={
+                    'order_id': str(order.id),
+                    'amount': str(refund_amt),
+                    'reason': reason_text,
+                },
+                db_alias=alias,
+            )
 
-        return refund
+            enqueue_outbox_event(
+                organization=order.branch.organization,
+                event_type='REFUND_PROCESSED',
+                aggregate_type='Refund',
+                aggregate_id=str(refund.id),
+                payload={
+                    'order_id': str(order.id),
+                    'refund_id': str(refund.id),
+                    'amount': str(refund_amt),
+                },
+                db_alias=alias,
+            )
+
+            return refund
 
     @classmethod
     @transaction.atomic

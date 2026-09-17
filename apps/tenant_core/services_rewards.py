@@ -159,7 +159,6 @@ class ReferralRewardService:
         return ledger
 
     @classmethod
-    @transaction.atomic
     def redeem_rewards(
         cls,
         user_profile: UserProfile,
@@ -176,93 +175,96 @@ class ReferralRewardService:
         Debits points or wallet credit for checkout redemption or gift card conversions.
         """
         alias = db_alias or get_current_tenant_db_alias() or 'default'
-        account = cls.get_or_create_reward_account(user_profile, db_alias=alias)
+        with transaction.atomic(using=alias):
+            account = cls.get_or_create_reward_account(user_profile, db_alias=alias)
+            # Lock reward account to serialize concurrent redemptions against balance
+            account = RewardAccount.objects.using(alias).select_for_update().get(id=account.id)
 
-        if account.status != 'ACTIVE':
-            raise ValidationError(f"Cannot redeem rewards: Reward account is {account.status}.")
+            if account.status != 'ACTIVE':
+                raise ValidationError(f"Cannot redeem rewards: Reward account is {account.status}.")
 
-        if quantity <= Decimal('0.00'):
-            raise ValidationError("Redeem quantity must be strictly positive.")
+            if quantity <= Decimal('0.00'):
+                raise ValidationError("Redeem quantity must be strictly positive.")
 
-        if reward_type == 'POINTS':
-            if account.points_balance < quantity:
-                raise ValidationError(
-                    f"Insufficient points. Available: {account.points_balance}, Required: {quantity}."
-                )
-            account.points_balance -= quantity
-            balance_after = account.points_balance
-        elif reward_type == 'CREDIT':
-            if account.credit_balance < quantity:
-                raise ValidationError(
-                    f"Insufficient credit balance. Available: {account.credit_balance}, Required: {quantity}."
-                )
-            account.credit_balance -= quantity
-            balance_after = account.credit_balance
-        else:
-            balance_after = Decimal('0.00')
+            if reward_type == 'POINTS':
+                if account.points_balance < quantity:
+                    raise ValidationError(
+                        f"Insufficient points. Available: {account.points_balance}, Required: {quantity}."
+                    )
+                account.points_balance -= quantity
+                balance_after = account.points_balance
+            elif reward_type == 'CREDIT':
+                if account.credit_balance < quantity:
+                    raise ValidationError(
+                        f"Insufficient credit balance. Available: {account.credit_balance}, Required: {quantity}."
+                    )
+                account.credit_balance -= quantity
+                balance_after = account.credit_balance
+            else:
+                balance_after = Decimal('0.00')
 
-        account.lifetime_redeemed += quantity
-        account.save(using=alias, update_fields=['points_balance', 'credit_balance', 'lifetime_redeemed', 'updated_at'])
+            account.lifetime_redeemed += quantity
+            account.save(using=alias, update_fields=['points_balance', 'credit_balance', 'lifetime_redeemed', 'updated_at'])
 
-        ledger = RewardLedger.objects.using(alias).create(
-            reward_account=account,
-            user_profile=user_profile,
-            transaction_type='REDEEM',
-            reward_type=reward_type,
-            quantity=-quantity,
-            order=order,
-            reason_code=reason_code,
-            reason=reason or f"Redeemed {quantity} {reward_type}",
-            balance_after=balance_after,
-            created_by_user=created_by_user,
-        )
-
-        redemption = None
-        if order:
-            effective_val = monetary_value if monetary_value is not None else quantity
-            redemption = OrderRewardRedemption.objects.using(alias).create(
-                order=order,
+            ledger = RewardLedger.objects.using(alias).create(
                 reward_account=account,
-                reward_ledger=ledger,
+                user_profile=user_profile,
+                transaction_type='REDEEM',
                 reward_type=reward_type,
-                units_redeemed=quantity,
-                monetary_value=effective_val,
+                quantity=-quantity,
+                order=order,
+                reason_code=reason_code,
+                reason=reason or f"Redeemed {quantity} {reward_type}",
+                balance_after=balance_after,
+                created_by_user=created_by_user,
             )
 
-        org = user_profile.user.organization
-        record_business_audit(
-            organization=org,
-            module='rewards',
-            action_code='REWARD_REDEEMED',
-            entity_type='RewardAccount',
-            entity_id=account.id,
-            actor_user=created_by_user,
-            metadata={
-                'user_profile_id': str(user_profile.id),
-                'reward_type': reward_type,
-                'quantity': str(quantity),
-                'balance_after': str(balance_after),
-                'order_id': str(order.id) if order else None,
-            },
-            db_alias=alias,
-        )
+            redemption = None
+            if order:
+                effective_val = monetary_value if monetary_value is not None else quantity
+                redemption = OrderRewardRedemption.objects.using(alias).create(
+                    order=order,
+                    reward_account=account,
+                    reward_ledger=ledger,
+                    reward_type=reward_type,
+                    units_redeemed=quantity,
+                    monetary_value=effective_val,
+                )
 
-        enqueue_outbox_event(
-            organization=org,
-            event_type='rewards.redeemed',
-            aggregate_type='RewardAccount',
-            aggregate_id=account.id,
-            payload={
-                'account_id': str(account.id),
-                'user_profile_id': str(user_profile.id),
-                'reward_type': reward_type,
-                'quantity': str(quantity),
-                'balance_after': str(balance_after),
-            },
-            db_alias=alias,
-        )
+            org = user_profile.user.organization
+            record_business_audit(
+                organization=org,
+                module='rewards',
+                action_code='REWARD_REDEEMED',
+                entity_type='RewardAccount',
+                entity_id=account.id,
+                actor_user=created_by_user,
+                metadata={
+                    'user_profile_id': str(user_profile.id),
+                    'reward_type': reward_type,
+                    'quantity': str(quantity),
+                    'balance_after': str(balance_after),
+                    'order_id': str(order.id) if order else None,
+                },
+                db_alias=alias,
+            )
 
-        return ledger, redemption
+            enqueue_outbox_event(
+                organization=org,
+                event_type='rewards.redeemed',
+                aggregate_type='RewardAccount',
+                aggregate_id=account.id,
+                payload={
+                    'account_id': str(account.id),
+                    'user_profile_id': str(user_profile.id),
+                    'reward_type': reward_type,
+                    'quantity': str(quantity),
+                    'balance_after': str(balance_after),
+                },
+                db_alias=alias,
+            )
+
+            return ledger, redemption
 
     # -------------------------------------------------------------------------
     # REFERRAL LIFECYCLE

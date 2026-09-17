@@ -287,6 +287,45 @@ class TenantModule(models.Model):
         super().save(*args, **kwargs)
 
 
+class ResourceMetricQuerySet(models.QuerySet):
+    def _translate_kwargs(self, kwargs):
+        t = {}
+        for k, v in kwargs.items():
+            if k == 'metric_type':
+                t['unit'] = v
+            elif k.startswith('metric_type__'):
+                t['unit__' + k[13:]] = v
+            elif k == 'aggregation_method':
+                t['aggregation_period'] = v
+            elif k.startswith('aggregation_method__'):
+                t['aggregation_period__' + k[21:]] = v
+            else:
+                t[k] = v
+        return t
+
+    def filter(self, *args, **kwargs):
+        return super().filter(*args, **self._translate_kwargs(kwargs))
+
+    def create(self, **kwargs):
+        return super().create(**self._translate_kwargs(kwargs))
+
+    def get_or_create(self, defaults=None, **kwargs):
+        if defaults is None:
+            defaults = kwargs.pop('defaults', None)
+        tr_kwargs = self._translate_kwargs(kwargs)
+        if defaults:
+            tr_kwargs['defaults'] = self._translate_kwargs(defaults)
+        return super().get_or_create(**tr_kwargs)
+
+    def update_or_create(self, defaults=None, **kwargs):
+        if defaults is None:
+            defaults = kwargs.pop('defaults', None)
+        tr_kwargs = self._translate_kwargs(kwargs)
+        if defaults:
+            tr_kwargs['defaults'] = self._translate_kwargs(defaults)
+        return super().update_or_create(**tr_kwargs)
+
+
 class ResourceMetric(models.Model):
     """
     Catalogue of measurable resource metrics (e.g. active_members, storage_gb, ai_minutes).
@@ -303,10 +342,35 @@ class ResourceMetric(models.Model):
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(default=timezone.now)
 
+    objects = ResourceMetricQuerySet.as_manager()
+
     class Meta:
         app_label = 'master'
         db_table = 'resource_metrics'
         ordering = ['code']
+
+    def __init__(self, *args, **kwargs):
+        if 'metric_type' in kwargs and 'unit' not in kwargs:
+            kwargs['unit'] = kwargs.pop('metric_type')
+        if 'aggregation_method' in kwargs and 'aggregation_period' not in kwargs:
+            kwargs['aggregation_period'] = kwargs.pop('aggregation_method')
+        super().__init__(*args, **kwargs)
+
+    @property
+    def metric_type(self):
+        return self.unit
+
+    @metric_type.setter
+    def metric_type(self, val):
+        self.unit = val
+
+    @property
+    def aggregation_method(self):
+        return self.aggregation_period
+
+    @aggregation_method.setter
+    def aggregation_method(self, val):
+        self.aggregation_period = val
 
     def __str__(self):
         return f"{self.name} ({self.unit})"

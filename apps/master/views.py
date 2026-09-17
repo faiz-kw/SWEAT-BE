@@ -130,6 +130,56 @@ class TenantViewSet(viewsets.ModelViewSet):
                 tenant.deactivate(reason=request.data.get('reason', 'Admin toggle'))
         return Response(TenantSerializer(tenant).data)
 
+    @action(detail=True, methods=['get'], url_path='staff')
+    def staff(self, request, pk=None):
+        """
+        Secure Platform Control-Plane Read-Only Cross-Tenant Staff Endpoint.
+        Allows Platform Admins with 'tenants.view' or 'tenants.edit' to view staff in the tenant DB.
+        Resolves TenantDataSource server-side, connects to tenant DB alias, serializes safe fields, and closes context.
+        Zero data duplication in Master DB.
+        """
+        import sys
+        from django.conf import settings
+        from apps.master.models_infra import TenantDataSource
+        from apps.tenant_core.models_users import TenantUser
+        from apps.tenant_core.serializers import TenantUserSerializer
+        from config.routers import set_tenant_db_alias, get_tenant_db_alias, build_tenant_db_alias
+        from config.tenant_middleware import _register_tenant_connection
+
+        tenant = self.get_object()
+        ds = TenantDataSource.objects.using('default').filter(tenant=tenant).first()
+        if not ds:
+            return Response({'error': 'Tenant data source not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        db_name = ds.database_name or ds.db_name
+        if 'test' in sys.argv and 'tenant_test' in settings.DATABASES and (db_name in ('fitness_tenant', 'test_fitness_tenant', 'test')):
+            db_alias = 'tenant_test'
+        else:
+            db_alias = get_tenant_db_alias() or build_tenant_db_alias(tenant.id)
+
+        _register_tenant_connection(db_alias, db_name, data_source=ds, tenant_id=tenant.id)
+        set_tenant_db_alias(db_alias)
+        try:
+            users_qs = TenantUser.objects.using(db_alias).select_related('home_branch', 'organization').all().order_by('email')
+            # Support optional role or search filtering
+            search = request.query_params.get('search')
+            if search:
+                users_qs = users_qs.filter(
+                    models.Q(first_name__icontains=search) |
+                    models.Q(last_name__icontains=search) |
+                    models.Q(email__icontains=search)
+                )
+            serializer = TenantUserSerializer(users_qs, many=True)
+            return Response({
+                'tenant_id': str(tenant.id),
+                'tenant_slug': tenant.slug,
+                'tenant_name': tenant.name,
+                'count': users_qs.count(),
+                'results': serializer.data,
+            })
+        finally:
+            set_tenant_db_alias(None)
+
     @action(detail=False, methods=['get', 'post'], url_path='database-health')
     def database_health(self, request):
         from apps.master.models_infra import TenantDataSource, TenantDataSourceHealth

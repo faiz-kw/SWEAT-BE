@@ -5,6 +5,7 @@ Enforces real-time database-driven RBAC authorization and branch/resource scopin
 """
 
 import logging
+import uuid
 from django.db import transaction
 from rest_framework import viewsets, permissions, status
 from rest_framework.views import APIView
@@ -60,6 +61,28 @@ class TenantDBMixin:
                 'to access tenant-scoped resources.'
             )
         return alias
+
+    def get_tenant_id(self) -> str:
+        """Resolve current tenant ID from auth context or active DB alias."""
+        request = getattr(self, 'request', None)
+        if request and hasattr(request, 'user'):
+            tid = getattr(request.user, '_tenant_id', None)
+            if tid:
+                return str(tid)
+            if hasattr(request, 'auth') and isinstance(request.auth, dict):
+                tid = request.auth.get('tid')
+                if tid:
+                    return str(tid)
+
+        db_alias = self.get_db()
+        from apps.master.models_infra import TenantDataSource
+        clean_alias = db_alias.replace('tenant_tenant_', 'tenant_').replace('tenant_', '')
+        ds = TenantDataSource.objects.using('default').filter(
+            db_name__icontains=clean_alias
+        ).first()
+        if ds and ds.tenant_id:
+            return str(ds.tenant_id)
+        raise PermissionDenied('Could not resolve authoritative tenant context.')
 
     def get_queryset(self):
         if hasattr(super(), 'get_queryset'):
@@ -281,6 +304,10 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
     required_module = 'core'
     required_submodule = 'users'
     permission_prefix = 'core.users'
+    action_permission_map = {
+        'reactivate': 'core.users.edit',
+        'deactivate': 'core.users.delete',
+    }
     queryset = TenantUser.objects.all()
 
     def get_serializer_class(self):
@@ -354,6 +381,123 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
                     defaults={'scope_type': 'HOME', 'is_primary': True, 'relationship_type': 'PRIMARY', 'status': 'ACTIVE', 'is_active': True}
                 )
 
+    def perform_destroy(self, instance):
+        """
+        Lifecycle Deactivation instead of Physical Hard Delete.
+        Preserves user row, UUID, historical audit logs, role assignments, bookings, and ledger entries.
+        Revokes active sessions immediately.
+        """
+        db = self.get_db()
+        from django.utils import timezone
+        from apps.authentication.security import revoke_all_user_sessions
+        from .audit import emit_audit_event, snapshot_model_state
+
+        actor = self.request.user if hasattr(self.request, 'user') else None
+        before_state = snapshot_model_state(instance)
+
+        with transaction.atomic(using=db):
+            instance.status = 'DEACTIVATED'
+            instance.is_login_allowed = False
+            instance.deactivated_at = timezone.now()
+            if actor and hasattr(actor, 'id') and getattr(actor, '_auth_type', None) == 'tenant':
+                try:
+                    actor_obj = TenantUser.objects.using(db).filter(id=actor.id).first()
+                    instance.deactivated_by = actor_obj
+                except Exception:
+                    pass
+            instance.deactivation_reason = self.request.data.get('reason') or 'Deactivated via user management'
+            instance.save(using=db, update_fields=[
+                'status', 'is_login_allowed', 'deactivated_at', 'deactivated_by', 'deactivation_reason', 'updated_at'
+            ])
+
+            # Revoke all active sessions and blacklist tokens
+            try:
+                revoke_all_user_sessions(
+                    user_id=str(instance.id),
+                    user_type='tenant',
+                    actor_email=actor.email if (actor and hasattr(actor, 'email')) else None,
+                    client_ip=self.request.META.get('REMOTE_ADDR'),
+                    db_alias=db,
+                )
+            except Exception as e:
+                logger.warning("Failed to revoke sessions for deactivated user %s: %s", instance.id, e)
+
+            after_state = snapshot_model_state(instance)
+            emit_audit_event(
+                action='DEACTIVATE',
+                resource_type='TenantUser',
+                resource_id=str(instance.pk),
+                request=self.request,
+                instance=instance,
+                before_state=before_state,
+                after_state=after_state,
+                db_alias=db,
+                description=f"User {instance.email} deactivated (lifecycle preserved)."
+            )
+
+    @action(detail=True, methods=['post'], url_path='deactivate')
+    def deactivate(self, request, pk=None):
+        """Explicit POST action for lifecycle user deactivation."""
+        user = self.get_object()
+        self.perform_destroy(user)
+        serializer = self.get_serializer(user)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='reactivate')
+    def reactivate(self, request, pk=None):
+        """Lifecycle user reactivation reusing the SAME TenantUser UUID."""
+        user = self.get_object()
+        db = self.get_db()
+        from django.utils import timezone
+        from apps.master.quota import QuotaChecker, QuotaExceededError
+        from .audit import emit_audit_event, snapshot_model_state
+
+        tenant_id = self.get_tenant_id()
+        # Assert user quota before reactivating
+        try:
+            QuotaChecker.assert_quota_available(
+                tenant_id=tenant_id,
+                metric_code='ACTIVE_USERS',
+                db_alias=db,
+                requested_increment=1,
+            )
+        except QuotaExceededError as qe:
+            return Response(
+                {
+                    'detail': f"Active user quota exceeded ({qe.current_usage}/{qe.limit_value}). Upgrade your plan to add more staff.",
+                    'code': 'QUOTA_EXCEEDED',
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        before_state = snapshot_model_state(user)
+        with transaction.atomic(using=db):
+            user.status = 'ACTIVE'
+            user.is_login_allowed = True
+            user.activated_at = timezone.now()
+            user.deactivated_at = None
+            user.deactivated_by = None
+            user.deactivation_reason = None
+            user.save(using=db, update_fields=[
+                'status', 'is_login_allowed', 'activated_at', 'deactivated_at', 'deactivated_by', 'deactivation_reason', 'updated_at'
+            ])
+
+            after_state = snapshot_model_state(user)
+            emit_audit_event(
+                action='REACTIVATE',
+                resource_type='TenantUser',
+                resource_id=str(user.pk),
+                request=request,
+                instance=user,
+                before_state=before_state,
+                after_state=after_state,
+                db_alias=db,
+                description=f"User {user.email} reactivated."
+            )
+
+        serializer = self.get_serializer(user)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
 
 class RoleViewSet(TenantDBMixin, viewsets.ModelViewSet):
     """
@@ -365,6 +509,10 @@ class RoleViewSet(TenantDBMixin, viewsets.ModelViewSet):
     required_module = 'core'
     required_submodule = 'roles'
     permission_prefix = 'core.roles'
+    action_permission_map = {
+        'update_permissions': 'core.roles.edit',
+        'matrix': 'core.roles.view',
+    }
     serializer_class = RoleSerializer
     queryset = Role.objects.all()
 
@@ -454,15 +602,30 @@ class RoleViewSet(TenantDBMixin, viewsets.ModelViewSet):
         module_access_data = request.data.get('module_access', [])
         submodule_access_data = request.data.get('submodule_access', [])
 
+        tenant_id = self.get_tenant_id()
+        from apps.master.models_saas import TenantModule
+        entitled_module_codes = set(
+            TenantModule.objects.using('default').filter(
+                tenant_id=tenant_id,
+                is_enabled=True,
+                status='ENABLED'
+            ).values_list('module__code', flat=True)
+        )
+        # Always allow core module
+        entitled_module_codes.add('core')
+        entitled_module_codes = {c.lower() for c in entitled_module_codes if c}
+
         try:
             with transaction.atomic(using=db):
                 # 1. Update module access if provided
                 for item in module_access_data:
                     m_code = item.get('module_code')
+                    if not m_code or m_code.lower() not in entitled_module_codes:
+                        raise ValueError(f"Module code '{m_code}' is not entitled for this tenant subscription.")
                     can_access = bool(item.get('is_allowed', item.get('can_access', True)))
                     mod_obj = ModuleCatalog.objects.using(db).filter(module_code=m_code, is_enabled=True).first()
                     if not mod_obj:
-                        raise ValueError(f"Module code '{m_code}' not found or not enabled.")
+                        raise ValueError(f"Module code '{m_code}' not found or not enabled in catalog.")
                     RoleModuleAccess.objects.using(db).update_or_create(
                         role=role,
                         module=mod_obj,
@@ -473,6 +636,8 @@ class RoleViewSet(TenantDBMixin, viewsets.ModelViewSet):
                 for item in submodule_access_data:
                     sm_code = item.get('submodule_code')
                     m_code = item.get('module_code')
+                    if m_code and m_code.lower() not in entitled_module_codes:
+                        raise ValueError(f"Module code '{m_code}' for submodule '{sm_code}' is not entitled for this tenant subscription.")
                     can_access = bool(item.get('is_allowed', item.get('can_access', True)))
                     sm_filter = {'submodule_code': sm_code, 'module__is_enabled': True}
                     if m_code:
@@ -480,6 +645,8 @@ class RoleViewSet(TenantDBMixin, viewsets.ModelViewSet):
                     sm_obj = SubmoduleCatalog.objects.using(db).filter(**sm_filter).first()
                     if not sm_obj:
                         raise ValueError(f"Submodule code '{sm_code}' not found or module not enabled.")
+                    if sm_obj.module.module_code.lower() not in entitled_module_codes:
+                        raise ValueError(f"Module code '{sm_obj.module.module_code}' for submodule '{sm_code}' is not entitled for this tenant subscription.")
                     RoleSubmoduleAccess.objects.using(db).update_or_create(
                         role=role,
                         submodule=sm_obj,
@@ -488,9 +655,16 @@ class RoleViewSet(TenantDBMixin, viewsets.ModelViewSet):
 
                 # 3. Update permissions
                 for item in permissions_data:
-                    p_id = item.get('permission_id')
-                    p_code = item.get('permission_code')
-                    granted = bool(item.get('granted', item.get('is_granted', True)))
+                    if isinstance(item, (str, uuid.UUID)):
+                        p_id = str(item)
+                        p_code = None
+                        granted = True
+                    elif isinstance(item, dict):
+                        p_id = item.get('permission_id') or item.get('id')
+                        p_code = item.get('permission_code') or item.get('code')
+                        granted = bool(item.get('granted', item.get('is_granted', True)))
+                    else:
+                        continue
                     perm_obj = None
                     if p_id:
                         perm_obj = Permission.objects.using(db).filter(id=p_id, module__is_enabled=True).first()
@@ -499,6 +673,11 @@ class RoleViewSet(TenantDBMixin, viewsets.ModelViewSet):
                     
                     if not perm_obj:
                         raise ValueError(f"Permission '{p_id or p_code}' not found or module not enabled.")
+
+                    # Authoritative Master TenantModule check
+                    perm_mod_code = perm_obj.module.module_code if perm_obj.module else ''
+                    if perm_mod_code.lower() not in entitled_module_codes:
+                        raise ValueError(f"Permission '{p_id or p_code}' belongs to unentitled module '{perm_mod_code}' (module is not entitled for this tenant subscription).")
 
                     # Also ensure the corresponding module and submodule are enabled for this role
                     if granted:
@@ -558,13 +737,29 @@ class RoleAssignmentViewSet(TenantDBMixin, viewsets.ModelViewSet):
 
 
 class ModuleCatalogViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
-    """Tenant's enabled module catalog."""
+    """Tenant's enabled module catalog filtered by Master TenantModule entitlements."""
     permission_classes = [RequireActiveTenantAndOrg]
     serializer_class = ModuleCatalogSerializer
     queryset = ModuleCatalog.objects.all()
 
     def get_queryset(self):
-        return super().get_queryset().filter(is_enabled=True)
+        qs = super().get_queryset().filter(is_enabled=True)
+        try:
+            tenant_id = self.get_tenant_id()
+            from apps.master.models_saas import TenantModule
+            entitled_codes = set(
+                TenantModule.objects.using('default').filter(
+                    tenant_id=tenant_id,
+                    is_enabled=True,
+                    status='ENABLED'
+                ).values_list('module__code', flat=True)
+            )
+            entitled_codes.add('core')
+            codes_lower = [c.lower() for c in entitled_codes if c]
+            qs = qs.filter(module_code__in=codes_lower)
+        except Exception as e:
+            logger.warning("Failed to filter ModuleCatalog by Master TenantModule: %s", e)
+        return qs
 
 
 class BranchModuleViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
@@ -587,6 +782,12 @@ class RolePermissionSetViewSet(TenantDBMixin, viewsets.ModelViewSet):
         'update': 'core.permissions.manage',
         'partial_update': 'core.permissions.manage',
         'destroy': 'core.permissions.manage',
+    }
+    audit_action_map = {
+        'create': 'CREATE',
+        'update': 'UPDATE',
+        'partial_update': 'UPDATE',
+        'destroy': 'DELETE',
     }
     serializer_class = RolePermissionSetSerializer
     queryset = RolePermissionSet.objects.all()
@@ -619,6 +820,18 @@ class RolePermissionSetViewSet(TenantDBMixin, viewsets.ModelViewSet):
         submodule_access_data = request.data.get('submodule_access', [])
         permissions_data = request.data.get('permissions', [])
 
+        tenant_id = self.get_tenant_id()
+        from apps.master.models_saas import TenantModule
+        entitled_module_codes = set(
+            TenantModule.objects.using('default').filter(
+                tenant_id=tenant_id,
+                is_enabled=True,
+                status='ENABLED'
+            ).values_list('module__code', flat=True)
+        )
+        entitled_module_codes.add('core')
+        entitled_module_codes = {c.lower() for c in entitled_module_codes if c}
+
         try:
             with transaction.atomic(using=db):
                 # Capture before state snapshot
@@ -636,10 +849,12 @@ class RolePermissionSetViewSet(TenantDBMixin, viewsets.ModelViewSet):
                 # 1. Update module access
                 for item in module_access_data:
                     m_code = item.get('module_code')
+                    if not m_code or m_code.lower() not in entitled_module_codes:
+                        raise ValueError(f"Module code '{m_code}' is not entitled for this tenant subscription.")
                     can_access = bool(item.get('is_allowed', item.get('can_access', True)))
-                    mod_obj = ModuleCatalog.objects.using(db).filter(module_code=m_code).first()
+                    mod_obj = ModuleCatalog.objects.using(db).filter(module_code=m_code, is_enabled=True).first()
                     if not mod_obj:
-                        raise ValueError(f"Module code '{m_code}' not found in catalog.")
+                        raise ValueError(f"Module code '{m_code}' not found or not enabled in catalog.")
                     RoleModuleAccess.objects.using(db).update_or_create(
                         role=role,
                         module=mod_obj,
@@ -650,13 +865,17 @@ class RolePermissionSetViewSet(TenantDBMixin, viewsets.ModelViewSet):
                 for item in submodule_access_data:
                     sm_code = item.get('submodule_code')
                     m_code = item.get('module_code')
+                    if m_code and m_code.lower() not in entitled_module_codes:
+                        raise ValueError(f"Module code '{m_code}' for submodule '{sm_code}' is not entitled for this tenant subscription.")
                     can_access = bool(item.get('is_allowed', item.get('can_access', True)))
-                    sm_filter = {'submodule_code': sm_code}
+                    sm_filter = {'submodule_code': sm_code, 'module__is_enabled': True}
                     if m_code:
                         sm_filter['module__module_code'] = m_code
                     sm_obj = SubmoduleCatalog.objects.using(db).filter(**sm_filter).first()
                     if not sm_obj:
-                        raise ValueError(f"Submodule code '{sm_code}' not found in catalog.")
+                        raise ValueError(f"Submodule code '{sm_code}' not found or module not enabled.")
+                    if sm_obj.module.module_code.lower() not in entitled_module_codes:
+                        raise ValueError(f"Module code '{sm_obj.module.module_code}' for submodule '{sm_code}' is not entitled for this tenant subscription.")
                     RoleSubmoduleAccess.objects.using(db).update_or_create(
                         role=role,
                         submodule=sm_obj,
@@ -667,9 +886,11 @@ class RolePermissionSetViewSet(TenantDBMixin, viewsets.ModelViewSet):
                 for item in permissions_data:
                     p_code = item.get('permission_code')
                     granted = bool(item.get('is_granted', item.get('granted', True)))
-                    perm_obj = Permission.objects.using(db).filter(permission_code=p_code).first()
+                    perm_obj = Permission.objects.using(db).filter(permission_code=p_code, module__is_enabled=True).first()
                     if not perm_obj:
-                        raise ValueError(f"Permission code '{p_code}' not found in catalog.")
+                        raise ValueError(f"Permission code '{p_code}' not found or module not enabled.")
+                    if perm_obj.module.module_code.lower() not in entitled_module_codes:
+                        raise ValueError(f"Permission code '{p_code}' belongs to unentitled module '{perm_obj.module.module_code}'.")
                     RolePermissionSetItem.objects.using(db).update_or_create(
                         permission_set=permission_set,
                         permission=perm_obj,
@@ -719,7 +940,7 @@ class RolePermissionSetViewSet(TenantDBMixin, viewsets.ModelViewSet):
 
 
 class SubmoduleCatalogViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
-    """Tenant's enabled submodule catalog (read-only)."""
+    """Tenant's enabled submodule catalog (read-only) filtered by Master TenantModule."""
     permission_classes = [TenantRBACPermission]
     required_module = 'core'
     required_submodule = 'permissions'
@@ -728,7 +949,23 @@ class SubmoduleCatalogViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
     queryset = SubmoduleCatalog.objects.all().select_related('module')
 
     def get_queryset(self):
-        qs = super().get_queryset().filter(is_enabled=True)
+        qs = super().get_queryset().filter(is_enabled=True, module__is_enabled=True)
+        try:
+            tenant_id = self.get_tenant_id()
+            from apps.master.models_saas import TenantModule
+            entitled_codes = set(
+                TenantModule.objects.using('default').filter(
+                    tenant_id=tenant_id,
+                    is_enabled=True,
+                    status='ENABLED'
+                ).values_list('module__code', flat=True)
+            )
+            entitled_codes.add('core')
+            codes_lower = [c.lower() for c in entitled_codes if c]
+            qs = qs.filter(module__module_code__in=codes_lower)
+        except Exception as e:
+            logger.warning("Failed to filter SubmoduleCatalog by Master TenantModule: %s", e)
+
         mod_code = self.request.query_params.get('module') or self.request.query_params.get('module_code')
         if mod_code:
             qs = qs.filter(module__module_code=mod_code)
@@ -736,7 +973,7 @@ class SubmoduleCatalogViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
 
 
 class PermissionViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
-    """Tenant's canonical action permission catalog (read-only)."""
+    """Tenant's canonical action permission catalog (read-only) filtered by Master TenantModule."""
     permission_classes = [TenantRBACPermission]
     required_module = 'core'
     required_submodule = 'permissions'
@@ -746,6 +983,22 @@ class PermissionViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         qs = super().get_queryset().filter(is_active=True, module__is_enabled=True)
+        try:
+            tenant_id = self.get_tenant_id()
+            from apps.master.models_saas import TenantModule
+            entitled_codes = set(
+                TenantModule.objects.using('default').filter(
+                    tenant_id=tenant_id,
+                    is_enabled=True,
+                    status='ENABLED'
+                ).values_list('module__code', flat=True)
+            )
+            entitled_codes.add('core')
+            codes_lower = [c.lower() for c in entitled_codes if c]
+            qs = qs.filter(module__module_code__in=codes_lower)
+        except Exception as e:
+            logger.warning("Failed to filter Permission by Master TenantModule: %s", e)
+
         mod_code = self.request.query_params.get('module') or self.request.query_params.get('module_code')
         if mod_code:
             qs = qs.filter(module__module_code=mod_code)

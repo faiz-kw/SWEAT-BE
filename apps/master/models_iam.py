@@ -218,12 +218,21 @@ class PlatformRoleQuerySet(models.QuerySet):
     def create(self, **kwargs):
         return super().create(**self._translate_kwargs(kwargs))
 
-    def get_or_create(self, **kwargs):
-        defaults = kwargs.pop('defaults', None)
+    def get_or_create(self, defaults=None, **kwargs):
+        if defaults is None:
+            defaults = kwargs.pop('defaults', None)
         tr_kwargs = self._translate_kwargs(kwargs)
         if defaults:
             tr_kwargs['defaults'] = self._translate_kwargs(defaults)
         return super().get_or_create(**tr_kwargs)
+
+    def update_or_create(self, defaults=None, **kwargs):
+        if defaults is None:
+            defaults = kwargs.pop('defaults', None)
+        tr_kwargs = self._translate_kwargs(kwargs)
+        if defaults:
+            tr_kwargs['defaults'] = self._translate_kwargs(defaults)
+        return super().update_or_create(**tr_kwargs)
 
 
 class PlatformRole(models.Model):
@@ -364,6 +373,46 @@ class PlatformSubmodule(models.Model):
         return f"{self.module.code} → {self.code}"
 
 
+class PlatformPermissionQuerySet(models.QuerySet):
+    def _translate_kwargs(self, kwargs):
+        t = {}
+        for k, v in kwargs.items():
+            if k == 'name':
+                t['label'] = v
+            elif k.startswith('name__'):
+                t['label__' + k[6:]] = v
+            elif k == 'module' and isinstance(v, str):
+                mod, _ = PlatformModule.objects.using(self.db).get_or_create(
+                    code=v, defaults={'name': v.capitalize(), 'is_active': True}
+                )
+                t['module'] = mod
+            else:
+                t[k] = v
+        return t
+
+    def filter(self, *args, **kwargs):
+        return super().filter(*args, **self._translate_kwargs(kwargs))
+
+    def create(self, **kwargs):
+        return super().create(**self._translate_kwargs(kwargs))
+
+    def get_or_create(self, defaults=None, **kwargs):
+        if defaults is None:
+            defaults = kwargs.pop('defaults', None)
+        tr_kwargs = self._translate_kwargs(kwargs)
+        if defaults:
+            tr_kwargs['defaults'] = self._translate_kwargs(defaults)
+        return super().get_or_create(**tr_kwargs)
+
+    def update_or_create(self, defaults=None, **kwargs):
+        if defaults is None:
+            defaults = kwargs.pop('defaults', None)
+        tr_kwargs = self._translate_kwargs(kwargs)
+        if defaults:
+            tr_kwargs['defaults'] = self._translate_kwargs(defaults)
+        return super().update_or_create(**tr_kwargs)
+
+
 class PlatformPermission(models.Model):
     """
     Granular action permissions for platform modules (e.g. tenants.create, billing.export).
@@ -379,10 +428,25 @@ class PlatformPermission(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    objects = PlatformPermissionQuerySet.as_manager()
+
     class Meta:
         app_label = 'master'
         db_table = 'platform_permissions'
         ordering = ['module', 'action']
+
+    def __init__(self, *args, **kwargs):
+        if 'name' in kwargs and 'label' not in kwargs:
+            kwargs['label'] = kwargs.pop('name')
+        super().__init__(*args, **kwargs)
+
+    @property
+    def name(self):
+        return self.label
+
+    @name.setter
+    def name(self, val):
+        self.label = val
 
     def __str__(self):
         return f"{self.code} — {self.label or self.action}"
@@ -406,12 +470,21 @@ class PlatformRoleModuleAccessQuerySet(models.QuerySet):
     def create(self, **kwargs):
         return super().create(**self._translate_kwargs(kwargs))
 
-    def get_or_create(self, **kwargs):
-        defaults = kwargs.pop('defaults', None)
+    def get_or_create(self, defaults=None, **kwargs):
+        if defaults is None:
+            defaults = kwargs.pop('defaults', None)
         tr_kwargs = self._translate_kwargs(kwargs)
         if defaults:
             tr_kwargs['defaults'] = self._translate_kwargs(defaults)
         return super().get_or_create(**tr_kwargs)
+
+    def update_or_create(self, defaults=None, **kwargs):
+        if defaults is None:
+            defaults = kwargs.pop('defaults', None)
+        tr_kwargs = self._translate_kwargs(kwargs)
+        if defaults:
+            tr_kwargs['defaults'] = self._translate_kwargs(defaults)
+        return super().update_or_create(**tr_kwargs)
 
 
 class PlatformRoleModuleAccess(models.Model):
@@ -467,12 +540,21 @@ class PlatformRoleSubmoduleAccessQuerySet(models.QuerySet):
     def create(self, **kwargs):
         return super().create(**self._translate_kwargs(kwargs))
 
-    def get_or_create(self, **kwargs):
-        defaults = kwargs.pop('defaults', None)
+    def get_or_create(self, defaults=None, **kwargs):
+        if defaults is None:
+            defaults = kwargs.pop('defaults', None)
         tr_kwargs = self._translate_kwargs(kwargs)
         if defaults:
             tr_kwargs['defaults'] = self._translate_kwargs(defaults)
         return super().get_or_create(**tr_kwargs)
+
+    def update_or_create(self, defaults=None, **kwargs):
+        if defaults is None:
+            defaults = kwargs.pop('defaults', None)
+        tr_kwargs = self._translate_kwargs(kwargs)
+        if defaults:
+            tr_kwargs['defaults'] = self._translate_kwargs(defaults)
+        return super().update_or_create(**tr_kwargs)
 
 
 class PlatformRoleSubmoduleAccess(models.Model):
@@ -528,12 +610,21 @@ class PlatformRolePermissionQuerySet(models.QuerySet):
     def create(self, **kwargs):
         return super().create(**self._translate_kwargs(kwargs))
 
-    def get_or_create(self, **kwargs):
-        defaults = kwargs.pop('defaults', None)
+    def get_or_create(self, defaults=None, **kwargs):
+        if defaults is None:
+            defaults = kwargs.pop('defaults', None)
         tr_kwargs = self._translate_kwargs(kwargs)
         if defaults:
             tr_kwargs['defaults'] = self._translate_kwargs(defaults)
         return super().get_or_create(**tr_kwargs)
+
+    def update_or_create(self, defaults=None, **kwargs):
+        if defaults is None:
+            defaults = kwargs.pop('defaults', None)
+        tr_kwargs = self._translate_kwargs(kwargs)
+        if defaults:
+            tr_kwargs['defaults'] = self._translate_kwargs(defaults)
+        return super().update_or_create(**tr_kwargs)
 
 
 class PlatformRolePermission(models.Model):
