@@ -262,15 +262,30 @@ class PackageSerializer(serializers.ModelSerializer):
 
     def get_active_version(self, obj):
         active = obj.versions.filter(status='ACTIVE').order_by('-version_number').first()
+        if not active:
+            active = obj.versions.order_by('-version_number').first()
         if active:
             prices = [
                 {
                     'branch_id': str(p.branch_id) if p.branch_id else None,
                     'currency': p.currency,
                     'base_price': str(p.base_price),
+                    'sale_price': str(p.base_price),
+                    'display_price': str(p.display_price) if p.display_price else None,
+                    'prices_include_tax': p.prices_include_tax,
+                    'tax_percent': str(p.tax_percent),
+                    'tax_percentage': str(p.tax_percent),
                     'total_price': str(p.total_price),
                 }
                 for p in active.prices.filter(status='ACTIVE')
+            ]
+            entitlements = [
+                {
+                    'entitlement_type': e.entitlement_type,
+                    'allocated_units': str(e.allocated_units) if e.allocated_units is not None else None,
+                    'extra_unit_price': str(e.extra_unit_price) if e.extra_unit_price is not None else None,
+                }
+                for e in active.entitlement_definitions.filter(status='ACTIVE')
             ]
             return {
                 'id': str(active.id),
@@ -278,6 +293,12 @@ class PackageSerializer(serializers.ModelSerializer):
                 'name_snapshot': active.name_snapshot,
                 'duration_value': active.duration_value,
                 'duration_unit': active.duration_unit,
+                'total_days': active.total_days,
+                'validity_days': active.validity_days,
+                'show_on_web': active.show_on_web,
+                'show_on_app': active.show_on_app,
+                'status': active.status,
                 'prices': prices,
+                'entitlements': entitlements,
             }
         return None

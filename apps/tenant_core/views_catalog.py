@@ -280,7 +280,7 @@ class PackageViewSet(viewsets.ModelViewSet):
             qs = qs.filter(program_id=program_id)
         if status_param:
             qs = qs.filter(status=status_param)
-        return qs.prefetch_related('versions__prices', 'branch_availabilities__branch').order_by('name')
+        return qs.prefetch_related('versions__prices', 'versions__entitlement_definitions', 'branch_availabilities__branch').order_by('name')
 
     def perform_create(self, serializer):
         alias = _get_db(self.request)
