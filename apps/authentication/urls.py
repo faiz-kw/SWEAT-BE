@@ -5,6 +5,7 @@ from .views import (
     SessionRevocationView, MFAVerifyView, MFAEnrollView,
     MFAEnableView, MFADisableView,
     PasswordResetRequestView, PasswordResetConfirmView,
+    PublicBrandingView,
 )
 
 app_name = 'authentication'
@@ -32,4 +33,6 @@ urlpatterns = [
     # Password Reset
     path('password/reset-request/', PasswordResetRequestView.as_view(), name='password-reset-request'),
     path('password/reset-confirm/', PasswordResetConfirmView.as_view(), name='password-reset-confirm'),
+    # Public branding — no auth required, used by login page
+    path('branding/', PublicBrandingView.as_view(), name='public-branding'),
 ]

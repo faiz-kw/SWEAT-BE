@@ -918,11 +918,22 @@ class MeView(APIView):
                     # Branding from master DB
                     if hasattr(tenant, 'branding') and tenant.branding:
                         b = tenant.branding
+                        primary_domain = tenant.domains.filter(is_primary=True).first() or tenant.domains.first()
                         branding = {
                             'primary_color': b.primary_color,
                             'accent_color': b.accent_color,
                             'logo_url': b.logo_url,
+                            'favicon_url': b.favicon_url,
                             'app_name': b.app_name,
+                            'brand_name': b.brand_name or b.app_name,
+                            'custom_domain': primary_domain.domain if primary_domain else '',
+                            'cname_verified': primary_domain.is_verified if primary_domain else False,
+                            'email_footer': b.email_footer,
+                            'support_email': b.support_email,
+                            'remove_watermark': b.remove_watermark,
+                            'login_tagline': b.login_tagline,
+                            'theme_preset_code': b.theme_preset_code,
+                            'theme_tokens': b.theme_tokens,
                         }
             except Exception as e:
                 logger.error('MeView: Error loading tenant context for tid=%s: %s', tenant_id, e)
@@ -1622,6 +1633,7 @@ class PasswordResetConfirmView(APIView):
             user.save(using='default')
             return Response({'message': 'Password has been reset successfully.'}, status=status.HTTP_200_OK)
 
+
         elif account_type == 'TENANT':
             from apps.master.models_tenant import Tenant
             from apps.tenant_core.models_users import TenantUser
@@ -1638,3 +1650,312 @@ class PasswordResetConfirmView(APIView):
 
         return Response({'error': 'Invalid account type.'}, status=status.HTTP_400_BAD_REQUEST)
 
+
+# ---------------------------------------------------------------------------
+# View: MFAEnableView
+# ---------------------------------------------------------------------------
+
+class MFAEnableView(APIView):
+    """
+    POST /api/v1/auth/mfa/enable/
+    Verifies code against pending or submitted secret and enables MFA on the account.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        import redis
+        from django.conf import settings
+
+        user = request.user
+        code = request.data.get('code')
+        secret = request.data.get('secret')
+
+        if not code:
+            return Response({'error': 'Verification code is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not secret:
+            try:
+                r = redis.from_url(getattr(settings, 'REDIS_URL', 'redis://127.0.0.1:6379/0'))
+                cached_secret = r.get(f"auth:mfa_pending:{user.id}")
+                if cached_secret:
+                    secret = cached_secret.decode('utf-8')
+            except Exception:
+                pass
+
+        if not secret:
+            return Response({'error': 'MFA secret not found or expired. Please re-enroll.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not verify_totp_code(secret, code):
+            return Response({'error': 'Invalid verification code.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user.mfa_secret = secret
+        user.is_mfa_enabled = True
+        db = getattr(user, '_db_alias', 'default')
+        user.save(using=db, update_fields=['mfa_secret', 'is_mfa_enabled'])
+
+        if getattr(user, '_auth_type', None) == 'tenant':
+            from apps.tenant_core.audit import emit_audit_event
+            try:
+                emit_audit_event(
+                    actor_id=str(user.id),
+                    actor_email=user.email,
+                    actor_roles=getattr(user, '_roles', []),
+                    action='SECURITY.MFA_ENABLED',
+                    target_type='TenantUser',
+                    target_id=str(user.id),
+                    db_alias=db,
+                    request=request,
+                )
+            except Exception:
+                pass
+
+        return Response({'message': 'MFA has been successfully enabled.'}, status=status.HTTP_200_OK)
+
+
+# ---------------------------------------------------------------------------
+# View: MFADisableView
+# ---------------------------------------------------------------------------
+
+class MFADisableView(APIView):
+    """
+    POST /api/v1/auth/mfa/disable/
+    Disables MFA for the user after validating password.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        password = request.data.get('password')
+        code = request.data.get('code')
+
+        if not password:
+            return Response({'error': 'Password is required to disable MFA.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not user.check_password(password):
+            return Response({'error': 'Invalid password.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if user.is_mfa_enabled and code:
+            if not verify_totp_code(user.mfa_secret, code):
+                return Response({'error': 'Invalid verification code.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user.is_mfa_enabled = False
+        user.mfa_secret = ''
+        db = getattr(user, '_db_alias', 'default')
+        user.save(using=db, update_fields=['mfa_secret', 'is_mfa_enabled'])
+
+        if getattr(user, '_auth_type', None) == 'tenant':
+            from apps.tenant_core.audit import emit_audit_event
+            try:
+                emit_audit_event(
+                    actor_id=str(user.id),
+                    actor_email=user.email,
+                    actor_roles=getattr(user, '_roles', []),
+                    action='SECURITY.MFA_DISABLED',
+                    target_type='TenantUser',
+                    target_id=str(user.id),
+                    db_alias=db,
+                    request=request,
+                )
+            except Exception:
+                pass
+
+        return Response({'message': 'MFA has been disabled.'}, status=status.HTTP_200_OK)
+
+
+# ---------------------------------------------------------------------------
+# Shared Helper
+# ---------------------------------------------------------------------------
+
+def _update_last_login(user, request, db: str) -> None:
+    """Update last_login_at and last_login_ip for any user type."""
+    try:
+        user.last_login_at = timezone.now()
+        user.last_login_ip = request.META.get('REMOTE_ADDR')
+        user.save(using=db, update_fields=['last_login_at', 'last_login_ip'])
+    except Exception as e:
+        # Non-critical — don't fail login because of a timestamp update error
+        logger.warning('_update_last_login: Failed to update login timestamp: %s', e)
+
+
+# ---------------------------------------------------------------------------
+# Universal Password Reset Views
+# ---------------------------------------------------------------------------
+
+from django.core.signing import TimestampSigner, BadSignature, SignatureExpired
+
+class PasswordResetRequestView(APIView):
+    """
+    POST /api/v1/auth/password/reset-request/
+    Initiates universal password reset by username or email without requiring tenant slug.
+    Always returns generic success message to prevent account enumeration.
+    """
+    permission_classes = [AllowAny]
+    throttle_classes = [LoginRateThrottle]
+
+    def post(self, request):
+        from apps.master.services_auth_directory import resolve_identity, normalize_identifier
+        raw_id = request.data.get('identifier') or request.data.get('email') or request.data.get('username') or ''
+        identifier = normalize_identifier(raw_id)
+
+        token = None
+        if identifier:
+            identity = resolve_identity(identifier)
+            if identity and identity.status == 'ACTIVE':
+                signer = TimestampSigner(salt='password-reset-salt')
+                token = signer.sign(f"{identity.account_type}:{identity.subject_id}:{identity.tenant_id or ''}")
+                logger.info("Password reset requested for identifier=%s.", identifier)
+
+        payload = {'message': 'If an account matches that identifier, password reset instructions have been sent.'}
+        from django.conf import settings
+        import sys
+        if (getattr(settings, 'DEBUG', False) or 'test' in sys.argv) and token:
+            payload['debug_token'] = token
+            if identity:
+                payload['account_type'] = identity.account_type
+                payload['tenant_id'] = str(identity.tenant_id) if identity.tenant_id else None
+        return Response(payload, status=status.HTTP_200_OK)
+
+
+class PasswordResetConfirmView(APIView):
+    """
+    POST /api/v1/auth/password/reset-confirm/
+    Confirms password reset using secure signed token and sets new password.
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        token = request.data.get('token', '').strip()
+        new_password = request.data.get('new_password', '')
+
+        if not token or not new_password:
+            return Response({'error': 'Token and new_password are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if len(new_password) < 8:
+            return Response({'error': 'Password must be at least 8 characters.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        signer = TimestampSigner(salt='password-reset-salt')
+        try:
+            val = signer.unsign(token, max_age=3600)
+            parts = val.split(':')
+            account_type, subject_id, tenant_id = parts[0], parts[1], parts[2] if len(parts) > 2 else ''
+        except (BadSignature, SignatureExpired):
+            return Response({'error': 'Invalid or expired password reset token.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if account_type == 'PLATFORM':
+            from apps.master.models_iam import PlatformUser
+            user = PlatformUser.objects.using('default').filter(id=subject_id).first()
+            if not user:
+                return Response({'error': 'Account not found.'}, status=status.HTTP_404_NOT_FOUND)
+            user.set_password(new_password)
+            user.save(using='default')
+            return Response({'message': 'Password has been reset successfully.'}, status=status.HTTP_200_OK)
+
+        elif account_type == 'TENANT':
+            from apps.master.models_tenant import Tenant
+            from apps.tenant_core.models_users import TenantUser
+            tenant = Tenant.objects.using('default').filter(id=tenant_id).first()
+            if not tenant:
+                return Response({'error': 'Organization not found.'}, status=status.HTTP_404_NOT_FOUND)
+            db_alias = _register_and_resolve_tenant(tenant)
+            user = TenantUser.objects.using(db_alias).filter(id=subject_id).first()
+            if not user:
+                return Response({'error': 'Account not found.'}, status=status.HTTP_404_NOT_FOUND)
+            user.set_password(new_password)
+            user.save(using=db_alias)
+            return Response({'message': 'Password has been reset successfully.'}, status=status.HTTP_200_OK)
+
+        return Response({'error': 'Invalid account type.'}, status=status.HTTP_400_BAD_REQUEST)
+
+# ---------------------------------------------------------------------------
+# Public Platform/Tenant Branding — No Authentication Required
+# Used by the login page to render dynamic branding before auth
+# ---------------------------------------------------------------------------
+
+class PublicBrandingView(APIView):
+    """
+    GET /api/v1/auth/branding/?tenant=<slug>
+
+    Returns public-safe branding data for the login page.
+    - Without ?tenant: returns platform-level branding (PlatformBranding table)
+    - With ?tenant=slug: returns that tenant's branding (TenantBranding table)
+
+    No authentication required. Only safe, non-sensitive fields are returned.
+    """
+    permission_classes = [AllowAny]
+    authentication_classes = []  # bypass JWT auth entirely
+
+    def get(self, request, *args, **kwargs):
+        from apps.master.models_tenant import PlatformBranding, TenantBranding, Tenant
+
+        tenant_slug = request.query_params.get('tenant', '').strip().lower()
+
+        if tenant_slug:
+            # Return tenant-specific public branding
+            try:
+                tenant = Tenant.objects.using('default').filter(
+                    slug=tenant_slug, status='Active'
+                ).select_related('branding').first()
+                if not tenant:
+                    return Response(
+                        {'error': f"Organization '{tenant_slug}' not found or inactive."},
+                        status=404
+                    )
+                b = getattr(tenant, 'branding', None)
+                primary_domain = tenant.domains.filter(is_primary=True).first() or tenant.domains.first()
+                data = {
+                    'type': 'tenant',
+                    'tenant_slug': tenant.slug,
+                    'app_name': (b.app_name or b.brand_name or tenant.name) if b else tenant.name,
+                    'brand_name': (b.brand_name or b.app_name or tenant.name) if b else tenant.name,
+                    'primary_color': b.primary_color if b else '#0f766e',
+                    'accent_color': b.accent_color if b else '#2dd4bf',
+                    'logo_url': b.logo_url if b else '',
+                    'favicon_url': b.favicon_url if b else '',
+                    'login_tagline': b.login_tagline if b else '',
+                    'support_email': b.support_email if b else '',
+                    'custom_domain': primary_domain.domain if primary_domain else '',
+                }
+                return Response(data)
+            except Exception as e:
+                logger.warning('PublicBrandingView: tenant lookup failed for slug=%s: %s', tenant_slug, e)
+                return Response({'error': 'Failed to load organization branding.'}, status=500)
+
+        # Return platform-level branding
+        try:
+            obj = PlatformBranding.objects.using('default').first()
+            if not obj:
+                return Response({
+                    'type': 'platform',
+                    'app_name': 'PerformanceOS',
+                    'brand_name': 'PerformanceOS',
+                    'primary_color': '#0f766e',
+                    'accent_color': '#2dd4bf',
+                    'logo_url': '',
+                    'favicon_url': '',
+                    'login_tagline': 'Enterprise Operating System for Modern Athletic Franchises',
+                    'support_email': '',
+                })
+            return Response({
+                'type': 'platform',
+                'app_name': obj.platform_name or obj.brand_name or 'PerformanceOS',
+                'brand_name': obj.brand_name or obj.platform_name or 'PerformanceOS',
+                'primary_color': obj.primary_color or '#0f766e',
+                'accent_color': obj.secondary_color or '#2dd4bf',
+                'logo_url': '',
+                'favicon_url': '',
+                'login_tagline': 'Enterprise Operating System for Modern Athletic Franchises',
+                'support_email': getattr(obj, 'support_email', '') or '',
+            })
+        except Exception as e:
+            logger.warning('PublicBrandingView: platform branding lookup failed: %s', e)
+            return Response({
+                'type': 'platform',
+                'app_name': 'PerformanceOS',
+                'brand_name': 'PerformanceOS',
+                'primary_color': '#0f766e',
+                'accent_color': '#2dd4bf',
+                'logo_url': '',
+                'favicon_url': '',
+                'login_tagline': 'Enterprise Operating System for Modern Athletic Franchises',
+                'support_email': '',
+            })

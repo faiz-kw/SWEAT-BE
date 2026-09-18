@@ -807,8 +807,20 @@ class TenantBrandingViewSet(viewsets.ModelViewSet):
         tenant = branding.tenant
 
         domain_obj = None
-        if domain_name:
-            domain_obj = tenant.domains.filter(domain=domain_name).first()
+        clean_domain = (domain_name or '').strip().lower()
+        if clean_domain:
+            domain_obj = tenant.domains.filter(domain=clean_domain).first()
+            if not domain_obj:
+                tenant.domains.filter(is_primary=True).update(is_primary=False)
+                domain_type = 'PLATFORM' if clean_domain.endswith('.performanceos.io') else 'CUSTOM'
+                domain_obj = TenantDomain.objects.using('default').create(
+                    tenant=tenant,
+                    domain=clean_domain,
+                    domain_type=domain_type,
+                    is_primary=True,
+                    is_verified=True,
+                    status='ACTIVE',
+                )
         if not domain_obj:
             domain_obj = tenant.domains.filter(is_primary=True).first() or tenant.domains.first()
 
@@ -818,7 +830,7 @@ class TenantBrandingViewSet(viewsets.ModelViewSet):
             domain_obj.save(update_fields=['is_verified', 'status', 'updated_at'])
             target_domain = domain_obj.domain
         else:
-            target_domain = domain_name or f"{tenant.slug}.performanceos.io"
+            target_domain = clean_domain or f"{tenant.slug}.performanceos.io"
 
         audit_branding_mutation(
             action='VERIFY_DNS',

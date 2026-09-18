@@ -358,8 +358,8 @@ class PlatformBrandingSerializer(serializers.ModelSerializer):
 class TenantBrandingSerializer(serializers.ModelSerializer):
     tenant_slug = serializers.CharField(source='tenant.slug', read_only=True)
     tenant_name = serializers.CharField(source='tenant.name', read_only=True)
-    custom_domain = serializers.SerializerMethodField()
-    cname_verified = serializers.SerializerMethodField()
+    custom_domain = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    cname_verified = serializers.BooleanField(required=False, allow_null=True)
 
     class Meta:
         model = TenantBranding
@@ -370,20 +370,66 @@ class TenantBrandingSerializer(serializers.ModelSerializer):
             'primary_color', 'secondary_color', 'accent_color',
             'theme_preset_code', 'theme_tokens',
             'support_phone', 'support_email',
+            'email_footer', 'remove_watermark',
             'logo_storage_key', 'favicon_storage_key',
             'login_logo_key', 'login_background_key', 'email_logo_key',
             'login_background_url', 'login_tagline',
             'custom_domain', 'cname_verified',
             'created_at', 'updated_at',
         ]
-        read_only_fields = ['id', 'tenant_slug', 'tenant_name', 'custom_domain', 'cname_verified', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'tenant_slug', 'tenant_name', 'created_at', 'updated_at']
 
-    def get_custom_domain(self, obj):
-        domain = obj.tenant.domains.filter(is_primary=True).first() or obj.tenant.domains.first()
-        return domain.domain if domain else ''
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        domain = instance.tenant.domains.filter(is_primary=True).first() or instance.tenant.domains.first()
+        ret['custom_domain'] = domain.domain if domain else ''
+        ret['cname_verified'] = domain.is_verified if domain else False
+        return ret
 
-    def get_cname_verified(self, obj):
-        domain = obj.tenant.domains.filter(is_primary=True).first() or obj.tenant.domains.first()
-        return domain.is_verified if domain else False
+    def update(self, instance, validated_data):
+        custom_domain = validated_data.pop('custom_domain', None)
+        cname_verified = validated_data.pop('cname_verified', None)
+
+        updated_instance = super().update(instance, validated_data)
+
+        if custom_domain is not None:
+            clean_domain = custom_domain.strip().lower()
+            if clean_domain:
+                domain_obj = instance.tenant.domains.filter(domain=clean_domain).first()
+                if not domain_obj:
+                    instance.tenant.domains.filter(is_primary=True).update(is_primary=False)
+                    domain_type = 'PLATFORM' if clean_domain.endswith('.performanceos.io') else 'CUSTOM'
+                    TenantDomain.objects.using('default').create(
+                        tenant=instance.tenant,
+                        domain=clean_domain,
+                        domain_type=domain_type,
+                        is_primary=True,
+                        is_verified=bool(cname_verified) if cname_verified is not None else False,
+                        status='ACTIVE' if cname_verified else 'PENDING',
+                    )
+                else:
+                    instance.tenant.domains.exclude(id=domain_obj.id).filter(is_primary=True).update(is_primary=False)
+                    domain_obj.is_primary = True
+                    if cname_verified is not None:
+                        domain_obj.is_verified = cname_verified
+                        if cname_verified:
+                            domain_obj.status = 'ACTIVE'
+                    domain_obj.save(using='default')
+            elif cname_verified is not None:
+                domain_obj = instance.tenant.domains.filter(is_primary=True).first() or instance.tenant.domains.first()
+                if domain_obj:
+                    domain_obj.is_verified = cname_verified
+                    if cname_verified:
+                        domain_obj.status = 'ACTIVE'
+                    domain_obj.save(using='default')
+        elif cname_verified is not None:
+            domain_obj = instance.tenant.domains.filter(is_primary=True).first() or instance.tenant.domains.first()
+            if domain_obj:
+                domain_obj.is_verified = cname_verified
+                if cname_verified:
+                    domain_obj.status = 'ACTIVE'
+                domain_obj.save(using='default')
+
+        return updated_instance
 
 

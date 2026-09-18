@@ -214,6 +214,8 @@ class TenantBranding(models.Model):
     login_background_url = models.TextField(blank=True, default='')
     login_tagline = models.CharField(max_length=300, blank=True, default='')
     support_email = models.EmailField(blank=True, default='')
+    email_footer = models.TextField(blank=True, default='')
+    remove_watermark = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
