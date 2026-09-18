@@ -20,6 +20,9 @@ class TenantSerializer(serializers.ModelSerializer):
     enabled_modules = serializers.SerializerMethodField()
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     status = serializers.SerializerMethodField()
+    max_locations = serializers.SerializerMethodField()
+    max_members = serializers.SerializerMethodField()
+    locations = serializers.SerializerMethodField()
 
     class Meta:
         model = Tenant
@@ -27,6 +30,7 @@ class TenantSerializer(serializers.ModelSerializer):
             'id', 'code', 'name', 'legal_name', 'slug', 'status', 'status_display',
             'country', 'currency', 'timezone', 'default_language',
             'tier', 'plan_name', 'enabled_modules',
+            'max_locations', 'max_members', 'locations',
             'activated_at', 'suspended_at', 'deactivated_at',
             'created_at', 'updated_at',
         ]
@@ -45,6 +49,71 @@ class TenantSerializer(serializers.ModelSerializer):
 
     def get_enabled_modules(self, obj):
         return list(obj.enabled_modules_set.filter(is_enabled=True).values_list('module__code', flat=True))
+
+    def get_max_locations(self, obj):
+        limit = obj.resource_limits.filter(metric__code='LOCATIONS').first()
+        if limit:
+            return int(limit.limit_value)
+        sub = obj.subscriptions.filter(status__in=['ACTIVE', 'TRIALING']).select_related('plan').first()
+        if sub and sub.plan:
+            plan_lim = sub.plan.resource_limits.filter(metric__code='LOCATIONS').first()
+            if plan_lim:
+                return int(plan_lim.limit_value)
+        return 3
+
+    def get_max_members(self, obj):
+        limit = obj.resource_limits.filter(metric__code__in=['ACTIVE_MEMBERS', 'ACTIVE_USERS']).first()
+        if limit:
+            return int(limit.limit_value)
+        sub = obj.subscriptions.filter(status__in=['ACTIVE', 'TRIALING']).select_related('plan').first()
+        if sub and sub.plan:
+            plan_lim = sub.plan.resource_limits.filter(metric__code__in=['ACTIVE_MEMBERS', 'ACTIVE_USERS']).first()
+            if plan_lim:
+                return int(plan_lim.limit_value)
+        return 2000
+
+    def get_locations(self, obj):
+        try:
+            from apps.master.models_infra import TenantDataSource
+            from config.tenant_middleware import _register_tenant_connection
+            from config.routers import build_tenant_db_alias, set_tenant_db_alias
+            from apps.tenant_core.models_org import Branch
+
+            ds = TenantDataSource.objects.using('default').filter(tenant=obj, status='ACTIVE').first()
+            if not ds:
+                return []
+            db_name = ds.database_name or ds.db_name
+            if not db_name:
+                return []
+            db_alias = build_tenant_db_alias(obj.id)
+            _register_tenant_connection(db_alias, db_name, data_source=ds, tenant_id=obj.id)
+            set_tenant_db_alias(db_alias)
+            try:
+                branches = Branch.objects.using(db_alias).select_related('location').all().order_by('name')
+                results = []
+                for b in branches:
+                    loc = b.location
+                    hours = f"{b.business_open_time} - {b.business_close_time}" if b.business_open_time else "06:00 - 22:00"
+                    results.append({
+                        'id': str(b.id),
+                        'name': b.name,
+                        'city': loc.city if loc else '',
+                        'address': b.address or (loc.area if loc else ''),
+                        'phone': b.phone or '',
+                        'capacity': b.capacity or 100,
+                        'operating_hours': hours,
+                        'is_active': b.status == 'ACTIVE',
+                        'tenant': str(obj.id),
+                        'tenant_name': obj.name,
+                        'members_count': 0,
+                        'revenue_collected': 0,
+                        'created_at': b.activated_at.isoformat() if b.activated_at else None,
+                    })
+                return results
+            finally:
+                set_tenant_db_alias(None)
+        except Exception:
+            return []
 
 
 class TenantDetailSerializer(TenantSerializer):

@@ -140,6 +140,70 @@ class Command(BaseCommand):
                         ('grievances', 'Helpdesk Tickets', 'Service issues and staff escalations'),
                     ]
                 },
+                {
+                    'code': 'performance', 'name': 'Athlete Performance & Tracking', 'icon': 'Activity', 'is_core': False, 'sort_order': 9,
+                    'description': 'Workout telemetry, biomechanics scoring, wearable IoT, and leaderboards.',
+                    'submodules': [
+                        ('workouts', 'Workout Logging', 'Session logs, sets, reps, and RPE'),
+                        ('analytics', 'Body Analytics', 'Volume, frequency, and progressive overload graphs'),
+                        ('wearables', 'Wearable IoT', 'Garmin, Apple Health, and Whoop biometric sync'),
+                        ('leaderboards', 'Leaderboards', 'Gym-floor rankings and challenge scores'),
+                        ('pr-tracker', 'PR Tracker', 'Personal records for compound lifts'),
+                    ]
+                },
+                {
+                    'code': 'coaching', 'name': 'Coaching & Athlete Development', 'icon': 'Dumbbell', 'is_core': False, 'sort_order': 10,
+                    'description': 'Personal trainer allocations, workout program builders, and exercise libraries.',
+                    'submodules': [
+                        ('trainers', 'Trainers Roster', 'Certified coach directory and availability'),
+                        ('online-coaches', 'Online Coaches', 'Remote training and digital check-ins'),
+                        ('nutrition-coaches', 'Nutrition Coaches', 'Certified nutritionists and meal consultants'),
+                        ('exercise-library', 'Exercise Library', 'Movement video guides and form cues'),
+                        ('program-builder', 'Program Builder', 'Custom periodized workout programming'),
+                    ]
+                },
+                {
+                    'code': 'support', 'name': 'Support & Grievance Desk', 'icon': 'LifeBuoy', 'is_core': False, 'sort_order': 11,
+                    'description': 'Help desk ticketing, issue escalation matrices, and SLA management.',
+                    'submodules': [
+                        ('tickets', 'Support Tickets', 'Member inquiries and service tickets'),
+                        ('escalations', 'Escalations Matrix', 'High-priority grievance tracking'),
+                        ('sla', 'SLA Monitor', 'Resolution time compliance dashboards'),
+                    ]
+                },
+                {
+                    'code': 'marketing', 'name': 'Marketing & Growth Engine', 'icon': 'Megaphone', 'is_core': False, 'sort_order': 12,
+                    'description': 'Lead magnets, broadcast SMS/WhatsApp campaigns, reviews, and referral programs.',
+                    'submodules': [
+                        ('campaigns', 'Broadcast Campaigns', 'Automated promotional broadcasts'),
+                        ('lead-magnets', 'Lead Magnets', 'Free passes, diet guides, and funnel assets'),
+                        ('referrals', 'Referral Program', 'Member-get-member reward tracking'),
+                        ('reviews', 'Reviews & Reputation', 'Google Business and Trustpilot review management'),
+                    ]
+                },
+                {
+                    'code': 'automation', 'name': 'Workflow & Rule Automation', 'icon': 'Workflow', 'is_core': False, 'sort_order': 13,
+                    'description': 'Trigger-action workflows, automated member approvals, and webhook rules.',
+                    'submodules': [
+                        ('workflows', 'Active Workflows', 'Visual trigger-action flow sequences'),
+                        ('triggers', 'Event Triggers', 'Check-in, expiry, and payment event hooks'),
+                        ('approvals', 'Manager Approvals', 'Refund, freeze, and discount approval queues'),
+                        ('notifications', 'Notifications Log', 'Push, SMS, and WhatsApp sent delivery logs'),
+                        ('rules', 'Business Rules Engine', 'Access gating and automated billing rules'),
+                    ]
+                },
+                {
+                    'code': 'reports', 'name': 'Analytics & Executive BI', 'icon': 'BarChart3', 'is_core': False, 'sort_order': 14,
+                    'description': 'Deep business reporting, revenue cohort analytics, and athletic performance KPIs.',
+                    'submodules': [
+                        ('business', 'Business Reports', 'High-level studio performance and revenue overview'),
+                        ('sales', 'Sales Reports', 'Conversion rates, rep leaderboards, and pipeline velocity'),
+                        ('members', 'Member Reports', 'Churn, retention, cohort, and attendance breakdowns'),
+                        ('trainers', 'Trainer Reports', 'PT utilization, client ratings, and session delivery'),
+                        ('financial', 'Financial Reports', 'GST filing, expense summaries, and collection ledger'),
+                        ('performance', 'Performance Reports', 'Workout volume and member fitness milestone trends'),
+                    ]
+                },
             ]
 
             modules_map = {}

@@ -9,6 +9,8 @@ import uuid
 import sys
 from django.db import models, transaction
 from django.http import Http404
+from django.utils import timezone
+from decimal import Decimal
 from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -60,6 +62,96 @@ class TenantViewSet(viewsets.ModelViewSet):
         if self.action == 'retrieve':
             return TenantDetailSerializer
         return TenantSerializer
+
+    def perform_update(self, serializer):
+        from decimal import Decimal
+        from django.utils import timezone
+        from apps.master.models_saas import ProductModule, TenantModule, ResourceMetric, TenantResourceLimit
+
+        tenant = serializer.save()
+
+        # 1. Update enabled_modules and sync to TenantModule and Tenant DB
+        if 'enabled_modules' in self.request.data:
+            raw_modules = self.request.data.get('enabled_modules') or []
+            enabled_codes = set()
+            for item in raw_modules:
+                if not item:
+                    continue
+                code = item.strip('/').split('/')[0].lower()
+                enabled_codes.add(code)
+
+            all_modules = ProductModule.objects.using('default').all()
+            for mod in all_modules:
+                is_on = mod.code in enabled_codes
+                TenantModule.objects.using('default').update_or_create(
+                    tenant=tenant,
+                    module=mod,
+                    defaults={
+                        'is_enabled': is_on,
+                        'status': 'ENABLED' if is_on else 'DISABLED',
+                        'availability_mode': 'ALL_BRANCHES',
+                    }
+                )
+
+            # Sync to tenant DB catalog and branch modules
+            try:
+                from apps.authentication.views import _register_and_resolve_tenant
+                from config.routers import set_tenant_db_alias
+                from apps.tenant_core.models_rbac import ModuleCatalog, BranchModule
+                from apps.tenant_core.models_org import Branch
+
+                db_alias = _register_and_resolve_tenant(tenant)
+                try:
+                    for mod in all_modules:
+                        is_on = mod.code in enabled_codes
+                        ModuleCatalog.objects.using(db_alias).filter(module_code=mod.code).update(is_enabled=is_on)
+                        if is_on:
+                            for br in Branch.objects.using(db_alias).all():
+                                BranchModule.objects.using(db_alias).update_or_create(
+                                    branch=br,
+                                    module_code=mod.code,
+                                    defaults={'is_enabled': True, 'status': 'ENABLED'}
+                                )
+                        else:
+                            BranchModule.objects.using(db_alias).filter(module_code=mod.code).update(
+                                is_enabled=False, status='DISABLED'
+                            )
+                finally:
+                    set_tenant_db_alias(None)
+            except Exception as e:
+                logger.warning("TenantViewSet: could not sync modules to tenant DB for %s: %s", tenant.slug, e)
+
+        # 2. Update max_locations
+        if 'max_locations' in self.request.data:
+            val = self.request.data.get('max_locations')
+            if val is not None:
+                loc_metric = ResourceMetric.objects.using('default').filter(code='LOCATIONS').first()
+                if loc_metric:
+                    TenantResourceLimit.objects.using('default').update_or_create(
+                        tenant=tenant,
+                        metric=loc_metric,
+                        defaults={
+                            'limit_value': Decimal(str(val)),
+                            'is_unlimited': int(val) == -1,
+                            'is_plan_default': False,
+                        }
+                    )
+
+        # 3. Update max_members
+        if 'max_members' in self.request.data:
+            val = self.request.data.get('max_members')
+            if val is not None:
+                mem_metric = ResourceMetric.objects.using('default').filter(code__in=['ACTIVE_MEMBERS', 'ACTIVE_USERS']).first()
+                if mem_metric:
+                    TenantResourceLimit.objects.using('default').update_or_create(
+                        tenant=tenant,
+                        metric=mem_metric,
+                        defaults={
+                            'limit_value': Decimal(str(val)),
+                            'is_unlimited': int(val) == -1,
+                            'is_plan_default': False,
+                        }
+                    )
 
     @action(detail=True, methods=['post'])
     def activate(self, request, pk=None):
@@ -224,6 +316,332 @@ class TenantViewSet(viewsets.ModelViewSet):
             'healthy': sum(1 for r in results if r['health_status'] == 'HEALTHY'),
             'results': results,
         })
+
+
+class PlatformLocationViewSet(viewsets.ViewSet):
+    """
+    Platform Super Admin endpoints for Studio Branches & Locations across tenants.
+    Mounted at /api/v1/platform/locations/
+    """
+    permission_classes = [PlatformRBACPermission]
+    platform_permission_prefix = 'tenants'
+
+    def list(self, request):
+        tenant_id = request.query_params.get('tenant') or request.query_params.get('tenant_id')
+        from apps.master.models_tenant import Tenant
+        from apps.master.models_infra import TenantDataSource
+        from config.tenant_middleware import _register_tenant_connection
+        from config.routers import build_tenant_db_alias, set_tenant_db_alias
+        from apps.tenant_core.models_org import Branch
+
+        if tenant_id:
+            tenants = Tenant.objects.using('default').filter(id=tenant_id)
+        else:
+            tenants = Tenant.objects.using('default').filter(status='ACTIVE')
+
+        results = []
+        for t in tenants:
+            ds = TenantDataSource.objects.using('default').filter(tenant=t, status='ACTIVE').first()
+            if not ds:
+                continue
+            db_name = ds.database_name or ds.db_name
+            if not db_name:
+                continue
+            db_alias = build_tenant_db_alias(t.id)
+            try:
+                _register_tenant_connection(db_alias, db_name, data_source=ds, tenant_id=t.id)
+                set_tenant_db_alias(db_alias)
+                branches = Branch.objects.using(db_alias).select_related('location').all().order_by('name')
+                for b in branches:
+                    loc = b.location
+                    hours = f"{b.business_open_time} - {b.business_close_time}" if b.business_open_time else "06:00 - 22:00"
+                    results.append({
+                        'id': str(b.id),
+                        'name': b.name,
+                        'city': loc.city if loc else '',
+                        'address': b.address or (loc.area if loc else ''),
+                        'phone': b.phone or '',
+                        'capacity': b.capacity or 100,
+                        'operating_hours': hours,
+                        'is_active': b.status == 'ACTIVE',
+                        'tenant': str(t.id),
+                        'tenant_name': t.name,
+                        'members_count': 0,
+                        'revenue_collected': 0,
+                        'created_at': b.activated_at.isoformat() if b.activated_at else None,
+                    })
+            except Exception as e:
+                logger.warning("Failed to fetch branches for tenant %s: %s", t.slug, e)
+            finally:
+                set_tenant_db_alias(None)
+
+        return Response(results)
+
+    def create(self, request):
+        data = request.data
+        tenant_id = data.get('tenant') or request.query_params.get('tenant')
+        name = (data.get('name') or '').strip()
+        city = (data.get('city') or '').strip()
+        address = (data.get('address') or '').strip()
+        phone = (data.get('phone') or '').strip()
+        capacity = int(data.get('capacity') or 150)
+        operating_hours = data.get('operating_hours') or '06:00 - 22:00'
+        is_active = data.get('is_active', True)
+
+        if not name:
+            return Response({'error': 'Branch name is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not city:
+            return Response({'error': 'City is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not address:
+            return Response({'error': 'Address is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if len(phone) != 10 or not phone.isdigit():
+            return Response({'error': 'Phone number must be exactly 10 numerical digits.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from apps.master.models_tenant import Tenant
+        tenant = None
+        if tenant_id:
+            tenant = Tenant.objects.using('default').filter(id=tenant_id).first()
+        else:
+            tenant = Tenant.objects.using('default').filter(status='ACTIVE').first()
+
+        if not tenant:
+            return Response({'error': 'Tenant organization not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        from apps.authentication.views import _register_and_resolve_tenant
+        from config.routers import set_tenant_db_alias
+        from apps.master.quota import QuotaChecker
+        from apps.tenant_core.models_org import Organization, Location, Branch
+        from apps.tenant_core.models_rbac import BranchModule
+        from apps.master.metering import sync_tenant_resource_usage
+        from django.utils.text import slugify
+
+        try:
+            db_alias = _register_and_resolve_tenant(tenant)
+        except Exception as e:
+            return Response({'error': f'Failed to resolve tenant database: {e}'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            # Enforce Quota
+            allowed, current_usage, limit = QuotaChecker.check_quota(
+                tenant_id=tenant.id, metric_code='LOCATIONS', db_alias=db_alias, requested_increment=1
+            )
+            if not allowed:
+                return Response({
+                    'error': f'Studio branch limit reached ({current_usage} of {limit} branches allocated). Please upgrade subscription tier or increase max locations.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            org = Organization.objects.using(db_alias).first()
+            if not org:
+                return Response({'error': 'Tenant organization root entity not found in tenant database.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Location record
+            loc_code = f"LOC-{slugify(city or name)[:15].upper()}-{uuid.uuid4().hex[:4].upper()}"
+            location = Location.objects.using(db_alias).create(
+                organization=org,
+                code=loc_code,
+                name=f"{city} Location" if city else f"{name} Location",
+                city=city,
+                area=address,
+                country=tenant.country or 'IN',
+                status='ACTIVE',
+                activated_at=timezone.now(),
+            )
+
+            times = operating_hours.split(' - ')
+            open_t = times[0].strip() if len(times) > 0 else '06:00'
+            close_t = times[1].strip() if len(times) > 1 else '22:00'
+
+            br_code = f"BR-{slugify(name)[:15].upper()}-{uuid.uuid4().hex[:4].upper()}"
+            branch = Branch.objects.using(db_alias).create(
+                organization=org,
+                location=location,
+                code=br_code,
+                name=name,
+                address=address,
+                phone=phone,
+                capacity=capacity,
+                business_open_time=open_t,
+                business_close_time=close_t,
+                status='ACTIVE' if is_active else 'INACTIVE',
+                activated_at=timezone.now() if is_active else None,
+            )
+
+            # Enable all current tenant-enabled modules for this new branch
+            for tm in tenant.enabled_modules_set.filter(is_enabled=True):
+                BranchModule.objects.using(db_alias).get_or_create(
+                    branch=branch,
+                    module_code=tm.module.code,
+                    defaults={'is_enabled': True, 'status': 'ENABLED'}
+                )
+
+            # Update live usage in master DB
+            try:
+                sync_tenant_resource_usage(tenant_id=tenant.id, metrics=['LOCATIONS'])
+            except Exception:
+                pass
+
+            resp_data = {
+                'id': str(branch.id),
+                'name': branch.name,
+                'city': location.city,
+                'address': branch.address,
+                'phone': branch.phone,
+                'capacity': branch.capacity,
+                'operating_hours': f"{branch.business_open_time} - {branch.business_close_time}",
+                'is_active': branch.status == 'ACTIVE',
+                'tenant': str(tenant.id),
+                'tenant_name': tenant.name,
+                'members_count': 0,
+                'revenue_collected': 0,
+                'created_at': branch.activated_at.isoformat() if branch.activated_at else timezone.now().isoformat(),
+            }
+            return Response(resp_data, status=status.HTTP_201_CREATED)
+
+        finally:
+            set_tenant_db_alias(None)
+
+    def retrieve(self, request, pk=None):
+        from apps.master.models_tenant import Tenant
+        from apps.master.models_infra import TenantDataSource
+        from config.tenant_middleware import _register_tenant_connection
+        from config.routers import build_tenant_db_alias, set_tenant_db_alias
+        from apps.tenant_core.models_org import Branch
+
+        for t in Tenant.objects.using('default').filter(status='ACTIVE'):
+            ds = TenantDataSource.objects.using('default').filter(tenant=t, status='ACTIVE').first()
+            if not ds:
+                continue
+            db_name = ds.database_name or ds.db_name
+            if not db_name:
+                continue
+            db_alias = build_tenant_db_alias(t.id)
+            try:
+                _register_tenant_connection(db_alias, db_name, data_source=ds, tenant_id=t.id)
+                set_tenant_db_alias(db_alias)
+                branch = Branch.objects.using(db_alias).select_related('location').filter(id=pk).first()
+                if branch:
+                    loc = branch.location
+                    hours = f"{branch.business_open_time} - {branch.business_close_time}" if branch.business_open_time else "06:00 - 22:00"
+                    return Response({
+                        'id': str(branch.id),
+                        'name': branch.name,
+                        'city': loc.city if loc else '',
+                        'address': branch.address,
+                        'phone': branch.phone,
+                        'capacity': branch.capacity,
+                        'operating_hours': hours,
+                        'is_active': branch.status == 'ACTIVE',
+                        'tenant': str(t.id),
+                        'tenant_name': t.name,
+                    })
+            finally:
+                set_tenant_db_alias(None)
+
+        return Response({'error': 'Branch not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    def partial_update(self, request, pk=None):
+        return self.update(request, pk)
+
+    def update(self, request, pk=None):
+        data = request.data
+        from apps.master.models_tenant import Tenant
+        from apps.master.models_infra import TenantDataSource
+        from config.tenant_middleware import _register_tenant_connection
+        from config.routers import build_tenant_db_alias, set_tenant_db_alias
+        from apps.tenant_core.models_org import Branch
+        from apps.master.metering import sync_tenant_resource_usage
+
+        tenant_id = data.get('tenant')
+        tenants = Tenant.objects.using('default').filter(id=tenant_id) if tenant_id else Tenant.objects.using('default').filter(status='ACTIVE')
+
+        for t in tenants:
+            ds = TenantDataSource.objects.using('default').filter(tenant=t, status='ACTIVE').first()
+            if not ds:
+                continue
+            db_name = ds.database_name or ds.db_name
+            if not db_name:
+                continue
+            db_alias = build_tenant_db_alias(t.id)
+            try:
+                _register_tenant_connection(db_alias, db_name, data_source=ds, tenant_id=t.id)
+                set_tenant_db_alias(db_alias)
+                branch = Branch.objects.using(db_alias).select_related('location').filter(id=pk).first()
+                if branch:
+                    if 'name' in data and data['name']:
+                        branch.name = data['name'].strip()
+                    if 'address' in data:
+                        branch.address = data['address'].strip()
+                    if 'phone' in data:
+                        branch.phone = data['phone'].strip()
+                    if 'capacity' in data:
+                        branch.capacity = int(data['capacity'])
+                    if 'is_active' in data:
+                        branch.status = 'ACTIVE' if data['is_active'] else 'INACTIVE'
+                    if 'operating_hours' in data and data['operating_hours']:
+                        times = data['operating_hours'].split(' - ')
+                        branch.business_open_time = times[0].strip() if len(times) > 0 else '06:00'
+                        branch.business_close_time = times[1].strip() if len(times) > 1 else '22:00'
+                    branch.save(using=db_alias)
+
+                    if 'city' in data and branch.location:
+                        branch.location.city = data['city'].strip()
+                        branch.location.save(using=db_alias)
+
+                    try:
+                        sync_tenant_resource_usage(tenant_id=t.id, metrics=['LOCATIONS'])
+                    except Exception:
+                        pass
+
+                    loc = branch.location
+                    hours = f"{branch.business_open_time} - {branch.business_close_time}" if branch.business_open_time else "06:00 - 22:00"
+                    return Response({
+                        'id': str(branch.id),
+                        'name': branch.name,
+                        'city': loc.city if loc else '',
+                        'address': branch.address,
+                        'phone': branch.phone,
+                        'capacity': branch.capacity,
+                        'operating_hours': hours,
+                        'is_active': branch.status == 'ACTIVE',
+                        'tenant': str(t.id),
+                        'tenant_name': t.name,
+                    })
+            finally:
+                set_tenant_db_alias(None)
+
+        return Response({'error': 'Branch not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    def destroy(self, request, pk=None):
+        from apps.master.models_tenant import Tenant
+        from apps.master.models_infra import TenantDataSource
+        from config.tenant_middleware import _register_tenant_connection
+        from config.routers import build_tenant_db_alias, set_tenant_db_alias
+        from apps.tenant_core.models_org import Branch
+        from apps.master.metering import sync_tenant_resource_usage
+
+        for t in Tenant.objects.using('default').filter(status='ACTIVE'):
+            ds = TenantDataSource.objects.using('default').filter(tenant=t, status='ACTIVE').first()
+            if not ds:
+                continue
+            db_name = ds.database_name or ds.db_name
+            if not db_name:
+                continue
+            db_alias = build_tenant_db_alias(t.id)
+            try:
+                _register_tenant_connection(db_alias, db_name, data_source=ds, tenant_id=t.id)
+                set_tenant_db_alias(db_alias)
+                branch = Branch.objects.using(db_alias).filter(id=pk).first()
+                if branch:
+                    branch.delete(using=db_alias)
+                    try:
+                        sync_tenant_resource_usage(tenant_id=t.id, metrics=['LOCATIONS'])
+                    except Exception:
+                        pass
+                    return Response(status=status.HTTP_204_NO_CONTENT)
+            finally:
+                set_tenant_db_alias(None)
+
+        return Response({'error': 'Branch not found.'}, status=status.HTTP_404_NOT_FOUND)
 
 
 class TenantModuleViewSet(viewsets.ModelViewSet):

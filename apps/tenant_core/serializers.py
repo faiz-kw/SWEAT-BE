@@ -26,13 +26,19 @@ class LocationSerializer(serializers.ModelSerializer):
 
 class BranchSerializer(serializers.ModelSerializer):
     location_name = serializers.CharField(source='location.name', read_only=True)
+    city = serializers.CharField(source='location.city', read_only=True)
+    operating_hours = serializers.SerializerMethodField()
 
     class Meta:
         model = Branch
-        fields = ['id', 'organization', 'company_entity', 'location', 'location_name', 'code', 'name',
+        fields = ['id', 'organization', 'company_entity', 'location', 'location_name', 'city', 'code', 'name',
                   'address', 'address_line_1', 'address_line_2', 'latitude', 'longitude', 'timezone',
-                  'phone', 'email', 'capacity', 'status', 'created_at']
+                  'phone', 'email', 'capacity', 'business_open_time', 'business_close_time', 'operating_hours',
+                  'status', 'created_at']
         read_only_fields = ['id', 'created_at']
+
+    def get_operating_hours(self, obj):
+        return f"{obj.business_open_time} - {obj.business_close_time}" if obj.business_open_time else "06:00 - 22:00"
 
 
 class DepartmentSerializer(serializers.ModelSerializer):
@@ -56,6 +62,7 @@ class TenantUserSerializer(serializers.ModelSerializer):
     role = serializers.SerializerMethodField()
     role_name = serializers.SerializerMethodField()
     roles = serializers.SerializerMethodField()
+    branch_access = serializers.SerializerMethodField()
     department = serializers.SerializerMethodField()
     departments = serializers.SerializerMethodField()
     home_branch_name = serializers.CharField(source='home_branch.name', read_only=True, default=None)
@@ -71,7 +78,7 @@ class TenantUserSerializer(serializers.ModelSerializer):
             'status', 'is_login_allowed', 'home_branch', 'deactivated_at',
             'deactivated_by', 'deactivation_reason', 'suspended_until',
             'last_login_at', 'created_at',
-            'full_name', 'role', 'role_name', 'roles', 'department', 'departments',
+            'full_name', 'role', 'role_name', 'roles', 'branch_access', 'department', 'departments',
             'home_branch_name', 'active_location_name', 'tenant_id', 'tenant_name', 'is_active',
         ]
         read_only_fields = ['id', 'last_login_at', 'created_at', 'deactivated_at', 'deactivated_by']
@@ -109,6 +116,21 @@ class TenantUserSerializer(serializers.ModelSerializer):
         except Exception:
             pass
         return 'Staff Member'
+
+    def get_branch_access(self, obj):
+        from .models_rbac import RoleAssignment
+        rows = RoleAssignment.objects.using(obj._state.db).filter(
+            user=obj, role__scope='BRANCH', branch__isnull=False,
+        ).select_related('branch')
+        # Older edits may leave multiple historical assignments. Active wins.
+        access = {}
+        for row in rows:
+            key = (str(row.role_id), str(row.branch_id))
+            enabled = row.is_active and row.status == 'ACTIVE'
+            if key not in access or enabled:
+                access[key] = {'role_id': key[0], 'branch_id': key[1],
+                               'branch_name': row.branch.name, 'enabled': enabled}
+        return list(access.values())
 
     def get_roles(self, obj):
         db = obj._state.db or 'default'
@@ -308,11 +330,12 @@ class TenantUserCreateSerializer(TenantUserSerializer):
         role_param = validated_data.pop('role', None)
         role_id_param = validated_data.pop('role_id', None)
         dept_id_param = validated_data.pop('department_id', None)
-        branch_param = (
-            validated_data.pop('branch', None) or
-            validated_data.pop('branch_id', None) or
-            validated_data.pop('home_branch', None)
-        )
+        # Consume every alias: the frontend sends all three. Short-circuiting
+        # pop() leaves branch_id in the model kwargs and causes a TypeError.
+        branch_value = validated_data.pop('branch', None)
+        branch_id_value = validated_data.pop('branch_id', None)
+        home_branch_value = validated_data.pop('home_branch', None)
+        branch_param = branch_value or branch_id_value or home_branch_value
 
         # Resolve home_branch from branch_param if provided
         if branch_param:
@@ -653,12 +676,19 @@ class SubmoduleCatalogSerializer(serializers.ModelSerializer):
 
 class PermissionSerializer(serializers.ModelSerializer):
     module_code = serializers.CharField(source='module.module_code', read_only=True)
+    module_name = serializers.CharField(source='module.name', read_only=True, default='')
     submodule_code = serializers.CharField(source='submodule.submodule_code', read_only=True, default=None)
+    submodule_name = serializers.CharField(source='submodule.name', read_only=True, default='')
+    code = serializers.CharField(source='permission_code', read_only=True)
 
     class Meta:
         from .models_rbac import Permission
         model = Permission
-        fields = ['id', 'module', 'module_code', 'submodule', 'submodule_code', 'permission_code', 'action', 'label', 'description', 'is_active']
+        fields = [
+            'id', 'module', 'module_code', 'module_name',
+            'submodule', 'submodule_code', 'submodule_name',
+            'permission_code', 'code', 'action', 'label', 'description', 'is_active'
+        ]
 
 
 class RoleModuleAccessSerializer(serializers.ModelSerializer):

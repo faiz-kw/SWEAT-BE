@@ -7,10 +7,12 @@ from .views import (
     TenantSubscriptionViewSet, SubscriptionInvoiceViewSet,
     TenantResourceUsageViewSet, BillingWebhookView,
     TenantBrandingViewSet, PlatformBrandingViewSet,
+    PlatformLocationViewSet,
 )
 
 router = DefaultRouter()
 router.register(r'tenants', TenantViewSet, basename='tenant')
+router.register(r'locations', PlatformLocationViewSet, basename='platform-location')
 router.register(r'tenant-modules', TenantModuleViewSet, basename='tenant-module')
 router.register(r'saas-plans', SaasPlanViewSet, basename='saas-plan')
 router.register(r'plans', SaasPlanViewSet, basename='plan')

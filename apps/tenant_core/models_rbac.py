@@ -384,8 +384,12 @@ class RolePermissionSetItem(models.Model):
         unique_together = ('permission_set', 'permission')
 
     def save(self, *args, **kwargs):
-        if 'is_allowed' in kwargs or hasattr(self, 'is_allowed'):
-            self.granted = self.is_allowed
+        # The API and authorization engine use granted as the authoritative value.
+        self.is_allowed = self.granted
+        if kwargs.get('update_fields') is not None:
+            fields = set(kwargs['update_fields'])
+            if fields & {'granted', 'is_allowed'}:
+                kwargs['update_fields'] = fields | {'granted', 'is_allowed'}
         super().save(*args, **kwargs)
 
     def __str__(self):

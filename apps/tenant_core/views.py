@@ -316,70 +316,121 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
         return TenantUserSerializer
 
     def perform_update(self, serializer):
-        super().perform_update(serializer)
-        instance = serializer.instance
-        db = self.get_db()
-        data = self.request.data
-        from .models_rbac import Role, RoleAssignment
-        from .models_users import UserDepartment, Department, UserBranch
-        from .models_org import Branch
+        with transaction.atomic(using=self.get_db()):
+            instance = serializer.instance
+            db = self.get_db()
+            data = self.request.data
+            from .models_rbac import Role, RoleAssignment
+            from .models_users import UserDepartment, Department, UserBranch
+            from .models_org import Branch
 
-        # Update role assignment if provided
-        role_id = data.get('role_id') or data.get('role')
-        if role_id:
+            from rest_framework.exceptions import ValidationError
+            role_id = data.get('role_id') or data.get('role')
             role_obj = None
-            import uuid
-            try:
-                role_obj = Role.objects.using(db).filter(id=uuid.UUID(str(role_id))).first()
-            except Exception:
-                role_obj = Role.objects.using(db).filter(code=str(role_id)).first()
-            
-            if role_obj:
-                RoleAssignment.objects.using(db).filter(user=instance, is_active=True).update(is_active=False)
-                RoleAssignment.objects.using(db).create(
-                    organization=instance.organization,
-                    user=instance,
-                    role=role_obj,
-                    branch=instance.home_branch,
-                    scope_type='BRANCH' if instance.home_branch else 'ORGANIZATION',
-                    status='ACTIVE',
-                    is_active=True
-                )
+            if role_id:
+                try:
+                    role_obj = Role.objects.using(db).filter(id=uuid.UUID(str(role_id))).first()
+                except (ValueError, TypeError, AttributeError):
+                    role_obj = Role.objects.using(db).filter(code=str(role_id)).first()
+                if role_obj is None:
+                    raise ValidationError({'role_id': 'Select a valid role.'})
 
-        # Update department if provided
-        dept_id = data.get('department_id') or data.get('department')
-        if dept_id:
-            dept_obj = None
-            try:
-                dept_obj = Department.objects.using(db).filter(id=dept_id).first()
-            except Exception:
-                dept_obj = Department.objects.using(db).filter(code=dept_id).first()
-            if dept_obj:
-                UserDepartment.objects.using(db).filter(user=instance, status='ACTIVE').update(status='INACTIVE')
-                UserDepartment.objects.using(db).create(
-                    user=instance,
-                    department=dept_obj,
-                    is_primary=True,
-                    status='ACTIVE'
-                )
+            branch_access = data.get('branch_access')
+            resolved_access = []
+            if branch_access is not None:
+                if not role_obj or role_obj.scope != 'BRANCH' or not role_obj.is_active or role_obj.organization_id != instance.organization_id:
+                    raise ValidationError({'branch_access': 'Select an active branch-scoped role.'})
+                if not isinstance(branch_access, list):
+                    raise ValidationError({'branch_access': 'Expected a list of branch access entries.'})
+                seen = set()
+                for entry in branch_access:
+                    if not isinstance(entry, dict) or type(entry.get('enabled')) is not bool:
+                        raise ValidationError({'branch_access': 'Each entry requires branch_id and enabled (true/false).'})
+                    try:
+                        branch_pk = uuid.UUID(str(entry.get('branch_id')))
+                    except (ValueError, TypeError, AttributeError):
+                        raise ValidationError({'branch_access': 'Invalid branch ID.'})
+                    branch_obj = Branch.objects.using(db).filter(pk=branch_pk, organization_id=instance.organization_id).first()
+                    if not branch_obj or branch_pk in seen:
+                        raise ValidationError({'branch_access': 'Branch is missing or repeated.'})
+                    if entry['enabled'] and branch_obj.status != 'ACTIVE':
+                        raise ValidationError({'branch_access': 'Cannot enable access to an inactive branch.'})
+                    self.validate_branch_scope(branch_pk)
+                    seen.add(branch_pk)
+                    resolved_access.append((branch_obj, entry['enabled']))
+                if data.get('branch_id') or data.get('branch') or data.get('home_branch'):
+                    raise ValidationError({'branch_access': 'Update home branch separately from branch access.'})
 
-        # Update home branch if provided
-        branch_id = data.get('home_branch') or data.get('branch_id') or data.get('branch')
-        if branch_id:
+            branch_id = data.get('home_branch') or data.get('branch_id') or data.get('branch')
             br_obj = None
-            try:
-                br_obj = Branch.objects.using(db).filter(id=uuid.UUID(str(branch_id))).first()
-            except Exception:
-                br_obj = Branch.objects.using(db).filter(name__iexact=str(branch_id)).first()
+            if branch_id:
+                try:
+                    br_obj = Branch.objects.using(db).filter(id=uuid.UUID(str(branch_id))).first()
+                except (ValueError, TypeError, AttributeError):
+                    br_obj = Branch.objects.using(db).filter(name__iexact=str(branch_id)).first()
+                if br_obj is None:
+                    raise ValidationError({'branch_id': 'Select a valid branch.'})
+                self.validate_branch_scope(br_obj.id)
+            old_branch_id = instance.home_branch_id
+            super().perform_update(serializer)
+
             if br_obj:
                 instance.home_branch = br_obj
                 instance.save(using=db, update_fields=['home_branch'])
-                UserBranch.objects.using(db).filter(user=instance, scope_type='HOME').update(scope_type='ADDITIONAL', is_primary=False)
+                UserBranch.objects.using(db).filter(user=instance, scope_type='HOME').exclude(branch=br_obj).update(status='INACTIVE', is_active=False, is_primary=False)
                 UserBranch.objects.using(db).update_or_create(
-                    user=instance,
-                    branch=br_obj,
-                    defaults={'scope_type': 'HOME', 'is_primary': True, 'relationship_type': 'PRIMARY', 'status': 'ACTIVE', 'is_active': True}
+                    user=instance, branch=br_obj, scope_type='HOME',
+                    defaults={'is_primary': True, 'relationship_type': 'PRIMARY', 'status': 'ACTIVE', 'is_active': True}
                 )
+                if not role_obj:
+                    # Move home-branch access; retain separately assigned additional branches.
+                    RoleAssignment.objects.using(db).filter(
+                        user=instance, is_active=True, role__scope='BRANCH', branch_id=old_branch_id,
+                    ).update(branch=br_obj, scope_type='BRANCH')
+
+            existing_role = role_obj and RoleAssignment.objects.using(db).filter(user=instance, role=role_obj, is_active=True).exists()
+            if role_obj and branch_access is None and (br_obj or not existing_role):
+                RoleAssignment.objects.using(db).filter(user=instance, is_active=True).update(is_active=False, status='INACTIVE')
+                assigned_branch = instance.home_branch if role_obj.scope == 'BRANCH' else None
+                RoleAssignment.objects.using(db).create(
+                    organization=instance.organization, user=instance, role=role_obj,
+                    branch=assigned_branch,
+                    scope_type='BRANCH' if assigned_branch else 'ORGANIZATION',
+                    status='ACTIVE', is_active=True,
+                )
+
+            if branch_access is not None:
+                for branch_obj, enabled in resolved_access:
+                    assignments = RoleAssignment.objects.using(db).filter(
+                        user=instance, role=role_obj, branch=branch_obj,
+                    )
+                    assignment = assignments.order_by('-created_at').first()
+                    assignments.update(is_active=False, status='INACTIVE')
+                    if assignment is None:
+                        assignment = RoleAssignment(organization=instance.organization,
+                                                    user=instance, role=role_obj, branch=branch_obj)
+                    assignment.is_active = enabled
+                    assignment.status = 'ACTIVE' if enabled else 'INACTIVE'
+                    assignment.scope_type = 'BRANCH'
+                    assignment.save(using=db)
+
+            # Update department if provided
+            dept_id = data.get('department_id') or data.get('department')
+            if dept_id:
+                dept_obj = None
+                try:
+                    dept_obj = Department.objects.using(db).filter(id=dept_id).first()
+                except Exception:
+                    dept_obj = Department.objects.using(db).filter(code=dept_id).first()
+                if dept_obj:
+                    UserDepartment.objects.using(db).filter(user=instance, status='ACTIVE').update(status='INACTIVE')
+                    UserDepartment.objects.using(db).create(
+                        user=instance,
+                        department=dept_obj,
+                        is_primary=True,
+                        status='ACTIVE'
+                    )
+
 
     def perform_destroy(self, instance):
         """

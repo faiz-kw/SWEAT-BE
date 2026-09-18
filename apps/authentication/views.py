@@ -941,13 +941,17 @@ class MeView(APIView):
         # Load active role assignments from Tenant DB
         active_roles = []
         allowed_branches = []
+        is_org_wide = False
 
         if db_alias:
             try:
+                from apps.tenant_core.models_rbac import RoleAssignment
+                from apps.tenant_core.models_org import Branch
+
                 assignments = (
                     RoleAssignment.objects.using(db_alias)
                     .filter(user=user, is_active=True)
-                    .select_related('role', 'branch')
+                    .select_related('role', 'branch', 'branch__location')
                 )
                 for ra in assignments:
                     active_roles.append({
@@ -957,12 +961,31 @@ class MeView(APIView):
                         'branch_id': str(ra.branch.id) if ra.branch else None,
                         'branch_name': ra.branch.name if ra.branch else None,
                     })
-                    if ra.branch:
+                    if ra.role.scope == 'ORG' or ra.role.code in ('ORG_ADMIN', 'TENANT_ADMIN'):
+                        is_org_wide = True
+                    elif ra.branch and ra.branch.status == 'ACTIVE':
+                        loc = ra.branch.location
                         allowed_branches.append({
                             'id': str(ra.branch.id),
                             'name': ra.branch.name,
                             'code': ra.branch.code,
+                            'city': loc.city if loc else '',
+                            'address': ra.branch.address or (loc.area if loc else ''),
                         })
+
+                # If user has ORG scope or no explicit branch restrictions, they can view ALL active branches in the organization
+                if is_org_wide:
+                    all_branches = Branch.objects.using(db_alias).filter(status='ACTIVE').select_related('location').order_by('name')
+                    allowed_branches = [
+                        {
+                            'id': str(b.id),
+                            'name': b.name,
+                            'code': b.code,
+                            'city': b.location.city if b.location else '',
+                            'address': b.address or (b.location.area if b.location else ''),
+                        }
+                        for b in all_branches
+                    ]
             except Exception as e:
                 logger.error('MeView: Error loading role assignments from db_alias=%s: %s', db_alias, e)
 
@@ -990,6 +1013,7 @@ class MeView(APIView):
             'full_name': user.full_name,
             'user_type': 'tenant',
             'roles': active_roles,                     # Real role assignments from DB
+            'is_org_wide': is_org_wide,
             'is_staff': False,
             'is_superuser': False,
             'tenant_id': str(tenant_id) if tenant_id else None,
@@ -998,6 +1022,8 @@ class MeView(APIView):
             'home_branch': home_branch_data,
             'enabled_modules': enabled_modules,        # Real module enablement from Master DB
             'allowed_branches': allowed_branches,
+            'allowed_locations': allowed_branches,       # Expose for frontend auth-context
+            'allowed_locations_list': allowed_branches,  # Expose for frontend auth.ts
             'branding': branding,
         })
 
