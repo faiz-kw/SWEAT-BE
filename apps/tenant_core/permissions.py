@@ -41,14 +41,14 @@ class TenantRBACPermission(permissions.BasePermission):
 
     def _resolve_permission_code(self, view, request) -> str:
         """Derive permission code from view metadata and action."""
-        # 1. Check direct override on view
-        if hasattr(view, 'required_permission') and view.required_permission:
-            return view.required_permission
-
-        # 2. Check action_permission_map dictionary
-        action_map = getattr(view, 'action_permission_map', {})
+        # 1. Check action_permission_map dictionary
+        action_map = getattr(view, 'action_permission_map', {}) or getattr(view, 'permission_action_map', {})
         if view.action in action_map:
             return action_map[view.action]
+
+        # 2. Check direct override on view
+        if hasattr(view, 'required_permission') and view.required_permission:
+            return view.required_permission
 
         # 3. Check permission_prefix + action suffix
         prefix = getattr(view, 'permission_prefix', None)

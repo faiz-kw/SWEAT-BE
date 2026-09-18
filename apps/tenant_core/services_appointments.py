@@ -138,7 +138,6 @@ class AppointmentSchedulingService:
         return appointment
 
     @classmethod
-    @transaction.atomic
     def assign_trainer_to_appointment(
         cls,
         appointment_id: str,
@@ -155,111 +154,111 @@ class AppointmentSchedulingService:
         4. Time conflict check with classes and other appointments.
         """
         alias = db_alias or 'default'
-        appt = Appointment.objects.using(alias).select_for_update().get(id=appointment_id)
-        trainer = TrainerProfile.objects.using(alias).select_related('employee_profile').get(id=trainer_profile_id)
+        with transaction.atomic(using=alias):
+            appt = Appointment.objects.using(alias).select_for_update().get(id=appointment_id)
+            trainer = TrainerProfile.objects.using(alias).select_related('employee_profile').get(id=trainer_profile_id)
 
-        # 1. Active Status Check
-        if trainer.trainer_status != 'ACTIVE' or trainer.employee_profile.employment_status != 'ACTIVE':
-            raise ValidationError(f"Trainer {trainer.trainer_code} is not active.")
+            # 1. Active Status Check
+            if trainer.trainer_status != 'ACTIVE' or trainer.employee_profile.employment_status != 'ACTIVE':
+                raise ValidationError(f"Trainer {trainer.trainer_code} is not active.")
 
-        # 2. Specialty Requirement Check (if defined for this appointment type)
-        mandatory_reqs = AppointmentTypeSpecialtyRequirement.objects.using(alias).filter(
-            appointment_type=appt.appointment_type,
-            is_mandatory=True,
-            status='ACTIVE',
-        )
-        if mandatory_reqs.exists() and not trainer.can_teach_all_specialties:
-            required_specialties = [r.trainer_specialty_id for r in mandatory_reqs]
-            has_spec = TrainerSpecialtyAssignment.objects.using(alias).filter(
-                trainer_profile=trainer,
-                trainer_specialty_id__in=required_specialties,
-                allow_individual=True,
+            # 2. Specialty Requirement Check (if defined for this appointment type)
+            mandatory_reqs = AppointmentTypeSpecialtyRequirement.objects.using(alias).filter(
+                appointment_type=appt.appointment_type,
+                is_mandatory=True,
                 status='ACTIVE',
+            )
+            if mandatory_reqs.exists() and not trainer.can_teach_all_specialties:
+                required_specialties = [r.trainer_specialty_id for r in mandatory_reqs]
+                has_spec = TrainerSpecialtyAssignment.objects.using(alias).filter(
+                    trainer_profile=trainer,
+                    trainer_specialty_id__in=required_specialties,
+                    allow_individual=True,
+                    status='ACTIVE',
+                ).exists()
+                if not has_spec:
+                    raise ValidationError(
+                        f"Trainer {trainer.trainer_code} does not possess required individual specialty credentials for {appt.appointment_type.name}."
+                    )
+
+            # 3. Schedule shift and leave check via TrainerAvailabilityService
+            duration = int((appt.end_at - appt.start_at).total_seconds() // 60)
+            is_avail, reason, _ = TrainerAvailabilityService.is_trainer_available(
+                trainer=trainer,
+                branch=appt.branch,
+                start_datetime=appt.start_at,
+                duration_minutes=duration,
+                delivery_mode='INDIVIDUAL',
+                db_alias=alias,
+            )
+            if not is_avail:
+                raise ValidationError(f"Trainer availability check failed: {reason}")
+
+            # 4. Conflict check with other appointments
+            conflict_appt = AppointmentTrainer.objects.using(alias).filter(
+                trainer_profile=trainer,
+                status__in=['ASSIGNED', 'CONFIRMED'],
+                appointment__start_at__lt=appt.end_at,
+                appointment__end_at__gt=appt.start_at,
+            ).exclude(appointment=appt).exists()
+            if conflict_appt:
+                raise ValidationError(f"Trainer {trainer.trainer_code} has a conflicting individual appointment.")
+
+            # 5. Conflict check with group class occurrences
+            conflict_class = ClassOccurrenceTrainer.objects.using(alias).filter(
+                trainer_profile=trainer,
+                status__in=['ASSIGNED', 'CONFIRMED'],
+                occurrence__start_at__lt=appt.end_at,
+                occurrence__end_at__gt=appt.start_at,
             ).exists()
-            if not has_spec:
-                raise ValidationError(
-                    f"Trainer {trainer.trainer_code} does not possess required individual specialty credentials for {appt.appointment_type.name}."
-                )
+            if conflict_class:
+                raise ValidationError(f"Trainer {trainer.trainer_code} has a conflicting group class assignment.")
 
-        # 3. Schedule shift and leave check via TrainerAvailabilityService
-        duration = int((appt.end_at - appt.start_at).total_seconds() // 60)
-        is_avail, reason, _ = TrainerAvailabilityService.is_trainer_available(
-            trainer=trainer,
-            branch=appt.branch,
-            start_datetime=appt.start_at,
-            duration_minutes=duration,
-            delivery_mode='INDIVIDUAL',
-            db_alias=alias,
-        )
-        if not is_avail:
-            raise ValidationError(f"Trainer availability check failed: {reason}")
+            # Create or update assignment
+            assignment, _ = AppointmentTrainer.objects.using(alias).update_or_create(
+                appointment=appt,
+                trainer_profile=trainer,
+                defaults={
+                    'role': role,
+                    'status': 'CONFIRMED',
+                    'assigned_by_user': actor,
+                    'assigned_at': timezone.now(),
+                }
+            )
 
-        # 4. Conflict check with other appointments
-        conflict_appt = AppointmentTrainer.objects.using(alias).filter(
-            trainer_profile=trainer,
-            status__in=['ASSIGNED', 'CONFIRMED'],
-            appointment__start_at__lt=appt.end_at,
-            appointment__end_at__gt=appt.start_at,
-        ).exclude(appointment=appt).exists()
-        if conflict_appt:
-            raise ValidationError(f"Trainer {trainer.trainer_code} has a conflicting individual appointment.")
+            record_business_audit(
+                organization=appt.branch.organization,
+                branch=appt.branch,
+                module='appointments',
+                action_code='APPOINTMENT_TRAINER_ASSIGNED',
+                entity_type='AppointmentTrainer',
+                entity_id=assignment.id,
+                actor_user=actor,
+                event_description=f"Assigned trainer {trainer.trainer_code} to appointment {appt.id}",
+                after_data={
+                    'appointment_id': str(appt.id),
+                    'trainer_code': trainer.trainer_code,
+                    'role': role,
+                },
+                db_alias=alias,
+            )
 
-        # 5. Conflict check with group class occurrences
-        conflict_class = ClassOccurrenceTrainer.objects.using(alias).filter(
-            trainer_profile=trainer,
-            status__in=['ASSIGNED', 'CONFIRMED'],
-            occurrence__start_at__lt=appt.end_at,
-            occurrence__end_at__gt=appt.start_at,
-        ).exists()
-        if conflict_class:
-            raise ValidationError(f"Trainer {trainer.trainer_code} has a conflicting group class assignment.")
+            enqueue_outbox_event(
+                organization=appt.branch.organization,
+                event_type='APPOINTMENT_TRAINER_ASSIGNED',
+                aggregate_type='Appointment',
+                aggregate_id=str(appt.id),
+                payload={
+                    'appointment_id': str(appt.id),
+                    'trainer_profile_id': str(trainer.id),
+                    'role': role,
+                },
+                db_alias=alias,
+            )
 
-        # Create or update assignment
-        assignment, _ = AppointmentTrainer.objects.using(alias).update_or_create(
-            appointment=appt,
-            trainer_profile=trainer,
-            defaults={
-                'role': role,
-                'status': 'CONFIRMED',
-                'assigned_by_user': actor,
-                'assigned_at': timezone.now(),
-            }
-        )
-
-        record_business_audit(
-            organization=appt.branch.organization,
-            branch=appt.branch,
-            module='appointments',
-            action_code='APPOINTMENT_TRAINER_ASSIGNED',
-            entity_type='AppointmentTrainer',
-            entity_id=assignment.id,
-            actor_user=actor,
-            event_description=f"Assigned trainer {trainer.trainer_code} to appointment {appt.id}",
-            after_data={
-                'appointment_id': str(appt.id),
-                'trainer_code': trainer.trainer_code,
-                'role': role,
-            },
-            db_alias=alias,
-        )
-
-        enqueue_outbox_event(
-            organization=appt.branch.organization,
-            event_type='APPOINTMENT_TRAINER_ASSIGNED',
-            aggregate_type='Appointment',
-            aggregate_id=str(appt.id),
-            payload={
-                'appointment_id': str(appt.id),
-                'trainer_profile_id': str(trainer.id),
-                'role': role,
-            },
-            db_alias=alias,
-        )
-
-        return assignment
+            return assignment
 
     @classmethod
-    @transaction.atomic
     def cancel_appointment(
         cls,
         appointment_id: str,
@@ -268,43 +267,43 @@ class AppointmentSchedulingService:
         db_alias: Optional[str] = None,
     ) -> Appointment:
         alias = db_alias or 'default'
-        appt = Appointment.objects.using(alias).select_for_update().get(id=appointment_id)
-        if appt.status in ['CANCELLED', 'COMPLETED']:
-            raise ValidationError(f"Cannot cancel appointment with status {appt.status}.")
+        with transaction.atomic(using=alias):
+            appt = Appointment.objects.using(alias).select_for_update().get(id=appointment_id)
+            if appt.status in ['CANCELLED', 'COMPLETED']:
+                raise ValidationError(f"Cannot cancel appointment with status {appt.status}.")
 
-        appt.status = 'CANCELLED'
-        if reason:
-            appt.notes = f"{appt.notes or ''}\nCancelled: {reason}".strip()
-        appt.save(using=alias)
+            appt.status = 'CANCELLED'
+            if reason:
+                appt.notes = f"{appt.notes or ''}\nCancelled: {reason}".strip()
+            appt.save(using=alias)
 
-        # Cancel trainer assignments
-        AppointmentTrainer.objects.using(alias).filter(appointment=appt).update(status='CANCELLED')
+            # Cancel trainer assignments
+            AppointmentTrainer.objects.using(alias).filter(appointment=appt).update(status='CANCELLED')
 
-        record_business_audit(
-            organization=appt.branch.organization,
-            branch=appt.branch,
-            module='appointments',
-            action_code='APPOINTMENT_CANCELLED',
-            entity_type='Appointment',
-            entity_id=appt.id,
-            actor_user=actor,
-            event_description=f"Cancelled appointment {appt.id}: {reason or 'No reason provided'}",
-            db_alias=alias,
-        )
+            record_business_audit(
+                organization=appt.branch.organization,
+                branch=appt.branch,
+                module='appointments',
+                action_code='APPOINTMENT_CANCELLED',
+                entity_type='Appointment',
+                entity_id=appt.id,
+                actor_user=actor,
+                event_description=f"Cancelled appointment {appt.id}: {reason or 'No reason provided'}",
+                db_alias=alias,
+            )
 
-        enqueue_outbox_event(
-            organization=appt.branch.organization,
-            event_type='APPOINTMENT_CANCELLED',
-            aggregate_type='Appointment',
-            aggregate_id=str(appt.id),
-            payload={'appointment_id': str(appt.id), 'reason': reason},
-            db_alias=alias,
-        )
+            enqueue_outbox_event(
+                organization=appt.branch.organization,
+                event_type='APPOINTMENT_CANCELLED',
+                aggregate_type='Appointment',
+                aggregate_id=str(appt.id),
+                payload={'appointment_id': str(appt.id), 'reason': reason},
+                db_alias=alias,
+            )
 
-        return appt
+            return appt
 
     @classmethod
-    @transaction.atomic
     def complete_appointment(
         cls,
         appointment_id: str,
@@ -312,32 +311,33 @@ class AppointmentSchedulingService:
         db_alias: Optional[str] = None,
     ) -> Appointment:
         alias = db_alias or 'default'
-        appt = Appointment.objects.using(alias).select_for_update().get(id=appointment_id)
-        if appt.status != 'CONFIRMED':
-            raise ValidationError(f"Cannot complete appointment with status {appt.status}.")
+        with transaction.atomic(using=alias):
+            appt = Appointment.objects.using(alias).select_for_update().get(id=appointment_id)
+            if appt.status != 'CONFIRMED':
+                raise ValidationError(f"Cannot complete appointment with status {appt.status}.")
 
-        appt.status = 'COMPLETED'
-        appt.save(using=alias)
+            appt.status = 'COMPLETED'
+            appt.save(using=alias)
 
-        record_business_audit(
-            organization=appt.branch.organization,
-            branch=appt.branch,
-            module='appointments',
-            action_code='APPOINTMENT_COMPLETED',
-            entity_type='Appointment',
-            entity_id=appt.id,
-            actor_user=actor,
-            event_description=f"Completed appointment {appt.id}",
-            db_alias=alias,
-        )
+            record_business_audit(
+                organization=appt.branch.organization,
+                branch=appt.branch,
+                module='appointments',
+                action_code='APPOINTMENT_COMPLETED',
+                entity_type='Appointment',
+                entity_id=appt.id,
+                actor_user=actor,
+                event_description=f"Completed appointment {appt.id}",
+                db_alias=alias,
+            )
 
-        enqueue_outbox_event(
-            organization=appt.branch.organization,
-            event_type='APPOINTMENT_COMPLETED',
-            aggregate_type='Appointment',
-            aggregate_id=str(appt.id),
-            payload={'appointment_id': str(appt.id)},
-            db_alias=alias,
-        )
+            enqueue_outbox_event(
+                organization=appt.branch.organization,
+                event_type='APPOINTMENT_COMPLETED',
+                aggregate_type='Appointment',
+                aggregate_id=str(appt.id),
+                payload={'appointment_id': str(appt.id)},
+                db_alias=alias,
+            )
 
-        return appt
+            return appt

@@ -1,7 +1,4 @@
-"""
-DRF Serializers for Layer 2: Module E (Group Classes, Scheduling, Content Studio & Demand Planning)
-"""
-
+from django.utils import timezone
 from rest_framework import serializers
 from .models_classes import (
     ClassCategory, ClassTemplate, ClassPrice, ClassBranchAvailability,
@@ -35,6 +32,8 @@ class ClassSpecialtyRequirementSerializer(serializers.ModelSerializer):
 
 class ClassPriceSerializer(serializers.ModelSerializer):
     branch_name = serializers.CharField(source='branch.name', read_only=True)
+    version_number = serializers.IntegerField(required=False)
+    effective_from = serializers.DateField(required=False)
 
     class Meta:
         model = ClassPrice
@@ -79,6 +78,9 @@ class ClassTemplateSerializer(serializers.ModelSerializer):
 class ClassScheduleRuleSerializer(serializers.ModelSerializer):
     class_name = serializers.CharField(source='class_template.name', read_only=True)
     branch_name = serializers.CharField(source='branch.name', read_only=True)
+    recurrence_type = serializers.CharField(required=False, default='WEEKLY')
+    delivery_mode = serializers.CharField(required=False, default='OFFLINE')
+    status = serializers.CharField(required=False, default='ACTIVE')
 
     class Meta:
         model = ClassScheduleRule
@@ -90,6 +92,70 @@ class ClassScheduleRuleSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def validate(self, attrs):
+        start_time = attrs.get('start_time') or (self.instance.start_time if self.instance else None)
+        end_time = attrs.get('end_time') or (self.instance.end_time if self.instance else None)
+        branch = attrs.get('branch') or (self.instance.branch if self.instance else None)
+        days_of_week = attrs.get('days_of_week') if 'days_of_week' in attrs else (self.instance.days_of_week if self.instance else [])
+        valid_from = attrs.get('valid_from') or (self.instance.valid_from if self.instance else None)
+        valid_until = attrs.get('valid_until') if 'valid_until' in attrs else (self.instance.valid_until if self.instance else None)
+
+        if not attrs.get('recurrence_type'):
+            attrs['recurrence_type'] = 'WEEKLY'
+        if not attrs.get('delivery_mode'):
+            attrs['delivery_mode'] = 'OFFLINE'
+        if not attrs.get('status'):
+            attrs['status'] = 'ACTIVE'
+
+        if start_time and end_time and end_time <= start_time:
+            raise serializers.ValidationError({"end_time": "End time must be strictly greater than start time."})
+
+        if valid_from and valid_until and valid_until < valid_from:
+            raise serializers.ValidationError({"valid_until": "Valid until date must be on or after valid from date."})
+
+        if valid_until and valid_until < timezone.now().date():
+            raise serializers.ValidationError({"valid_until": "Recurring schedule period cannot be entirely in the past."})
+
+        if branch:
+            if getattr(branch, 'status', None) and branch.status != 'ACTIVE':
+                raise serializers.ValidationError({"branch": f"Branch '{branch.name}' is not ACTIVE."})
+
+            # Check branch working hours
+            from .models_govern import BranchWorkingHours, BranchOperatingException
+            from .context import get_tenant_db_alias
+            alias = get_tenant_db_alias() or 'default'
+            day_names = {1: 'Monday', 2: 'Tuesday', 3: 'Wednesday', 4: 'Thursday', 5: 'Friday', 6: 'Saturday', 7: 'Sunday'}
+            for dow in (days_of_week or []):
+                wh = BranchWorkingHours.objects.using(alias).filter(branch=branch, day_of_week=dow).first()
+                if wh:
+                    d_name = day_names.get(dow, f'Day {dow}')
+                    if not wh.is_open:
+                        raise serializers.ValidationError({"branch": f"Branch '{branch.name}' is closed on {d_name}."})
+                    if not wh.is_24_hours:
+                        if wh.open_time and start_time and start_time < wh.open_time:
+                            raise serializers.ValidationError(
+                                {"start_time": f"Class start time ({start_time.strftime('%H:%M')}) is before branch opening time ({wh.open_time.strftime('%H:%M')}) on {d_name}."}
+                            )
+                        if wh.close_time and end_time and end_time > wh.close_time:
+                            raise serializers.ValidationError(
+                                {"end_time": f"Class end time ({end_time.strftime('%H:%M')}) is after branch closing time ({wh.close_time.strftime('%H:%M')}) on {d_name}."}
+                            )
+
+            # Check holiday exceptions when valid_from is single date or short range
+            if valid_from:
+                end_check = valid_until or valid_from
+                # If exact single day rule falls on a closed holiday
+                if valid_from == end_check:
+                    holiday = BranchOperatingException.objects.using(alias).filter(
+                        branch=branch, exception_date=valid_from, is_closed=True
+                    ).first()
+                    if holiday:
+                        raise serializers.ValidationError({
+                            "valid_from": f"Branch '{branch.name}' is closed on {valid_from} ({holiday.reason or 'Holiday/Maintenance'})."
+                        })
+
+        return attrs
 
 
 class ClassOccurrenceTrainerSerializer(serializers.ModelSerializer):
@@ -109,18 +175,103 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
     class_name = serializers.CharField(source='class_template.name', read_only=True)
     branch_name = serializers.CharField(source='branch.name', read_only=True)
     trainers = ClassOccurrenceTrainerSerializer(source='trainer_assignments', many=True, read_only=True)
+    active_content = serializers.SerializerMethodField()
+    start_time = serializers.TimeField(write_only=True, required=False)
+    end_time = serializers.TimeField(write_only=True, required=False)
+
+    def get_active_content(self, obj):
+        try:
+            latest = obj.content_assignments.filter(status='ACTIVE').select_related('content_item').order_by('-assigned_at').first()
+            if latest and latest.content_item:
+                return {
+                    'id': str(latest.id),
+                    'title': latest.content_item.title,
+                    'content_type': latest.content_item.content_type,
+                    'external_url': latest.content_item.external_url,
+                    'rotation_cycle_number': latest.rotation_cycle_number,
+                }
+        except Exception:
+            pass
+        return None
 
     class Meta:
         model = ClassOccurrence
         fields = [
             'id', 'class_template', 'class_name', 'schedule_rule', 'branch', 'branch_name',
-            'occurrence_date', 'start_at', 'end_at', 'delivery_mode',
+            'occurrence_date', 'start_at', 'end_at', 'start_time', 'end_time', 'delivery_mode',
             'online_provider', 'online_join_url', 'capacity', 'trial_capacity',
             'waitlist_capacity', 'booking_open_at', 'booking_close_at',
             'cancellation_cutoff_at', 'status', 'is_manual', 'is_override',
-            'trainers', 'created_at', 'updated_at'
+            'trainers', 'active_content', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
+        extra_kwargs = {
+            'start_at': {'required': False},
+            'end_at': {'required': False},
+            'occurrence_date': {'required': False},
+            'capacity': {'required': False, 'allow_null': True},
+            'trial_capacity': {'required': False, 'allow_null': True},
+            'waitlist_capacity': {'required': False, 'allow_null': True},
+        }
+
+    def validate(self, attrs):
+        start_time = attrs.pop('start_time', None)
+        end_time = attrs.pop('end_time', None)
+        occ_date = attrs.get('occurrence_date')
+        tpl = attrs.get('class_template') or (self.instance.class_template if self.instance else None)
+        branch = attrs.get('branch') or (self.instance.branch if self.instance else None)
+
+        if start_time and end_time and occ_date:
+            if end_time <= start_time:
+                raise serializers.ValidationError({"end_time": "end_time must be strictly greater than start_time."})
+            import datetime
+            from django.utils import timezone
+            attrs['start_at'] = timezone.make_aware(datetime.datetime.combine(occ_date, start_time))
+            attrs['end_at'] = timezone.make_aware(datetime.datetime.combine(occ_date, end_time))
+
+        start_at = attrs.get('start_at') or (self.instance.start_at if self.instance else None)
+        end_at = attrs.get('end_at') or (self.instance.end_at if self.instance else None)
+
+        if start_at and end_at and end_at <= start_at:
+            raise serializers.ValidationError({"end_at": "end_at must be strictly greater than start_at."})
+
+        if start_at and not occ_date:
+            attrs['occurrence_date'] = start_at.date()
+            occ_date = start_at.date()
+
+        if tpl:
+            if attrs.get('capacity') is None:
+                attrs['capacity'] = tpl.default_capacity
+            if attrs.get('trial_capacity') is None:
+                attrs['trial_capacity'] = tpl.default_trial_capacity
+            if attrs.get('waitlist_capacity') is None:
+                attrs['waitlist_capacity'] = tpl.default_waitlist_capacity
+            if 'delivery_mode' not in attrs or not attrs.get('delivery_mode'):
+                attrs['delivery_mode'] = tpl.default_delivery_mode
+        else:
+            if attrs.get('capacity') is None:
+                attrs['capacity'] = 20
+            if attrs.get('trial_capacity') is None:
+                attrs['trial_capacity'] = 0
+            if attrs.get('waitlist_capacity') is None:
+                attrs['waitlist_capacity'] = 0
+
+        if branch and occ_date and start_at and end_at:
+            from .services_schedule import BranchScheduleService
+            from .context import get_tenant_db_alias
+            alias = get_tenant_db_alias() or 'default'
+            eff = BranchScheduleService.get_effective_schedule_for_date(branch, occ_date, alias)
+            if not eff.get('is_open', True):
+                raise serializers.ValidationError({"branch": f"Branch '{branch.name}' is closed on {occ_date} ({eff.get('reason') or 'Closed'})."})
+            if not eff.get('is_24_hours', False):
+                st_time = start_at.time()
+                et_time = end_at.time()
+                if eff.get('open_time') and st_time < eff['open_time']:
+                    raise serializers.ValidationError({"start_at": f"Class start time {st_time.strftime('%H:%M')} is before branch opening time {eff['open_time'].strftime('%H:%M')}."})
+                if eff.get('close_time') and et_time > eff['close_time']:
+                    raise serializers.ValidationError({"end_at": f"Class end time {et_time.strftime('%H:%M')} is after branch closing time {eff['close_time'].strftime('%H:%M')}."})
+
+        return attrs
 
 
 class PackageClassAccessRuleSerializer(serializers.ModelSerializer):

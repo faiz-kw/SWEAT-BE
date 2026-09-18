@@ -193,6 +193,7 @@ router.register(r'class-categories', ClassCategoryViewSet, basename='class-categ
 router.register(r'class-templates', ClassTemplateViewSet, basename='class-template')
 router.register(r'class-prices', ClassPriceViewSet, basename='class-price')
 router.register(r'class-branch-availability', ClassBranchAvailabilityViewSet, basename='class-branch-availability')
+router.register(r'class-branch-availabilities', ClassBranchAvailabilityViewSet, basename='class-branch-availabilities')
 router.register(r'class-schedule-rules', ClassScheduleRuleViewSet, basename='class-schedule-rule')
 router.register(r'class-occurrences', ClassOccurrenceViewSet, basename='class-occurrence')
 router.register(r'class-occurrence-trainers', ClassOccurrenceTrainerViewSet, basename='class-occurrence-trainer')

@@ -67,6 +67,7 @@ class TenantUserSerializer(serializers.ModelSerializer):
     departments = serializers.SerializerMethodField()
     home_branch_name = serializers.CharField(source='home_branch.name', read_only=True, default=None)
     active_location_name = serializers.CharField(source='home_branch.name', read_only=True, default=None)
+    active_location_id = serializers.CharField(source='home_branch_id', read_only=True, default=None)
     tenant_id = serializers.SerializerMethodField()
     tenant_name = serializers.SerializerMethodField()
     is_active = serializers.BooleanField(source='is_accessible', read_only=True)
@@ -79,7 +80,7 @@ class TenantUserSerializer(serializers.ModelSerializer):
             'deactivated_by', 'deactivation_reason', 'suspended_until',
             'last_login_at', 'created_at',
             'full_name', 'role', 'role_name', 'roles', 'branch_access', 'department', 'departments',
-            'home_branch_name', 'active_location_name', 'tenant_id', 'tenant_name', 'is_active',
+            'home_branch_name', 'active_location_name', 'active_location_id', 'tenant_id', 'tenant_name', 'is_active',
         ]
         read_only_fields = ['id', 'last_login_at', 'created_at', 'deactivated_at', 'deactivated_by']
         extra_kwargs = {

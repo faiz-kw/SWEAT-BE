@@ -655,7 +655,6 @@ class TermsLegalService:
         return version
 
     @classmethod
-    @transaction.atomic
     def publish_terms_version(
         cls,
         terms_document_version_id: str,
@@ -663,26 +662,27 @@ class TermsLegalService:
         db_alias: Optional[str] = None,
     ) -> TermsDocumentVersion:
         alias = db_alias or 'default'
-        version = TermsDocumentVersion.objects.using(alias).select_for_update().get(id=terms_document_version_id)
-        now = timezone.now()
+        with transaction.atomic(using=alias):
+            version = TermsDocumentVersion.objects.using(alias).select_for_update().get(id=terms_document_version_id)
+            now = timezone.now()
 
-        # Retire prior active versions
-        prior_active = TermsDocumentVersion.objects.using(alias).filter(
-            terms_document=version.terms_document,
-            status='ACTIVE'
-        ).exclude(id=version.id)
+            # Retire prior active versions
+            prior_active = TermsDocumentVersion.objects.using(alias).filter(
+                terms_document=version.terms_document,
+                status='ACTIVE'
+            ).exclude(id=version.id)
 
-        for prior in prior_active:
-            prior.status = 'RETIRED'
-            prior.effective_until = now
-            prior.save(using=alias, update_fields=['status', 'effective_until', 'updated_at'])
+            for prior in prior_active:
+                prior.status = 'RETIRED'
+                prior.effective_until = now
+                prior.save(using=alias, update_fields=['status', 'effective_until', 'updated_at'])
 
-        version.status = 'ACTIVE'
-        version.effective_from = now
-        version.save(using=alias, update_fields=['status', 'effective_from', 'updated_at'])
+            version.status = 'ACTIVE'
+            version.effective_from = now
+            version.save(using=alias, update_fields=['status', 'effective_from', 'updated_at'])
 
-        record_business_audit(
-            organization=version.terms_document.organization,
+            record_business_audit(
+                organization=version.terms_document.organization,
             module='core',
             action_code='TERMS_VERSION_PUBLISHED',
             entity_type='TermsDocumentVersion',

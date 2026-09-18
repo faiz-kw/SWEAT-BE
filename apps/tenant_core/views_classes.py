@@ -28,6 +28,8 @@ from .serializers_classes import (
 )
 from .services_classes import ClassSchedulingService, ContentStudioService
 from .permissions import RequireActiveTenantAndOrg, TenantRBACPermission
+from .services_reliability import record_business_audit
+from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +108,12 @@ class ClassPriceViewSet(viewsets.ModelViewSet):
         return ClassPrice.objects.using(alias).all().order_by('-effective_from')
 
     def perform_create(self, serializer):
-        serializer.save(created_by_user=self.request.user)
+        alias = _get_db(self.request)
+        tpl = serializer.validated_data.get('class_template')
+        existing_count = ClassPrice.objects.using(alias).filter(class_template=tpl).count()
+        ver = serializer.validated_data.get('version_number') or (existing_count + 1)
+        eff_from = serializer.validated_data.get('effective_from') or timezone.now().date()
+        serializer.save(created_by_user=self.request.user, version_number=ver, effective_from=eff_from)
 
 
 class ClassBranchAvailabilityViewSet(viewsets.ModelViewSet):
@@ -137,6 +144,22 @@ class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
         if branch_id:
             qs = qs.filter(branch_id=branch_id)
         return qs.order_by('start_time')
+
+    def perform_create(self, serializer):
+        rule = serializer.save()
+        alias = _get_db(self.request)
+        record_business_audit(
+            organization=rule.branch.organization,
+            branch=rule.branch,
+            module='classes',
+            action_code='SCHEDULE_RULE_CREATED',
+            entity_type='ClassScheduleRule',
+            entity_id=rule.id,
+            actor_user=self.request.user,
+            event_description=f"Created recurring schedule rule for {rule.class_template.name} at {rule.branch.name}",
+            after_data={'template_id': str(rule.class_template_id), 'branch_id': str(rule.branch_id), 'days': rule.days_of_week},
+            db_alias=alias,
+        )
 
     @action(detail=True, methods=['post'], url_path='generate-occurrences')
     def generate_occurrences(self, request, pk=None):
@@ -184,6 +207,22 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             qs = qs.filter(status=status_param)
         return qs.select_related('class_template', 'branch').prefetch_related('trainer_assignments__trainer_profile').order_by('start_at')
 
+    def perform_create(self, serializer):
+        occ = serializer.save(is_manual=True)
+        alias = _get_db(self.request)
+        record_business_audit(
+            organization=occ.branch.organization,
+            branch=occ.branch,
+            module='classes',
+            action_code='OCCURRENCE_CREATED',
+            entity_type='ClassOccurrence',
+            entity_id=occ.id,
+            actor_user=self.request.user,
+            event_description=f"Created one-off class occurrence for {occ.class_template.name} at {occ.branch.name} on {occ.occurrence_date}",
+            after_data={'template_id': str(occ.class_template_id), 'branch_id': str(occ.branch_id), 'date': str(occ.occurrence_date)},
+            db_alias=alias,
+        )
+
     @action(detail=True, methods=['post'], url_path='assign-trainer')
     def assign_trainer(self, request, pk=None):
         alias = _get_db(request)
@@ -201,7 +240,10 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
                 db_alias=alias,
             )
             return Response(ClassOccurrenceTrainerSerializer(assignment).data, status=status.HTTP_201_CREATED)
-        except (ValidationError, Exception) as e:
+        except ValidationError as e:
+            msg = e.messages[0] if hasattr(e, 'messages') and e.messages else str(e)
+            return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=True, methods=['post'], url_path='assign-content')

@@ -153,12 +153,11 @@ class Command(BaseCommand):
                 },
                 {
                     'code': 'coaching', 'name': 'Coaching & Athlete Development', 'icon': 'Dumbbell', 'is_core': False, 'sort_order': 10,
-                    'description': 'Personal trainer allocations, workout program builders, and exercise libraries.',
+                    'description': 'Personal trainer allocations and workout program builders.',
                     'submodules': [
                         ('trainers', 'Trainers Roster', 'Certified coach directory and availability'),
                         ('online-coaches', 'Online Coaches', 'Remote training and digital check-ins'),
                         ('nutrition-coaches', 'Nutrition Coaches', 'Certified nutritionists and meal consultants'),
-                        ('exercise-library', 'Exercise Library', 'Movement video guides and form cues'),
                         ('program-builder', 'Program Builder', 'Custom periodized workout programming'),
                     ]
                 },

@@ -15,6 +15,7 @@ Endpoints:
 """
 
 import logging
+import uuid
 from datetime import datetime
 from rest_framework import viewsets, filters, status
 from rest_framework.decorators import action
@@ -24,6 +25,7 @@ from django.utils.dateparse import parse_datetime
 from config.routers import get_tenant_db_alias
 
 from .models_org import Branch
+from .models_users import TenantUser
 from .models_workforce import (
     UserProfile,
     EmployeeProfile,
@@ -169,6 +171,66 @@ class TrainerProfileViewSet(viewsets.ModelViewSet):
             qs = qs.filter(trainer_status=status_filter)
         return qs
 
+    def create(self, request, *args, **kwargs):
+        alias = _get_db(request)
+        org = getattr(request, 'organization', None)
+        data = request.data.copy()
+
+        user_id = data.get('user_id')
+        if user_id and not data.get('employee_profile'):
+            user = TenantUser.objects.using(alias).filter(id=user_id).first()
+            if not user:
+                return Response({'error': 'Selected staff user was not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+            user_profile, _ = UserProfile.objects.using(alias).get_or_create(
+                user=user,
+                defaults={
+                    'first_name_snapshot': user.first_name,
+                    'last_name_snapshot': user.last_name,
+                }
+            )
+
+            emp = EmployeeProfile.objects.using(alias).filter(user_profile=user_profile).first()
+            if not emp:
+                emp_code = data.get('employee_code') or f"EMP-{uuid.uuid4().hex[:6].upper()}"
+                emp = EmployeeProfile.objects.using(alias).create(
+                    user_profile=user_profile,
+                    organization=org or user.organization,
+                    employee_code=emp_code,
+                    designation=data.get('designation') or 'Fitness Trainer',
+                    employment_status='ACTIVE',
+                )
+
+            if TrainerProfile.objects.using(alias).filter(employee_profile=emp).exists():
+                return Response(
+                    {'error': f"'{user.full_name or user.email}' is already registered as a trainer."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            data['employee_profile'] = str(emp.id)
+
+        if not data.get('trainer_code'):
+            data['trainer_code'] = f"TRN-{uuid.uuid4().hex[:6].upper()}"
+
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+    def destroy(self, request, *args, **kwargs):
+        alias = _get_db(request)
+        instance = self.get_object()
+        try:
+            instance.specialty_assignments.using(alias).all().delete()
+            self.perform_destroy(instance)
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        except Exception as e:
+            return Response(
+                {'error': f"Cannot delete trainer: {str(e)}. Try setting their status to INACTIVE instead."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
     @action(detail=True, methods=['get'], url_path='check-availability')
     def check_availability(self, request, pk=None):
         """
@@ -186,13 +248,13 @@ class TrainerProfileViewSet(viewsets.ModelViewSet):
 
         duration = int(request.query_params.get('duration_minutes', 60))
         branch_id = request.query_params.get('branch_id')
-        if not branch_id:
-            return Response({'error': 'branch_id query param is required'}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            branch = Branch.objects.using(alias).get(id=branch_id)
-        except Branch.DoesNotExist:
-            return Response({'error': 'Branch not found'}, status=status.HTTP_404_NOT_FOUND)
+        branch = None
+        if branch_id and branch_id not in ('all', '00000000-0000-0000-0000-000000000000'):
+            branch = Branch.objects.using(alias).filter(id=branch_id).first()
+        if not branch:
+            branch = Branch.objects.using(alias).filter(organization=org).first() or Branch.objects.using(alias).first()
+        if not branch:
+            return Response({'error': 'No active branch found.'}, status=status.HTTP_404_NOT_FOUND)
 
         delivery_mode = request.query_params.get('delivery_mode', 'GROUP')
         specialty_code = request.query_params.get('specialty_code')
@@ -233,13 +295,13 @@ class TrainerProfileViewSet(viewsets.ModelViewSet):
 
         duration = int(request.query_params.get('duration_minutes', 60))
         branch_id = request.query_params.get('branch_id')
-        if not branch_id:
-            return Response({'error': 'branch_id query param is required'}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            branch = Branch.objects.using(alias).get(id=branch_id)
-        except Branch.DoesNotExist:
-            return Response({'error': 'Branch not found'}, status=status.HTTP_404_NOT_FOUND)
+        branch = None
+        if branch_id and branch_id not in ('all', '00000000-0000-0000-0000-000000000000'):
+            branch = Branch.objects.using(alias).filter(id=branch_id).first()
+        if not branch:
+            branch = Branch.objects.using(alias).filter(organization=org).first() or Branch.objects.using(alias).first()
+        if not branch:
+            return Response({'error': 'No active branch found.'}, status=status.HTTP_404_NOT_FOUND)
 
         delivery_mode = request.query_params.get('delivery_mode', 'GROUP')
         specialty_code = request.query_params.get('specialty_code')

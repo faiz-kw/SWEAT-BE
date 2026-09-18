@@ -29,13 +29,13 @@ class BranchScheduleService:
             return ZoneInfo('UTC')
 
     @classmethod
-    def get_effective_schedule_for_date(cls, branch: Branch, target_date: date) -> Dict[str, Any]:
+    def get_effective_schedule_for_date(cls, branch: Branch, target_date: date, db_alias: Optional[str] = None) -> Dict[str, Any]:
         """
         Determines the effective schedule for a branch on a given date.
         Rule 2: exception row overrides weekly working hours.
         Rule 3: is_24_hours controls 24-hour operation.
         """
-        db_alias = getattr(branch, '_state', None) and getattr(branch._state, 'db', None) or 'default'
+        db_alias = db_alias or (getattr(branch, '_state', None) and getattr(branch._state, 'db', None)) or 'default'
 
         # Check for operating exception first (Rule 2)
         exception = BranchOperatingException.objects.using(db_alias).filter(

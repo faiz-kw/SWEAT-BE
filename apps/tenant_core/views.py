@@ -307,8 +307,45 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
     action_permission_map = {
         'reactivate': 'core.users.edit',
         'deactivate': 'core.users.delete',
+        'toggle_active': 'core.users.edit',
     }
     queryset = TenantUser.objects.all()
+
+    def get_queryset(self):
+        db = self.get_db()
+        qs = TenantUser.objects.using(db).select_related('organization', 'home_branch').all()
+        qs = self.filter_queryset_by_scope(qs)
+
+        branch_param = self.request.query_params.get('branch') or self.request.query_params.get('location')
+        if branch_param and branch_param != 'all':
+            from django.db.models import Q
+            try:
+                import uuid
+                branch_uuid = uuid.UUID(str(branch_param))
+                qs = qs.filter(Q(home_branch_id=branch_uuid) | Q(role_assignments__branch_id=branch_uuid, role_assignments__is_active=True)).distinct()
+            except (ValueError, TypeError, AttributeError):
+                qs = qs.filter(Q(home_branch__name__iexact=str(branch_param)) | Q(role_assignments__branch__name__iexact=str(branch_param), role_assignments__is_active=True)).distinct()
+
+        role_param = self.request.query_params.get('role')
+        if role_param and role_param != 'all':
+            from django.db.models import Q
+            qs = qs.filter(
+                Q(role_assignments__role__name__iexact=str(role_param)) |
+                Q(role_assignments__role__code__iexact=str(role_param)),
+                role_assignments__is_active=True
+            ).distinct()
+
+        search_param = self.request.query_params.get('search')
+        if search_param:
+            from django.db.models import Q
+            qs = qs.filter(
+                Q(first_name__icontains=search_param) |
+                Q(last_name__icontains=search_param) |
+                Q(email__icontains=search_param) |
+                Q(phone__icontains=search_param)
+            )
+
+        return qs
 
     def get_serializer_class(self):
         if self.action == 'create':
@@ -548,6 +585,15 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
 
         serializer = self.get_serializer(user)
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='toggle-active')
+    def toggle_active(self, request, pk=None):
+        """Toggle user active / deactivated status."""
+        user = self.get_object()
+        if user.status == 'ACTIVE' or user.is_login_allowed:
+            return self.deactivate(request, pk)
+        else:
+            return self.reactivate(request, pk)
 
 
 class RoleViewSet(TenantDBMixin, viewsets.ModelViewSet):
@@ -1302,6 +1348,13 @@ class BranchWorkingHoursViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelV
     serializer_class = BranchWorkingHoursSerializer
     queryset = BranchWorkingHours.objects.all().select_related('branch')
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        branch_id = self.request.query_params.get('branch_id') or self.request.query_params.get('branch')
+        if branch_id:
+            qs = qs.filter(branch_id=branch_id)
+        return qs.order_by('day_of_week')
+
     def perform_create(self, serializer):
         user = self.request.user if hasattr(self.request, 'user') and self.request.user.is_authenticated else None
         db = self.get_db()
@@ -1371,6 +1424,13 @@ class BranchOperatingExceptionViewSet(TenantScopeMixin, TenantDBMixin, viewsets.
     }
     serializer_class = BranchOperatingExceptionSerializer
     queryset = BranchOperatingException.objects.all().select_related('branch')
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        branch_id = self.request.query_params.get('branch_id') or self.request.query_params.get('branch')
+        if branch_id:
+            qs = qs.filter(branch_id=branch_id)
+        return qs.order_by('exception_date')
 
     def perform_create(self, serializer):
         user = self.request.user if hasattr(self.request, 'user') and self.request.user.is_authenticated else None
