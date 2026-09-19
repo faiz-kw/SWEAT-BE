@@ -317,7 +317,13 @@ class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
             entity_id=rule.id,
             actor_user=self.request.user,
             event_description=f"Created recurring schedule rule for {rule.class_template.name} at {rule.branch.name}",
-            after_data={'template_id': str(rule.class_template_id), 'branch_id': str(rule.branch_id), 'days': rule.days_of_week, 'status': rule.status},
+            after_data={
+                'template_name': rule.class_template.name,
+                'branch_name': rule.branch.name,
+                'days': rule.days_of_week,
+                'time_window': f"{rule.start_time.strftime('%H:%M')} – {rule.end_time.strftime('%H:%M')}",
+                'status': rule.status,
+            },
             db_alias=alias,
         )
 
@@ -333,7 +339,13 @@ class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
             entity_id=rule.id,
             actor_user=self.request.user,
             event_description=f"Updated recurring schedule rule for {rule.class_template.name} at {rule.branch.name}",
-            after_data={'template_id': str(rule.class_template_id), 'branch_id': str(rule.branch_id), 'days': rule.days_of_week, 'status': rule.status},
+            after_data={
+                'template_name': rule.class_template.name,
+                'branch_name': rule.branch.name,
+                'days': rule.days_of_week,
+                'time_window': f"{rule.start_time.strftime('%H:%M')} – {rule.end_time.strftime('%H:%M')}",
+                'status': rule.status,
+            },
             db_alias=alias,
         )
 

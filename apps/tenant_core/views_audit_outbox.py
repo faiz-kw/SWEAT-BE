@@ -50,6 +50,14 @@ class BusinessAuditEventViewSet(viewsets.ReadOnlyModelViewSet):
         entity_type = self.request.query_params.get('entity_type')
         if entity_type:
             qs = qs.filter(entity_type=entity_type)
+        entity_id = self.request.query_params.get('entity_id')
+        if entity_id:
+            try:
+                import uuid
+                val_uuid = uuid.UUID(str(entity_id))
+                qs = qs.filter(entity_id=val_uuid)
+            except (ValueError, TypeError):
+                qs = qs.filter(entity_id=entity_id)
         return qs
 
 
