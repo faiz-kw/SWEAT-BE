@@ -88,7 +88,7 @@ class UserProfileViewSet(viewsets.ModelViewSet):
         'destroy': 'core.users.delete',
     }
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
-    search_fields = ['member_number', 'first_name_snapshot', 'last_name_snapshot', 'user__email']
+    search_fields = ['member_number', 'first_name_snapshot', 'last_name_snapshot', 'user__email', 'user__phone', 'user__full_name']
     ordering = ['-created_at']
 
     def get_queryset(self):
@@ -97,6 +97,11 @@ class UserProfileViewSet(viewsets.ModelViewSet):
         qs = UserProfile.objects.using(alias).select_related('user', 'preferred_branch')
         if org:
             qs = qs.filter(user__organization=org)
+
+        bookable_only = self.request.query_params.get('bookable_only')
+        if bookable_only in ('true', 'True', '1'):
+            qs = qs.filter(member_status='ACTIVE', user__status='ACTIVE')
+
         status_filter = self.request.query_params.get('member_status')
         if status_filter:
             qs = qs.filter(member_status=status_filter)
@@ -141,16 +146,16 @@ class EmployeeProfileViewSet(viewsets.ModelViewSet):
 class TrainerProfileViewSet(viewsets.ModelViewSet):
     serializer_class = TrainerProfileSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'core'
-    required_submodule = 'users'
-    required_permission = 'core.users.view'
+    required_module = 'ops'
+    required_submodule = 'trainers'
+    required_permission = 'ops.trainers.view'
     permission_action_map = {
-        'create': 'core.users.create',
-        'update': 'core.users.edit',
-        'partial_update': 'core.users.edit',
-        'destroy': 'core.users.delete',
-        'check_availability': 'core.users.view',
-        'find_eligible': 'core.users.view',
+        'create': 'ops.trainers.create',
+        'update': 'ops.trainers.edit',
+        'partial_update': 'ops.trainers.edit',
+        'destroy': 'ops.trainers.delete',
+        'check_availability': 'ops.trainers.view',
+        'find_eligible': 'ops.trainers.view',
     }
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['trainer_code', 'bio', 'employee_profile__user_profile__user__email']
@@ -351,14 +356,14 @@ class SalesProfileViewSet(viewsets.ModelViewSet):
 class EmployeeWorkScheduleViewSet(viewsets.ModelViewSet):
     serializer_class = EmployeeWorkScheduleSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'core'
-    required_submodule = 'users'
-    required_permission = 'core.users.view'
+    required_module = 'ops'
+    required_submodule = 'trainers'
+    required_permission = 'ops.trainers.view'
     permission_action_map = {
-        'create': 'core.users.create',
-        'update': 'core.users.edit',
-        'partial_update': 'core.users.edit',
-        'destroy': 'core.users.delete',
+        'create': 'ops.trainers.create',
+        'update': 'ops.trainers.edit',
+        'partial_update': 'ops.trainers.edit',
+        'destroy': 'ops.trainers.delete',
     }
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     ordering = ['employee_profile', 'day_of_week', 'start_time']
@@ -381,14 +386,14 @@ class EmployeeWorkScheduleViewSet(viewsets.ModelViewSet):
 class EmployeeScheduleExceptionViewSet(viewsets.ModelViewSet):
     serializer_class = EmployeeScheduleExceptionSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'core'
-    required_submodule = 'users'
-    required_permission = 'core.users.view'
+    required_module = 'ops'
+    required_submodule = 'trainers'
+    required_permission = 'ops.trainers.view'
     permission_action_map = {
-        'create': 'core.users.create',
-        'update': 'core.users.edit',
-        'partial_update': 'core.users.edit',
-        'destroy': 'core.users.delete',
+        'create': 'ops.trainers.create',
+        'update': 'ops.trainers.edit',
+        'partial_update': 'ops.trainers.edit',
+        'destroy': 'ops.trainers.delete',
     }
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     ordering = ['-exception_date']
@@ -408,14 +413,14 @@ class EmployeeScheduleExceptionViewSet(viewsets.ModelViewSet):
 class TrainerSpecialtyViewSet(viewsets.ModelViewSet):
     serializer_class = TrainerSpecialtySerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'core'
-    required_submodule = 'users'
-    required_permission = 'core.users.view'
+    required_module = 'ops'
+    required_submodule = 'trainers'
+    required_permission = 'ops.trainers.view'
     permission_action_map = {
-        'create': 'core.users.create',
-        'update': 'core.users.edit',
-        'partial_update': 'core.users.edit',
-        'destroy': 'core.users.delete',
+        'create': 'ops.trainers.create',
+        'update': 'ops.trainers.edit',
+        'partial_update': 'ops.trainers.edit',
+        'destroy': 'ops.trainers.delete',
     }
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['code', 'name', 'category']
@@ -440,14 +445,14 @@ class TrainerSpecialtyViewSet(viewsets.ModelViewSet):
 class TrainerSpecialtyAssignmentViewSet(viewsets.ModelViewSet):
     serializer_class = TrainerSpecialtyAssignmentSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'core'
-    required_submodule = 'users'
-    required_permission = 'core.users.view'
+    required_module = 'ops'
+    required_submodule = 'trainers'
+    required_permission = 'ops.trainers.view'
     permission_action_map = {
-        'create': 'core.users.create',
-        'update': 'core.users.edit',
-        'partial_update': 'core.users.edit',
-        'destroy': 'core.users.delete',
+        'create': 'ops.trainers.create',
+        'update': 'ops.trainers.edit',
+        'partial_update': 'ops.trainers.edit',
+        'destroy': 'ops.trainers.delete',
     }
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     ordering = ['trainer_profile', 'trainer_specialty']

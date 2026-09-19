@@ -7,6 +7,7 @@ from datetime import date
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.views import APIView
 from django.core.exceptions import ValidationError
 
 from .context import get_tenant_db_alias
@@ -57,13 +58,111 @@ def _get_org(request):
     return org
 
 
+def get_user_effective_branch_ids(user, db_alias: str):
+    """
+    Derives the effective permitted branch IDs for a user based on active RoleAssignments
+    and UserBranch records.
+    Returns None if user has ORG scope (meaning all branches permitted).
+    Returns a set of branch ID strings if branch-scoped.
+    """
+    if getattr(user, 'is_superuser', False):
+        return None
+
+    from .models_rbac import RoleAssignment
+    from .models_users import UserBranch
+
+    assignments = list(
+        RoleAssignment.objects.using(db_alias)
+        .filter(user=user, is_active=True, status='ACTIVE')
+        .select_related('role', 'branch')
+    )
+
+    if not assignments:
+        ub_ids = set(
+            str(b) for b in UserBranch.objects.using(db_alias)
+            .filter(user=user, is_active=True)
+            .values_list('branch_id', flat=True)
+            if b
+        )
+        return ub_ids
+
+    # If any active assignment has ORG scope, user has org-wide scope
+    for ra in assignments:
+        if ra.role and ra.role.is_active and ra.role.scope == 'ORG':
+            return None
+
+    permitted = set()
+    for ra in assignments:
+        if ra.role and ra.role.is_active:
+            if ra.branch_id:
+                permitted.add(str(ra.branch_id))
+
+    # Also merge UserBranch records
+    for bid in UserBranch.objects.using(db_alias).filter(user=user, is_active=True).values_list('branch_id', flat=True):
+        if bid:
+            permitted.add(str(bid))
+
+    return permitted
+
+
+class ClassesMetadataView(APIView):
+    permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
+    required_module = 'ops'
+    required_submodule = 'classes'
+    required_permission = 'ops.classes.view'
+    action = 'view'
+
+    def get(self, request):
+        return Response({
+            'statuses': [
+                {'value': 'ACTIVE', 'label': 'Active'},
+                {'value': 'INACTIVE', 'label': 'Inactive'},
+                {'value': 'DRAFT', 'label': 'Draft'},
+                {'value': 'ARCHIVED', 'label': 'Archived'},
+            ],
+            'delivery_modes': [
+                {'value': 'OFFLINE', 'label': 'Offline / Studio'},
+                {'value': 'ONLINE', 'label': 'Online Live Stream'},
+                {'value': 'HYBRID', 'label': 'Hybrid'},
+            ],
+            'recurrence_types': [
+                {'value': 'WEEKLY', 'label': 'Weekly'},
+            ],
+            'weekdays': [
+                {'value': 1, 'label': 'Mon', 'full_name': 'Monday'},
+                {'value': 2, 'label': 'Tue', 'full_name': 'Tuesday'},
+                {'value': 3, 'label': 'Wed', 'full_name': 'Wednesday'},
+                {'value': 4, 'label': 'Thu', 'full_name': 'Thursday'},
+                {'value': 5, 'label': 'Fri', 'full_name': 'Friday'},
+                {'value': 6, 'label': 'Sat', 'full_name': 'Saturday'},
+                {'value': 7, 'label': 'Sun', 'full_name': 'Sunday'},
+            ],
+            'trainer_roles': [
+                {'value': 'LEAD', 'label': 'Lead Trainer'},
+                {'value': 'ASSISTANT', 'label': 'Assistant Trainer'},
+                {'value': 'SUBSTITUTE', 'label': 'Substitute Trainer'},
+            ],
+            'content_types': [
+                {'value': 'VIDEO', 'label': 'Video'},
+                {'value': 'VIDEO_LINK', 'label': 'Video Stream Link'},
+                {'value': 'DOCUMENT', 'label': 'Document'},
+                {'value': 'IMAGE', 'label': 'Image'},
+                {'value': 'OTHER', 'label': 'Other'},
+            ],
+            'branch_avail_statuses': [
+                {'value': 'ENABLED', 'label': 'Enabled'},
+                {'value': 'DISABLED', 'label': 'Disabled'},
+            ],
+        })
+
+
 class ClassCategoryViewSet(viewsets.ModelViewSet):
     serializer_class = ClassCategorySerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'core'
-    required_submodule = 'settings'
-    required_permission = 'core.settings.view'
-    permission_action_map = {'create': 'core.settings.edit', 'update': 'core.settings.edit', 'destroy': 'core.settings.edit'}
+    required_module = 'ops'
+    required_submodule = 'classes'
+    required_permission = 'ops.classes.view'
+    permission_action_map = {'create': 'ops.classes.create', 'update': 'ops.classes.edit', 'partial_update': 'ops.classes.edit', 'destroy': 'ops.classes.delete'}
 
     def get_queryset(self):
         alias = _get_db(self.request)
@@ -71,16 +170,45 @@ class ClassCategoryViewSet(viewsets.ModelViewSet):
         return ClassCategory.objects.using(alias).filter(organization=org).order_by('display_order')
 
     def perform_create(self, serializer):
-        serializer.save(organization=_get_org(self.request))
+        org = _get_org(self.request)
+        instance = serializer.save(organization=org)
+        alias = _get_db(self.request)
+        record_business_audit(
+            organization=org,
+            module='classes',
+            action_code='CLASS_CATEGORY_CREATED',
+            entity_type='ClassCategory',
+            entity_id=instance.id,
+            actor_user=self.request.user,
+            event_description=f"Created class category '{instance.name}'",
+            after_data={'code': instance.code, 'name': instance.name, 'status': instance.status},
+            db_alias=alias,
+        )
+
+    def perform_update(self, serializer):
+        instance = serializer.save()
+        alias = _get_db(self.request)
+        org = _get_org(self.request)
+        record_business_audit(
+            organization=org,
+            module='classes',
+            action_code='CLASS_CATEGORY_UPDATED',
+            entity_type='ClassCategory',
+            entity_id=instance.id,
+            actor_user=self.request.user,
+            event_description=f"Updated class category '{instance.name}'",
+            after_data={'code': instance.code, 'name': instance.name, 'status': instance.status},
+            db_alias=alias,
+        )
 
 
 class ClassTemplateViewSet(viewsets.ModelViewSet):
     serializer_class = ClassTemplateSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'core'
-    required_submodule = 'settings'
-    required_permission = 'core.settings.view'
-    permission_action_map = {'create': 'core.settings.edit', 'update': 'core.settings.edit', 'destroy': 'core.settings.edit'}
+    required_module = 'ops'
+    required_submodule = 'classes'
+    required_permission = 'ops.classes.view'
+    permission_action_map = {'create': 'ops.classes.create', 'update': 'ops.classes.edit', 'partial_update': 'ops.classes.edit', 'destroy': 'ops.classes.delete'}
 
     def get_queryset(self):
         alias = _get_db(self.request)
@@ -92,16 +220,45 @@ class ClassTemplateViewSet(viewsets.ModelViewSet):
         return qs.order_by('name')
 
     def perform_create(self, serializer):
-        serializer.save(organization=_get_org(self.request))
+        org = _get_org(self.request)
+        instance = serializer.save(organization=org)
+        alias = _get_db(self.request)
+        record_business_audit(
+            organization=org,
+            module='classes',
+            action_code='CLASS_TEMPLATE_CREATED',
+            entity_type='ClassTemplate',
+            entity_id=instance.id,
+            actor_user=self.request.user,
+            event_description=f"Created class template '{instance.name}'",
+            after_data={'code': instance.code, 'name': instance.name, 'status': instance.status},
+            db_alias=alias,
+        )
+
+    def perform_update(self, serializer):
+        instance = serializer.save()
+        alias = _get_db(self.request)
+        org = _get_org(self.request)
+        record_business_audit(
+            organization=org,
+            module='classes',
+            action_code='CLASS_TEMPLATE_UPDATED',
+            entity_type='ClassTemplate',
+            entity_id=instance.id,
+            actor_user=self.request.user,
+            event_description=f"Updated class template '{instance.name}'",
+            after_data={'code': instance.code, 'name': instance.name, 'status': instance.status},
+            db_alias=alias,
+        )
 
 
 class ClassPriceViewSet(viewsets.ModelViewSet):
     serializer_class = ClassPriceSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'core'
-    required_submodule = 'settings'
-    required_permission = 'core.settings.view'
-    permission_action_map = {'create': 'core.settings.edit', 'update': 'core.settings.edit', 'destroy': 'core.settings.edit'}
+    required_module = 'ops'
+    required_submodule = 'classes'
+    required_permission = 'ops.classes.view'
+    permission_action_map = {'create': 'ops.classes.create', 'update': 'ops.classes.edit', 'partial_update': 'ops.classes.edit', 'destroy': 'ops.classes.delete'}
 
     def get_queryset(self):
         alias = _get_db(self.request)
@@ -119,10 +276,10 @@ class ClassPriceViewSet(viewsets.ModelViewSet):
 class ClassBranchAvailabilityViewSet(viewsets.ModelViewSet):
     serializer_class = ClassBranchAvailabilitySerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'core'
-    required_submodule = 'settings'
-    required_permission = 'core.settings.view'
-    permission_action_map = {'create': 'core.settings.edit', 'update': 'core.settings.edit', 'destroy': 'core.settings.edit'}
+    required_module = 'ops'
+    required_submodule = 'classes'
+    required_permission = 'ops.classes.view'
+    permission_action_map = {'create': 'ops.classes.create', 'update': 'ops.classes.edit', 'partial_update': 'ops.classes.edit', 'destroy': 'ops.classes.delete'}
 
     def get_queryset(self):
         alias = _get_db(self.request)
@@ -132,14 +289,17 @@ class ClassBranchAvailabilityViewSet(viewsets.ModelViewSet):
 class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
     serializer_class = ClassScheduleRuleSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'core'
-    required_submodule = 'settings'
-    required_permission = 'core.settings.view'
-    permission_action_map = {'create': 'core.settings.edit', 'update': 'core.settings.edit', 'destroy': 'core.settings.edit', 'generate_occurrences': 'core.settings.edit'}
+    required_module = 'ops'
+    required_submodule = 'classes'
+    required_permission = 'ops.classes.view'
+    permission_action_map = {'create': 'ops.classes.create', 'update': 'ops.classes.edit', 'partial_update': 'ops.classes.edit', 'destroy': 'ops.classes.delete', 'generate_occurrences': 'ops.classes.create'}
 
     def get_queryset(self):
         alias = _get_db(self.request)
         qs = ClassScheduleRule.objects.using(alias).all()
+        permitted_branches = get_user_effective_branch_ids(self.request.user, alias)
+        if permitted_branches is not None:
+            qs = qs.filter(branch_id__in=permitted_branches)
         branch_id = self.request.query_params.get('branch_id')
         if branch_id:
             qs = qs.filter(branch_id=branch_id)
@@ -157,7 +317,23 @@ class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
             entity_id=rule.id,
             actor_user=self.request.user,
             event_description=f"Created recurring schedule rule for {rule.class_template.name} at {rule.branch.name}",
-            after_data={'template_id': str(rule.class_template_id), 'branch_id': str(rule.branch_id), 'days': rule.days_of_week},
+            after_data={'template_id': str(rule.class_template_id), 'branch_id': str(rule.branch_id), 'days': rule.days_of_week, 'status': rule.status},
+            db_alias=alias,
+        )
+
+    def perform_update(self, serializer):
+        rule = serializer.save()
+        alias = _get_db(self.request)
+        record_business_audit(
+            organization=rule.branch.organization,
+            branch=rule.branch,
+            module='classes',
+            action_code='SCHEDULE_RULE_UPDATED',
+            entity_type='ClassScheduleRule',
+            entity_id=rule.id,
+            actor_user=self.request.user,
+            event_description=f"Updated recurring schedule rule for {rule.class_template.name} at {rule.branch.name}",
+            after_data={'template_id': str(rule.class_template_id), 'branch_id': str(rule.branch_id), 'days': rule.days_of_week, 'status': rule.status},
             db_alias=alias,
         )
 
@@ -188,14 +364,20 @@ class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
 class ClassOccurrenceViewSet(viewsets.ModelViewSet):
     serializer_class = ClassOccurrenceSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'core'
-    required_submodule = 'settings'
-    required_permission = 'core.settings.view'
-    permission_action_map = {'create': 'core.settings.edit', 'update': 'core.settings.edit', 'destroy': 'core.settings.edit', 'assign_trainer': 'core.settings.edit', 'assign_content': 'core.settings.edit'}
+    required_module = 'ops'
+    required_submodule = 'classes'
+    required_permission = 'ops.classes.view'
+    permission_action_map = {'create': 'ops.classes.create', 'update': 'ops.classes.edit', 'partial_update': 'ops.classes.edit', 'destroy': 'ops.classes.delete', 'assign_trainer': 'ops.classes.edit', 'assign_content': 'ops.classes.edit'}
 
     def get_queryset(self):
         alias = _get_db(self.request)
         qs = ClassOccurrence.objects.using(alias).all()
+
+        # Branch scope enforcement
+        permitted_branches = get_user_effective_branch_ids(self.request.user, alias)
+        if permitted_branches is not None:
+            qs = qs.filter(branch_id__in=permitted_branches)
+
         branch_id = self.request.query_params.get('branch_id')
         occ_date = self.request.query_params.get('occurrence_date')
         status_param = self.request.query_params.get('status')
@@ -265,10 +447,10 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
 class ClassOccurrenceTrainerViewSet(viewsets.ModelViewSet):
     serializer_class = ClassOccurrenceTrainerSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'core'
-    required_submodule = 'settings'
-    required_permission = 'core.settings.view'
-    permission_action_map = {'create': 'core.settings.edit', 'update': 'core.settings.edit', 'destroy': 'core.settings.edit'}
+    required_module = 'ops'
+    required_submodule = 'classes'
+    required_permission = 'ops.classes.view'
+    permission_action_map = {'create': 'ops.classes.create', 'update': 'ops.classes.edit', 'partial_update': 'ops.classes.edit', 'destroy': 'ops.classes.delete'}
 
     def get_queryset(self):
         alias = _get_db(self.request)
@@ -278,10 +460,10 @@ class ClassOccurrenceTrainerViewSet(viewsets.ModelViewSet):
 class PackageClassAccessRuleViewSet(viewsets.ModelViewSet):
     serializer_class = PackageClassAccessRuleSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'core'
-    required_submodule = 'settings'
-    required_permission = 'core.settings.view'
-    permission_action_map = {'create': 'core.settings.edit', 'update': 'core.settings.edit', 'destroy': 'core.settings.edit'}
+    required_module = 'ops'
+    required_submodule = 'classes'
+    required_permission = 'ops.classes.view'
+    permission_action_map = {'create': 'ops.classes.create', 'update': 'ops.classes.edit', 'partial_update': 'ops.classes.edit', 'destroy': 'ops.classes.delete'}
 
     def get_queryset(self):
         alias = _get_db(self.request)
@@ -291,10 +473,10 @@ class PackageClassAccessRuleViewSet(viewsets.ModelViewSet):
 class ClassSpecialtyRequirementViewSet(viewsets.ModelViewSet):
     serializer_class = ClassSpecialtyRequirementSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'core'
-    required_submodule = 'settings'
-    required_permission = 'core.settings.view'
-    permission_action_map = {'create': 'core.settings.edit', 'update': 'core.settings.edit', 'destroy': 'core.settings.edit'}
+    required_module = 'ops'
+    required_submodule = 'classes'
+    required_permission = 'ops.classes.view'
+    permission_action_map = {'create': 'ops.classes.create', 'update': 'ops.classes.edit', 'partial_update': 'ops.classes.edit', 'destroy': 'ops.classes.delete'}
 
     def get_queryset(self):
         alias = _get_db(self.request)
@@ -304,10 +486,10 @@ class ClassSpecialtyRequirementViewSet(viewsets.ModelViewSet):
 class ClassScheduleImportBatchViewSet(viewsets.ModelViewSet):
     serializer_class = ClassScheduleImportBatchSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'core'
-    required_submodule = 'settings'
-    required_permission = 'core.settings.view'
-    permission_action_map = {'create': 'core.settings.edit', 'update': 'core.settings.edit', 'destroy': 'core.settings.edit'}
+    required_module = 'ops'
+    required_submodule = 'classes'
+    required_permission = 'ops.classes.view'
+    permission_action_map = {'create': 'ops.classes.create', 'update': 'ops.classes.edit', 'partial_update': 'ops.classes.edit', 'destroy': 'ops.classes.delete'}
 
     def get_queryset(self):
         alias = _get_db(self.request)
@@ -317,9 +499,9 @@ class ClassScheduleImportBatchViewSet(viewsets.ModelViewSet):
 class ClassScheduleImportRowViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = ClassScheduleImportRowSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'core'
-    required_submodule = 'settings'
-    required_permission = 'core.settings.view'
+    required_module = 'ops'
+    required_submodule = 'classes'
+    required_permission = 'ops.classes.view'
 
     def get_queryset(self):
         alias = _get_db(self.request)
@@ -329,10 +511,10 @@ class ClassScheduleImportRowViewSet(viewsets.ReadOnlyModelViewSet):
 class ClassContentItemViewSet(viewsets.ModelViewSet):
     serializer_class = ClassContentItemSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'core'
-    required_submodule = 'settings'
-    required_permission = 'core.settings.view'
-    permission_action_map = {'create': 'core.settings.edit', 'update': 'core.settings.edit', 'destroy': 'core.settings.edit'}
+    required_module = 'ops'
+    required_submodule = 'classes'
+    required_permission = 'ops.classes.view'
+    permission_action_map = {'create': 'ops.classes.create', 'update': 'ops.classes.edit', 'partial_update': 'ops.classes.edit', 'destroy': 'ops.classes.delete'}
 
     def get_queryset(self):
         alias = _get_db(self.request)
@@ -346,10 +528,10 @@ class ClassContentItemViewSet(viewsets.ModelViewSet):
 class ClassContentMappingViewSet(viewsets.ModelViewSet):
     serializer_class = ClassContentMappingSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'core'
-    required_submodule = 'settings'
-    required_permission = 'core.settings.view'
-    permission_action_map = {'create': 'core.settings.edit', 'update': 'core.settings.edit', 'destroy': 'core.settings.edit'}
+    required_module = 'ops'
+    required_submodule = 'classes'
+    required_permission = 'ops.classes.view'
+    permission_action_map = {'create': 'ops.classes.create', 'update': 'ops.classes.edit', 'partial_update': 'ops.classes.edit', 'destroy': 'ops.classes.delete'}
 
     def get_queryset(self):
         alias = _get_db(self.request)
@@ -359,10 +541,10 @@ class ClassContentMappingViewSet(viewsets.ModelViewSet):
 class ClassContentAssignmentViewSet(viewsets.ModelViewSet):
     serializer_class = ClassContentAssignmentSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'core'
-    required_submodule = 'settings'
-    required_permission = 'core.settings.view'
-    permission_action_map = {'create': 'core.settings.edit', 'update': 'core.settings.edit', 'destroy': 'core.settings.edit'}
+    required_module = 'ops'
+    required_submodule = 'classes'
+    required_permission = 'ops.classes.view'
+    permission_action_map = {'create': 'ops.classes.create', 'update': 'ops.classes.edit', 'partial_update': 'ops.classes.edit', 'destroy': 'ops.classes.delete'}
 
     def get_queryset(self):
         alias = _get_db(self.request)
@@ -372,10 +554,10 @@ class ClassContentAssignmentViewSet(viewsets.ModelViewSet):
 class ClassDemandEventViewSet(viewsets.ModelViewSet):
     serializer_class = ClassDemandEventSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'core'
-    required_submodule = 'settings'
-    required_permission = 'core.settings.view'
-    permission_action_map = {'create': 'core.settings.edit'}
+    required_module = 'ops'
+    required_submodule = 'classes'
+    required_permission = 'ops.classes.view'
+    permission_action_map = {'create': 'ops.classes.create'}
 
     def get_queryset(self):
         alias = _get_db(self.request)
@@ -385,10 +567,10 @@ class ClassDemandEventViewSet(viewsets.ModelViewSet):
 class ClassDemandPlanningRunViewSet(viewsets.ModelViewSet):
     serializer_class = ClassDemandPlanningRunSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'core'
-    required_submodule = 'settings'
-    required_permission = 'core.settings.view'
-    permission_action_map = {'create': 'core.settings.edit', 'update': 'core.settings.edit', 'destroy': 'core.settings.edit'}
+    required_module = 'ops'
+    required_submodule = 'classes'
+    required_permission = 'ops.classes.view'
+    permission_action_map = {'create': 'ops.classes.create', 'update': 'ops.classes.edit', 'partial_update': 'ops.classes.edit', 'destroy': 'ops.classes.delete'}
 
     def get_queryset(self):
         alias = _get_db(self.request)
@@ -402,10 +584,10 @@ class ClassDemandPlanningRunViewSet(viewsets.ModelViewSet):
 class ClassScheduleRecommendationViewSet(viewsets.ModelViewSet):
     serializer_class = ClassScheduleRecommendationSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'core'
-    required_submodule = 'settings'
-    required_permission = 'core.settings.view'
-    permission_action_map = {'create': 'core.settings.edit', 'update': 'core.settings.edit', 'destroy': 'core.settings.edit'}
+    required_module = 'ops'
+    required_submodule = 'classes'
+    required_permission = 'ops.classes.view'
+    permission_action_map = {'create': 'ops.classes.create', 'update': 'ops.classes.edit', 'partial_update': 'ops.classes.edit', 'destroy': 'ops.classes.delete'}
 
     def get_queryset(self):
         alias = _get_db(self.request)

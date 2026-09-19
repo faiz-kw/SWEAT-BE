@@ -308,7 +308,6 @@ class MembershipLifecycleService:
             return ledger
 
     @classmethod
-    @transaction.atomic
     def reverse_entitlement(
         cls,
         membership: Membership,
@@ -323,38 +322,38 @@ class MembershipLifecycleService:
         Reverses consumed units back to an entitlement upon booking cancellation and writes an immutable ledger entry.
         """
         alias = db_alias or get_current_tenant_db_alias() or 'default'
+        with transaction.atomic(using=alias):
+            ent = MembershipEntitlement.objects.using(alias).select_for_update().filter(
+                membership=membership,
+                entitlement_type=entitlement_type,
+            ).first()
 
-        ent = MembershipEntitlement.objects.using(alias).filter(
-            membership=membership,
-            entitlement_type=entitlement_type,
-        ).first()
+            if not ent:
+                raise ValidationError(f"Entitlement '{entitlement_type}' not found on this membership.")
 
-        if not ent:
-            raise ValidationError(f"Entitlement '{entitlement_type}' not found on this membership.")
+            if not ent.is_unlimited:
+                ent.consumed_units = max(Decimal('0.00'), ent.consumed_units - units)
+                if ent.status == 'EXHAUSTED':
+                    ent.status = 'ACTIVE'
+                ent.save(using=alias, update_fields=['consumed_units', 'status', 'updated_at'])
+                balance_after = ent.remaining_units
+            else:
+                ent.consumed_units = max(Decimal('0.00'), ent.consumed_units - units)
+                ent.save(using=alias, update_fields=['consumed_units', 'updated_at'])
+                balance_after = Decimal('999999.00')
 
-        if not ent.is_unlimited:
-            ent.consumed_units = max(Decimal('0.00'), ent.consumed_units - units)
-            if ent.status == 'EXHAUSTED':
-                ent.status = 'ACTIVE'
-            ent.save(using=alias, update_fields=['consumed_units', 'status', 'updated_at'])
-            balance_after = ent.remaining_units
-        else:
-            ent.consumed_units = max(Decimal('0.00'), ent.consumed_units - units)
-            ent.save(using=alias, update_fields=['consumed_units', 'updated_at'])
-            balance_after = Decimal('999999.00')
+            ledger = MembershipEntitlementLedger.objects.using(alias).create(
+                membership_entitlement=ent,
+                transaction_type='REVERSAL',
+                units=units,
+                booking_id=booking_id,
+                reason_code='CANCELLATION_REVERSAL',
+                reason_text=reason_text or f"Reversed {units} unit(s) for booking {booking_id}",
+                balance_after=balance_after,
+                created_by_user=created_by_user,
+            )
 
-        ledger = MembershipEntitlementLedger.objects.using(alias).create(
-            membership_entitlement=ent,
-            transaction_type='REVERSAL',
-            units=units,
-            booking_id=booking_id,
-            reason_code='CANCELLATION_REVERSAL',
-            reason_text=reason_text or f"Reversed {units} unit(s) for booking {booking_id}",
-            balance_after=balance_after,
-            created_by_user=created_by_user,
-        )
-
-        return ledger
+            return ledger
 
     # Alias restore_entitlement to reverse_entitlement
     restore_entitlement = reverse_entitlement

@@ -69,6 +69,7 @@ from .views_catalog import (
     PackageEntitlementDefinitionViewSet,
 )
 from .views_classes import (
+    ClassesMetadataView,
     ClassCategoryViewSet,
     ClassTemplateViewSet,
     ClassPriceViewSet,
@@ -283,5 +284,6 @@ urlpatterns = [
     path('storage/presign-upload/', StoragePresignUploadView.as_view(), name='storage-presign-upload'),
     path('storage/confirm-upload/', StorageConfirmUploadView.as_view(), name='storage-confirm-upload'),
     path('storage/presign-download/<uuid:id>/', StoragePresignDownloadView.as_view(), name='storage-presign-download'),
+    path('classes/metadata/', ClassesMetadataView.as_view(), name='classes-metadata'),
     path('', include(router.urls)),
 ]

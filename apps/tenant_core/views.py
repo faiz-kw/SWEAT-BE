@@ -671,12 +671,7 @@ class RoleViewSet(TenantDBMixin, viewsets.ModelViewSet):
         """
         role = self.get_object()
         db = self.get_db()
-
-        if role.is_system:
-            return Response(
-                {'error': 'System roles cannot be modified.'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        # System roles (e.g. FRONT_DESK, TRAINER, MEMBER) can have their permissions customized by Org Admin.
 
         from .models_rbac import (
             RolePermissionSet, RolePermissionSetItem, Permission,

@@ -87,6 +87,16 @@ class ClassesModuleTargetedTestCase(APITestCase):
             is_enabled=True,
             availability_mode='ALL_BRANCHES',
         )
+        self.prod_mod_ops, _ = ProductModule.objects.using('default').get_or_create(
+            code='ops',
+            defaults={'name': 'Operations', 'status': 'ACTIVE'},
+        )
+        self.tm_ops = TenantModule.objects.using('default').create(
+            tenant=self.tenant,
+            module=self.prod_mod_ops,
+            is_enabled=True,
+            availability_mode='ALL_BRANCHES',
+        )
         self.prod_mod_classes, _ = ProductModule.objects.using('default').get_or_create(
             code='classes',
             defaults={'name': 'Classes', 'status': 'ACTIVE'},
@@ -189,6 +199,24 @@ class ClassesModuleTargetedTestCase(APITestCase):
             action='edit',
             defaults={'permission_code': 'core.settings.edit', 'label': 'Edit Settings'},
         )
+
+        # Operations / Classes module RBAC
+        self.mod_cat_ops, _ = ModuleCatalog.objects.using('tenant_test').get_or_create(
+            module_code='ops',
+            defaults={'name': 'Operations', 'is_enabled': True},
+        )
+        RoleModuleAccess.objects.using('tenant_test').get_or_create(
+            role=self.role_admin, module=self.mod_cat_ops, defaults={'can_access': True}
+        )
+        self.sub_classes, _ = SubmoduleCatalog.objects.using('tenant_test').get_or_create(
+            module=self.mod_cat_ops,
+            submodule_code='classes',
+            defaults={'name': 'Classes', 'is_enabled': True},
+        )
+        RoleSubmoduleAccess.objects.using('tenant_test').get_or_create(
+            role=self.role_admin, submodule=self.sub_classes, defaults={'can_access': True}
+        )
+
         self.perm_set = RolePermissionSet.objects.using('tenant_test').create(
             role=self.role_admin,
             name='Admin Perm Set',
@@ -199,6 +227,17 @@ class ClassesModuleTargetedTestCase(APITestCase):
         RolePermissionSetItem.objects.using('tenant_test').get_or_create(
             permission_set=self.perm_set, permission=self.perm_edit, defaults={'granted': True}
         )
+
+        for act in ['view', 'create', 'edit', 'delete']:
+            perm, _ = Permission.objects.using('tenant_test').get_or_create(
+                module=self.mod_cat_ops,
+                submodule=self.sub_classes,
+                action=act,
+                defaults={'permission_code': f'ops.classes.{act}', 'label': f'{act.capitalize()} Classes'},
+            )
+            RolePermissionSetItem.objects.using('tenant_test').get_or_create(
+                permission_set=self.perm_set, permission=perm, defaults={'granted': True}
+            )
 
         # 4. Unauthorized User (Member role with view-only or no access)
         self.unauth_user = TenantUser.objects.using('tenant_test').create(
@@ -292,34 +331,62 @@ class ClassesModuleTargetedTestCase(APITestCase):
         refresh = _build_tenant_token(user=self.unauth_user, tenant=self.tenant, db_alias='tenant_test')
         self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {str(refresh.access_token)}')
 
-    # 1. ClassCategory create
+    # 1. ClassCategory create without code -> auto-code, collision handling, rename stability, activate/deactivate
     def test_01_class_category_create(self):
         self._auth_as_admin()
         res = self.client.post('/api/v1/tenant/class-categories/', {
-            'code': 'QA_GROUP_FITNESS',
-            'name': 'QA Group Fitness',
+            'name': 'Group Fitness',
             'description': 'Temporary UAT class category',
             'display_order': 1,
             'status': 'ACTIVE',
         }, format='json')
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(res.data['code'], 'QA_GROUP_FITNESS')
+        self.assertEqual(res.data['code'], 'GROUP_FITNESS')
         self.assertTrue(
-            ClassCategory.objects.using('tenant_test').filter(code='QA_GROUP_FITNESS').exists()
+            ClassCategory.objects.using('tenant_test').filter(code='GROUP_FITNESS').exists()
         )
+        cat_id = res.data['id']
 
-    # 2. ClassTemplate create
+        # Auto-code collision test: same name gets suffix _2
+        res2 = self.client.post('/api/v1/tenant/class-categories/', {
+            'name': 'Group Fitness',
+            'description': 'Second group fitness category',
+        }, format='json')
+        self.assertEqual(res2.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res2.data['code'], 'GROUP_FITNESS_2')
+
+        # Rename stability test: renaming preserves original code
+        res_rename = self.client.patch(f'/api/v1/tenant/class-categories/{cat_id}/', {
+            'name': 'Premium Group Fitness',
+        }, format='json')
+        self.assertEqual(res_rename.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_rename.data['name'], 'Premium Group Fitness')
+        self.assertEqual(res_rename.data['code'], 'GROUP_FITNESS')
+
+        # Deactivate / Activate test
+        res_deact = self.client.patch(f'/api/v1/tenant/class-categories/{cat_id}/', {
+            'status': 'INACTIVE',
+        }, format='json')
+        self.assertEqual(res_deact.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_deact.data['status'], 'INACTIVE')
+
+        res_act = self.client.patch(f'/api/v1/tenant/class-categories/{cat_id}/', {
+            'status': 'ACTIVE',
+        }, format='json')
+        self.assertEqual(res_act.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_act.data['status'], 'ACTIVE')
+
+    # 2. ClassTemplate create without code -> auto-code, collision handling, rename stability, activate/deactivate
     def test_02_class_template_create(self):
         self._auth_as_admin()
         cat = ClassCategory.objects.using('tenant_test').create(
             organization=self.org,
-            code='QA_CAT',
-            name='QA Category',
+            code='PILATES',
+            name='Pilates',
             status='ACTIVE',
         )
         res = self.client.post('/api/v1/tenant/class-templates/', {
-            'code': 'QA_MORNING_MOBILITY',
-            'name': 'QA Morning Mobility',
+            'name': 'Reformer Pilates',
             'category': str(cat.id),
             'default_duration_minutes': 60,
             'default_capacity': 20,
@@ -333,10 +400,50 @@ class ClassesModuleTargetedTestCase(APITestCase):
             'status': 'ACTIVE',
         }, format='json')
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(res.data['code'], 'QA_MORNING_MOBILITY')
+        self.assertEqual(res.data['code'], 'REFORMER_PILATES')
         self.assertTrue(
-            ClassTemplate.objects.using('tenant_test').filter(code='QA_MORNING_MOBILITY').exists()
+            ClassTemplate.objects.using('tenant_test').filter(code='REFORMER_PILATES').exists()
         )
+        tpl_id = res.data['id']
+
+        # Auto-code collision test: same name gets suffix _2
+        res2 = self.client.post('/api/v1/tenant/class-templates/', {
+            'name': 'Reformer Pilates',
+            'category': str(cat.id),
+            'default_duration_minutes': 45,
+        }, format='json')
+        self.assertEqual(res2.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res2.data['code'], 'REFORMER_PILATES_2')
+
+        # Rename stability test: renaming retains original code
+        res_rename = self.client.patch(f'/api/v1/tenant/class-templates/{tpl_id}/', {
+            'name': 'Premium Reformer Pilates',
+        }, format='json')
+        self.assertEqual(res_rename.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_rename.data['name'], 'Premium Reformer Pilates')
+        self.assertEqual(res_rename.data['code'], 'REFORMER_PILATES')
+
+        # Deactivate / Activate test
+        res_deact = self.client.patch(f'/api/v1/tenant/class-templates/{tpl_id}/', {
+            'status': 'INACTIVE',
+        }, format='json')
+        self.assertEqual(res_deact.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_deact.data['status'], 'INACTIVE')
+
+        res_act = self.client.patch(f'/api/v1/tenant/class-templates/{tpl_id}/', {
+            'status': 'ACTIVE',
+        }, format='json')
+        self.assertEqual(res_act.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_act.data['status'], 'ACTIVE')
+
+        # Template create with ONLY category and NO name (name derived from category)
+        res_no_name = self.client.post('/api/v1/tenant/class-templates/', {
+            'category': str(cat.id),
+            'default_duration_minutes': 50,
+        }, format='json')
+        self.assertEqual(res_no_name.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res_no_name.data['name'], 'Pilates')
+        self.assertEqual(res_no_name.data['code'], 'PILATES')
 
     # 3. Branch availability
     def test_03_branch_availability(self):
@@ -362,7 +469,7 @@ class ClassesModuleTargetedTestCase(APITestCase):
             .exists()
         )
 
-    # 4. RecurringRule create
+    # 4. RecurringRule create, edit, activate/deactivate
     def test_04_recurring_rule_create(self):
         self._auth_as_admin()
         tpl = ClassTemplate.objects.using('tenant_test').create(
@@ -389,6 +496,28 @@ class ClassesModuleTargetedTestCase(APITestCase):
         self.assertTrue(
             ClassScheduleRule.objects.using('tenant_test').filter(class_template=tpl).exists()
         )
+        rule_id = res.data['id']
+
+        # Edit rule
+        res_edit = self.client.patch(f'/api/v1/tenant/class-schedule-rules/{rule_id}/', {
+            'start_time': '08:00',
+            'end_time': '09:00',
+        }, format='json')
+        self.assertEqual(res_edit.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_edit.data['start_time'], '08:00:00')
+
+        # Deactivate / Activate rule
+        res_deact = self.client.patch(f'/api/v1/tenant/class-schedule-rules/{rule_id}/', {
+            'status': 'INACTIVE',
+        }, format='json')
+        self.assertEqual(res_deact.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_deact.data['status'], 'INACTIVE')
+
+        res_act = self.client.patch(f'/api/v1/tenant/class-schedule-rules/{rule_id}/', {
+            'status': 'ACTIVE',
+        }, format='json')
+        self.assertEqual(res_act.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_act.data['status'], 'ACTIVE')
 
     # 5. Invalid branch-hours rule rejected
     def test_05_invalid_branch_hours_rule_rejected(self):
@@ -625,3 +754,20 @@ class ClassesModuleTargetedTestCase(APITestCase):
         # Ensure it does NOT exist in master DB (zero master contamination)
         with self.assertRaises(Exception):
             ClassCategory.objects.using('default').filter(id=cat1.id).exists()
+
+    # 13. Classes metadata endpoint
+    def test_13_classes_metadata_endpoint(self):
+        self._auth_as_admin()
+        res = self.client.get('/api/v1/tenant/classes/metadata/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn('statuses', res.data)
+        self.assertIn('delivery_modes', res.data)
+        self.assertIn('weekdays', res.data)
+        self.assertIn('trainer_roles', res.data)
+        status_vals = [s['value'] for s in res.data['statuses']]
+        self.assertIn('ACTIVE', status_vals)
+        self.assertIn('INACTIVE', status_vals)
+        modes = [m['value'] for m in res.data['delivery_modes']]
+        self.assertIn('OFFLINE', modes)
+        self.assertIn('ONLINE', modes)
+        self.assertIn('HYBRID', modes)

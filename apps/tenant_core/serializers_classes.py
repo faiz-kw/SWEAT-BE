@@ -10,11 +10,33 @@ from .models_classes import (
 )
 
 
+from .serializers_catalog import _generate_unique_code
+
+
 class ClassCategorySerializer(serializers.ModelSerializer):
+    code = serializers.CharField(required=False, allow_blank=True, max_length=100)
+
     class Meta:
         model = ClassCategory
         fields = ['id', 'organization', 'code', 'name', 'description', 'display_order', 'status', 'created_at', 'updated_at']
         read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
+        extra_kwargs = {
+            'code': {'required': False, 'allow_blank': True},
+        }
+        validators = []
+
+    def create(self, validated_data):
+        if not validated_data.get('code'):
+            req = self.context.get('request')
+            alias = getattr(getattr(req, 'user', None), '_db_alias', None) or self.context.get('db_alias')
+            org = validated_data.get('organization') or getattr(req, 'organization', None) or self.context.get('organization')
+            validated_data['code'] = _generate_unique_code(ClassCategory, org, validated_data.get('name', 'CATEGORY'), db_alias=alias)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if 'code' in validated_data and not validated_data['code']:
+            validated_data.pop('code')
+        return super().update(instance, validated_data)
 
 
 class ClassSpecialtyRequirementSerializer(serializers.ModelSerializer):
@@ -59,6 +81,8 @@ class ClassBranchAvailabilitySerializer(serializers.ModelSerializer):
 
 
 class ClassTemplateSerializer(serializers.ModelSerializer):
+    code = serializers.CharField(required=False, allow_blank=True, max_length=100)
+    name = serializers.CharField(required=False, allow_blank=True, max_length=200)
     category_name = serializers.CharField(source='category.name', read_only=True)
     program_name = serializers.CharField(source='program.name', read_only=True)
     specialty_requirements = ClassSpecialtyRequirementSerializer(many=True, read_only=True)
@@ -73,6 +97,45 @@ class ClassTemplateSerializer(serializers.ModelSerializer):
             'min_age', 'max_age', 'status', 'specialty_requirements', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
+        extra_kwargs = {
+            'code': {'required': False, 'allow_blank': True},
+            'name': {'required': False, 'allow_blank': True},
+            'min_age': {'required': False, 'allow_null': True},
+            'max_age': {'required': False, 'allow_null': True},
+        }
+        validators = []
+
+    def validate(self, attrs):
+        if not attrs.get('name'):
+            category = attrs.get('category')
+            if category:
+                attrs['name'] = category.name
+            elif self.instance and self.instance.category:
+                attrs['name'] = self.instance.category.name
+            elif self.instance and self.instance.name:
+                attrs['name'] = self.instance.name
+            else:
+                raise serializers.ValidationError({'category': 'Please select a Class Name.'})
+        return attrs
+
+    def create(self, validated_data):
+        if not validated_data.get('name'):
+            cat = validated_data.get('category')
+            if cat:
+                validated_data['name'] = cat.name
+        if not validated_data.get('code'):
+            req = self.context.get('request')
+            alias = getattr(getattr(req, 'user', None), '_db_alias', None) or self.context.get('db_alias')
+            org = validated_data.get('organization') or getattr(req, 'organization', None) or self.context.get('organization')
+            validated_data['code'] = _generate_unique_code(ClassTemplate, org, validated_data.get('name', 'CLASS'), db_alias=alias)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if 'code' in validated_data and not validated_data['code']:
+            validated_data.pop('code')
+        if not validated_data.get('name') and validated_data.get('category'):
+            validated_data['name'] = validated_data['category'].name
+        return super().update(instance, validated_data)
 
 
 class ClassScheduleRuleSerializer(serializers.ModelSerializer):

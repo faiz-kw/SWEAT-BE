@@ -2,12 +2,41 @@
 DRF Serializers for Layer 2: Module C (Terms) & Module D (Programs / Packages / Catalog)
 """
 
+import re
 from rest_framework import serializers
 from .models_catalog import (
     TermsDocument, TermsDocumentVersion, TermsAcceptance,
     ProgramCategory, ProgramType, Program, Package, PackageVersion,
     PackagePrice, PackageBranchAvailability, PackageEntitlementDefinition,
 )
+
+
+def _generate_unique_code(model_class, organization, name, db_alias=None, field_name='code'):
+    """
+    Auto-generates a stable internal code from a human-readable name.
+    E.g. "Pilates Group" -> "PILATES_GROUP".
+    Handles collisions by deterministically appending _2, _3, etc.
+    """
+    if not name:
+        base_code = 'ITEM'
+    else:
+        cleaned = re.sub(r'[^A-Za-z0-9]+', '_', str(name).strip().upper()).strip('_')
+        base_code = cleaned[:80] if cleaned else 'ITEM'
+
+    from config.routers import get_tenant_db_alias
+    alias = db_alias or (getattr(organization, '_state', None) and getattr(organization._state, 'db', None)) or get_tenant_db_alias() or 'default'
+    qs = model_class.objects.using(alias)
+    if organization is not None:
+        qs = qs.filter(organization=organization)
+
+    candidate = base_code
+    counter = 1
+    while qs.filter(**{field_name: candidate}).exists():
+        counter += 1
+        suffix = f"_{counter}"
+        candidate = f"{base_code[:100 - len(suffix)]}{suffix}"
+
+    return candidate
 
 
 # ============================================================================
@@ -31,6 +60,7 @@ class TermsDocumentVersionSerializer(serializers.ModelSerializer):
 
 
 class TermsDocumentSerializer(serializers.ModelSerializer):
+    code = serializers.CharField(required=False, allow_blank=True, max_length=100)
     active_version = serializers.SerializerMethodField()
     versions_count = serializers.SerializerMethodField()
 
@@ -41,6 +71,22 @@ class TermsDocumentSerializer(serializers.ModelSerializer):
             'status', 'active_version', 'versions_count', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
+        extra_kwargs = {
+            'code': {'required': False, 'allow_blank': True},
+        }
+
+    def create(self, validated_data):
+        if not validated_data.get('code'):
+            req = self.context.get('request')
+            alias = getattr(getattr(req, 'user', None), '_db_alias', None) or self.context.get('db_alias')
+            org = validated_data.get('organization') or getattr(req, 'organization', None) or self.context.get('organization')
+            validated_data['code'] = _generate_unique_code(TermsDocument, org, validated_data.get('name', 'TERMS'), db_alias=alias)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if 'code' in validated_data and not validated_data['code']:
+            validated_data.pop('code')
+        return super().update(instance, validated_data)
 
     def get_active_version(self, obj):
         active_ver = obj.versions.filter(status='ACTIVE').order_by('-version_number').first()
@@ -75,6 +121,7 @@ class TermsAcceptanceSerializer(serializers.ModelSerializer):
 # ============================================================================
 
 class ProgramTypeSerializer(serializers.ModelSerializer):
+    code = serializers.CharField(required=False, allow_blank=True, max_length=100)
     programs_count = serializers.SerializerMethodField()
 
     class Meta:
@@ -84,12 +131,29 @@ class ProgramTypeSerializer(serializers.ModelSerializer):
             'display_order', 'status', 'programs_count', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
+        extra_kwargs = {
+            'code': {'required': False, 'allow_blank': True},
+        }
+
+    def create(self, validated_data):
+        if not validated_data.get('code'):
+            req = self.context.get('request')
+            alias = getattr(getattr(req, 'user', None), '_db_alias', None) or self.context.get('db_alias')
+            org = validated_data.get('organization') or getattr(req, 'organization', None) or self.context.get('organization')
+            validated_data['code'] = _generate_unique_code(ProgramType, org, validated_data.get('name', 'PROGRAM_TYPE'), db_alias=alias)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if 'code' in validated_data and not validated_data['code']:
+            validated_data.pop('code')
+        return super().update(instance, validated_data)
 
     def get_programs_count(self, obj):
         return obj.programs.count()
 
 
 class ProgramCategorySerializer(serializers.ModelSerializer):
+    code = serializers.CharField(required=False, allow_blank=True, max_length=100)
     programs_count = serializers.SerializerMethodField()
 
     class Meta:
@@ -99,12 +163,29 @@ class ProgramCategorySerializer(serializers.ModelSerializer):
             'display_order', 'status', 'programs_count', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
+        extra_kwargs = {
+            'code': {'required': False, 'allow_blank': True},
+        }
+
+    def create(self, validated_data):
+        if not validated_data.get('code'):
+            req = self.context.get('request')
+            alias = getattr(getattr(req, 'user', None), '_db_alias', None) or self.context.get('db_alias')
+            org = validated_data.get('organization') or getattr(req, 'organization', None) or self.context.get('organization')
+            validated_data['code'] = _generate_unique_code(ProgramCategory, org, validated_data.get('name', 'CATEGORY'), db_alias=alias)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if 'code' in validated_data and not validated_data['code']:
+            validated_data.pop('code')
+        return super().update(instance, validated_data)
 
     def get_programs_count(self, obj):
         return obj.programs.count()
 
 
 class ProgramSerializer(serializers.ModelSerializer):
+    code = serializers.CharField(required=False, allow_blank=True, max_length=100)
     category_name = serializers.CharField(source='category.name', read_only=True)
     program_type_name = serializers.CharField(source='program_type.name', read_only=True)
     program_type_code = serializers.CharField(source='program_type.code', read_only=True)
@@ -119,6 +200,22 @@ class ProgramSerializer(serializers.ModelSerializer):
             'trial_allowed', 'status', 'packages_count', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
+        extra_kwargs = {
+            'code': {'required': False, 'allow_blank': True},
+        }
+
+    def create(self, validated_data):
+        if not validated_data.get('code'):
+            req = self.context.get('request')
+            alias = getattr(getattr(req, 'user', None), '_db_alias', None) or self.context.get('db_alias')
+            org = validated_data.get('organization') or getattr(req, 'organization', None) or self.context.get('organization')
+            validated_data['code'] = _generate_unique_code(Program, org, validated_data.get('name', 'PROGRAM'), db_alias=alias)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if 'code' in validated_data and not validated_data['code']:
+            validated_data.pop('code')
+        return super().update(instance, validated_data)
 
     def get_packages_count(self, obj):
         return obj.packages.count()
@@ -211,10 +308,13 @@ class PackageVersionSerializer(serializers.ModelSerializer):
 
 
 class PackageSerializer(serializers.ModelSerializer):
+    code = serializers.CharField(required=False, allow_blank=True, max_length=100)
     program = serializers.PrimaryKeyRelatedField(queryset=Program.objects.all(), required=False, allow_null=True)
     program_name = serializers.CharField(source='program.name', read_only=True)
     latest_version = serializers.SerializerMethodField()
     active_version = serializers.SerializerMethodField()
+    versions = PackageVersionSerializer(many=True, read_only=True)
+    versions_count = serializers.SerializerMethodField()
     branch_availabilities = PackageBranchAvailabilitySerializer(many=True, read_only=True)
 
     class Meta:
@@ -222,9 +322,30 @@ class PackageSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'organization', 'program', 'program_name',
             'code', 'name', 'status', 'latest_version', 'active_version',
+            'versions', 'versions_count',
             'branch_availabilities', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
+        extra_kwargs = {
+            'code': {'required': False, 'allow_blank': True},
+        }
+        validators = []
+
+    def create(self, validated_data):
+        if not validated_data.get('code'):
+            req = self.context.get('request')
+            alias = getattr(getattr(req, 'user', None), '_db_alias', None) or self.context.get('db_alias')
+            org = validated_data.get('organization') or getattr(req, 'organization', None) or self.context.get('organization')
+            validated_data['code'] = _generate_unique_code(Package, org, validated_data.get('name', 'PACKAGE'), db_alias=alias)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if 'code' in validated_data and not validated_data['code']:
+            validated_data.pop('code')
+        return super().update(instance, validated_data)
+
+    def get_versions_count(self, obj):
+        return obj.versions.count()
 
     def to_internal_value(self, data):
         data = data.copy()

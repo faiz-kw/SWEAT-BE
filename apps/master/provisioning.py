@@ -606,35 +606,9 @@ def sync_tenant_catalog_and_rbac(db_alias: str, org=None, admin_user=None) -> di
                 defaults={'is_active': True, 'branch': None, 'organization': org, 'status': 'ACTIVE'},
             )
 
-        # For any ORG_ADMIN roles present in the tenant DB, grant all modules, submodules, and permissions
-        org_admin_roles = Role.objects.using(db_alias).filter(code='ORG_ADMIN')
-        for a_role in org_admin_roles:
-            perm_set, _ = RolePermissionSet.objects.using(db_alias).get_or_create(
-                role=a_role,
-                name='Organization Administrator Full Access',
-                defaults={'is_active': True, 'description': 'Full system permissions for Org Admin', 'organization': a_role.organization},
-            )
-
-            for module_obj in module_map.values():
-                RoleModuleAccess.objects.using(db_alias).get_or_create(
-                    role=a_role,
-                    module=module_obj,
-                    defaults={'permission_set': perm_set, 'can_access': True, 'is_visible': True},
-                )
-
-            for sm_obj in submodule_map.values():
-                RoleSubmoduleAccess.objects.using(db_alias).get_or_create(
-                    role=a_role,
-                    submodule=sm_obj,
-                    defaults={'permission_set': perm_set, 'can_access': True, 'is_visible': True},
-                )
-
-            for p in Permission.objects.using(db_alias).all():
-                RolePermissionSetItem.objects.using(db_alias).get_or_create(
-                    permission_set=perm_set,
-                    permission=p,
-                    defaults={'granted': True},
-                )
+        # Sync all canonical system role defaults (ORG_ADMIN, BRANCH_MANAGER, FRONT_DESK, TRAINER, MEMBER, SALES_REP, FINANCE_ADMIN)
+        from apps.tenant_core.rbac_defaults import sync_default_role_permissions
+        sync_default_role_permissions(db_alias, org=org, overwrite_custom=False)
 
         return {
             'modules': len(module_map),
