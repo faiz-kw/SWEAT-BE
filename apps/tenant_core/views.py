@@ -1344,16 +1344,67 @@ class BranchWorkingHoursViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelV
         'update': 'core.settings.edit',
         'partial_update': 'core.settings.edit',
         'destroy': 'core.settings.edit',
+        'bulk_sync': 'core.settings.edit',
     }
     serializer_class = BranchWorkingHoursSerializer
     queryset = BranchWorkingHours.objects.all().select_related('branch')
 
     def get_queryset(self):
         qs = super().get_queryset()
-        branch_id = self.request.query_params.get('branch_id') or self.request.query_params.get('branch')
+        branch_id = self.request.query_params.get('branch') or self.request.query_params.get('branch_id')
         if branch_id:
             qs = qs.filter(branch_id=branch_id)
         return qs.order_by('day_of_week')
+
+    @action(detail=False, methods=['post'], url_path='bulk-sync')
+    def bulk_sync(self, request):
+        """
+        Synchronize 7-day weekly schedule for a branch in a single atomic transaction.
+        """
+        db = self.get_db()
+        branch_id = request.data.get('branch_id') or request.data.get('branch')
+        schedule = request.data.get('schedule', [])
+
+        if not branch_id:
+            return Response({'error': 'branch_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not isinstance(schedule, list):
+            return Response({'error': 'schedule must be a list of daily schedules.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        branch = Branch.objects.using(db).filter(id=branch_id).first()
+        if not branch:
+            return Response({'error': 'Branch not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        user = request.user if hasattr(request, 'user') and request.user.is_authenticated else None
+
+        saved_items = []
+        with transaction.atomic(using=db):
+            for day_item in schedule:
+                day_num = day_item.get('day_of_week')
+                if not day_num or not (1 <= int(day_num) <= 7):
+                    continue
+                is_open = bool(day_item.get('is_open', True))
+                is_24_hours = bool(day_item.get('is_24_hours', False))
+                open_time = day_item.get('open_time') if is_open and not is_24_hours else None
+                close_time = day_item.get('close_time') if is_open and not is_24_hours else None
+
+                obj, created = BranchWorkingHours.objects.using(db).update_or_create(
+                    branch=branch,
+                    day_of_week=int(day_num),
+                    defaults={
+                        'is_open': is_open,
+                        'is_24_hours': is_24_hours,
+                        'open_time': open_time,
+                        'close_time': close_time,
+                        'updated_by': user,
+                    }
+                )
+                if created and user:
+                    obj.created_by = user
+                    obj.save(using=db, update_fields=['created_by'])
+                saved_items.append(obj)
+
+        serializer = self.get_serializer(saved_items, many=True)
+        return Response({'success': True, 'branch_id': str(branch.id), 'schedule': serializer.data})
 
     def perform_create(self, serializer):
         user = self.request.user if hasattr(self.request, 'user') and self.request.user.is_authenticated else None
@@ -1427,7 +1478,7 @@ class BranchOperatingExceptionViewSet(TenantScopeMixin, TenantDBMixin, viewsets.
 
     def get_queryset(self):
         qs = super().get_queryset()
-        branch_id = self.request.query_params.get('branch_id') or self.request.query_params.get('branch')
+        branch_id = self.request.query_params.get('branch') or self.request.query_params.get('branch_id')
         if branch_id:
             qs = qs.filter(branch_id=branch_id)
         return qs.order_by('exception_date')

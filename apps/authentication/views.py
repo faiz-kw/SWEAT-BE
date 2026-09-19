@@ -76,9 +76,12 @@ def _build_platform_token(user):
         .values_list('role__code', flat=True)
     )
 
+    primary_role = active_roles[0] if active_roles else ('Super Admin' if user.is_superuser else 'Platform User')
+
     refresh = RefreshToken()
     refresh['sub'] = str(user.id)
     refresh['user_type'] = 'platform'
+    refresh['role'] = primary_role
     refresh['roles'] = active_roles         # Real roles — list, not hardcoded string
     refresh['is_staff'] = user.is_staff
     refresh['is_superuser'] = user.is_superuser
@@ -127,9 +130,12 @@ def _build_tenant_token(user, tenant, db_alias):
         else None
     )
 
+    primary_role = active_roles[0] if active_roles else 'MEMBER'
+
     refresh = RefreshToken()
     refresh['sub'] = str(user.id)
     refresh['user_type'] = 'tenant'
+    refresh['role'] = primary_role
     refresh['roles'] = active_roles         # Real roles — list, not hardcoded string
     if hasattr(tenant, 'id'):
         refresh['tid'] = str(tenant.id)
@@ -860,6 +866,10 @@ class MeView(APIView):
             .values('role__code', 'role__name')
         )
 
+        active_role_obj = active_roles[0] if active_roles else None
+        primary_role = active_role_obj['role__name'] if active_role_obj else ('Super Admin' if user.is_superuser else 'Platform User')
+        primary_role_code = active_role_obj['role__code'] if active_role_obj else ('SUPER_ADMIN' if user.is_superuser else 'PLATFORM_USER')
+
         return Response({
             'id': str(user.id),
             'email': user.email,
@@ -867,7 +877,10 @@ class MeView(APIView):
             'last_name': user.last_name,
             'full_name': user.full_name,
             'user_type': 'platform',
+            'role': primary_role,
+            'role_code': primary_role_code,
             'roles': [{'code': r['role__code'], 'name': r['role__name']} for r in active_roles],
+            'permissions': [],
             'is_staff': user.is_staff,
             'is_superuser': user.is_superuser,
             'tenant_id': None,
@@ -938,14 +951,21 @@ class MeView(APIView):
             except Exception as e:
                 logger.error('MeView: Error loading tenant context for tid=%s: %s', tenant_id, e)
 
-        # Load active role assignments from Tenant DB
+        # Load active role assignments and RBAC grants from Tenant DB
         active_roles = []
         allowed_branches = []
         is_org_wide = False
+        user_permissions = []
+        user_accessible_modules = None
 
         if db_alias:
             try:
-                from apps.tenant_core.models_rbac import RoleAssignment
+                from apps.tenant_core.models_rbac import (
+                    RoleAssignment,
+                    RoleModuleAccess,
+                    RoleSubmoduleAccess,
+                    RolePermissionSetItem,
+                )
                 from apps.tenant_core.models_org import Branch
 
                 assignments = (
@@ -953,6 +973,7 @@ class MeView(APIView):
                     .filter(user=user, is_active=True)
                     .select_related('role', 'branch', 'branch__location')
                 )
+                role_ids = []
                 for ra in assignments:
                     active_roles.append({
                         'code': ra.role.code,
@@ -961,6 +982,7 @@ class MeView(APIView):
                         'branch_id': str(ra.branch.id) if ra.branch else None,
                         'branch_name': ra.branch.name if ra.branch else None,
                     })
+                    role_ids.append(ra.role_id)
                     if ra.role.scope == 'ORG' or ra.role.code in ('ORG_ADMIN', 'TENANT_ADMIN'):
                         is_org_wide = True
                     elif ra.branch and ra.branch.status == 'ACTIVE':
@@ -986,8 +1008,71 @@ class MeView(APIView):
                         }
                         for b in all_branches
                     ]
+
+                # Fetch permissions granted to user's active roles
+                if role_ids:
+                    perm_items = (
+                        RolePermissionSetItem.objects.using(db_alias)
+                        .filter(
+                            permission_set__role_id__in=role_ids,
+                            permission_set__is_active=True,
+                            granted=True,
+                        )
+                        .select_related('permission')
+                    )
+                    perm_codes = set()
+                    for item in perm_items:
+                        if item.permission:
+                            p_code = item.permission.permission_code or item.permission.code
+                            if p_code:
+                                perm_codes.add(p_code)
+                    user_permissions = sorted(list(perm_codes))
+
+                    # Calculate role-permitted modules/submodules
+                    if is_org_wide:
+                        # Org Admin gets all tenant-enabled modules
+                        user_accessible_modules = list(enabled_modules)
+                    else:
+                        # Intersect role module/submodule grants with tenant's enabled_modules
+                        tenant_mod_codes_lower = {m.lower() for m in enabled_modules}
+                        accessible = set()
+
+                        # Check whole module grants
+                        mod_accesses = (
+                            RoleModuleAccess.objects.using(db_alias)
+                            .filter(role_id__in=role_ids, can_access=True)
+                            .select_related('module')
+                        )
+                        for ma in mod_accesses:
+                            m_code = (ma.module.module_code or ma.module.code or '').lower()
+                            if m_code and m_code in tenant_mod_codes_lower:
+                                accessible.add(m_code)
+
+                        # Check granular submodule grants
+                        submod_accesses = (
+                            RoleSubmoduleAccess.objects.using(db_alias)
+                            .filter(role_id__in=role_ids, can_access=True)
+                            .select_related('submodule', 'submodule__module')
+                        )
+                        for sa in submod_accesses:
+                            parent_m_code = (sa.submodule.module.module_code or sa.submodule.module.code or '').lower()
+                            s_code = (sa.submodule.submodule_code or sa.submodule.code or '').lower()
+                            if parent_m_code in tenant_mod_codes_lower and s_code:
+                                accessible.add(f"/{parent_m_code}/{s_code}")
+
+                        user_accessible_modules = sorted(list(accessible))
+                else:
+                    if is_org_wide:
+                        user_accessible_modules = list(enabled_modules)
+                    else:
+                        user_accessible_modules = []
+
             except Exception as e:
                 logger.error('MeView: Error loading role assignments from db_alias=%s: %s', db_alias, e)
+
+        # Primary role resolution
+        primary_role = active_roles[0]['name'] if active_roles else 'Member'
+        primary_role_code = active_roles[0]['code'] if active_roles else 'MEMBER'
 
         # Home branch details from Tenant DB
         home_branch_data = None
@@ -1005,6 +1090,8 @@ class MeView(APIView):
         except Exception:
             pass
 
+        effective_enabled_modules = user_accessible_modules if user_accessible_modules is not None else enabled_modules
+
         return Response({
             'id': str(user.id),
             'email': user.email,
@@ -1012,7 +1099,10 @@ class MeView(APIView):
             'last_name': user.last_name,
             'full_name': user.full_name,
             'user_type': 'tenant',
+            'role': primary_role,
+            'role_code': primary_role_code,
             'roles': active_roles,                     # Real role assignments from DB
+            'permissions': user_permissions,           # Real granted permissions from RBAC
             'is_org_wide': is_org_wide,
             'is_staff': False,
             'is_superuser': False,
@@ -1020,7 +1110,8 @@ class MeView(APIView):
             'tenant_name': tenant_data.get('name') if tenant_data else None,
             'tenant': tenant_data,
             'home_branch': home_branch_data,
-            'enabled_modules': enabled_modules,        # Real module enablement from Master DB
+            'enabled_modules': effective_enabled_modules, # Role-filtered modules/submodules
+            'tenant_enabled_modules': enabled_modules,    # Organization subscription modules
             'allowed_branches': allowed_branches,
             'allowed_locations': allowed_branches,       # Expose for frontend auth-context
             'allowed_locations_list': allowed_branches,  # Expose for frontend auth.ts
