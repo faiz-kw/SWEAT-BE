@@ -50,35 +50,39 @@ class DiscountCouponEngineService:
         order_subtotal: Decimal,
         branch: Optional[Branch] = None,
         package: Optional[Package] = None,
+        db_alias: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Validate a coupon code against campaign rules, usage limits, and scopes.
         """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
         code_clean = (code_str or '').strip().upper()
         if not code_clean:
-            return {'is_valid': False, 'reason': 'Coupon code is required.'}
+            return {'is_valid': False, 'reason': 'Coupon code is required.', 'reason_code': 'REQUIRED'}
 
         try:
-            discount_code = DiscountCode.objects.select_related('campaign', 'branch', 'package').get(
+            discount_code = DiscountCode.objects.using(alias).select_related('campaign', 'branch', 'package').get(
                 code__iexact=code_clean
             )
         except DiscountCode.DoesNotExist:
-            return {'is_valid': False, 'reason': f"Coupon code '{code_str}' is invalid or does not exist."}
+            return {'is_valid': False, 'reason': f"Coupon code '{code_str}' is invalid or does not exist.", 'reason_code': 'NOT_FOUND'}
 
         if discount_code.status != 'ACTIVE':
-            return {'is_valid': False, 'reason': f"Coupon code '{code_str}' is {discount_code.status.lower()}."}
+            return {'is_valid': False, 'reason': f"Coupon code '{code_str}' is {discount_code.status.lower()}.", 'reason_code': 'INACTIVE'}
 
         campaign = discount_code.campaign
         if not campaign.is_currently_valid():
-            return {'is_valid': False, 'reason': f"Campaign '{campaign.name}' is inactive or expired."}
+            now = timezone.now()
+            r_code = 'EXPIRED' if (campaign.valid_until and now > campaign.valid_until) else 'INACTIVE'
+            return {'is_valid': False, 'reason': f"Campaign '{campaign.name}' is inactive or expired.", 'reason_code': r_code}
 
         # Branch scope
         if discount_code.branch and branch and discount_code.branch_id != branch.id:
-            return {'is_valid': False, 'reason': f"Coupon is only valid at {discount_code.branch.name}."}
+            return {'is_valid': False, 'reason': f"Coupon is only valid at {discount_code.branch.name}.", 'reason_code': 'BRANCH_NOT_ELIGIBLE'}
 
         # Package scope
         if discount_code.package and package and discount_code.package_id != package.id:
-            return {'is_valid': False, 'reason': f"Coupon is only valid for package '{discount_code.package.name}'."}
+            return {'is_valid': False, 'reason': f"Coupon is only valid for package '{discount_code.package.name}'.", 'reason_code': 'PACKAGE_NOT_ELIGIBLE'}
 
         # Minimum order amount
         subtotal_dec = Decimal(str(order_subtotal or '0'))
@@ -86,21 +90,22 @@ class DiscountCouponEngineService:
             return {
                 'is_valid': False,
                 'reason': f"Minimum order amount of {campaign.minimum_order_amount} required to use this coupon.",
+                'reason_code': 'MINIMUM_ORDER_NOT_MET',
             }
 
         # Global usage limit
         if campaign.usage_limit is not None:
-            total_redemptions = DiscountRedemption.objects.filter(campaign=campaign).count()
+            total_redemptions = DiscountRedemption.objects.using(alias).filter(campaign=campaign).count()
             if total_redemptions >= campaign.usage_limit:
-                return {'is_valid': False, 'reason': 'Coupon usage limit has been reached.'}
+                return {'is_valid': False, 'reason': 'Coupon usage limit has been reached.', 'reason_code': 'USAGE_LIMIT_EXCEEDED'}
 
         # Per-user limit
         if campaign.per_user_limit is not None and user_profile:
-            user_redemptions = DiscountRedemption.objects.filter(
+            user_redemptions = DiscountRedemption.objects.using(alias).filter(
                 campaign=campaign, user_profile=user_profile
             ).count()
             if user_redemptions >= campaign.per_user_limit:
-                return {'is_valid': False, 'reason': 'You have already reached the maximum usage limit for this coupon.'}
+                return {'is_valid': False, 'reason': 'You have already reached the maximum usage limit for this coupon.', 'reason_code': 'PER_USER_LIMIT_EXCEEDED'}
 
         # Calculate discount amount
         discount_amount = Decimal('0.00')

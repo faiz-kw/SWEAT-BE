@@ -288,7 +288,22 @@ def process_domain_outbox_events_task(self, tenant_id: str, limit: int = 50, **k
                 event.save(using=db_alias, update_fields=['status', 'updated_at'])
 
                 try:
-                    # In Layer 2, external handlers (email/sms/webhook/push) subscribe to event types
+                    if event.event_type == 'CRM_TRIAL_BOOKED':
+                        from apps.tenant_core.communication.service import CommunicationService
+                        from apps.tenant_core.models_crm import TrialBooking
+                        trial_id = event.aggregate_id or event.payload.get('trial_id')
+                        if trial_id:
+                            tb = TrialBooking.objects.using(db_alias).filter(id=trial_id).first()
+                            if tb:
+                                CommunicationService.send_trial_confirmation(tb)
+
+                    # 2. Generic Automation Engine consumption
+                    try:
+                        from apps.tenant_core.automation.engine import AutomationEngine
+                        AutomationEngine.handle_domain_event(event, db_alias=db_alias)
+                    except Exception as auto_err:
+                        logger.error("AutomationEngine error processing event %s: %s", event.id, auto_err, exc_info=True)
+
                     logger.info(
                         "Dispatched domain outbox event %s (%s) for aggregate %s:%s",
                         event.id, event.event_type, event.aggregate_type, event.aggregate_id
@@ -319,4 +334,57 @@ def process_domain_outbox_events_task(self, tenant_id: str, limit: int = 50, **k
     except TenantRoutingError as tre:
         logger.error("Outbox task failed to resolve tenant context for tenant '%s': %s", tenant_id, tre)
         return {'status': 'FAILED', 'error': str(tre)}
+
+
+@shared_task(
+    bind=True,
+    name='apps.tenant_core.tasks.process_trial_reminders_periodic_task',
+    max_retries=1,
+    acks_late=True,
+)
+def process_trial_reminders_periodic_task(self, tenant_id: str = None, **kwargs) -> dict:
+    """
+    Periodic task to scan and execute due trial reminders for a tenant.
+    Dispatches notifications based on active CRMTrialReminderPolicy and TrialBooking.
+    """
+    if not tenant_id:
+        return {'status': 'FAILED', 'error': 'tenant_id is mandatory'}
+
+    from .context import tenant_database_context
+    from .communication.service import CommunicationService
+
+    with tenant_database_context(tenant_id) as db_alias:
+        dispatched = CommunicationService.process_due_trial_reminders()
+        return {
+            'status': 'COMPLETED',
+            'tenant_id': str(tenant_id),
+            'dispatched_count': len(dispatched),
+        }
+
+
+@shared_task(
+    bind=True,
+    name='apps.tenant_core.tasks.process_due_waiting_automations_periodic_task',
+    max_retries=1,
+    acks_late=True,
+)
+def process_due_waiting_automations_periodic_task(self, tenant_id: str = None, **kwargs) -> dict:
+    """
+    Periodic task to scan and resume due WAITING automation step executions.
+    Safe across worker crashes and multiple workers using SELECT FOR UPDATE SKIP LOCKED.
+    """
+    if not tenant_id:
+        return {'status': 'FAILED', 'error': 'tenant_id is mandatory'}
+
+    from .context import tenant_database_context
+    from apps.tenant_core.automation.engine import AutomationEngine
+
+    with tenant_database_context(tenant_id) as db_alias:
+        resumed = AutomationEngine.resume_due_waiting_executions(db_alias=db_alias)
+        return {
+            'status': 'COMPLETED',
+            'tenant_id': str(tenant_id),
+            'resumed_count': resumed,
+        }
+
 

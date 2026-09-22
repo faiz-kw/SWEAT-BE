@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 TENANT_EXEMPT_PREFIXES = (
     '/api/v1/platform/',
     '/api/v1/auth/',
+    '/api/v1/webhooks/',
     '/admin/',
     '/api/schema/',
     '/api/docs/',

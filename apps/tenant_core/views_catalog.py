@@ -232,16 +232,32 @@ class ProgramViewSet(viewsets.ModelViewSet):
         'destroy': 'core.settings.edit',
     }
 
+    def get_permissions(self):
+        # Reading programs catalog is allowed for all active staff (for lead intake, bookings, sales)
+        if self.action in ['list', 'retrieve']:
+            return [RequireActiveTenantAndOrg()]
+        return super().get_permissions()
+
     def get_queryset(self):
         alias = _get_db(self.request)
         org = _get_org(self.request)
         qs = Program.objects.using(alias).filter(organization=org)
         cat_id = self.request.query_params.get('category_id')
         status_param = self.request.query_params.get('status')
+        branch_id = self.request.query_params.get('branch_id')
+
         if cat_id:
             qs = qs.filter(category_id=cat_id)
         if status_param:
             qs = qs.filter(status=status_param)
+        if branch_id:
+            # Check programs associated with packages available at this branch
+            from .models_catalog import PackageBranchAvailability
+            branch_avail = PackageBranchAvailability.objects.using(alias).filter(branch_id=branch_id)
+            if branch_avail.exists():
+                branch_prog_ids = branch_avail.filter(status='ENABLED').values_list('package__program_id', flat=True)
+                qs = qs.filter(id__in=branch_prog_ids)
+
         return qs.order_by('name')
 
     def perform_create(self, serializer):

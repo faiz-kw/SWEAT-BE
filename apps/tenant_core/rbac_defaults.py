@@ -51,6 +51,11 @@ DEFAULT_ROLES_CONFIG: Dict[str, dict] = {
             'crm.pipeline.view', 'crm.pipeline.create', 'crm.pipeline.edit',
             'crm.trials.view', 'crm.trials.create', 'crm.trials.edit',
             'crm.follow-ups.view', 'crm.follow-ups.create', 'crm.follow-ups.edit',
+            'crm.communications.view', 'crm.communications.send',
+            'crm.settings.view',
+            'crm.settings.edit',
+            'automation.workflows.view',
+            'automation.executions.view',
             # Reports & CS
             'reports.business.view', 'reports.sales.view', 'reports.members.view', 'reports.trainers.view',
             'cs.member-health.view', 'cs.at-risk.view', 'cs.feedback.view',
@@ -81,6 +86,7 @@ DEFAULT_ROLES_CONFIG: Dict[str, dict] = {
             'crm.leads.view', 'crm.leads.create', 'crm.leads.edit',
             'crm.trials.view', 'crm.trials.create', 'crm.trials.edit',
             'crm.follow-ups.view', 'crm.follow-ups.create', 'crm.follow-ups.edit',
+            'crm.communications.view', 'crm.communications.send',
         ],
     },
     'TRAINER': {
@@ -147,6 +153,8 @@ DEFAULT_ROLES_CONFIG: Dict[str, dict] = {
             'crm.trials.view', 'crm.trials.create', 'crm.trials.edit',
             'crm.campaigns.view',
             'crm.follow-ups.view', 'crm.follow-ups.create', 'crm.follow-ups.edit',
+            'crm.communications.view', 'crm.communications.send',
+            'crm.settings.view',
             # Members Read
             'members.client-360.view', 'members.client-360.create',
             'members.memberships.view',

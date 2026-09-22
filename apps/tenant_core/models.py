@@ -33,7 +33,7 @@ from .models_crm import (
     LeadSource, Lead, LeadStatusHistory, LeadAssignment, LeadNote,
     LeadActivity, IntakeForm, IntakeQuestion, IntakeQuestionOption,
     IntakeSubmission, IntakeAnswer, TrialBooking, TrialStatusHistory,
-    LeadConversion, SalesFollowupTask,
+    LeadConversion, SalesFollowupTask, LeadCommercialProfile,
 )
 
 from .models_catalog import (
@@ -249,4 +249,37 @@ __all__ += [
     'ApprovalRequest',
     'ApprovalAction',
 ]
+
+from .models_communication import (
+    CommunicationMessage,
+    CommunicationStatusEvent,
+)
+
+__all__ += [
+    'CommunicationMessage',
+    'CommunicationStatusEvent',
+]
+
+from .models_automation import (
+    AutomationWorkflow,
+    AutomationWorkflowVersion,
+    AutomationExecution,
+    AutomationStepExecution,
+)
+
+__all__ += [
+    'AutomationWorkflow',
+    'AutomationWorkflowVersion',
+    'AutomationExecution',
+    'AutomationStepExecution',
+]
+
+from .models_attention import (
+    CRMAttentionPolicy,
+)
+
+__all__ += [
+    'CRMAttentionPolicy',
+]
+
 

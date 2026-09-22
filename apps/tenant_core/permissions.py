@@ -89,8 +89,20 @@ class TenantRBACPermission(permissions.BasePermission):
 
     def has_permission(self, request, view):
         user = request.user
-        if not user or not user.is_authenticated or getattr(user, '_auth_type', None) != 'tenant':
+        if not user or not user.is_authenticated:
             raise AuthenticationFailed('A valid tenant JWT authentication is required.')
+
+        # Allow platform superuser / admin override for testing and system administration
+        is_platform_admin = (
+            getattr(user, '_auth_type', None) == 'platform'
+            and (getattr(user, 'is_superuser', False) or 'SUPER_ADMIN' in getattr(user, '_role_codes', set()))
+        ) or getattr(user, 'is_superuser', False)
+
+        if getattr(user, '_auth_type', None) != 'tenant' and not is_platform_admin:
+            raise AuthenticationFailed('A valid tenant JWT authentication is required.')
+
+        if is_platform_admin:
+            return True
 
         required_module = getattr(view, 'required_module', None)
         required_submodule = getattr(view, 'required_submodule', None)
@@ -138,6 +150,20 @@ class TenantRBACPermission(permissions.BasePermission):
             request=request,
         )
 
+        if not allowed and hasattr(view, 'alternative_permissions'):
+            for alt_perm in view.alternative_permissions:
+                alt_allowed, _, _ = RBACAuthorizationEngine.evaluate(
+                    user=user,
+                    required_module=required_module,
+                    required_submodule=required_submodule,
+                    required_permission=alt_perm,
+                    branch_id=branch_id,
+                    request=request,
+                )
+                if alt_allowed:
+                    allowed = True
+                    break
+
         if not allowed:
             logger.warning(
                 'TenantRBACPermission DENIED: user=%s view=%s check=%s reason=%s',
@@ -182,8 +208,19 @@ class RequireActiveTenantAndOrg(permissions.BasePermission):
 
     def has_permission(self, request, view):
         user = request.user
-        if not user or not user.is_authenticated or getattr(user, '_auth_type', None) != 'tenant':
+        if not user or not user.is_authenticated:
             raise AuthenticationFailed('A valid tenant JWT authentication is required.')
+
+        is_platform_admin = (
+            getattr(user, '_auth_type', None) == 'platform'
+            and (getattr(user, 'is_superuser', False) or 'SUPER_ADMIN' in getattr(user, '_role_codes', set()))
+        ) or getattr(user, 'is_superuser', False)
+
+        if getattr(user, '_auth_type', None) != 'tenant' and not is_platform_admin:
+            raise AuthenticationFailed('A valid tenant JWT authentication is required.')
+
+        if is_platform_admin:
+            return True
 
         allowed, reason, check_code = RBACAuthorizationEngine.evaluate(
             user=user,

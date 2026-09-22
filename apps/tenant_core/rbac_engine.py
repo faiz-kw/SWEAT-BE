@@ -56,6 +56,14 @@ class RBACAuthorizationEngine:
         if not auth_type and hasattr(user, '__class__') and user.__class__.__name__ == 'TenantUser':
             auth_type = 'tenant'
 
+        # Platform superuser / admin bypass
+        is_platform_admin = (
+            auth_type == 'platform'
+            and (getattr(user, 'is_superuser', False) or 'SUPER_ADMIN' in getattr(user, '_role_codes', set()))
+        ) or getattr(user, 'is_superuser', False)
+        if is_platform_admin:
+            return True, 'Platform admin override', 'CHECK_SUPERUSER_PASSED'
+
         # Fast-fail if not authenticated or not a tenant user
         if not user or not getattr(user, 'is_authenticated', False) or auth_type != 'tenant':
             return False, 'User is not an authenticated tenant user.', 'AUTH_FAILED'

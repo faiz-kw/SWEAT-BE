@@ -42,6 +42,7 @@ from .views_workforce import (
 from .views_crm import (
     LeadSourceViewSet,
     LeadViewSet,
+    LeadAttributionViewSet,
     LeadStatusHistoryViewSet,
     LeadAssignmentViewSet,
     LeadNoteViewSet,
@@ -54,6 +55,17 @@ from .views_crm import (
     TrialStatusHistoryViewSet,
     LeadConversionViewSet,
     SalesFollowupTaskViewSet,
+    CRMStageSlaPolicyViewSet,
+    CRMTrialReminderPolicyViewSet,
+    CRMAttentionPolicyViewSet,
+    CRMAgentAssignmentConfigViewSet,
+    CRMCommunicationChannelsViewSet,
+    CommunicationMessageViewSet,
+    CRMCampaignPerformanceViewSet,
+)
+from .views_automation import (
+    AutomationWorkflowViewSet,
+    AutomationExecutionViewSet,
 )
 from .views_catalog import (
     TermsDocumentViewSet,
@@ -236,6 +248,7 @@ router.register(r'trainer-specialties', TrainerSpecialtyViewSet, basename='train
 router.register(r'trainer-specialty-assignments', TrainerSpecialtyAssignmentViewSet, basename='trainer-specialty-assignment')
 router.register(r'lead-sources', LeadSourceViewSet, basename='lead-source')
 router.register(r'leads', LeadViewSet, basename='lead')
+router.register(r'lead-attributions', LeadAttributionViewSet, basename='lead-attribution')
 router.register(r'lead-status-history', LeadStatusHistoryViewSet, basename='lead-status-history')
 router.register(r'lead-assignments', LeadAssignmentViewSet, basename='lead-assignment')
 router.register(r'lead-notes', LeadNoteViewSet, basename='lead-note')
@@ -248,6 +261,15 @@ router.register(r'trial-bookings', TrialBookingViewSet, basename='trial-booking'
 router.register(r'trial-status-history', TrialStatusHistoryViewSet, basename='trial-status-history')
 router.register(r'lead-conversions', LeadConversionViewSet, basename='lead-conversion')
 router.register(r'sales-followup-tasks', SalesFollowupTaskViewSet, basename='sales-followup-task')
+router.register(r'crm/sla-policies', CRMStageSlaPolicyViewSet, basename='crm-sla-policy')
+router.register(r'crm/trial-reminder-policy', CRMTrialReminderPolicyViewSet, basename='crm-trial-reminder-policy')
+router.register(r'crm/attention-policy', CRMAttentionPolicyViewSet, basename='crm-attention-policy')
+router.register(r'crm/agent-assignment-config', CRMAgentAssignmentConfigViewSet, basename='crm-agent-assignment-config')
+router.register(r'crm/channels', CRMCommunicationChannelsViewSet, basename='crm-channel')
+router.register(r'crm/communications', CommunicationMessageViewSet, basename='crm-communication')
+router.register(r'crm/campaigns', CRMCampaignPerformanceViewSet, basename='crm-campaign')
+router.register(r'automation/workflows', AutomationWorkflowViewSet, basename='automation-workflow')
+router.register(r'automation/executions', AutomationExecutionViewSet, basename='automation-execution')
 router.register(r'organizations', OrganizationViewSet, basename='organization')
 router.register(r'company-entities', CompanyEntityViewSet, basename='company-entity')
 router.register(r'locations', LocationViewSet, basename='location')

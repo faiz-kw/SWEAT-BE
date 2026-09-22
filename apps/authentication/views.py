@@ -921,13 +921,16 @@ class MeView(APIView):
                         'slug': tenant.slug,
                         'name': tenant.name,
                     }
-                    # Enabled modules come from master TenantModule — real data
-                    enabled_modules = list(
-                        tenant.enabled_modules_set
-                        .filter(is_enabled=True)
-                        .select_related('module')
-                        .values_list('module__code', flat=True)
-                    )
+                    # Enabled modules and submodules come from master TenantModule — real data
+                    enabled_modules_list = []
+                    for tm in tenant.enabled_modules_set.filter(is_enabled=True).select_related('module'):
+                        enabled_modules_list.append(tm.module.code)
+                        if tm.configuration and isinstance(tm.configuration, dict):
+                            subs = tm.configuration.get('enabled_submodules') or []
+                            for s in subs:
+                                if s not in enabled_modules_list:
+                                    enabled_modules_list.append(s)
+                    enabled_modules = enabled_modules_list
                     # Branding from master DB
                     if hasattr(tenant, 'branding') and tenant.branding:
                         b = tenant.branding
@@ -1030,8 +1033,11 @@ class MeView(APIView):
 
                     # Calculate role-permitted modules/submodules
                     if is_org_wide:
-                        # Org Admin gets all tenant-enabled modules
+                        # Org Admin gets all tenant-enabled modules and submodules
                         user_accessible_modules = list(enabled_modules)
+                        for essential in ['crm.settings.view', 'crm.settings.edit', 'core.settings.view']:
+                            if essential not in user_permissions:
+                                user_permissions.append(essential)
                     else:
                         # Intersect role module/submodule grants with tenant's enabled_modules
                         tenant_mod_codes_lower = {m.lower() for m in enabled_modules}
@@ -1059,6 +1065,8 @@ class MeView(APIView):
                             s_code = (sa.submodule.submodule_code or sa.submodule.code or '').lower()
                             if parent_m_code in tenant_mod_codes_lower and s_code:
                                 accessible.add(f"/{parent_m_code}/{s_code}")
+                                if parent_m_code == 'crm' and s_code == 'settings':
+                                    accessible.add('/crm/setup')
 
                         user_accessible_modules = sorted(list(accessible))
                 else:

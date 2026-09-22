@@ -61,6 +61,7 @@ class Command(BaseCommand):
                         ('campaigns', 'SMS & WhatsApp Campaigns', 'Automated broadcast campaigns'),
                         ('ai-calling', 'AI Voice Calling', 'Autonomous AI calling assistant for follow-ups'),
                         ('follow-ups', 'Tasks & Reminders', 'Scheduled sales touchpoints'),
+                        ('settings', 'CRM Setup & Settings', 'Configurable lead sources, stage SLAs, trial reminders, and channels'),
                     ]
                 },
                 {

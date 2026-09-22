@@ -12,6 +12,7 @@ from drf_spectacular.views import (
 )
 from apps.master.views import BillingWebhookView
 from apps.tenant_core.views_security_policy import SecurityPolicyView
+from apps.tenant_core.views_communication_webhook import CommunicationWebhookView
 
 # Django admin branding
 admin.site.site_header = "PerformanceOS • Platform Control Panel"
@@ -28,6 +29,7 @@ urlpatterns = [
     # Platform (Super Admin) — Tenant management, SaaS plans, provisioning, IAM
     path('api/v1/platform/', include('apps.master.urls')),
     path('api/v1/billing/webhook/', BillingWebhookView.as_view({'post': 'create'}), name='global-billing-webhook'),
+    path('api/v1/webhooks/communications/<str:provider>/<str:public_integration_id>/', CommunicationWebhookView.as_view(), name='communication-provider-webhook'),
 
     # Tenant Admin — Org/Branch/User/RBAC management (scoped to tenant DB)
     path('api/v1/admin/', include('apps.tenant_core.urls')),

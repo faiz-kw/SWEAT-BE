@@ -66,19 +66,23 @@ def execute_idempotent_operation(
     request_data: Optional[Any] = None,
     actor_user: Optional[TenantUser] = None,
     ttl_seconds: int = 86400,
+    db_alias: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Executes an operation idempotently within the tenant database.
-    If already completed, returns the cached response snapshot.
+    If already completed with identical payload hash, returns the cached response snapshot.
+    If request payload hash differs from original record, raises IdempotencyConflictError.
     If processing, raises IdempotencyConflictError.
     If new, marks PROCESSING, executes, saves response snapshot, and marks COMPLETED.
     """
+    from apps.tenant_core.context import get_tenant_db_alias
+    alias = db_alias or get_tenant_db_alias() or 'default'
     req_hash = compute_request_hash(request_data)
     now = timezone.now()
     expires_at = now + timedelta(seconds=ttl_seconds)
 
-    with transaction.atomic():
-        record, created = IdempotencyRecord.objects.select_for_update().get_or_create(
+    with transaction.atomic(using=alias):
+        record, created = IdempotencyRecord.objects.using(alias).select_for_update().get_or_create(
             organization=organization,
             operation_type=operation_type,
             idempotency_key=idempotency_key,
@@ -91,6 +95,13 @@ def execute_idempotent_operation(
         )
 
         if not created:
+            # ── Payload mismatch check ──────────────────────────────────────
+            if record.request_hash and req_hash and record.request_hash != req_hash:
+                raise IdempotencyConflictError(
+                    f"Idempotent operation '{operation_type}' with key '{idempotency_key}' "
+                    "was previously submitted with a different payload."
+                )
+
             if record.status == 'COMPLETED':
                 logger.info(
                     "Idempotency hit: replaying completed response for key=%s op=%s",
@@ -103,7 +114,7 @@ def execute_idempotent_operation(
                     logger.warning("Idempotency lock expired for key=%s op=%s. Overriding.", idempotency_key, operation_type)
                     record.status = 'PROCESSING'
                     record.request_hash = req_hash
-                    record.save()
+                    record.save(using=alias)
                 else:
                     raise IdempotencyConflictError(
                         f"Idempotent operation '{operation_type}' with key '{idempotency_key}' is currently processing."
@@ -112,23 +123,23 @@ def execute_idempotent_operation(
                 # Allow retry on failed previous attempts
                 record.status = 'PROCESSING'
                 record.request_hash = req_hash
-                record.save()
+                record.save(using=alias)
 
     # Execute operation outside initial lock but commit results
     try:
         result = operation_func()
-        with transaction.atomic():
-            record = IdempotencyRecord.objects.select_for_update().get(id=record.id)
+        with transaction.atomic(using=alias):
+            record = IdempotencyRecord.objects.using(alias).select_for_update().get(id=record.id)
             record.status = 'COMPLETED'
             record.response_snapshot = sanitize_payload(result)
-            record.save(update_fields=['status', 'response_snapshot', 'updated_at'])
+            record.save(using=alias, update_fields=['status', 'response_snapshot', 'updated_at'])
         return result
     except Exception as exc:
-        with transaction.atomic():
-            record = IdempotencyRecord.objects.select_for_update().get(id=record.id)
+        with transaction.atomic(using=alias):
+            record = IdempotencyRecord.objects.using(alias).select_for_update().get(id=record.id)
             record.status = 'FAILED'
             record.response_snapshot = {'error': str(exc)}
-            record.save(update_fields=['status', 'response_snapshot', 'updated_at'])
+            record.save(using=alias, update_fields=['status', 'response_snapshot', 'updated_at'])
         raise
 
 

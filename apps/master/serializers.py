@@ -48,7 +48,15 @@ class TenantSerializer(serializers.ModelSerializer):
         return sub.plan.name if (sub and sub.plan) else None
 
     def get_enabled_modules(self, obj):
-        return list(obj.enabled_modules_set.filter(is_enabled=True).values_list('module__code', flat=True))
+        modules = []
+        for tm in obj.enabled_modules_set.filter(is_enabled=True).select_related('module'):
+            modules.append(tm.module.code)
+            if tm.configuration and isinstance(tm.configuration, dict):
+                subs = tm.configuration.get('enabled_submodules') or []
+                for s in subs:
+                    if s not in modules:
+                        modules.append(s)
+        return modules
 
     def get_max_locations(self, obj):
         limit = obj.resource_limits.filter(metric__code='LOCATIONS').first()

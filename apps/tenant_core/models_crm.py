@@ -28,6 +28,7 @@ from django.utils import timezone
 from .models_org import Organization, Branch
 from .models_users import TenantUser
 from .models_workforce import UserProfile, TrainerProfile
+from .models_catalog import Program
 
 
 class LeadSource(models.Model):
@@ -133,6 +134,25 @@ class Lead(models.Model):
     occupation = models.CharField(max_length=150, null=True, blank=True)
     company_name = models.CharField(max_length=200, null=True, blank=True)
     area = models.CharField(max_length=200, null=True, blank=True)
+    country = models.CharField(max_length=100, null=True, blank=True, default='India')
+    interested_program = models.ForeignKey(
+        Program,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='interested_leads',
+        db_column='interested_program_id',
+    )
+    fitness_goal = models.CharField(max_length=255, null=True, blank=True)
+    referred_by_user = models.ForeignKey(
+        TenantUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='referred_leads',
+        db_column='referred_by_user_id',
+    )
+    referred_by_name = models.CharField(max_length=150, null=True, blank=True)
     current_status = models.CharField(max_length=40, choices=STATUSES, default='NEW_LEAD')
     assigned_sales_user = models.ForeignKey(
         TenantUser,
@@ -161,6 +181,10 @@ class Lead(models.Model):
         related_name='converted_from_leads',
         db_column='converted_user_profile_id',
     )
+    do_not_contact = models.BooleanField(default=False)
+    consent_whatsapp = models.BooleanField(default=True)
+    consent_email = models.BooleanField(default=True)
+    consent_sms = models.BooleanField(default=True)
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -175,8 +199,93 @@ class Lead(models.Model):
             models.Index(fields=['assigned_sales_user'], name='idx_lead_sales_user'),
         ]
 
+
+class LeadAttribution(models.Model):
+    """
+    Append-only multi-touch marketing attribution record for a Lead.
+    Preserves initial discovery (FIRST_TOUCH), conversion touch (LEAD_CAPTURE),
+    and follow-up marketing interactions (ASSISTED_TOUCH).
+    """
+    TOUCH_TYPES = [
+        ('FIRST_TOUCH', 'First Touch (Initial Discovery)'),
+        ('LEAD_CAPTURE', 'Lead Capture (Form / Conversion Submission)'),
+        ('ASSISTED_TOUCH', 'Assisted Touch (Follow-up / Secondary Channel)'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey(
+        Organization,
+        on_delete=models.PROTECT,
+        related_name='lead_attributions',
+        db_column='organization_id',
+    )
+    lead = models.ForeignKey(
+        Lead,
+        on_delete=models.CASCADE,
+        related_name='attributions',
+        db_column='lead_id',
+    )
+    lead_source = models.ForeignKey(
+        LeadSource,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='attributions',
+        db_column='lead_source_id',
+    )
+    touch_type = models.CharField(max_length=30, choices=TOUCH_TYPES, default='LEAD_CAPTURE')
+    platform = models.CharField(max_length=50, null=True, blank=True)
+
+    # Campaign & Ad hierarchy
+    campaign_name = models.CharField(max_length=255, null=True, blank=True)
+    campaign_external_id = models.CharField(max_length=150, null=True, blank=True)
+    ad_set_name = models.CharField(max_length=255, null=True, blank=True)
+    ad_set_external_id = models.CharField(max_length=150, null=True, blank=True)
+    ad_name = models.CharField(max_length=255, null=True, blank=True)
+    ad_external_id = models.CharField(max_length=150, null=True, blank=True)
+    form_name = models.CharField(max_length=255, null=True, blank=True)
+    form_external_id = models.CharField(max_length=150, null=True, blank=True)
+
+    # External Provider ID (e.g. Meta Lead ID, Google Click ID)
+    external_lead_id = models.CharField(max_length=150, null=True, blank=True)
+
+    # UTM tracking parameters
+    utm_source = models.CharField(max_length=150, null=True, blank=True)
+    utm_medium = models.CharField(max_length=150, null=True, blank=True)
+    utm_campaign = models.CharField(max_length=150, null=True, blank=True)
+    utm_term = models.CharField(max_length=150, null=True, blank=True)
+    utm_content = models.CharField(max_length=150, null=True, blank=True)
+
+    # URLs
+    landing_page_url = models.URLField(max_length=1000, null=True, blank=True)
+    referrer_url = models.URLField(max_length=1000, null=True, blank=True)
+
+    capture_method = models.CharField(max_length=50, null=True, blank=True, default='MANUAL')
+    captured_at = models.DateTimeField(default=timezone.now)
+    raw_metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        app_label = 'tenant_core'
+        db_table = 'crm_lead_attributions'
+        ordering = ['captured_at', 'created_at']
+        indexes = [
+            models.Index(fields=['lead', 'touch_type'], name='idx_attr_lead_touch'),
+            models.Index(fields=['organization', 'platform'], name='idx_attr_org_platform'),
+            models.Index(fields=['campaign_name'], name='idx_attr_campaign'),
+            models.Index(fields=['external_lead_id'], name='idx_attr_ext_lead'),
+            models.Index(fields=['utm_source', 'utm_medium'], name='idx_attr_utm'),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['organization', 'platform', 'external_lead_id'],
+                condition=models.Q(external_lead_id__isnull=False) & ~models.Q(external_lead_id=''),
+                name='uq_org_platform_ext_lead_id',
+            ),
+        ]
+
     def __str__(self):
-        return f"Lead({self.first_name} {self.last_name} - {self.current_status})"
+        return f"LeadAttribution(Lead:{self.lead_id} {self.touch_type} [{self.platform or self.utm_source or 'Attribution'}])"
 
 
 class LeadStatusHistory(models.Model):
@@ -593,6 +702,22 @@ class TrialBooking(models.Model):
         ('ADMIN', 'Admin'),
         ('OTHER', 'Other'),
     ]
+    CONFIRMATION_STATUSES = [
+        ('PENDING', 'Pending Confirmation'),
+        ('CONFIRMED', 'Confirmed'),
+        ('RESCHEDULE_REQUESTED', 'Reschedule Requested'),
+        ('DECLINED', 'Declined'),
+        ('CANCELLED', 'Cancelled'),
+    ]
+    CONFIRMATION_CHANNELS = [
+        ('MANUAL', 'Manual'),
+        ('PHONE', 'Phone Call'),
+        ('IN_PERSON', 'In Person'),
+        ('WHATSAPP', 'WhatsApp'),
+        ('EMAIL', 'Email'),
+        ('SMS', 'SMS'),
+        ('API', 'API'),
+    ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     lead = models.ForeignKey(
@@ -632,6 +757,20 @@ class TrialBooking(models.Model):
     scheduled_start = models.DateTimeField()
     scheduled_end = models.DateTimeField()
     status = models.CharField(max_length=30, choices=STATUSES, default='BOOKED')
+    confirmation_status = models.CharField(max_length=30, choices=CONFIRMATION_STATUSES, default='PENDING')
+    confirmation_channel = models.CharField(max_length=30, choices=CONFIRMATION_CHANNELS, null=True, blank=True)
+    confirmation_requested_at = models.DateTimeField(null=True, blank=True)
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+    cancellation_reason = models.TextField(null=True, blank=True)
+    rescheduled_from = models.ForeignKey(
+        'self',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='rescheduled_trials',
+        db_column='rescheduled_from_trial_id',
+    )
+    notes = models.TextField(null=True, blank=True)
     booking_source = models.CharField(max_length=30, choices=BOOKING_SOURCES, default='WEB')
     created_by_user = models.ForeignKey(
         TenantUser,
@@ -785,6 +924,7 @@ class SalesFollowupTask(models.Model):
     status = models.CharField(max_length=20, choices=STATUSES, default='PENDING')
     outcome = models.TextField(null=True, blank=True)
     next_followup_at = models.DateTimeField(null=True, blank=True)
+    external_reference = models.CharField(max_length=128, null=True, blank=True, db_index=True)
     created_by_user = models.ForeignKey(
         TenantUser,
         on_delete=models.PROTECT,
@@ -794,6 +934,22 @@ class SalesFollowupTask(models.Model):
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
+    @property
+    def title(self):
+        return self.outcome
+
+    @title.setter
+    def title(self, value):
+        self.outcome = value
+
+    @property
+    def notes(self):
+        return self.outcome
+
+    @notes.setter
+    def notes(self, value):
+        self.outcome = value
+
     class Meta:
         app_label = 'tenant_core'
         db_table = 'sales_followup_tasks'
@@ -801,6 +957,163 @@ class SalesFollowupTask(models.Model):
             models.Index(fields=['assigned_to_user', 'status', 'due_at'], name='idx_sft_user_stat_due'),
             models.Index(fields=['lead', 'status'], name='idx_sft_lead_stat'),
         ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['lead', 'external_reference'],
+                condition=models.Q(external_reference__isnull=False),
+                name='uq_sft_lead_ext_ref'
+            ),
+        ]
 
     def __str__(self):
         return f"FollowupTask({self.task_type} for Lead:{self.lead_id} due {self.due_at} [{self.status}])"
+
+
+class LeadCommercialProfile(models.Model):
+    """
+    Commercial, business, and invoicing metadata for a lead.
+    Keeps core Lead model decoupled from business/tax fields (billing name, GST, PAN).
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    lead = models.OneToOneField(
+        Lead,
+        on_delete=models.CASCADE,
+        related_name='commercial_profile',
+        db_column='lead_id',
+    )
+    billing_name = models.CharField(max_length=200, null=True, blank=True)
+    gst_number = models.CharField(max_length=50, null=True, blank=True)
+    pan_number = models.CharField(max_length=50, null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        app_label = 'tenant_core'
+        db_table = 'lead_commercial_profiles'
+
+    def __str__(self):
+        return f"CommercialProfile(Lead:{self.lead_id} - {self.billing_name or 'No Billing Name'})"
+
+
+class CRMStageSlaPolicy(models.Model):
+    """
+    Configurable Service Level Agreement (SLA) response and escalation policies
+    for canonical lead pipeline stages per tenant organization.
+    """
+    TIME_UNITS = [
+        ('MINUTES', 'Minutes'),
+        ('HOURS', 'Hours'),
+        ('DAYS', 'Days'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey(
+        Organization,
+        on_delete=models.CASCADE,
+        related_name='crm_stage_sla_policies',
+        db_column='organization_id',
+    )
+    canonical_stage = models.CharField(max_length=50, choices=Lead.STATUSES)
+    display_label = models.CharField(max_length=150)
+    response_target_value = models.PositiveIntegerField(default=15)
+    response_target_unit = models.CharField(max_length=20, choices=TIME_UNITS, default='MINUTES')
+    is_enabled = models.BooleanField(default=True)
+    escalation_enabled = models.BooleanField(default=False)
+    escalation_after_value = models.PositiveIntegerField(null=True, blank=True)
+    escalation_after_unit = models.CharField(max_length=20, choices=TIME_UNITS, default='HOURS', null=True, blank=True)
+    display_order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        app_label = 'tenant_core'
+        db_table = 'crm_stage_sla_policies'
+        constraints = [
+            models.UniqueConstraint(fields=['organization', 'canonical_stage'], name='uq_crm_sla_org_stage'),
+        ]
+        ordering = ['display_order', 'created_at']
+
+    def __str__(self):
+        return f"StageSLA({self.organization_id}: {self.canonical_stage} -> {self.response_target_value} {self.response_target_unit})"
+
+
+class CRMTrialReminderPolicy(models.Model):
+    """
+    Configurable reminder, confirmation, and notification policy for trials
+    per tenant organization.
+    """
+    WAIT_UNITS = [
+        ('HOURS', 'Hours'),
+        ('DAYS', 'Days'),
+    ]
+    NO_RESPONSE_ACTIONS = [
+        ('CREATE_FOLLOWUP', 'Create Follow-up Task'),
+        ('NOTIFY_AGENT', 'Notify Assigned Agent'),
+        ('NONE', 'No Action'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.OneToOneField(
+        Organization,
+        on_delete=models.CASCADE,
+        related_name='crm_trial_reminder_policy',
+        db_column='organization_id',
+    )
+    immediate_whatsapp = models.BooleanField(default=True)
+    immediate_email = models.BooleanField(default=True)
+    immediate_sms = models.BooleanField(default=False)
+    reminder_offsets = models.JSONField(default=list, blank=True)
+    ask_attendance_confirmation = models.BooleanField(default=True)
+    confirmation_wait_duration_value = models.PositiveIntegerField(default=2)
+    confirmation_wait_duration_unit = models.CharField(max_length=20, choices=WAIT_UNITS, default='HOURS')
+    no_response_action = models.CharField(max_length=30, choices=NO_RESPONSE_ACTIONS, default='CREATE_FOLLOWUP')
+    post_attended_followup_enabled = models.BooleanField(default=False)
+    post_attended_followup_delay_value = models.PositiveIntegerField(null=True, blank=True)
+    post_attended_followup_delay_unit = models.CharField(max_length=20, choices=WAIT_UNITS, default='HOURS')
+    no_show_followup_enabled = models.BooleanField(default=False)
+    no_show_followup_delay_value = models.PositiveIntegerField(null=True, blank=True)
+    no_show_followup_delay_unit = models.CharField(max_length=20, default='MINUTES')
+    ai_calling_enabled = models.BooleanField(default=False, help_text="AI calling integration status (unavailable in current phase)")
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        app_label = 'tenant_core'
+        db_table = 'crm_trial_reminder_policies'
+
+    def __str__(self):
+        return f"TrialReminderPolicy({self.organization_id}: WA={self.immediate_whatsapp}, Email={self.immediate_email})"
+
+
+class CRMAgentAssignmentConfig(models.Model):
+    """
+    Tenant-configurable policy for which roles and users are eligible
+    as assigned agents in CRM lead workflows.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.OneToOneField(
+        Organization,
+        on_delete=models.CASCADE,
+        related_name='crm_agent_assignment_config',
+        db_column='organization_id',
+    )
+    # Role codes eligible for lead assignment (e.g. ['SALES_REP', 'BRANCH_MANAGER', 'FRONT_DESK', 'ORG_ADMIN'])
+    allowed_role_codes = models.JSONField(default=list, blank=True)
+    # Specific user UUIDs excluded from assignment even if role matches
+    excluded_user_ids = models.JSONField(default=list, blank=True)
+    # Fallback to all staff if allowed_role_codes is empty
+    allow_all_staff_fallback = models.BooleanField(default=True)
+    # Require branch matching (only show agents matching lead branch unless org-wide scope)
+    require_branch_match = models.BooleanField(default=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        app_label = 'tenant_core'
+        db_table = 'crm_agent_assignment_configs'
+        verbose_name = 'CRM Agent Assignment Config'
+        verbose_name_plural = 'CRM Agent Assignment Configs'
+
+    def __str__(self):
+        return f"CRMAgentAssignmentConfig({self.organization_id}: roles={self.allowed_role_codes})"
+

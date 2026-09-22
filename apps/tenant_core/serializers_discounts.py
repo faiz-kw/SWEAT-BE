@@ -2,6 +2,7 @@
 apps/tenant_core/serializers_discounts.py — Serializers for Layer 2 Module H: Discounts & Dynamic Offers
 """
 
+from django.utils import timezone
 from rest_framework import serializers
 from .models_discounts import (
     DiscountCampaign,
@@ -17,6 +18,9 @@ class DiscountCodeSerializer(serializers.ModelSerializer):
     campaign_name = serializers.ReadOnlyField(source='campaign.name')
     branch_name = serializers.ReadOnlyField(source='branch.name')
     package_name = serializers.ReadOnlyField(source='package.name')
+    computed_status = serializers.SerializerMethodField()
+    redemption_count = serializers.SerializerMethodField()
+    usage_remaining = serializers.SerializerMethodField()
 
     class Meta:
         model = DiscountCode
@@ -30,15 +34,48 @@ class DiscountCodeSerializer(serializers.ModelSerializer):
             'package',
             'package_name',
             'status',
+            'computed_status',
+            'redemption_count',
+            'usage_remaining',
             'created_at',
             'updated_at',
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at', 'computed_status', 'redemption_count', 'usage_remaining']
+
+    def get_computed_status(self, obj) -> str:
+        now = timezone.now()
+        if obj.status == 'INACTIVE':
+            return 'INACTIVE'
+        camp = obj.campaign
+        if not camp:
+            return obj.status
+        if camp.status == 'PAUSED':
+            return 'INACTIVE'
+        if camp.status == 'DRAFT':
+            return 'SCHEDULED'
+        if camp.valid_from and now < camp.valid_from:
+            return 'SCHEDULED'
+        if (camp.valid_until and now > camp.valid_until) or camp.status == 'EXPIRED':
+            return 'EXPIRED'
+        if camp.usage_limit is not None and camp.redemptions.count() >= camp.usage_limit:
+            return 'USAGE_EXHAUSTED'
+        return 'ACTIVE'
+
+    def get_redemption_count(self, obj) -> int:
+        return obj.redemptions.count()
+
+    def get_usage_remaining(self, obj):
+        camp = obj.campaign
+        if not camp or camp.usage_limit is None:
+            return None
+        return max(0, camp.usage_limit - camp.redemptions.count())
 
 
 class DiscountCampaignSerializer(serializers.ModelSerializer):
     codes = DiscountCodeSerializer(many=True, read_only=True)
     redemption_count = serializers.SerializerMethodField()
+    computed_status = serializers.SerializerMethodField()
+    usage_remaining = serializers.SerializerMethodField()
 
     class Meta:
         model = DiscountCampaign
@@ -56,16 +93,37 @@ class DiscountCampaignSerializer(serializers.ModelSerializer):
             'valid_from',
             'valid_until',
             'status',
+            'computed_status',
+            'usage_remaining',
             'configuration',
             'codes',
             'redemption_count',
             'created_at',
             'updated_at',
         ]
-        read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'organization', 'created_at', 'updated_at', 'computed_status', 'usage_remaining']
 
     def get_redemption_count(self, obj) -> int:
         return obj.redemptions.count()
+
+    def get_computed_status(self, obj) -> str:
+        now = timezone.now()
+        if obj.status == 'PAUSED':
+            return 'INACTIVE'
+        if obj.status == 'DRAFT':
+            return 'SCHEDULED'
+        if obj.valid_from and now < obj.valid_from:
+            return 'SCHEDULED'
+        if (obj.valid_until and now > obj.valid_until) or obj.status == 'EXPIRED':
+            return 'EXPIRED'
+        if obj.usage_limit is not None and obj.redemptions.count() >= obj.usage_limit:
+            return 'USAGE_EXHAUSTED'
+        return 'ACTIVE'
+
+    def get_usage_remaining(self, obj):
+        if obj.usage_limit is None:
+            return None
+        return max(0, obj.usage_limit - obj.redemptions.count())
 
 
 class DiscountRuleConditionSerializer(serializers.ModelSerializer):

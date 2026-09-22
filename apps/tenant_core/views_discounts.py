@@ -25,6 +25,7 @@ from .models_catalog import Package
 from .models_org import Branch
 from .models_commerce import Order
 
+from apps.tenant_core.services_reliability import record_business_audit
 from .serializers_discounts import (
     DiscountCampaignSerializer,
     DiscountCodeSerializer,
@@ -51,6 +52,7 @@ class DiscountCampaignViewSet(viewsets.ModelViewSet):
     permission_action_map = {
         'create': 'core.settings.edit',
         'update': 'core.settings.edit',
+        'partial_update': 'core.settings.edit',
         'destroy': 'core.settings.edit',
         'generate_code': 'core.settings.edit',
         'validate_coupon': 'core.settings.view',
@@ -70,7 +72,38 @@ class DiscountCampaignViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         org = getattr(self.request.user, 'organization', None)
-        serializer.save(organization=org)
+        campaign = serializer.save(organization=org)
+        db = _get_db(self.request)
+        record_business_audit(
+            organization=org,
+            actor_user=self.request.user,
+            module='crm',
+            action_code='CAMPAIGN_CREATED',
+            entity_type='DiscountCampaign',
+            entity_id=campaign.id,
+            event_description=f"Created discount campaign '{campaign.name}'",
+            after_data={'name': campaign.name, 'discount_type': campaign.discount_type, 'discount_value': str(campaign.discount_value)},
+            db_alias=db,
+        )
+
+    def perform_update(self, serializer):
+        db = _get_db(self.request)
+        old_obj = self.get_object()
+        old_data = {'name': old_obj.name, 'status': old_obj.status, 'discount_value': str(old_obj.discount_value)}
+        campaign = serializer.save()
+        org = getattr(self.request.user, 'organization', None) or campaign.organization
+        record_business_audit(
+            organization=org,
+            actor_user=self.request.user,
+            module='crm',
+            action_code='CAMPAIGN_UPDATED',
+            entity_type='DiscountCampaign',
+            entity_id=campaign.id,
+            event_description=f"Updated discount campaign '{campaign.name}'",
+            before_data=old_data,
+            after_data={'name': campaign.name, 'status': campaign.status, 'discount_value': str(campaign.discount_value)},
+            db_alias=db,
+        )
 
     @action(detail=True, methods=['post'], url_path='generate-code')
     def generate_code(self, request, pk=None):
@@ -88,6 +121,18 @@ class DiscountCampaignViewSet(viewsets.ModelViewSet):
             branch_id=branch_id,
             package_id=package_id,
             status='ACTIVE',
+        )
+        org = getattr(request.user, 'organization', None) or campaign.organization
+        record_business_audit(
+            organization=org,
+            actor_user=request.user,
+            module='crm',
+            action_code='COUPON_CREATED',
+            entity_type='DiscountCode',
+            entity_id=code.id,
+            event_description=f"Generated coupon code '{code.code}' for campaign '{campaign.name}'",
+            after_data={'code': code.code, 'campaign_id': str(campaign.id), 'branch_id': str(branch_id) if branch_id else None},
+            db_alias=db,
         )
         return Response(DiscountCodeSerializer(code).data, status=status.HTTP_201_CREATED)
 
@@ -166,7 +211,9 @@ class DiscountCodeViewSet(viewsets.ModelViewSet):
     permission_action_map = {
         'create': 'core.settings.edit',
         'update': 'core.settings.edit',
+        'partial_update': 'core.settings.edit',
         'destroy': 'core.settings.edit',
+        'toggle_status': 'core.settings.edit',
     }
 
     def get_queryset(self):
@@ -181,7 +228,96 @@ class DiscountCodeViewSet(viewsets.ModelViewSet):
         return qs.order_by('code')
 
     def perform_create(self, serializer):
-        serializer.save()
+        code = serializer.save()
+        db = _get_db(self.request)
+        org = getattr(self.request.user, 'organization', None) or code.campaign.organization
+        record_business_audit(
+            organization=org,
+            actor_user=self.request.user,
+            module='crm',
+            action_code='COUPON_CREATED',
+            entity_type='DiscountCode',
+            entity_id=code.id,
+            event_description=f"Created coupon code '{code.code}'",
+            after_data={'code': code.code, 'campaign_id': str(code.campaign_id), 'status': code.status},
+            db_alias=db,
+        )
+
+    def perform_update(self, serializer):
+        old_obj = self.get_object()
+        old_status = old_obj.status
+        code = serializer.save()
+        db = _get_db(self.request)
+        org = getattr(self.request.user, 'organization', None) or code.campaign.organization
+        record_business_audit(
+            organization=org,
+            actor_user=self.request.user,
+            module='crm',
+            action_code='COUPON_UPDATED',
+            entity_type='DiscountCode',
+            entity_id=code.id,
+            event_description=f"Updated coupon code '{code.code}'",
+            before_data={'status': old_status},
+            after_data={'status': code.status},
+            db_alias=db,
+        )
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        db = _get_db(request)
+        if DiscountRedemption.objects.using(db).filter(discount_code=instance).exists():
+            return Response(
+                {'error': 'Cannot delete a coupon code with redemption history. Deactivate it instead.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        code_str = instance.code
+        camp_id = str(instance.campaign_id)
+        code_id = instance.id
+        org = getattr(request.user, 'organization', None) or instance.campaign.organization
+        response = super().destroy(request, *args, **kwargs)
+        record_business_audit(
+            organization=org,
+            actor_user=request.user,
+            module='crm',
+            action_code='COUPON_DELETED',
+            entity_type='DiscountCode',
+            entity_id=code_id,
+            event_description=f"Deleted coupon code '{code_str}'",
+            before_data={'code': code_str, 'campaign_id': camp_id},
+            db_alias=db,
+        )
+        return response
+
+    @action(detail=True, methods=['post'], url_path='toggle-status')
+    def toggle_status(self, request, pk=None):
+        code = self.get_object()
+        db = _get_db(request)
+        target_status = request.data.get('status')
+        if target_status:
+            target_status = target_status.upper()
+            if target_status not in ['ACTIVE', 'INACTIVE', 'EXPIRED']:
+                return Response({'error': f"Invalid status '{target_status}'"}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            target_status = 'INACTIVE' if code.status == 'ACTIVE' else 'ACTIVE'
+
+        old_status = code.status
+        code.status = target_status
+        code.save(using=db)
+
+        org = getattr(request.user, 'organization', None) or code.campaign.organization
+        record_business_audit(
+            organization=org,
+            actor_user=request.user,
+            module='crm',
+            action_code='COUPON_STATUS_CHANGED',
+            entity_type='DiscountCode',
+            entity_id=code.id,
+            event_description=f"Updated coupon code '{code.code}' status from {old_status} to {target_status}",
+            before_data={'status': old_status},
+            after_data={'status': target_status},
+            db_alias=db,
+        )
+        return Response(DiscountCodeSerializer(code).data, status=status.HTTP_200_OK)
 
 
 class DiscountEligibilityRuleViewSet(viewsets.ModelViewSet):

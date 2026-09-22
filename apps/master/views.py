@@ -83,6 +83,10 @@ class TenantViewSet(viewsets.ModelViewSet):
             all_modules = ProductModule.objects.using('default').all()
             for mod in all_modules:
                 is_on = mod.code in enabled_codes
+                mod_submodules = [
+                    item for item in raw_modules
+                    if item.startswith(f"/{mod.code}/") or item == f"/{mod.code}"
+                ]
                 TenantModule.objects.using('default').update_or_create(
                     tenant=tenant,
                     module=mod,
@@ -90,6 +94,7 @@ class TenantViewSet(viewsets.ModelViewSet):
                         'is_enabled': is_on,
                         'status': 'ENABLED' if is_on else 'DISABLED',
                         'availability_mode': 'ALL_BRANCHES',
+                        'configuration': {'enabled_submodules': mod_submodules} if mod_submodules else None,
                     }
                 )
 
@@ -97,11 +102,16 @@ class TenantViewSet(viewsets.ModelViewSet):
             try:
                 from apps.authentication.views import _register_and_resolve_tenant
                 from config.routers import set_tenant_db_alias
-                from apps.tenant_core.models_rbac import ModuleCatalog, BranchModule
+                from apps.tenant_core.models_rbac import ModuleCatalog, SubmoduleCatalog, BranchModule
                 from apps.tenant_core.models_org import Branch
+                from apps.master.provisioning import sync_tenant_catalog_and_rbac
 
                 db_alias = _register_and_resolve_tenant(tenant)
                 try:
+                    # Sync latest product catalog and ensure RBAC grants are complete
+                    first_org = tenant.organizations.first() if hasattr(tenant, 'organizations') else None
+                    sync_tenant_catalog_and_rbac(db_alias, org=first_org)
+
                     for mod in all_modules:
                         is_on = mod.code in enabled_codes
                         ModuleCatalog.objects.using(db_alias).filter(module_code=mod.code).update(is_enabled=is_on)

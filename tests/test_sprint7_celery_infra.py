@@ -75,7 +75,7 @@ class CeleryInfrastructurePhase7ATest(TestCase):
 
     def test_eager_mode_disabled_outside_test_mode(self):
         """Outside 'test' in sys.argv, eager mode must be strictly False."""
-        simulated_argv = ['manage.py', 'runserver', '8080']
+        simulated_argv = ['manage.py', 'runserver', '8000']
         # Evaluate settings logic when 'test' is not in argv
         is_eager_in_runserver = 'test' in simulated_argv
         self.assertFalse(is_eager_in_runserver)
