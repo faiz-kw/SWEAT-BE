@@ -2374,6 +2374,27 @@ class LeadConversionService:
             ).values('entitlement_type', 'allocated_units', 'is_unlimited')
         )
 
+        from .models_commerce import PaymentTransaction
+        from .models_infra import Integration
+
+        all_provider_choices = [c[0] for c in PaymentTransaction.PROVIDER_CHOICES]
+        offline_providers = ['CASH', 'BANK_TRANSFER', 'OTHER']
+        gateway_providers = [c for c in all_provider_choices if c not in offline_providers]
+
+        available_providers = [p for p in offline_providers if p in all_provider_choices]
+        try:
+            active_gateways = set(
+                Integration.objects.using(alias)
+                .filter(integration_type='PAYMENT', status='ACTIVE')
+                .values_list('provider', flat=True)
+            )
+            active_gateways_upper = {g.strip().upper() for g in active_gateways if g}
+            for gw in gateway_providers:
+                if gw in active_gateways_upper:
+                    available_providers.append(gw)
+        except Exception:
+            pass
+
         return {
             'program': {'id': str(program.id), 'name': program.name, 'code': program.code},
             'package': {'id': str(pv.package.id), 'name': pv.package.name, 'code': pv.package.code},
@@ -2404,10 +2425,7 @@ class LeadConversionService:
             },
             'coupon': coupon_preview,
             'entitlements': entitlements,
-            'payment_providers': [c[0] for c in __import__(
-                'apps.tenant_core.models_commerce',
-                fromlist=['PaymentTransaction']
-            ).PaymentTransaction.PROVIDER_CHOICES],
+            'payment_providers': available_providers,
         }
 
     # ------------------------------------------------------------------

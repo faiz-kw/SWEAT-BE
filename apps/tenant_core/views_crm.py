@@ -269,11 +269,17 @@ class LeadSourceViewSet(viewsets.ModelViewSet):
         )
 
     def destroy(self, request, *args, **kwargs):
-        # Soft-deactivate to preserve historical lead-source references
-        instance = self.get_object()
-        instance.status = 'INACTIVE'
-        instance.save(using=_get_db(request), update_fields=['status', 'updated_at'])
         alias = _get_db(request)
+        instance = self.get_object()
+        # Reject deletion with 400 if historical lead references exist
+        if Lead.objects.using(alias).filter(lead_source=instance).exists():
+            return Response(
+                {'error': 'Permanent deletion of lead sources is not permitted as historical references exist. Please deactivate the lead source instead.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # Soft-deactivate to preserve audit trail and references
+        instance.status = 'INACTIVE'
+        instance.save(using=alias, update_fields=['status', 'updated_at'])
         org = _get_org(request)
         record_business_audit(
             organization=org,
@@ -2968,4 +2974,43 @@ class CRMCampaignPerformanceViewSet(viewsets.ViewSet):
         if campaign_name:
             qs = qs.filter(campaign__name=campaign_name)
         return Response(DiscountRedemptionSerializer(qs.order_by('-redeemed_at')[:100], many=True).data)
+
+
+class CRMDashboardViewSet(viewsets.ViewSet):
+    """
+    CRMDashboardViewSet — Layer 2 Module B Phase 10: CRM Dashboard & Sales Analytics
+    Authoritative backend aggregation of leads, funnel, attribution, trials,
+    follow-ups, attention, agent/branch metrics, and verified commercial revenue.
+    """
+    permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
+    required_module = 'crm'
+    required_submodule = 'leads'
+    required_permission = 'crm.dashboard.view'
+    permission_action_map = {
+        'list': 'crm.dashboard.view',
+    }
+
+    def list(self, request):
+        alias = _get_db(request)
+        org = _get_org(request)
+        if not org:
+            return Response({'error': 'Organization not found'}, status=400)
+
+        from .services_crm_dashboard import CRMDashboardService
+
+        try:
+            data = CRMDashboardService.get_dashboard_data(
+                organization=org,
+                user=request.user,
+                filters=request.query_params,
+                db_alias=alias,
+            )
+            return Response(data)
+        except PermissionDenied as e:
+            return Response({'error': str(e)}, status=403)
+        except ValidationError as e:
+            return Response({'error': str(e)}, status=400)
+        except Exception as e:
+            logger.exception("CRM Dashboard aggregation failed")
+            return Response({'error': 'Failed to load CRM dashboard metrics'}, status=500)
 

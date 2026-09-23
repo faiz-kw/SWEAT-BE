@@ -47,6 +47,7 @@ DEFAULT_ROLES_CONFIG: Dict[str, dict] = {
             'members.freeze.view', 'members.freeze.create', 'members.freeze.edit',
             'members.transfers.view', 'members.transfers.create',
             # CRM
+            'crm.dashboard.view',
             'crm.leads.view', 'crm.leads.create', 'crm.leads.edit',
             'crm.pipeline.view', 'crm.pipeline.create', 'crm.pipeline.edit',
             'crm.trials.view', 'crm.trials.create', 'crm.trials.edit',
@@ -148,6 +149,7 @@ DEFAULT_ROLES_CONFIG: Dict[str, dict] = {
             # Core
             'core.settings.view', 'core.files.view', 'core.users.view',
             # CRM Full
+            'crm.dashboard.view',
             'crm.leads.view', 'crm.leads.create', 'crm.leads.edit', 'crm.leads.delete',
             'crm.pipeline.view', 'crm.pipeline.create', 'crm.pipeline.edit',
             'crm.trials.view', 'crm.trials.create', 'crm.trials.edit',

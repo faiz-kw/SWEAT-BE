@@ -275,6 +275,44 @@ class CRMPhase8ConversionTestCase(APITestCase):
                 db_alias=DB,
             )
 
+    def test_conversion_quote_payment_providers_availability(self):
+        """
+        Quote returns only offline methods and active Integration payment gateways.
+        Unconfigured gateways (e.g. STRIPE, RAZORPAY) are not exposed unless an
+        Integration row with status='ACTIVE' exists for the tenant.
+        """
+        from apps.tenant_core.models_infra import Integration
+
+        # 1. Without active gateway integrations, only offline methods are exposed
+        quote = LeadConversionService.get_conversion_quote(
+            lead=self.lead,
+            package_version_id=str(self.pkg_version.id),
+            branch_id=str(self.branch.id),
+            db_alias=DB,
+        )
+        self.assertIn('CASH', quote['payment_providers'])
+        self.assertIn('BANK_TRANSFER', quote['payment_providers'])
+        self.assertIn('OTHER', quote['payment_providers'])
+        self.assertNotIn('RAZORPAY', quote['payment_providers'])
+        self.assertNotIn('STRIPE', quote['payment_providers'])
+        self.assertNotIn('ICICI_POS', quote['payment_providers'])
+
+        # 2. Add an ACTIVE Razorpay integration -> RAZORPAY becomes available
+        Integration.objects.using(DB).create(
+            integration_type='PAYMENT',
+            provider='Razorpay',
+            status='ACTIVE',
+        )
+        quote_with_gateway = LeadConversionService.get_conversion_quote(
+            lead=self.lead,
+            package_version_id=str(self.pkg_version.id),
+            branch_id=str(self.branch.id),
+            db_alias=DB,
+        )
+        self.assertIn('RAZORPAY', quote_with_gateway['payment_providers'])
+        self.assertNotIn('STRIPE', quote_with_gateway['payment_providers'])
+        self.assertNotIn('ICICI_POS', quote_with_gateway['payment_providers'])
+
     # ------------------------------------------------------------------
     # Identity Resolution Tests
     # ------------------------------------------------------------------

@@ -62,6 +62,7 @@ from .views_crm import (
     CRMCommunicationChannelsViewSet,
     CommunicationMessageViewSet,
     CRMCampaignPerformanceViewSet,
+    CRMDashboardViewSet,
 )
 from .views_automation import (
     AutomationWorkflowViewSet,
@@ -268,6 +269,7 @@ router.register(r'crm/agent-assignment-config', CRMAgentAssignmentConfigViewSet,
 router.register(r'crm/channels', CRMCommunicationChannelsViewSet, basename='crm-channel')
 router.register(r'crm/communications', CommunicationMessageViewSet, basename='crm-communication')
 router.register(r'crm/campaigns', CRMCampaignPerformanceViewSet, basename='crm-campaign')
+router.register(r'crm/dashboard', CRMDashboardViewSet, basename='crm-dashboard')
 router.register(r'automation/workflows', AutomationWorkflowViewSet, basename='automation-workflow')
 router.register(r'automation/executions', AutomationExecutionViewSet, basename='automation-execution')
 router.register(r'organizations', OrganizationViewSet, basename='organization')

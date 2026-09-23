@@ -314,7 +314,7 @@ class CRMPhase2AttributionLead360Tests(TestCase):
             'first_name': 'Manual',
             'last_name': 'Walkin',
             'phone_normalized': '+919999000001',
-            'email_normalized': 'manual@walkin.com',
+            'email_normalized': 'manual.walkin@gmail.com',
             'branch': str(self.branch_1.id),
             'lead_source': str(self.source_walkin.id),
         }
@@ -334,7 +334,7 @@ class CRMPhase2AttributionLead360Tests(TestCase):
             'first_name': 'Ad',
             'last_name': 'Prospect',
             'phone_normalized': '+919999000002',
-            'email_normalized': 'ad@prospect.com',
+            'email_normalized': 'ad.prospect@gmail.com',
             'branch': str(self.branch_1.id),
             'lead_source': str(self.source_instagram.id),
             'attribution': {

@@ -55,6 +55,7 @@ class Command(BaseCommand):
                     'code': 'crm', 'name': 'CRM & Sales Automation', 'icon': 'Target', 'is_core': False, 'sort_order': 1,
                     'description': 'Lead capture, pipeline stages, trial bookings, and promotional campaigns.',
                     'submodules': [
+                        ('dashboard', 'CRM Dashboard & Sales Analytics', 'Sales analytics, funnel performance, and real commercial revenue metrics'),
                         ('leads', 'Lead Management', 'Capture walk-ins and digital enquiries'),
                         ('pipeline', 'Sales Pipeline', 'Kanban deal stages and conversion tracking'),
                         ('trials', 'Free Trial Passes', 'Trial booking and attendance logging'),
