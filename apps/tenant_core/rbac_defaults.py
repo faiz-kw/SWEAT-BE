@@ -285,10 +285,25 @@ def sync_default_role_permissions(
             else:
                 for p_code in config.get('permissions', []):
                     p_obj = all_perms.get(p_code.lower())
+                    if not p_obj:
+                        parts = p_code.split('.')
+                        mod_code = parts[0]
+                        submod_code = parts[1] if len(parts) > 2 else None
+                        mod_obj = all_modules.get(mod_code.lower())
+                        submod_obj = all_submodules.get((mod_code.lower(), submod_code.lower())) if submod_code else None
+                        p_obj, _ = Permission.objects.using(db_alias).get_or_create(
+                            permission_code=p_code,
+                            defaults={
+                                'module': mod_obj,
+                                'submodule': submod_obj,
+                                'code': p_code,
+                                'label': p_code,
+                                'action': parts[-1],
+                            }
+                        )
+                        all_perms[p_code.lower()] = p_obj
                     if p_obj:
                         target_perms.append(p_obj)
-                    else:
-                        logger.warning(f"Permission code '{p_code}' not found in tenant DB '{db_alias}'.")
 
             # 4. Grant permissions and enable module/submodule gates
             granted_count = 0

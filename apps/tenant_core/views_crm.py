@@ -647,15 +647,19 @@ class LeadViewSet(viewsets.ModelViewSet):
         if not new_status:
             return Response({'error': 'new_status is required'}, status=status.HTTP_400_BAD_REQUEST)
 
-        updated_lead = CRMLeadService.transition_lead_status(
-            lead=lead,
-            new_status=new_status,
-            reason_code=reason_code,
-            reason_text=reason_text,
-            actor_user=request.user,
-            db_alias=_get_db(request),
-        )
-        return Response(LeadSerializer(updated_lead).data)
+        try:
+            updated_lead = CRMLeadService.transition_lead_status(
+                lead=lead,
+                new_status=new_status,
+                reason_code=reason_code,
+                reason_text=reason_text,
+                actor_user=request.user,
+                db_alias=_get_db(request),
+            )
+            return Response(LeadSerializer(updated_lead).data)
+        except (ValueError, ValidationError) as exc:
+            msg = exc.message if hasattr(exc, 'message') else str(exc)
+            return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=True, methods=['post'], url_path='assign')
     def assign(self, request, pk=None):
@@ -1688,6 +1692,7 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
         date_from = request.query_params.get('date_from') or request.query_params.get('date')
         date_to = request.query_params.get('date_to') or request.query_params.get('date')
         class_template_id = request.query_params.get('class_template_id')
+        program_id = request.query_params.get('program_id')
 
         slots = CRMLeadService.get_available_trial_slots(
             branch_id=branch_id,
@@ -1695,6 +1700,7 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
             date_from=date_from,
             date_to=date_to,
             class_template_id=class_template_id,
+            program_id=program_id,
             db_alias=alias,
         )
         return Response({'slots': slots, 'results': slots})

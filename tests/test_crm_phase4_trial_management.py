@@ -891,12 +891,18 @@ class CRMPhase4TrialManagementTests(TestCase):
             {'new_class_occurrence_id': str(occ_new.id)},
             **self.auth_headers(self.token_admin, self.branch_a1)
         )
+        resp = self.client.post(
+            f'/api/v1/tenant/trial-bookings/{old_trial.id}/reschedule/',
+            {'new_class_occurrence_id': str(occ_new.id)},
+            **self.auth_headers(self.token_admin, self.branch_a1)
+        )
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         old_trial.refresh_from_db(using='tenant_test')
-        self.assertEqual(old_trial.status, 'RESCHEDULED')
+        self.assertEqual(old_trial.status, 'BOOKED')
+        self.assertEqual(old_trial.class_occurrence_id, occ_new.id)
 
-    def test_29_reschedule_trial_creates_linked_new_trial_with_rescheduled_from(self):
-        """29. Reschedule trial creates new replacement TrialBooking linked via rescheduled_from."""
+    def test_29_reschedule_trial_preserves_canonical_trial_and_records_history(self):
+        """29. Reschedule trial preserves single canonical TrialBooking ID and records status history."""
         old_trial = self._create_trial(branch=self.branch_a1, lead=self.lead_a1, occurrence=self.occurrence_a1, status='BOOKED')
         new_date = self.tomorrow_date + timedelta(days=2)
         occ_new = ClassOccurrence.objects.using('tenant_test').create(
@@ -911,11 +917,13 @@ class CRMPhase4TrialManagementTests(TestCase):
             {'new_class_occurrence_id': str(occ_new.id)},
             **self.auth_headers(self.token_admin, self.branch_a1)
         )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
         new_trial_id = resp.data['new_trial']['id']
-        new_trial = TrialBooking.objects.using('tenant_test').select_related('rescheduled_from').get(id=new_trial_id)
-        self.assertEqual(new_trial.status, 'BOOKED')
-        self.assertEqual(new_trial.rescheduled_from_id, old_trial.id)
-        self.assertEqual(new_trial.scheduled_start.date(), new_date)
+        self.assertEqual(str(new_trial_id), str(old_trial.id))
+        old_trial.refresh_from_db(using='tenant_test')
+        self.assertEqual(old_trial.status, 'BOOKED')
+        self.assertEqual(old_trial.class_occurrence_id, occ_new.id)
+        self.assertEqual(old_trial.scheduled_start.date(), new_date)
 
     def test_30_reschedule_trial_locks_new_occurrence_capacity(self):
         """30. Reschedule trial locks new occurrence capacity atomically (fails if full)."""

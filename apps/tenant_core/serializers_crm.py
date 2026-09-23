@@ -426,6 +426,7 @@ class TrialBookingSerializer(serializers.ModelSerializer):
     branch_name = serializers.CharField(source='branch.name', read_only=True)
     trainer_name = serializers.SerializerMethodField()
     class_name = serializers.SerializerMethodField()
+    program_name = serializers.SerializerMethodField()
     is_rescheduled = serializers.SerializerMethodField()
 
     class Meta:
@@ -459,6 +460,16 @@ class TrialBookingSerializer(serializers.ModelSerializer):
         from .models_classes import ClassOccurrence
         occ = ClassOccurrence.objects.using(alias).filter(id=obj.class_occurrence_id).select_related('class_template').first()
         return occ.class_template.name if occ and occ.class_template else obj.trial_type
+
+    def get_program_name(self, obj):
+        if not obj.class_occurrence_id:
+            return obj.lead.interested_program.name if (obj.lead and obj.lead.interested_program) else None
+        alias = obj._state.db or 'default'
+        from .models_classes import ClassOccurrence
+        occ = ClassOccurrence.objects.using(alias).filter(id=obj.class_occurrence_id).select_related('class_template__program').first()
+        if occ and occ.class_template and occ.class_template.program:
+            return occ.class_template.program.name
+        return obj.lead.interested_program.name if (obj.lead and obj.lead.interested_program) else None
 
     def get_is_rescheduled(self, obj):
         alias = obj._state.db or 'default'

@@ -15,8 +15,8 @@ import re
 import logging
 from datetime import datetime, timedelta, date
 from typing import Optional, Dict, Any, List, Tuple
-from django.db import transaction
-from django.db.models import Q as models_Q, F as models_F
+from django.db import transaction, models
+from django.db.models import Q as models_Q, F as models_F, Q
 from django.utils import timezone
 from django.core.exceptions import ValidationError
 from config.routers import get_tenant_db_alias
@@ -763,6 +763,35 @@ class CRMLeadService:
                         "Leads may only be converted through the commercial conversion flow."
                     )
 
+            if new_status == 'TRIAL_BOOKED':
+                from .models_crm import TrialBooking
+                has_active = TrialBooking.objects.using(alias).filter(
+                    lead=lead,
+                    status__in=['BOOKED', 'CONFIRMED', 'ATTENDED'],
+                ).exclude(confirmation_status__in=['CANCELLED', 'DECLINED']).exists()
+                if not has_active:
+                    raise ValidationError("Book a real trial session to move this lead to Trial Booked.")
+
+            if new_status == 'TRIAL_CONFIRMED':
+                from .models_crm import TrialBooking
+                has_confirmed = TrialBooking.objects.using(alias).filter(
+                    lead=lead,
+                ).filter(
+                    models.Q(status='CONFIRMED') | models.Q(confirmation_status='CONFIRMED')
+                ).exists()
+                if not has_confirmed:
+                    raise ValidationError("Trial must be confirmed through the trial management lifecycle.")
+
+            if new_status == 'TRIAL_ATTENDED':
+                from .models_crm import TrialBooking
+                if not TrialBooking.objects.using(alias).filter(lead=lead, status='ATTENDED').exists():
+                    raise ValidationError("Trial attendance must be verified through the trial check-in lifecycle.")
+
+            if new_status == 'NO_SHOW':
+                from .models_crm import TrialBooking
+                if not TrialBooking.objects.using(alias).filter(lead=lead, status='NO_SHOW').exists():
+                    raise ValidationError("Trial no-show must be recorded through the trial management lifecycle.")
+
             lead.current_status = new_status
             lead.save(using=alias, update_fields=['current_status', 'updated_at'])
 
@@ -890,18 +919,27 @@ class CRMLeadService:
         date_from: Optional[Any] = None,
         date_to: Optional[Any] = None,
         class_template_id: Optional[str] = None,
+        program_id: Optional[str] = None,
         db_alias: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         alias = db_alias or get_tenant_db_alias() or 'default'
-        from .models_classes import ClassOccurrence
+        from .models_classes import ClassOccurrence, ClassBranchAvailability
         from .models_bookings import Booking
 
         now = timezone.now()
         qs = ClassOccurrence.objects.using(alias).filter(
             branch_id=branch_id,
             status__in=['SCHEDULED', 'OPEN'],
-            start_at__gte=now,
-        ).select_related('class_template', 'branch').prefetch_related('trainer_assignments__trainer_profile__user')
+            start_at__gt=now,
+            class_template__status='ACTIVE',
+            class_template__allow_trial=True,
+        ).select_related(
+            'class_template',
+            'class_template__program',
+            'branch'
+        ).prefetch_related(
+            'trainer_assignments__trainer_profile__employee_profile__user_profile__user'
+        )
 
         if date_from:
             qs = qs.filter(occurrence_date__gte=date_from)
@@ -909,11 +947,36 @@ class CRMLeadService:
             qs = qs.filter(occurrence_date__lte=date_to)
         if class_template_id:
             qs = qs.filter(class_template_id=class_template_id)
+        if program_id:
+            qs = qs.filter(class_template__program_id=program_id)
 
         lead = Lead.objects.using(alias).filter(id=lead_id).first() if lead_id else None
 
         slots = []
         for occ in qs.order_by('start_at')[:100]:
+            # Branch availability check
+            branch_avail = ClassBranchAvailability.objects.using(alias).filter(
+                class_template=occ.class_template,
+                branch=occ.branch,
+            ).first()
+            if branch_avail and branch_avail.status == 'DISABLED':
+                continue
+
+            effective_capacity = (
+                occ.capacity
+                or (branch_avail.capacity_override if branch_avail and branch_avail.capacity_override else None)
+                or occ.class_template.default_capacity
+            )
+            effective_trial_cap = (
+                occ.trial_capacity
+                or (branch_avail.trial_capacity_override if branch_avail and branch_avail.trial_capacity_override else None)
+                or occ.class_template.default_trial_capacity
+            )
+
+            # Semantics: If effective_trial_cap <= 0, trials are disabled for this session
+            if effective_trial_cap <= 0:
+                continue
+
             policy_allowed, policy_message = cls.resolve_trial_booking_policy(
                 lead=lead,
                 branch=occ.branch,
@@ -921,6 +984,8 @@ class CRMLeadService:
                 occurrence=occ,
                 db_alias=alias,
             )
+            if not policy_allowed and lead:
+                continue
 
             # Calculate total occupancy
             regular_bookings_count = Booking.objects.using(alias).filter(
@@ -930,18 +995,24 @@ class CRMLeadService:
             trial_bookings_count = TrialBooking.objects.using(alias).filter(
                 class_occurrence_id=occ.id,
                 status__in=['BOOKED', 'CONFIRMED', 'ATTENDED'],
-            ).count()
+            ).exclude(confirmation_status__in=['CANCELLED', 'DECLINED']).count()
+
             total_occupied = regular_bookings_count + trial_bookings_count
-            available_spots = max(0, occ.capacity - total_occupied)
+            remaining_capacity = max(0, effective_capacity - total_occupied)
+            remaining_trial_capacity = max(0, effective_trial_cap - trial_bookings_count)
 
-            if occ.trial_capacity > 0:
-                trial_spots_left = max(0, occ.trial_capacity - trial_bookings_count)
-                available_trial_spots = min(available_spots, trial_spots_left)
-            else:
-                trial_spots_left = available_spots
-                available_trial_spots = available_spots
+            # CRITICAL TRIAL CAPACITY RULE:
+            # Must have BOTH overall capacity remaining AND trial capacity remaining!
+            if remaining_capacity <= 0 or remaining_trial_capacity <= 0:
+                continue
 
-            is_available = bool(policy_allowed and available_spots > 0 and (occ.trial_capacity <= 0 or trial_spots_left > 0))
+            # Duplicate booking check: if this lead already has an active trial for this session, skip
+            if lead and TrialBooking.objects.using(alias).filter(
+                lead=lead,
+                class_occurrence_id=occ.id,
+                status__in=['BOOKED', 'CONFIRMED', 'ATTENDED'],
+            ).exclude(confirmation_status__in=['CANCELLED', 'DECLINED']).exists():
+                continue
 
             # Trainer info
             trainer_assignment = occ.trainer_assignments.filter(status='ACTIVE').first() or occ.trainer_assignments.first()
@@ -950,29 +1021,45 @@ class CRMLeadService:
             if trainer_assignment and trainer_assignment.trainer_profile:
                 tp = trainer_assignment.trainer_profile
                 trainer_id = str(tp.id)
-                trainer_name = f"{tp.user.first_name} {tp.user.last_name}".strip() if tp.user else tp.trainer_code
+                emp = getattr(tp, 'employee_profile', None)
+                up = getattr(emp, 'user_profile', None) if emp else None
+                u = getattr(up, 'user', None) if up else None
+                if u:
+                    trainer_name = f"{u.first_name} {u.last_name}".strip()
+                elif emp:
+                    trainer_name = f"{emp.first_name_snapshot or ''} {emp.last_name_snapshot or ''}".strip() or emp.employee_code
+                else:
+                    trainer_name = tp.trainer_code
 
             slots.append({
                 'occurrence_id': str(occ.id),
                 'class_template_id': str(occ.class_template_id),
                 'class_name': occ.class_template.name,
+                'program_id': str(occ.class_template.program_id) if occ.class_template.program_id else None,
+                'program_name': occ.class_template.program.name if occ.class_template.program else None,
                 'branch_id': str(occ.branch_id),
                 'branch_name': occ.branch.name,
                 'occurrence_date': occ.occurrence_date.isoformat(),
                 'start_at': occ.start_at.isoformat(),
                 'end_at': occ.end_at.isoformat(),
-                'capacity': occ.capacity,
-                'total_capacity': occ.capacity,
+                'start_time': occ.start_at.strftime('%H:%M'),
+                'end_time': occ.end_at.strftime('%H:%M'),
+                'delivery_mode': occ.delivery_mode,
+                'booking_capacity': effective_capacity,
+                'capacity': effective_capacity,
+                'total_capacity': effective_capacity,
+                'booked_count': total_occupied,
                 'total_booked': total_occupied,
-                'remaining_capacity': available_spots,
-                'trial_capacity': occ.trial_capacity,
+                'remaining_capacity': remaining_capacity,
+                'available_spots': remaining_capacity,
+                'trial_capacity': effective_trial_cap,
                 'trial_booked': trial_bookings_count,
-                'remaining_trial_capacity': trial_spots_left,
-                'available_spots': available_spots,
-                'available_trial_spots': available_trial_spots,
+                'trial_booked_count': trial_bookings_count,
+                'remaining_trial_capacity': remaining_trial_capacity,
+                'available_trial_spots': min(remaining_capacity, remaining_trial_capacity),
                 'policy_allowed': policy_allowed,
-                'policy_message': policy_message or '',
-                'is_available': is_available,
+                'policy_message': policy_message if not policy_allowed else '',
+                'is_available': policy_allowed and remaining_capacity > 0 and remaining_trial_capacity > 0,
                 'trainer_id': trainer_id,
                 'trainer_name': trainer_name,
             })
@@ -1005,7 +1092,10 @@ class CRMLeadService:
         if not class_occurrence_id and 'class_occurrence_id' in kwargs:
             class_occurrence_id = kwargs['class_occurrence_id']
 
-        from .models_classes import ClassOccurrence
+        if not class_occurrence_id:
+            raise ValidationError("A valid class occurrence must be selected to book a trial.")
+
+        from .models_classes import ClassOccurrence, ClassBranchAvailability
         from .models_bookings import Booking
 
         with transaction.atomic(using=alias):
@@ -1013,67 +1103,93 @@ class CRMLeadService:
             if lead.organization_id != branch.organization_id:
                 raise ValidationError("Lead and Branch belong to different organizations.")
 
-            occ = None
-            if class_occurrence_id:
-                try:
-                    occ = ClassOccurrence.objects.using(alias).select_for_update().get(id=class_occurrence_id)
-                except ClassOccurrence.DoesNotExist:
-                    raise ValidationError("Class occurrence does not exist.")
+            if lead.current_status == 'CONVERTED':
+                raise ValidationError("Converted leads are members and cannot book prospect trials. Use member booking.")
 
-                if occ.branch_id != branch.id:
-                    raise ValidationError("Class occurrence does not belong to the selected branch.")
+            try:
+                occ = ClassOccurrence.objects.using(alias).select_for_update().get(id=class_occurrence_id)
+            except ClassOccurrence.DoesNotExist:
+                raise ValidationError("Class occurrence does not exist.")
 
-                if occ.status not in ['SCHEDULED', 'OPEN']:
-                    raise ValidationError(f"Class occurrence is not open for booking (status: {occ.status}).")
+            if occ.branch_id != branch.id:
+                raise ValidationError("Class occurrence does not belong to the selected branch.")
 
-                # Booking Policy Check
-                allowed, reason = cls.resolve_trial_booking_policy(
-                    lead=lead,
-                    branch=branch,
-                    class_template=occ.class_template,
-                    occurrence=occ,
-                    db_alias=alias,
-                )
-                if not allowed:
-                    raise ValidationError(reason or "Booking policy does not allow trial for this session.")
+            if occ.status not in ['SCHEDULED', 'OPEN']:
+                raise ValidationError(f"Class occurrence is not open for booking (status: {occ.status}).")
 
-                # Concurrency-safe capacity re-validation
-                regular_booked = Booking.objects.using(alias).filter(
-                    occurrence=occ,
-                    status__in=['CONFIRMED', 'RESERVED', 'COMPLETED'],
-                ).count()
-                trial_booked = TrialBooking.objects.using(alias).filter(
-                    class_occurrence_id=occ.id,
-                    status__in=['BOOKED', 'CONFIRMED', 'ATTENDED'],
-                ).count()
+            if occ.start_at <= timezone.now():
+                raise ValidationError("Cannot book a trial for a past class occurrence.")
 
-                if regular_booked + trial_booked >= occ.capacity:
-                    raise ValidationError("Total occurrence capacity reached for this session.")
+            if occ.class_template.status != 'ACTIVE':
+                raise ValidationError("Class template is not active.")
 
-                if occ.trial_capacity > 0 and trial_booked >= occ.trial_capacity:
-                    raise ValidationError("Trial capacity reached for this session.")
+            if not occ.class_template.allow_trial:
+                raise ValidationError("Trials are not permitted for this class.")
 
-                scheduled_start = occ.start_at
-                scheduled_end = occ.end_at
-                if not assigned_trainer:
-                    ta = occ.trainer_assignments.filter(status='ACTIVE').first() or occ.trainer_assignments.first()
-                    if ta and ta.trainer_profile:
-                        assigned_trainer = ta.trainer_profile
-            else:
-                if not scheduled_start or not scheduled_end:
-                    raise ValidationError("scheduled_start and scheduled_end are required when class_occurrence_id is not provided.")
-                if assigned_trainer:
-                    duration = int((scheduled_end - scheduled_start).total_seconds() / 60)
-                    available, reason, _ = TrainerAvailabilityService.is_trainer_available(
-                        trainer=assigned_trainer,
-                        branch=branch,
-                        start_datetime=scheduled_start,
-                        duration_minutes=duration,
-                        delivery_mode='GROUP' if trial_type == 'GROUP_CLASS' else 'INDIVIDUAL',
-                        db_alias=alias,
-                    )
-                    if not available:
-                        raise ValidationError(f"Selected trainer is not available: {reason}")
+            branch_avail = ClassBranchAvailability.objects.using(alias).filter(
+                class_template=occ.class_template,
+                branch=occ.branch,
+            ).first()
+            if branch_avail and branch_avail.status == 'DISABLED':
+                raise ValidationError("This class is disabled at the selected branch.")
+
+            effective_capacity = (
+                occ.capacity
+                or (branch_avail.capacity_override if branch_avail and branch_avail.capacity_override else None)
+                or occ.class_template.default_capacity
+            )
+            effective_trial_cap = (
+                occ.trial_capacity
+                or (branch_avail.trial_capacity_override if branch_avail and branch_avail.trial_capacity_override else None)
+                or occ.class_template.default_trial_capacity
+            )
+
+            if effective_trial_cap <= 0:
+                raise ValidationError("Trial bookings are not enabled for this session (trial capacity is 0).")
+
+            # Duplicate booking check: lead already has active trial for this occurrence
+            # Booking Policy Check
+            allowed, reason = cls.resolve_trial_booking_policy(
+                lead=lead,
+                branch=branch,
+                class_template=occ.class_template,
+                occurrence=occ,
+                db_alias=alias,
+            )
+            if not allowed:
+                raise ValidationError(reason or "Booking policy does not allow trial for this session.")
+
+            # Duplicate booking check: lead already has active trial for this occurrence
+            existing_active = TrialBooking.objects.using(alias).filter(
+                lead=lead,
+                class_occurrence_id=occ.id,
+                status__in=['BOOKED', 'CONFIRMED', 'ATTENDED'],
+            ).exclude(confirmation_status__in=['CANCELLED', 'DECLINED']).exists()
+            if existing_active:
+                raise ValidationError("Lead already has an active trial booked for this session.")
+
+            # Concurrency-safe capacity re-validation under lock
+            regular_booked = Booking.objects.using(alias).filter(
+                occurrence=occ,
+                status__in=['CONFIRMED', 'RESERVED', 'COMPLETED'],
+            ).count()
+            trial_booked = TrialBooking.objects.using(alias).filter(
+                class_occurrence_id=occ.id,
+                status__in=['BOOKED', 'CONFIRMED', 'ATTENDED'],
+            ).exclude(confirmation_status__in=['CANCELLED', 'DECLINED']).count()
+
+            if regular_booked + trial_booked >= effective_capacity:
+                raise ValidationError("Total occurrence capacity reached for this session. This trial session is now full. Please select another session.")
+
+            if effective_trial_cap > 0 and trial_booked >= effective_trial_cap:
+                raise ValidationError("Trial capacity reached for this session. This trial session is now full. Please select another session.")
+
+            scheduled_start = occ.start_at
+            scheduled_end = occ.end_at
+            if not assigned_trainer:
+                ta = occ.trainer_assignments.filter(status='ACTIVE').first() or occ.trainer_assignments.first()
+                if ta and ta.trainer_profile:
+                    assigned_trainer = ta.trainer_profile
 
             trial = TrialBooking.objects.using(alias).create(
                 lead=lead,
@@ -1170,6 +1286,15 @@ class CRMLeadService:
                 changed_by_user=actor_user,
             )
 
+            cls.transition_lead_status(
+                lead=trial.lead,
+                new_status='TRIAL_CONFIRMED',
+                reason_code='TRIAL_CONFIRMED',
+                reason_text=f"Trial confirmed via {channel}",
+                actor_user=actor_user,
+                db_alias=alias,
+            )
+
             record_business_audit(
                 organization=trial.lead.organization,
                 branch=trial.branch,
@@ -1244,92 +1369,135 @@ class CRMLeadService:
         db_alias: Optional[str] = None,
     ) -> TrialBooking:
         alias = db_alias or get_tenant_db_alias() or 'default'
-        from .models_classes import ClassOccurrence
+        from .models_classes import ClassOccurrence, ClassBranchAvailability
         from .models_bookings import Booking, BookingPolicySet
 
         with transaction.atomic(using=alias):
+            # Re-lock trial record
+            trial = TrialBooking.objects.using(alias).select_for_update().get(id=trial.id)
+
             if trial.status in ['ATTENDED', 'CANCELLED']:
                 raise ValidationError(f"Cannot reschedule trial in '{trial.status}' status.")
 
             # Max reschedules check
-            reschedule_count = TrialBooking.objects.using(alias).filter(rescheduled_from=trial).count()
+            reschedule_count = TrialStatusHistory.objects.using(alias).filter(
+                trial_booking=trial, to_status='RESCHEDULED'
+            ).count()
             bp = BookingPolicySet.objects.using(alias).filter(organization=trial.lead.organization, status='ACTIVE').first()
             if bp and bp.max_reschedules and reschedule_count >= bp.max_reschedules:
                 raise ValidationError(f"Maximum reschedules ({bp.max_reschedules}) exceeded for this trial.")
 
-            new_occ = None
-            assigned_trainer = trial.assigned_trainer_profile
-            if new_class_occurrence_id:
-                try:
-                    new_occ = ClassOccurrence.objects.using(alias).select_for_update().get(id=new_class_occurrence_id)
-                except ClassOccurrence.DoesNotExist:
-                    raise ValidationError("New class occurrence does not exist.")
+            if not new_class_occurrence_id:
+                raise ValidationError("new_class_occurrence_id is required to reschedule trial to an authoritative session.")
 
-                if new_occ.branch_id != trial.branch_id:
-                    raise ValidationError("New class occurrence does not belong to the trial's branch.")
+            try:
+                new_occ = ClassOccurrence.objects.using(alias).select_for_update().get(id=new_class_occurrence_id)
+            except ClassOccurrence.DoesNotExist:
+                raise ValidationError("New class occurrence does not exist.")
 
-                # Capacity check
-                reg_count = Booking.objects.using(alias).filter(
-                    occurrence=new_occ,
-                    status__in=['CONFIRMED', 'RESERVED', 'COMPLETED'],
-                ).count()
-                tr_count = TrialBooking.objects.using(alias).filter(
-                    class_occurrence_id=new_occ.id,
-                    status__in=['BOOKED', 'CONFIRMED', 'ATTENDED'],
-                ).count()
+            if new_occ.branch_id != trial.branch_id:
+                raise ValidationError("New class occurrence does not belong to the trial's branch.")
 
-                if reg_count + tr_count >= new_occ.capacity:
-                    raise ValidationError("Total occurrence capacity reached for this session.")
-                if new_occ.trial_capacity > 0 and tr_count >= new_occ.trial_capacity:
-                    raise ValidationError("Trial capacity reached for this session.")
+            if new_occ.status not in ['SCHEDULED', 'OPEN']:
+                raise ValidationError(f"Class occurrence is not open for booking (status: {new_occ.status}).")
 
-                new_scheduled_start = new_occ.start_at
-                new_scheduled_end = new_occ.end_at
-                ta = new_occ.trainer_assignments.filter(status='ACTIVE').first() or new_occ.trainer_assignments.first()
-                if ta and ta.trainer_profile:
-                    assigned_trainer = ta.trainer_profile
-            else:
-                if not new_scheduled_start or not new_scheduled_end:
-                    raise ValidationError("new_scheduled_start and new_scheduled_end required when occurrence is not specified.")
+            if new_occ.start_at <= timezone.now():
+                raise ValidationError("Cannot reschedule to a past class occurrence.")
 
-            # 1. Update old trial to RESCHEDULED
+            if new_occ.class_template.status != 'ACTIVE':
+                raise ValidationError("Class template is not active.")
+
+            if not new_occ.class_template.allow_trial:
+                raise ValidationError("Trials are not permitted for this class.")
+
+            branch_avail = ClassBranchAvailability.objects.using(alias).filter(
+                class_template=new_occ.class_template,
+                branch=new_occ.branch,
+            ).first()
+            if branch_avail and branch_avail.status == 'DISABLED':
+                raise ValidationError("This class is disabled at the selected branch.")
+
+            effective_capacity = (
+                new_occ.capacity
+                if new_occ.capacity is not None
+                else (branch_avail.capacity_override if branch_avail and branch_avail.capacity_override is not None else new_occ.class_template.default_capacity)
+            )
+            effective_trial_cap = (
+                new_occ.trial_capacity
+                if new_occ.trial_capacity is not None
+                else (branch_avail.trial_capacity_override if branch_avail and branch_avail.trial_capacity_override is not None else new_occ.class_template.default_trial_capacity)
+            )
+
+            if effective_trial_cap <= 0 or effective_capacity <= 0:
+                raise ValidationError("Trial capacity reached for this session. This trial session is now full. Please select another session.")
+
+            # Concurrency-safe capacity re-validation under lock
+            reg_count = Booking.objects.using(alias).filter(
+                occurrence=new_occ,
+                status__in=['CONFIRMED', 'RESERVED', 'COMPLETED'],
+            ).count()
+            tr_count = TrialBooking.objects.using(alias).filter(
+                class_occurrence_id=new_occ.id,
+                status__in=['BOOKED', 'CONFIRMED', 'ATTENDED'],
+            ).exclude(confirmation_status__in=['CANCELLED', 'DECLINED']).count()
+
+            # If target occurrence is the same as current occurrence, don't double count self
+            if trial.class_occurrence_id == new_occ.id:
+                tr_count = max(0, tr_count - 1)
+
+            if reg_count + tr_count >= effective_capacity:
+                raise ValidationError("Total occurrence capacity reached for this session. This trial session is now full. Please select another session.")
+            if effective_trial_cap > 0 and tr_count >= effective_trial_cap:
+                raise ValidationError("Trial capacity reached for this session. This trial session is now full. Please select another session.")
+
+            assigned_trainer = None
+            ta = new_occ.trainer_assignments.filter(status='ACTIVE').first() or new_occ.trainer_assignments.first()
+            if ta and ta.trainer_profile:
+                assigned_trainer = ta.trainer_profile
+
+            old_occ_id = trial.class_occurrence_id
+            old_start = trial.scheduled_start
+            old_end = trial.scheduled_end
             old_status = trial.status
-            trial.status = 'RESCHEDULED'
-            trial.confirmation_status = 'CANCELLED'
-            trial.cancellation_reason = f"Rescheduled: {reason}" if reason else "Rescheduled"
-            trial.save(using=alias, update_fields=['status', 'confirmation_status', 'cancellation_reason', 'updated_at'])
 
+            # Atomic capacity transfer: update single canonical TrialBooking in-place
+            trial.class_occurrence_id = new_occ.id
+            trial.scheduled_start = new_occ.start_at
+            trial.scheduled_end = new_occ.end_at
+            trial.assigned_trainer_profile = assigned_trainer
+            trial.status = 'BOOKED'
+            trial.confirmation_status = 'PENDING'
+            trial.cancellation_reason = None
+            trial.save(using=alias, update_fields=[
+                'class_occurrence_id', 'scheduled_start', 'scheduled_end',
+                'assigned_trainer_profile', 'status', 'confirmation_status',
+                'cancellation_reason', 'updated_at'
+            ])
+
+            # Write status transition history
             TrialStatusHistory.objects.using(alias).create(
                 trial_booking=trial,
                 from_status=old_status,
                 to_status='RESCHEDULED',
-                reason_code=reason or 'RESCHEDULED_TO_NEW_SLOT',
+                reason_code=reason or f"RESCHEDULED_FROM_{old_start}_TO_{new_occ.start_at}",
                 changed_by_user=actor_user,
             )
-
-            # 2. Create new replacement TrialBooking linked to old
-            new_trial = TrialBooking.objects.using(alias).create(
-                lead=trial.lead,
-                branch=trial.branch,
-                class_occurrence_id=new_occ.id if new_occ else None,
-                assigned_trainer_profile=assigned_trainer,
-                trial_type=trial.trial_type,
-                scheduled_start=new_scheduled_start,
-                scheduled_end=new_scheduled_end,
-                status='BOOKED',
-                confirmation_status='PENDING',
-                booking_source=trial.booking_source,
-                rescheduled_from=trial,
-                notes=f"Rescheduled from trial #{str(trial.id)[:8]}. Reason: {reason or 'Customer request'}",
-                created_by_user=actor_user,
-            )
-
             TrialStatusHistory.objects.using(alias).create(
-                trial_booking=new_trial,
-                from_status=None,
+                trial_booking=trial,
+                from_status='RESCHEDULED',
                 to_status='BOOKED',
-                reason_code='RESCHEDULED_FROM_PREVIOUS',
+                reason_code='RESCHEDULED_SLOT_BOOKED',
                 changed_by_user=actor_user,
+            )
+
+            # Sync lead status to TRIAL_BOOKED
+            cls.transition_lead_status(
+                lead=trial.lead,
+                new_status='TRIAL_BOOKED',
+                reason_code='TRIAL_RESCHEDULED',
+                reason_text=f"Rescheduled from {old_start} to {new_occ.start_at}",
+                actor_user=actor_user,
+                db_alias=alias,
             )
 
             record_business_audit(
@@ -1341,8 +1509,14 @@ class CRMLeadService:
                 action_code='CRM_TRIAL_RESCHEDULED',
                 entity_type='TrialBooking',
                 entity_id=trial.id,
-                event_description=f"Rescheduled trial {trial.id} to new trial {new_trial.id} at {new_scheduled_start}",
-                after_data={'old_trial_id': str(trial.id), 'new_trial_id': str(new_trial.id)},
+                event_description=f"Rescheduled trial {trial.id} to new occurrence {new_occ.id} at {new_occ.start_at}",
+                after_data={
+                    'trial_id': str(trial.id),
+                    'old_occurrence_id': str(old_occ_id) if old_occ_id else None,
+                    'new_occurrence_id': str(new_occ.id),
+                    'old_start': old_start.isoformat() if old_start else None,
+                    'new_start': new_occ.start_at.isoformat(),
+                },
                 db_alias=alias,
             )
 
@@ -1351,11 +1525,15 @@ class CRMLeadService:
                 event_type='CRM_TRIAL_RESCHEDULED',
                 aggregate_type='TrialBooking',
                 aggregate_id=str(trial.id),
-                payload={'old_trial_id': str(trial.id), 'new_trial_id': str(new_trial.id)},
+                payload={
+                    'trial_id': str(trial.id),
+                    'old_occurrence_id': str(old_occ_id) if old_occ_id else None,
+                    'new_occurrence_id': str(new_occ.id),
+                },
                 db_alias=alias,
             )
 
-            return new_trial
+            return trial
 
     @classmethod
     def cancel_trial(
@@ -1367,7 +1545,7 @@ class CRMLeadService:
     ) -> TrialBooking:
         alias = db_alias or get_tenant_db_alias() or 'default'
         with transaction.atomic(using=alias):
-            if trial.status in ['ATTENDED', 'CANCELLED', 'RESCHEDULED']:
+            if trial.status in ['ATTENDED', 'CANCELLED']:
                 raise ValidationError(f"Cannot cancel trial in '{trial.status}' status.")
 
             old_status = trial.status
@@ -1383,6 +1561,22 @@ class CRMLeadService:
                 reason_code=reason or 'MANUAL_CANCELLATION',
                 changed_by_user=actor_user,
             )
+
+            # Check if lead has any other active trial bookings
+            has_other_active = TrialBooking.objects.using(alias).filter(
+                lead=trial.lead,
+                status__in=['BOOKED', 'CONFIRMED', 'ATTENDED'],
+            ).exclude(id=trial.id).exists()
+
+            if not has_other_active and trial.lead.current_status in ['TRIAL_BOOKED', 'TRIAL_CONFIRMED']:
+                cls.transition_lead_status(
+                    lead=trial.lead,
+                    new_status='FOLLOW_UP_PENDING',
+                    reason_code='TRIAL_CANCELLED',
+                    reason_text=f"Trial cancelled: {reason or 'Customer request'}",
+                    actor_user=actor_user,
+                    db_alias=alias,
+                )
 
             record_business_audit(
                 organization=trial.lead.organization,

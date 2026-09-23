@@ -26,10 +26,11 @@ from .models_bookings import (
 )
 from .models_attendance import AttendanceRecord, AccessEvent
 from .models_classes import ClassOccurrence
-from .models_crm import UserProfile
+from .models_crm import UserProfile, TrialBooking
 from .models_memberships import Membership
 from .models_org import Branch
 from .models_rbac import RoleAssignment
+from .services_crm import CRMLeadService
 from .serializers_bookings import (
     BookingPolicySetSerializer,
     BookingCancellationRuleSerializer,
@@ -189,6 +190,160 @@ class BookingViewSet(viewsets.ModelViewSet):
 
         return qs.order_by('-booked_at')
 
+    def list(self, request, *args, **kwargs):
+        alias = _get_db(request)
+        queryset = self.filter_queryset(self.get_queryset())
+        serializer = self.get_serializer(queryset, many=True)
+        results = list(serializer.data)
+
+        # Unified Operations View: Include TrialBookings as first-class rows
+        include_trials = request.query_params.get('include_trials', 'true').lower() in ['true', '1', 'yes']
+        user_roles = set(
+            RoleAssignment.objects.using(alias)
+            .filter(user=request.user, is_active=True)
+            .values_list('role__code', flat=True)
+        )
+        staff_roles = {'ORG_ADMIN', 'BRANCH_MANAGER', 'FRONT_DESK', 'TRAINER', 'SALES_REP', 'FINANCE_ADMIN'}
+        is_member_only = 'MEMBER' in user_roles and not (user_roles & staff_roles)
+
+        if include_trials and not is_member_only:
+            trial_qs = TrialBooking.objects.using(alias).select_related('lead', 'branch', 'assigned_trainer_profile')
+
+            permitted_branches = get_user_effective_branch_ids(request.user, alias)
+            if permitted_branches is not None:
+                trial_qs = trial_qs.filter(branch_id__in=permitted_branches)
+
+            branch_id = request.query_params.get('branch_id')
+            if branch_id:
+                trial_qs = trial_qs.filter(branch_id=branch_id)
+
+            occurrence_id = request.query_params.get('occurrence_id')
+            if occurrence_id:
+                trial_qs = trial_qs.filter(class_occurrence_id=occurrence_id)
+
+            status_filter = request.query_params.get('status')
+            if status_filter:
+                if status_filter == 'CONFIRMED':
+                    trial_qs = trial_qs.filter(models.Q(status='CONFIRMED') | models.Q(confirmation_status='CONFIRMED'))
+                else:
+                    trial_qs = trial_qs.filter(status=status_filter)
+
+            search = request.query_params.get('search')
+            if search:
+                trial_qs = trial_qs.filter(
+                    models.Q(lead__first_name__icontains=search) |
+                    models.Q(lead__last_name__icontains=search) |
+                    models.Q(lead__email_normalized__icontains=search) |
+                    models.Q(lead__phone_normalized__icontains=search) |
+                    models.Q(notes__icontains=search)
+                )
+
+            occ_ids = [t.class_occurrence_id for t in trial_qs if t.class_occurrence_id]
+            occ_map = {}
+            if occ_ids:
+                for occ in ClassOccurrence.objects.using(alias).filter(id__in=occ_ids).select_related('class_template'):
+                    occ_map[occ.id] = {
+                        'title': occ.class_template.name if occ.class_template else 'Class Session',
+                        'date': occ.occurrence_date.isoformat() if occ.occurrence_date else None,
+                        'start_at': occ.start_at.isoformat() if occ.start_at else None,
+                        'end_at': occ.end_at.isoformat() if occ.end_at else None,
+                    }
+
+            for t in trial_qs:
+                occ_info = occ_map.get(t.class_occurrence_id, {})
+                title = occ_info.get('title')
+                if search and title and search.lower() not in title.lower() and not (
+                    search.lower() in (t.lead.first_name or '').lower() or
+                    search.lower() in (t.lead.last_name or '').lower() or
+                    search.lower() in (t.lead.email_normalized or '').lower() or
+                    f"TRL-{str(t.id)[:8].upper()}".lower().find(search.lower()) != -1
+                ):
+                    continue
+
+                trial_item = {
+                    'id': str(t.id),
+                    'is_trial': True,
+                    'booking_number': f"TRL-{str(t.id)[:8].upper()}",
+                    'status': t.status,
+                    'confirmation_status': t.confirmation_status,
+                    'booking_type': 'PROSPECT',
+                    'booking_source': 'TRIAL',
+                    'waitlist_position': None,
+                    'booked_at': t.created_at.isoformat() if t.created_at else None,
+                    'cancelled_at': t.updated_at.isoformat() if t.status == 'CANCELLED' else None,
+                    'completed_at': t.updated_at.isoformat() if t.status == 'ATTENDED' else None,
+                    'user_profile': None,
+                    'user_profile_name': f"{t.lead.first_name} {t.lead.last_name}".strip() if t.lead else 'Prospect',
+                    'user_profile_email': t.lead.email_normalized if t.lead else None,
+                    'occurrence': str(t.class_occurrence_id) if t.class_occurrence_id else None,
+                    'occurrence_title': occ_info.get('title', 'Trial Session'),
+                    'occurrence_date': occ_info.get('date', t.scheduled_start.date().isoformat() if t.scheduled_start else None),
+                    'occurrence_start_at': occ_info.get('start_at', t.scheduled_start.isoformat() if t.scheduled_start else None),
+                    'occurrence_end_at': occ_info.get('end_at', t.scheduled_end.isoformat() if t.scheduled_end else None),
+                    'branch': str(t.branch_id) if t.branch_id else None,
+                    'branch_name': t.branch.name if t.branch else 'Main Studio',
+                    'membership': None,
+                    'package_name': 'Trial Session',
+                    'entitlement': None,
+                    'lead_id': str(t.lead_id) if t.lead_id else None,
+                    'created_at': t.created_at.isoformat() if t.created_at else None,
+                    'updated_at': t.updated_at.isoformat() if t.updated_at else None,
+                }
+                results.append(trial_item)
+
+        results.sort(key=lambda x: x.get('booked_at') or x.get('created_at') or '', reverse=True)
+        return Response(results)
+
+    def retrieve(self, request, *args, **kwargs):
+        alias = _get_db(request)
+        pk = kwargs.get('pk')
+        try:
+            return super().retrieve(request, *args, **kwargs)
+        except Exception:
+            trial = TrialBooking.objects.using(alias).select_related('lead', 'branch', 'assigned_trainer_profile').filter(id=pk).first()
+            if not trial:
+                return Response({'detail': 'Booking not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+            occ = ClassOccurrence.objects.using(alias).filter(id=trial.class_occurrence_id).select_related('class_template').first() if trial.class_occurrence_id else None
+            data = {
+                'id': str(trial.id),
+                'is_trial': True,
+                'booking_number': f"TRL-{str(trial.id)[:8].upper()}",
+                'status': trial.status,
+                'confirmation_status': trial.confirmation_status,
+                'booking_type': 'PROSPECT',
+                'booking_source': 'TRIAL',
+                'member_name': f"{trial.lead.first_name} {trial.lead.last_name}".strip() if trial.lead else 'Prospect',
+                'member_email': trial.lead.email_normalized if trial.lead else None,
+                'member_phone': trial.lead.phone_normalized if trial.lead else None,
+                'member_number': 'PROSPECT',
+                'user_profile_name': f"{trial.lead.first_name} {trial.lead.last_name}".strip() if trial.lead else 'Prospect',
+                'user_profile_email': trial.lead.email_normalized if trial.lead else None,
+                'occurrence': str(trial.class_occurrence_id) if trial.class_occurrence_id else None,
+                'occurrence_title': occ.class_template.name if occ and occ.class_template else 'Trial Session',
+                'class_name': occ.class_template.name if occ and occ.class_template else 'Trial Session',
+                'occurrence_date': occ.occurrence_date.isoformat() if occ and occ.occurrence_date else (trial.scheduled_start.date().isoformat() if trial.scheduled_start else None),
+                'occurrence_start_at': trial.scheduled_start.isoformat() if trial.scheduled_start else None,
+                'occurrence_end_at': trial.scheduled_end.isoformat() if trial.scheduled_end else None,
+                'start_at': trial.scheduled_start.isoformat() if trial.scheduled_start else None,
+                'end_at': trial.scheduled_end.isoformat() if trial.scheduled_end else None,
+                'start_time': trial.scheduled_start.isoformat() if trial.scheduled_start else None,
+                'end_time': trial.scheduled_end.isoformat() if trial.scheduled_end else None,
+                'branch': str(trial.branch_id) if trial.branch_id else None,
+                'branch_name': trial.branch.name if trial.branch else 'Main Studio',
+                'membership': None,
+                'package_name': 'Trial Session',
+                'lead_id': str(trial.lead_id) if trial.lead_id else None,
+                'booked_at': trial.created_at.isoformat() if trial.created_at else None,
+                'created_at': trial.created_at.isoformat() if trial.created_at else None,
+                'updated_at': trial.updated_at.isoformat() if trial.updated_at else None,
+                'reschedules': [],
+                'status_history': [],
+                'cancellations': [],
+                'waitlist_events': [],
+            }
+            return Response(data)
+
     def create(self, request, *args, **kwargs):
         alias = _get_db(request)
         user_profile_id = request.data.get('user_profile')
@@ -269,6 +424,17 @@ class BookingViewSet(viewsets.ModelViewSet):
         try:
             booking = Booking.objects.using(alias).select_related('occurrence__class_template__category__organization', 'branch').get(id=pk)
         except Booking.DoesNotExist:
+            trial = TrialBooking.objects.using(alias).filter(id=pk).first()
+            if trial:
+                permitted_branches = get_user_effective_branch_ids(request.user, alias)
+                if permitted_branches is not None and str(trial.branch_id) not in permitted_branches:
+                    return Response({'detail': 'User lacks permission to modify bookings for this branch.'}, status=status.HTTP_403_FORBIDDEN)
+                reason = request.data.get('reason_text') or request.data.get('reason_code') or 'Cancelled from Operations'
+                try:
+                    cancelled = CRMLeadService.cancel_trial(trial=trial, reason=reason, actor_user=request.user, db_alias=alias)
+                    return Response({'status': cancelled.status, 'detail': 'Trial booking cancelled successfully.'}, status=status.HTTP_200_OK)
+                except ValidationError as e:
+                    return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
             return Response({'detail': 'Booking not found.'}, status=status.HTTP_404_NOT_FOUND)
 
         # Branch scope check
@@ -301,6 +467,25 @@ class BookingViewSet(viewsets.ModelViewSet):
         try:
             booking = Booking.objects.using(alias).select_related('occurrence', 'branch').get(id=pk)
         except Booking.DoesNotExist:
+            trial = TrialBooking.objects.using(alias).filter(id=pk).first()
+            if trial:
+                permitted_branches = get_user_effective_branch_ids(request.user, alias)
+                if permitted_branches is not None and str(trial.branch_id) not in permitted_branches:
+                    return Response({'detail': 'User lacks permission to modify bookings for this branch.'}, status=status.HTTP_403_FORBIDDEN)
+                to_occurrence_id = request.data.get('to_occurrence_id') or request.data.get('new_occurrence_id')
+                reason = request.data.get('reason_text') or request.data.get('reason_code') or 'Rescheduled from Operations'
+                try:
+                    rescheduled = CRMLeadService.reschedule_trial(trial=trial, new_class_occurrence_id=to_occurrence_id, reason=reason, actor_user=request.user, db_alias=alias)
+                    return Response({
+                        'id': str(rescheduled.id),
+                        'is_trial': True,
+                        'status': rescheduled.status,
+                        'occurrence': str(rescheduled.class_occurrence_id),
+                        'scheduled_start': rescheduled.scheduled_start.isoformat(),
+                        'detail': 'Trial booking rescheduled successfully.'
+                    }, status=status.HTTP_200_OK)
+                except ValidationError as e:
+                    return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
             return Response({'detail': 'Booking not found.'}, status=status.HTTP_404_NOT_FOUND)
 
         # Branch scope check on current booking
@@ -351,6 +536,23 @@ class BookingViewSet(viewsets.ModelViewSet):
                 'user_profile', 'branch', 'occurrence__class_template__category__organization'
             ).get(id=pk)
         except Booking.DoesNotExist:
+            trial = TrialBooking.objects.using(alias).filter(id=pk).first()
+            if trial:
+                permitted_branches = get_user_effective_branch_ids(request.user, alias)
+                if permitted_branches is not None and str(trial.branch_id) not in permitted_branches:
+                    return Response({'detail': 'User lacks permission to modify bookings for this branch.'}, status=status.HTTP_403_FORBIDDEN)
+                att_status = request.data.get('status', 'PRESENT')
+                notes = request.data.get('notes')
+                try:
+                    if att_status in ['PRESENT', 'ATTENDED']:
+                        attended = CRMLeadService.mark_trial_attended(trial=trial, notes=notes, actor_user=request.user, db_alias=alias)
+                        return Response({'status': attended.status, 'detail': 'Trial marked as attended.'}, status=status.HTTP_200_OK)
+                    elif att_status in ['NO_SHOW', 'ABSENT']:
+                        noshow = CRMLeadService.mark_trial_no_show(trial=trial, notes=notes, actor_user=request.user, db_alias=alias)
+                        return Response({'status': noshow.status, 'detail': 'Trial marked as no show.'}, status=status.HTTP_200_OK)
+                    return Response({'detail': f"Unsupported attendance status '{att_status}' for trial."}, status=status.HTTP_400_BAD_REQUEST)
+                except ValidationError as e:
+                    return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
             return Response({'detail': 'Booking not found.'}, status=status.HTTP_404_NOT_FOUND)
 
         att_status = request.data.get('status', 'PRESENT')
@@ -371,6 +573,23 @@ class BookingViewSet(viewsets.ModelViewSet):
             return Response({'detail': detail}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
             return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'], url_path='confirm')
+    def confirm(self, request, pk=None):
+        alias = _get_db(request)
+        trial = TrialBooking.objects.using(alias).filter(id=pk).first()
+        if trial:
+            permitted_branches = get_user_effective_branch_ids(request.user, alias)
+            if permitted_branches is not None and str(trial.branch_id) not in permitted_branches:
+                return Response({'detail': 'User lacks permission to modify bookings for this branch.'}, status=status.HTTP_403_FORBIDDEN)
+            channel = request.data.get('channel', 'MANUAL')
+            notes = request.data.get('notes')
+            try:
+                confirmed = CRMLeadService.confirm_trial(trial=trial, channel=channel, notes=notes, actor_user=request.user, db_alias=alias)
+                return Response({'status': confirmed.status, 'confirmation_status': confirmed.confirmation_status}, status=status.HTTP_200_OK)
+            except ValidationError as e:
+                return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({'detail': 'Booking not found or not a trial.'}, status=status.HTTP_404_NOT_FOUND)
 
     @action(detail=False, methods=['post'], url_path='promote-waitlist')
     def promote_waitlist(self, request):
