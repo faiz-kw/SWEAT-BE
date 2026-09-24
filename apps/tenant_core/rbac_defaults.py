@@ -108,8 +108,7 @@ DEFAULT_ROLES_CONFIG: Dict[str, dict] = {
             # Members & Attendance
             'members.client-360.view',
             'members.attendance.view', 'members.attendance.create',
-            # Coaching & Performance
-            'coaching.trainers.view', 'coaching.program-builder.view', 'coaching.program-builder.create', 'coaching.program-builder.edit',
+            # Performance
             'performance.workouts.view', 'performance.workouts.create', 'performance.workouts.edit',
             'performance.analytics.view',
             'performance.pr-tracker.view', 'performance.pr-tracker.create', 'performance.pr-tracker.edit',
@@ -330,6 +329,15 @@ def sync_default_role_permissions(
                 if p_obj.submodule:
                     enabled_submodules.add(p_obj.submodule)
 
+            # If overwrite_custom is True, revoke permissions that are no longer in target_perms
+            if overwrite_custom and not config.get('all_permissions'):
+                target_perm_ids = [p.id for p in target_perms]
+                RolePermissionSetItem.objects.using(db_alias).filter(
+                    permission_set=perm_set
+                ).exclude(
+                    permission_id__in=target_perm_ids
+                ).update(granted=False, is_allowed=False)
+
             # For ORG_ADMIN, enable all catalog modules & submodules
             if config.get('all_permissions'):
                 enabled_modules = set(all_modules.values())
@@ -346,6 +354,13 @@ def sync_default_role_permissions(
                         'is_visible': True,
                     },
                 )
+            if overwrite_custom and not config.get('all_permissions'):
+                enabled_mod_ids = [m.id for m in enabled_modules]
+                RoleModuleAccess.objects.using(db_alias).filter(
+                    role=role
+                ).exclude(
+                    module_id__in=enabled_mod_ids
+                ).update(can_access=False, is_visible=False)
 
             # 6. Open RoleSubmoduleAccess gates
             for sm_obj in enabled_submodules:
@@ -358,6 +373,13 @@ def sync_default_role_permissions(
                         'is_visible': True,
                     },
                 )
+            if overwrite_custom and not config.get('all_permissions'):
+                enabled_sm_ids = [sm.id for sm in enabled_submodules]
+                RoleSubmoduleAccess.objects.using(db_alias).filter(
+                    role=role
+                ).exclude(
+                    submodule_id__in=enabled_sm_ids
+                ).update(can_access=False, is_visible=False)
 
             results[role_code] = {
                 'role_id': str(role.id),

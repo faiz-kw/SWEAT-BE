@@ -557,6 +557,15 @@ class BookingViewSet(viewsets.ModelViewSet):
 
         att_status = request.data.get('status', 'PRESENT')
         check_in_method = request.data.get('check_in_method', 'MANUAL')
+        latitude = request.data.get('latitude') or request.data.get('trainer_latitude')
+        longitude = request.data.get('longitude') or request.data.get('trainer_longitude')
+        accuracy = request.data.get('accuracy') or request.data.get('trainer_accuracy_meters')
+        distance_meters = request.data.get('distance_meters') or request.data.get('geofence_distance_meters')
+        face_verified = bool(request.data.get('face_verified', False))
+        liveness_score = request.data.get('liveness_score')
+        liveness_method = request.data.get('liveness_method', '')
+        selfie_image = request.data.get('selfie_image') or request.data.get('trainer_selfie_url', '')
+        challenges_passed = request.data.get('challenges_passed') or request.data.get('liveness_challenges_passed', [])
 
         try:
             record = BookingWaitlistAttendanceService.record_attendance(
@@ -564,6 +573,15 @@ class BookingViewSet(viewsets.ModelViewSet):
                 status=att_status,
                 check_in_method=check_in_method,
                 marked_by_user=request.user,
+                latitude=latitude,
+                longitude=longitude,
+                accuracy=accuracy,
+                distance_meters=distance_meters,
+                face_verified=face_verified,
+                liveness_score=liveness_score,
+                liveness_method=liveness_method,
+                selfie_image=selfie_image,
+                challenges_passed=challenges_passed,
                 db_alias=alias,
             )
             serializer = AttendanceRecordSerializer(record)
@@ -780,7 +798,10 @@ class AttendanceRecordViewSet(viewsets.ModelViewSet):
         att_status = self.request.query_params.get('status')
         if att_status:
             qs = qs.filter(status=att_status)
-        return qs.order_by('-created_at')
+        occurrence_id = self.request.query_params.get('occurrence_id') or self.request.query_params.get('occurrence')
+        if occurrence_id:
+            qs = qs.filter(occurrence_id=occurrence_id)
+        return qs
 
 
 class AccessEventViewSet(viewsets.ModelViewSet):

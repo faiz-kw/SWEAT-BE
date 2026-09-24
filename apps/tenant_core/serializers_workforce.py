@@ -70,6 +70,9 @@ class TrainerProfileSerializer(serializers.ModelSerializer):
     email = serializers.CharField(source='employee_profile.user_profile.user.email', read_only=True)
     specialties = serializers.SerializerMethodField()
 
+    branch_ids = serializers.SerializerMethodField()
+    branch_names = serializers.SerializerMethodField()
+
     class Meta:
         model = TrainerProfile
         fields = '__all__'
@@ -80,6 +83,32 @@ class TrainerProfileSerializer(serializers.ModelSerializer):
         first = up.first_name_snapshot or getattr(up.user, 'first_name', '')
         last = up.last_name_snapshot or getattr(up.user, 'last_name', '')
         return f"{first} {last}".strip()
+
+    def get_branch_ids(self, obj):
+        alias = obj._state.db or 'default'
+        user = obj.employee_profile.user_profile.user
+        b_ids = set()
+        if user.home_branch_id:
+            b_ids.add(str(user.home_branch_id))
+        assignments = user.branch_assignments.using(alias).filter(status='ACTIVE')
+        for a in assignments:
+            b_ids.add(str(a.branch_id))
+        pref = obj.employee_profile.user_profile.preferred_branch_id
+        if pref:
+            b_ids.add(str(pref))
+        return list(b_ids)
+
+    def get_branch_names(self, obj):
+        alias = obj._state.db or 'default'
+        user = obj.employee_profile.user_profile.user
+        names = []
+        if user.home_branch:
+            names.append(user.home_branch.name)
+        assignments = user.branch_assignments.using(alias).filter(status='ACTIVE').select_related('branch')
+        for a in assignments:
+            if a.branch and a.branch.name not in names:
+                names.append(a.branch.name)
+        return names
 
     def get_specialties(self, obj):
         alias = obj._state.db or 'default'

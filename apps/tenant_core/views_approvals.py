@@ -9,6 +9,10 @@ from .serializers_approvals import ApprovalRequestSerializer, ApprovalActionSeri
 from .services_approvals import AdminApprovalService
 
 
+from .models_users import TenantUser
+from .models_org import Organization
+
+
 class ApprovalRequestViewSet(viewsets.ModelViewSet):
     serializer_class = ApprovalRequestSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -21,14 +25,42 @@ class ApprovalRequestViewSet(viewsets.ModelViewSet):
         req_type = self.request.query_params.get('request_type')
         if req_type:
             qs = qs.filter(request_type=req_type)
+        user_id = self.request.query_params.get('requested_by_user_id')
+        if user_id:
+            qs = qs.filter(requested_by_user_id=user_id)
+        entity_id = self.request.query_params.get('entity_id')
+        if entity_id:
+            qs = qs.filter(entity_id=entity_id)
+        entity_type = self.request.query_params.get('entity_type')
+        if entity_type:
+            qs = qs.filter(entity_type=entity_type)
         return qs
 
     def perform_create(self, serializer):
-        user = self.request.user if hasattr(self.request.user, 'tenantuser') else None
-        if user:
-            serializer.save(requested_by_user=user, organization=user.organization)
+        user = self.request.user
+        tenant_user = None
+        if isinstance(user, TenantUser):
+            tenant_user = user
+        elif hasattr(user, 'tenantuser'):
+            tenant_user = user.tenantuser
         else:
-            serializer.save()
+            email = getattr(user, 'email', '')
+            if email:
+                tenant_user = TenantUser.objects.filter(email=email).first()
+            if not tenant_user:
+                tenant_user = TenantUser.objects.first()
+
+        org = getattr(self.request, 'organization', None) or (tenant_user.organization if tenant_user else None)
+        if not org:
+            org = Organization.objects.first()
+
+        kwargs = {}
+        if 'requested_by_user' not in serializer.validated_data and tenant_user:
+            kwargs['requested_by_user'] = tenant_user
+        if 'organization' not in serializer.validated_data and org:
+            kwargs['organization'] = org
+
+        serializer.save(**kwargs)
 
     @action(detail=True, methods=['post'], url_path='act')
     def act(self, request, pk=None):

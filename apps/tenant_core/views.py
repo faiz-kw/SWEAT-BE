@@ -277,8 +277,8 @@ class LocationViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
     queryset = Location.objects.all()
 
 
-class BranchViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ReadOnlyModelViewSet):
-    """Read-only — branches managed by platform team. Scoped to user's branch if not org-wide."""
+class BranchViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
+    """Branches managed by tenant org admin. Scoped to user's branch if not org-wide."""
     permission_classes = [RequireActiveTenantAndOrg]
     serializer_class = BranchSerializer
     queryset = Branch.objects.all()
@@ -1370,6 +1370,9 @@ class BranchWorkingHoursViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelV
             return Response({'error': 'Branch not found.'}, status=status.HTTP_404_NOT_FOUND)
 
         user = request.user if hasattr(request, 'user') and request.user.is_authenticated else None
+        tenant_user = user if isinstance(user, TenantUser) else None
+        if not tenant_user and user and hasattr(user, 'email'):
+            tenant_user = TenantUser.objects.using(db).filter(email=user.email).first()
 
         saved_items = []
         with transaction.atomic(using=db):
@@ -1379,8 +1382,11 @@ class BranchWorkingHoursViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelV
                     continue
                 is_open = bool(day_item.get('is_open', True))
                 is_24_hours = bool(day_item.get('is_24_hours', False))
+                has_split_shift = bool(day_item.get('has_split_shift', False)) and is_open and not is_24_hours
                 open_time = day_item.get('open_time') if is_open and not is_24_hours else None
                 close_time = day_item.get('close_time') if is_open and not is_24_hours else None
+                open_time_2 = day_item.get('open_time_2') if has_split_shift else None
+                close_time_2 = day_item.get('close_time_2') if has_split_shift else None
 
                 obj, created = BranchWorkingHours.objects.using(db).update_or_create(
                     branch=branch,
@@ -1388,13 +1394,16 @@ class BranchWorkingHoursViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelV
                     defaults={
                         'is_open': is_open,
                         'is_24_hours': is_24_hours,
+                        'has_split_shift': has_split_shift,
                         'open_time': open_time,
                         'close_time': close_time,
-                        'updated_by': user,
+                        'open_time_2': open_time_2,
+                        'close_time_2': close_time_2,
+                        'updated_by': tenant_user,
                     }
                 )
-                if created and user:
-                    obj.created_by = user
+                if created and tenant_user:
+                    obj.created_by = tenant_user
                     obj.save(using=db, update_fields=['created_by'])
                 saved_items.append(obj)
 
@@ -1404,8 +1413,11 @@ class BranchWorkingHoursViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelV
     def perform_create(self, serializer):
         user = self.request.user if hasattr(self.request, 'user') and self.request.user.is_authenticated else None
         db = self.get_db()
+        tenant_user = user if isinstance(user, TenantUser) else None
+        if not tenant_user and user and hasattr(user, 'email'):
+            tenant_user = TenantUser.objects.using(db).filter(email=user.email).first()
         before_state = None
-        instance = serializer.save(created_by=user, updated_by=user)
+        instance = serializer.save(created_by=tenant_user, updated_by=tenant_user)
         after_state = snapshot_model_state(instance)
         emit_audit_event(
             action='CREATE',
@@ -1421,8 +1433,11 @@ class BranchWorkingHoursViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelV
     def perform_update(self, serializer):
         user = self.request.user if hasattr(self.request, 'user') and self.request.user.is_authenticated else None
         db = self.get_db()
+        tenant_user = user if isinstance(user, TenantUser) else None
+        if not tenant_user and user and hasattr(user, 'email'):
+            tenant_user = TenantUser.objects.using(db).filter(email=user.email).first()
         before_state = snapshot_model_state(serializer.instance)
-        instance = serializer.save(updated_by=user)
+        instance = serializer.save(updated_by=tenant_user)
         after_state = snapshot_model_state(instance)
         emit_audit_event(
             action='UPDATE',
@@ -1481,8 +1496,11 @@ class BranchOperatingExceptionViewSet(TenantScopeMixin, TenantDBMixin, viewsets.
     def perform_create(self, serializer):
         user = self.request.user if hasattr(self.request, 'user') and self.request.user.is_authenticated else None
         db = self.get_db()
+        tenant_user = user if isinstance(user, TenantUser) else None
+        if not tenant_user and user and hasattr(user, 'email'):
+            tenant_user = TenantUser.objects.using(db).filter(email=user.email).first()
         before_state = None
-        instance = serializer.save(created_by=user, updated_by=user)
+        instance = serializer.save(created_by=tenant_user, updated_by=tenant_user)
         after_state = snapshot_model_state(instance)
         emit_audit_event(
             action='CREATE',
@@ -1498,8 +1516,11 @@ class BranchOperatingExceptionViewSet(TenantScopeMixin, TenantDBMixin, viewsets.
     def perform_update(self, serializer):
         user = self.request.user if hasattr(self.request, 'user') and self.request.user.is_authenticated else None
         db = self.get_db()
+        tenant_user = user if isinstance(user, TenantUser) else None
+        if not tenant_user and user and hasattr(user, 'email'):
+            tenant_user = TenantUser.objects.using(db).filter(email=user.email).first()
         before_state = snapshot_model_state(serializer.instance)
-        instance = serializer.save(updated_by=user)
+        instance = serializer.save(updated_by=tenant_user)
         after_state = snapshot_model_state(instance)
         emit_audit_event(
             action='UPDATE',

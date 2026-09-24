@@ -162,6 +162,13 @@ class Branch(models.Model):
     address_line_2 = models.CharField(max_length=250, blank=True, null=True)
     latitude = models.DecimalField(max_digits=10, decimal_places=7, null=True, blank=True)
     longitude = models.DecimalField(max_digits=10, decimal_places=7, null=True, blank=True)
+    geofence_radius_meters = models.IntegerField(default=200, help_text='Maximum allowed distance in meters for attendance check-in')
+    geofence_enforcement = models.CharField(
+        max_length=20,
+        default='STRICT',
+        choices=[('STRICT', 'Strict Lock'), ('FLAG_AUDIT', 'Audit Flag Only')],
+        help_text='Strictly block attendance or flag for audit when outside radius'
+    )
     timezone = models.CharField(max_length=100, default='Asia/Kolkata')
     phone = models.CharField(max_length=30, blank=True, default='')
     email = models.EmailField(blank=True, default='')

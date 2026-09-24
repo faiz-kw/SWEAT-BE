@@ -864,6 +864,15 @@ class BookingWaitlistAttendanceService:
         status: str = 'PRESENT',
         check_in_method: str = 'QR',
         marked_by_user=None,
+        latitude=None,
+        longitude=None,
+        accuracy=None,
+        distance_meters=None,
+        face_verified: bool = False,
+        liveness_score=None,
+        liveness_method: str = '',
+        selfie_image: str = '',
+        challenges_passed=None,
         db_alias: str = None,
     ) -> AttendanceRecord:
         alias = db_alias or get_current_tenant_db_alias() or 'default'
@@ -873,6 +882,32 @@ class BookingWaitlistAttendanceService:
             occurrence = booking.occurrence
             now = timezone.now()
             organization = occurrence.class_template.category.organization
+
+            # Geofence distance calculation & validation
+            computed_distance = distance_meters
+            if computed_distance is None and latitude is not None and longitude is not None and branch.latitude is not None and branch.longitude is not None:
+                import math
+                try:
+                    R = 6371000  # Earth radius in meters
+                    phi1 = math.radians(float(branch.latitude))
+                    phi2 = math.radians(float(latitude))
+                    delta_phi = math.radians(float(latitude) - float(branch.latitude))
+                    delta_lambda = math.radians(float(longitude) - float(branch.longitude))
+                    a = math.sin(delta_phi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2.0) ** 2
+                    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+                    computed_distance = round(R * c, 1)
+                except Exception:
+                    computed_distance = None
+
+            is_within_geofence = True
+            if computed_distance is not None and branch.geofence_radius_meters:
+                if computed_distance > branch.geofence_radius_meters:
+                    is_within_geofence = False
+                    if branch.geofence_enforcement == 'STRICT':
+                        raise ValidationError(
+                            f"Geofence validation failed: You are {int(computed_distance)}m away from {branch.name}. "
+                            f"Attendance check-in is restricted to within {branch.geofence_radius_meters}m."
+                        )
 
             record = AttendanceRecord.objects.using(alias).filter(booking=booking).first()
             if not record:
@@ -886,6 +921,16 @@ class BookingWaitlistAttendanceService:
                     check_in_method=check_in_method,
                     check_in_at=now if status in ['PRESENT', 'LATE'] else None,
                     marked_by_user=marked_by_user,
+                    trainer_latitude=latitude,
+                    trainer_longitude=longitude,
+                    trainer_accuracy_meters=accuracy,
+                    is_within_geofence=is_within_geofence,
+                    geofence_distance_meters=computed_distance,
+                    face_verified=face_verified,
+                    liveness_score=liveness_score,
+                    liveness_method=liveness_method or ('FACE_LIVENESS' if face_verified else ''),
+                    trainer_selfie_url=selfie_image or '',
+                    liveness_challenges_passed=challenges_passed or [],
                 )
             else:
                 record.status = status
@@ -894,6 +939,25 @@ class BookingWaitlistAttendanceService:
                 if status in ['PRESENT', 'LATE']:
                     record.check_in_at = now
                 record.marked_by_user = marked_by_user
+                if latitude is not None:
+                    record.trainer_latitude = latitude
+                if longitude is not None:
+                    record.trainer_longitude = longitude
+                if accuracy is not None:
+                    record.trainer_accuracy_meters = accuracy
+                record.is_within_geofence = is_within_geofence
+                if computed_distance is not None:
+                    record.geofence_distance_meters = computed_distance
+                if face_verified:
+                    record.face_verified = True
+                if liveness_score is not None:
+                    record.liveness_score = liveness_score
+                if liveness_method:
+                    record.liveness_method = liveness_method
+                if selfie_image:
+                    record.trainer_selfie_url = selfie_image
+                if challenges_passed:
+                    record.liveness_challenges_passed = challenges_passed
                 record.save(using=alias)
 
             # Update booking lifecycle

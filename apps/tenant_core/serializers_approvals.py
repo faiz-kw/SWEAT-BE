@@ -19,3 +19,7 @@ class ApprovalRequestSerializer(serializers.ModelSerializer):
         model = ApprovalRequest
         fields = '__all__'
         read_only_fields = ['id', 'status', 'resolved_at', 'created_at', 'updated_at']
+        extra_kwargs = {
+            'organization': {'required': False},
+            'requested_by_user': {'required': False},
+        }

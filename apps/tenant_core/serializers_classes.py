@@ -237,10 +237,74 @@ class ClassOccurrenceTrainerSerializer(serializers.ModelSerializer):
 class ClassOccurrenceSerializer(serializers.ModelSerializer):
     class_name = serializers.CharField(source='class_template.name', read_only=True)
     branch_name = serializers.CharField(source='branch.name', read_only=True)
+    branch_latitude = serializers.DecimalField(source='branch.latitude', max_digits=10, decimal_places=7, read_only=True)
+    branch_longitude = serializers.DecimalField(source='branch.longitude', max_digits=10, decimal_places=7, read_only=True)
+    branch_geofence_radius_meters = serializers.IntegerField(source='branch.geofence_radius_meters', read_only=True)
+    branch_geofence_enforcement = serializers.CharField(source='branch.geofence_enforcement', read_only=True)
     trainers = ClassOccurrenceTrainerSerializer(source='trainer_assignments', many=True, read_only=True)
     active_content = serializers.SerializerMethodField()
+    trainer_checked_in = serializers.SerializerMethodField()
+    trainer_check_in_details = serializers.SerializerMethodField()
+    booking_count = serializers.SerializerMethodField()
+    waitlist_count = serializers.SerializerMethodField()
     start_time = serializers.TimeField(write_only=True, required=False)
     end_time = serializers.TimeField(write_only=True, required=False)
+
+    def get_trainer_checked_in(self, obj):
+        try:
+            return any(t.status == 'CONFIRMED' for t in obj.trainer_assignments.all())
+        except Exception:
+            return False
+
+    def get_trainer_check_in_details(self, obj):
+        try:
+            confirmed = next((t for t in obj.trainer_assignments.all() if t.status == 'CONFIRMED'), None)
+            if confirmed:
+                t_name = None
+                if confirmed.trainer_profile and getattr(confirmed.trainer_profile, 'employee_profile', None):
+                    up = getattr(confirmed.trainer_profile.employee_profile, 'user_profile', None)
+                    if up and getattr(up, 'user', None):
+                        t_name = up.user.full_name or up.user.email
+                if not t_name and confirmed.trainer_profile:
+                    t_name = confirmed.trainer_profile.trainer_code
+                return {
+                    'checked_in': True,
+                    'trainer_name': t_name or 'Trainer',
+                    'status': 'CONFIRMED',
+                }
+            assigned = next((t for t in obj.trainer_assignments.all() if t.status in ['ASSIGNED', 'CONFIRMED']), None)
+            if assigned:
+                t_name = None
+                if assigned.trainer_profile and getattr(assigned.trainer_profile, 'employee_profile', None):
+                    up = getattr(assigned.trainer_profile.employee_profile, 'user_profile', None)
+                    if up and getattr(up, 'user', None):
+                        t_name = up.user.full_name or up.user.email
+                if not t_name and assigned.trainer_profile:
+                    t_name = assigned.trainer_profile.trainer_code
+                return {
+                    'checked_in': False,
+                    'trainer_name': t_name or 'Trainer',
+                    'status': 'PENDING',
+                }
+            return {
+                'checked_in': False,
+                'trainer_name': None,
+                'status': 'UNASSIGNED',
+            }
+        except Exception:
+            return {'checked_in': False, 'status': 'UNKNOWN'}
+
+    def get_booking_count(self, obj):
+        try:
+            return sum(1 for b in obj.bookings.all() if b.status in ['CONFIRMED', 'RESERVED', 'COMPLETED'])
+        except Exception:
+            return 0
+
+    def get_waitlist_count(self, obj):
+        try:
+            return sum(1 for b in obj.bookings.all() if b.status == 'WAITLISTED')
+        except Exception:
+            return 0
 
     def get_active_content(self, obj):
         try:
@@ -261,11 +325,13 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
         model = ClassOccurrence
         fields = [
             'id', 'class_template', 'class_name', 'schedule_rule', 'branch', 'branch_name',
+            'branch_latitude', 'branch_longitude', 'branch_geofence_radius_meters', 'branch_geofence_enforcement',
             'occurrence_date', 'start_at', 'end_at', 'start_time', 'end_time', 'delivery_mode',
             'online_provider', 'online_join_url', 'capacity', 'trial_capacity',
             'waitlist_capacity', 'booking_open_at', 'booking_close_at',
             'cancellation_cutoff_at', 'status', 'is_manual', 'is_override',
-            'trainers', 'active_content', 'created_at', 'updated_at'
+            'trainers', 'trainer_checked_in', 'trainer_check_in_details', 'booking_count', 'waitlist_count',
+            'active_content', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
         extra_kwargs = {

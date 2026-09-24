@@ -45,6 +45,7 @@ class AttendanceRecord(models.Model):
             ('MOBILE', 'MOBILE'),
             ('FRONT_DESK', 'FRONT_DESK'),
             ('ADMIN', 'ADMIN'),
+            ('FACE_LIVENESS', 'FACE_LIVENESS'),
         ]
     )
     check_in_at = models.DateTimeField(null=True, blank=True)
@@ -53,6 +54,19 @@ class AttendanceRecord(models.Model):
     completion_verified_at = models.DateTimeField(null=True, blank=True)
     no_show_evaluated_at = models.DateTimeField(null=True, blank=True)
     marked_by_user = models.ForeignKey(TenantUser, on_delete=models.SET_NULL, null=True, blank=True, related_name='marked_attendances')
+
+    # Geofencing & Biometric Anti-Spoofing Verification
+    trainer_latitude = models.DecimalField(max_digits=10, decimal_places=7, null=True, blank=True)
+    trainer_longitude = models.DecimalField(max_digits=10, decimal_places=7, null=True, blank=True)
+    trainer_accuracy_meters = models.FloatField(null=True, blank=True)
+    is_within_geofence = models.BooleanField(default=True)
+    geofence_distance_meters = models.FloatField(null=True, blank=True)
+    face_verified = models.BooleanField(default=False)
+    liveness_score = models.FloatField(null=True, blank=True)
+    liveness_method = models.CharField(max_length=50, blank=True, default='')
+    trainer_selfie_url = models.TextField(blank=True, default='')
+    liveness_challenges_passed = models.JSONField(default=list, blank=True)
+
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(default=timezone.now)
 

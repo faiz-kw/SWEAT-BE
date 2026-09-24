@@ -143,6 +143,10 @@ class AdminApprovalService:
                 approval_request.resolved_at = timezone.now()
                 approval_request.save(using=alias, update_fields=['status', 'resolved_at', 'updated_at'])
 
+                # Automatic materialization for workforce schedule/leave exceptions
+                if approval_request.request_type in ['TRAINER_LEAVE_REQUEST', 'SCHEDULE_EXCEPTION_REQUEST']:
+                    cls._materialize_schedule_exception(approval_request, alias=alias)
+
         record_business_audit(
             organization=approval_request.organization,
             module='approvals',
@@ -173,3 +177,61 @@ class AdminApprovalService:
         )
 
         return action_record
+
+    @classmethod
+    def _materialize_schedule_exception(cls, approval_request: ApprovalRequest, alias: str = 'default'):
+        """
+        Creates or updates an active EmployeeScheduleException when a workforce
+        leave/exception approval request is granted.
+        """
+        from .models_workforce import EmployeeProfile, EmployeeScheduleException
+        from .models_org import Branch
+
+        payload = approval_request.requested_payload or {}
+        emp_id = payload.get('employee_profile_id')
+        emp = None
+        if emp_id:
+            emp = EmployeeProfile.objects.using(alias).filter(id=emp_id).first()
+        if not emp:
+            user = approval_request.requested_by_user
+            emp = EmployeeProfile.objects.using(alias).filter(user_profile__user=user).first()
+
+        if not emp:
+            logger.warning(
+                "Cannot materialize schedule exception for ApprovalRequest %s: EmployeeProfile not found.",
+                approval_request.id
+            )
+            return
+
+        branch_id = payload.get('branch_id')
+        branch = Branch.objects.using(alias).filter(id=branch_id).first() if branch_id else None
+        exception_date = payload.get('exception_date')
+        if not exception_date:
+            logger.warning(
+                "Cannot materialize schedule exception for ApprovalRequest %s: exception_date missing.",
+                approval_request.id
+            )
+            return
+
+        exception_type = payload.get('exception_type', 'LEAVE')
+        is_available = payload.get('is_available')
+        if is_available is None:
+            is_available = exception_type in ['WEEKLY_OFF_OVERRIDE', 'SPECIAL_SHIFT', 'TEMPORARY_AVAILABILITY']
+
+        start_time = payload.get('start_time') or None
+        end_time = payload.get('end_time') or None
+        reason = payload.get('reason') or f"Approved {exception_type} request #{str(approval_request.id)[:8]}"
+
+        EmployeeScheduleException.objects.using(alias).update_or_create(
+            employee_profile=emp,
+            exception_date=exception_date,
+            defaults={
+                'branch': branch,
+                'exception_type': exception_type,
+                'is_available': is_available,
+                'start_time': start_time,
+                'end_time': end_time,
+                'reason': reason,
+                'status': 'ACTIVE',
+            }
+        )

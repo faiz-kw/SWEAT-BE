@@ -32,7 +32,8 @@ class BranchSerializer(serializers.ModelSerializer):
     class Meta:
         model = Branch
         fields = ['id', 'organization', 'company_entity', 'location', 'location_name', 'city', 'code', 'name',
-                  'address', 'address_line_1', 'address_line_2', 'latitude', 'longitude', 'timezone',
+                  'address', 'address_line_1', 'address_line_2', 'latitude', 'longitude',
+                  'geofence_radius_meters', 'geofence_enforcement', 'timezone',
                   'phone', 'email', 'capacity', 'business_open_time', 'business_close_time', 'operating_hours',
                   'status', 'created_at']
         read_only_fields = ['id', 'created_at']
@@ -71,6 +72,8 @@ class TenantUserSerializer(serializers.ModelSerializer):
     tenant_id = serializers.SerializerMethodField()
     tenant_name = serializers.SerializerMethodField()
     is_active = serializers.BooleanField(source='is_accessible', read_only=True)
+    reports_to_id = serializers.SerializerMethodField()
+    reports_to_name = serializers.SerializerMethodField()
 
     class Meta:
         model = TenantUser
@@ -81,11 +84,38 @@ class TenantUserSerializer(serializers.ModelSerializer):
             'last_login_at', 'created_at',
             'full_name', 'role', 'role_name', 'roles', 'branch_access', 'department', 'departments',
             'home_branch_name', 'active_location_name', 'active_location_id', 'tenant_id', 'tenant_name', 'is_active',
+            'reports_to_id', 'reports_to_name',
         ]
         read_only_fields = ['id', 'last_login_at', 'created_at', 'deactivated_at', 'deactivated_by']
         extra_kwargs = {
             'organization': {'required': False},
         }
+
+    def get_reports_to_id(self, obj):
+        try:
+            profile = getattr(obj, 'profile', None)
+            emp = getattr(profile, 'employee_profile', None) if profile else None
+            mgr = emp.reporting_manager if emp else None
+            if mgr:
+                mgr_user = mgr.user_profile.user if (mgr.user_profile and mgr.user_profile.user) else None
+                return str(mgr_user.id) if mgr_user else str(mgr.id)
+        except Exception:
+            pass
+        return None
+
+    def get_reports_to_name(self, obj):
+        try:
+            profile = getattr(obj, 'profile', None)
+            emp = getattr(profile, 'employee_profile', None) if profile else None
+            mgr = emp.reporting_manager if emp else None
+            if mgr:
+                mgr_user = mgr.user_profile.user if (mgr.user_profile and mgr.user_profile.user) else None
+                if mgr_user:
+                    return mgr_user.full_name or mgr_user.email
+                return mgr.employee_code or 'Supervisor'
+        except Exception:
+            pass
+        return None
 
     def get_tenant_id(self, obj):
         return str(obj.organization_id) if obj.organization_id else ''
@@ -266,7 +296,45 @@ class TenantUserSerializer(serializers.ModelSerializer):
                             'detail': str(qc),
                             'code': 'QUOTA_CONFIG_ERROR',
                         })
-                    return super().update(instance, validated_data)
+
+        # Update reporting manager if reports_to_id is provided in payload
+        if hasattr(self, 'initial_data') and 'reports_to_id' in self.initial_data:
+            reports_to_param = self.initial_data.get('reports_to_id')
+            import uuid
+            from .models_workforce import UserProfile, EmployeeProfile
+            db_alias = getattr(getattr(instance, '_state', None), 'db', None) or 'default'
+            user_profile, _ = UserProfile.objects.using(db_alias).get_or_create(
+                user=instance,
+                defaults={'first_name_snapshot': instance.first_name, 'last_name_snapshot': instance.last_name}
+            )
+            mgr_emp = None
+            if reports_to_param and str(reports_to_param).strip() and str(reports_to_param).strip().lower() not in ('none', 'unassigned', ''):
+                try:
+                    mgr_user = TenantUser.objects.using(db_alias).filter(id=uuid.UUID(str(reports_to_param))).first()
+                    if mgr_user:
+                        mgr_prof, _ = UserProfile.objects.using(db_alias).get_or_create(
+                            user=mgr_user,
+                            defaults={'first_name_snapshot': mgr_user.first_name, 'last_name_snapshot': mgr_user.last_name}
+                        )
+                        mgr_emp, _ = EmployeeProfile.objects.using(db_alias).get_or_create(
+                            user_profile=mgr_prof,
+                            organization=instance.organization,
+                            defaults={'employee_code': f"EMP-{mgr_user.id.hex[:6].upper()}"}
+                        )
+                except Exception:
+                    mgr_emp = None
+
+            emp_profile, _ = EmployeeProfile.objects.using(db_alias).get_or_create(
+                user_profile=user_profile,
+                organization=instance.organization,
+                defaults={
+                    'employee_code': f"EMP-{instance.id.hex[:6].upper()}",
+                    'reporting_manager': mgr_emp,
+                }
+            )
+            if emp_profile.reporting_manager != mgr_emp:
+                emp_profile.reporting_manager = mgr_emp
+                emp_profile.save(using=db_alias, update_fields=['reporting_manager'])
 
         return super().update(instance, validated_data)
 
@@ -279,9 +347,10 @@ class TenantUserCreateSerializer(TenantUserSerializer):
     branch = serializers.CharField(write_only=True, required=False, allow_blank=True)
     branch_id = serializers.CharField(write_only=True, required=False, allow_blank=True)
     home_branch = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    reports_to_id = serializers.CharField(write_only=True, required=False, allow_blank=True, allow_null=True)
 
     class Meta(TenantUserSerializer.Meta):
-        fields = TenantUserSerializer.Meta.fields + ['password', 'role', 'role_id', 'department_id', 'branch', 'branch_id']
+        fields = TenantUserSerializer.Meta.fields + ['password', 'role', 'role_id', 'department_id', 'branch', 'branch_id', 'reports_to_id']
 
     def validate_password(self, value):
         if not value:
@@ -331,6 +400,7 @@ class TenantUserCreateSerializer(TenantUserSerializer):
         role_param = validated_data.pop('role', None)
         role_id_param = validated_data.pop('role_id', None)
         dept_id_param = validated_data.pop('department_id', None)
+        reports_to_id_param = validated_data.pop('reports_to_id', None)
         # Consume every alias: the frontend sends all three. Short-circuiting
         # pop() leaves branch_id in the model kwargs and causes a TypeError.
         branch_value = validated_data.pop('branch', None)
@@ -499,6 +569,46 @@ class TenantUserCreateSerializer(TenantUserSerializer):
                     scope_type='HOME',
                     defaults={'is_active': True, 'status': 'ACTIVE', 'is_primary': True, 'relationship_type': 'PRIMARY'},
                 )
+
+            # 9. Handle Reporting Manager & EmployeeProfile (Optional for non-Org Admin roles)
+            from .models_workforce import UserProfile, EmployeeProfile
+            user_profile, _ = UserProfile.objects.using(db_alias).get_or_create(
+                user=user,
+                defaults={
+                    'first_name_snapshot': user.first_name,
+                    'last_name_snapshot': user.last_name,
+                }
+            )
+            mgr_emp = None
+            role_code = (target_role.code if target_role else str(role_param or '')).upper()
+            if role_code not in ('ORG_ADMIN', 'SUPER_ADMIN', 'ORGANIZATION_ADMINISTRATOR') and reports_to_id_param:
+                if str(reports_to_id_param).strip().lower() not in ('none', 'unassigned', ''):
+                    try:
+                        mgr_user = TenantUser.objects.using(db_alias).filter(id=uuid.UUID(str(reports_to_id_param))).first()
+                        if mgr_user:
+                            mgr_prof, _ = UserProfile.objects.using(db_alias).get_or_create(
+                                user=mgr_user,
+                                defaults={'first_name_snapshot': mgr_user.first_name, 'last_name_snapshot': mgr_user.last_name}
+                            )
+                            mgr_emp, _ = EmployeeProfile.objects.using(db_alias).get_or_create(
+                                user_profile=mgr_prof,
+                                organization=org,
+                                defaults={'employee_code': f"EMP-{mgr_user.id.hex[:6].upper()}"}
+                            )
+                    except Exception:
+                        mgr_emp = None
+
+            emp_profile, _ = EmployeeProfile.objects.using(db_alias).get_or_create(
+                user_profile=user_profile,
+                organization=org,
+                defaults={
+                    'employee_code': f"EMP-{user.id.hex[:6].upper()}",
+                    'reporting_manager': mgr_emp,
+                }
+            )
+            if emp_profile.reporting_manager != mgr_emp:
+                emp_profile.reporting_manager = mgr_emp
+                emp_profile.save(using=db_alias, update_fields=['reporting_manager'])
 
             return user
 
@@ -813,6 +923,7 @@ class BranchWorkingHoursSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'branch', 'day_of_week', 'is_open',
             'open_time', 'close_time', 'is_24_hours',
+            'has_split_shift', 'open_time_2', 'close_time_2',
             'created_by', 'updated_by', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'created_by', 'updated_by', 'created_at', 'updated_at']
@@ -826,10 +937,16 @@ class BranchWorkingHoursSerializer(serializers.ModelSerializer):
         is_24_hours = data.get('is_24_hours', getattr(self.instance, 'is_24_hours', False))
         open_time = data.get('open_time', getattr(self.instance, 'open_time', None))
         close_time = data.get('close_time', getattr(self.instance, 'close_time', None))
+        has_split_shift = data.get('has_split_shift', getattr(self.instance, 'has_split_shift', False))
+        open_time_2 = data.get('open_time_2', getattr(self.instance, 'open_time_2', None))
+        close_time_2 = data.get('close_time_2', getattr(self.instance, 'close_time_2', None))
 
         if is_open and not is_24_hours:
             if not open_time or not close_time:
                 raise serializers.ValidationError('open_time and close_time are required when branch is open and not 24 hours.')
+            if has_split_shift:
+                if not open_time_2 or not close_time_2:
+                    raise serializers.ValidationError('open_time_2 and close_time_2 are required when split shift is enabled.')
 
         return data
 

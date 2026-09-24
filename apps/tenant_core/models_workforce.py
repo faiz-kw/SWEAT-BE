@@ -298,8 +298,10 @@ class EmployeeScheduleException(models.Model):
     EXCEPTION_TYPES = [
         ('LEAVE', 'Leave'),
         ('WEEKLY_OFF', 'Weekly Off'),
-        ('UNAVAILABLE', 'Unavailable'),
+        ('WEEKLY_OFF_OVERRIDE', 'Weekly Off Override'),
         ('SPECIAL_SHIFT', 'Special Shift'),
+        ('UNAVAILABLE', 'Unavailable'),
+        ('TEMPORARY_AVAILABILITY', 'Temporary Availability'),
         ('OTHER', 'Other'),
     ]
     STATUSES = [

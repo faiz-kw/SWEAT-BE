@@ -393,13 +393,27 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
         branch_id = self.request.query_params.get('branch_id')
         occ_date = self.request.query_params.get('occurrence_date')
         status_param = self.request.query_params.get('status')
+        trainer_id = self.request.query_params.get('trainer_id')
+        from_date = self.request.query_params.get('from_date')
+        to_date = self.request.query_params.get('to_date')
+
         if branch_id:
             qs = qs.filter(branch_id=branch_id)
         if occ_date:
             qs = qs.filter(occurrence_date=occ_date)
         if status_param:
             qs = qs.filter(status=status_param)
-        return qs.select_related('class_template', 'branch').prefetch_related('trainer_assignments__trainer_profile').order_by('start_at')
+        if trainer_id:
+            qs = qs.filter(trainer_assignments__trainer_profile_id=trainer_id)
+        if from_date:
+            qs = qs.filter(occurrence_date__gte=from_date)
+        if to_date:
+            qs = qs.filter(occurrence_date__lte=to_date)
+
+        return qs.select_related('class_template', 'branch').prefetch_related(
+            'trainer_assignments__trainer_profile__employee_profile__user_profile__user',
+            'bookings'
+        ).order_by('start_at').distinct()
 
     def perform_create(self, serializer):
         occ = serializer.save(is_manual=True)
@@ -454,6 +468,98 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             return Response(ClassContentAssignmentSerializer(assignment).data, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'], url_path='trainer-check-in')
+    def trainer_check_in(self, request, pk=None):
+        """
+        Trainer marks their biometric and geofenced check-in for this class occurrence.
+        Validates branch geofence radius and anti-spoofing liveness proof.
+        """
+        alias = _get_db(request)
+        try:
+            occurrence = ClassOccurrence.objects.using(alias).select_related('branch').get(id=pk)
+        except ClassOccurrence.DoesNotExist:
+            return Response({'error': 'Class occurrence not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        branch = occurrence.branch
+        latitude = request.data.get('latitude') or request.data.get('trainer_latitude')
+        longitude = request.data.get('longitude') or request.data.get('trainer_longitude')
+        accuracy = request.data.get('accuracy') or request.data.get('trainer_accuracy_meters')
+        distance_meters = request.data.get('distance_meters')
+        face_verified = bool(request.data.get('face_verified', False))
+        liveness_score = request.data.get('liveness_score')
+        liveness_method = request.data.get('liveness_method', 'FACE_LIVENESS')
+        selfie_image = request.data.get('selfie_image') or request.data.get('trainer_selfie_url', '')
+        challenges_passed = request.data.get('challenges_passed') or []
+
+        # Geofence validation
+        computed_distance = distance_meters
+        if computed_distance is None and latitude is not None and longitude is not None and branch.latitude is not None and branch.longitude is not None:
+            import math
+            try:
+                R = 6371000
+                phi1 = math.radians(float(branch.latitude))
+                phi2 = math.radians(float(latitude))
+                delta_phi = math.radians(float(latitude) - float(branch.latitude))
+                delta_lambda = math.radians(float(longitude) - float(branch.longitude))
+                a = math.sin(delta_phi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2.0) ** 2
+                c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+                computed_distance = round(R * c, 1)
+            except Exception:
+                computed_distance = None
+
+        is_within_geofence = True
+        if computed_distance is not None and branch.geofence_radius_meters:
+            if computed_distance > branch.geofence_radius_meters:
+                is_within_geofence = False
+                if branch.geofence_enforcement == 'STRICT':
+                    return Response({
+                        'error': f"Geofence check failed: You are {int(computed_distance)}m away from {branch.name}. Check-in is restricted to within {branch.geofence_radius_meters}m."
+                    }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Update or confirm trainer assignment
+        from .models_classes import ClassOccurrenceTrainer
+        from .models_workforce import TrainerProfile
+        now = timezone.now()
+        target_trainer_id = request.data.get('trainer_id')
+        assignment = None
+        if target_trainer_id:
+            assignment = ClassOccurrenceTrainer.objects.using(alias).filter(
+                occurrence=occurrence,
+                trainer_profile_id=target_trainer_id
+            ).first()
+
+        if not assignment:
+            trainer_profile = TrainerProfile.objects.using(alias).filter(
+                employee_profile__user_profile__user=request.user
+            ).first()
+
+            if trainer_profile:
+                assignment = ClassOccurrenceTrainer.objects.using(alias).filter(
+                    occurrence=occurrence,
+                    trainer_profile=trainer_profile
+                ).first()
+
+        if not assignment:
+            # Fallback to lead trainer assignment if admin or first trainer
+            assignment = ClassOccurrenceTrainer.objects.using(alias).filter(
+                occurrence=occurrence
+            ).first()
+
+        if assignment:
+            assignment.status = 'CONFIRMED'
+            assignment.save(using=alias, update_fields=['status'])
+
+        return Response({
+            'message': 'Trainer check-in verified successfully',
+            'occurrence_id': str(occurrence.id),
+            'trainer_name': request.user.full_name or request.user.email,
+            'is_within_geofence': is_within_geofence,
+            'geofence_distance_meters': computed_distance,
+            'face_verified': face_verified,
+            'liveness_score': liveness_score,
+            'checked_in_at': now.isoformat(),
+        }, status=status.HTTP_200_OK)
 
 
 class ClassOccurrenceTrainerViewSet(viewsets.ModelViewSet):

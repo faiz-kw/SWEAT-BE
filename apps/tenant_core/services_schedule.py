@@ -51,9 +51,13 @@ class BranchScheduleService:
                     'is_24_hours': False,
                     'open_time': None,
                     'close_time': None,
+                    'has_split_shift': False,
+                    'open_time_2': None,
+                    'close_time_2': None,
                     'source': 'EXCEPTION',
                     'reason': exception.reason,
                     'is_overnight': False,
+                    'is_overnight_2': False,
                 }
             is_overnight = (
                 exception.open_time is not None and
@@ -66,9 +70,13 @@ class BranchScheduleService:
                 'is_24_hours': False,
                 'open_time': exception.open_time,
                 'close_time': exception.close_time,
+                'has_split_shift': False,
+                'open_time_2': None,
+                'close_time_2': None,
                 'source': 'EXCEPTION',
                 'reason': exception.reason,
                 'is_overnight': is_overnight,
+                'is_overnight_2': False,
             }
 
         # No exception: check weekly working hours
@@ -86,9 +94,13 @@ class BranchScheduleService:
                 'is_24_hours': False,
                 'open_time': None,
                 'close_time': None,
+                'has_split_shift': False,
+                'open_time_2': None,
+                'close_time_2': None,
                 'source': 'WEEKLY_SCHEDULE' if working_hours else 'DEFAULT_CLOSED',
                 'reason': None,
                 'is_overnight': False,
+                'is_overnight_2': False,
             }
 
         if working_hours.is_24_hours:
@@ -98,9 +110,13 @@ class BranchScheduleService:
                 'is_24_hours': True,
                 'open_time': time(0, 0),
                 'close_time': time(23, 59, 59),
+                'has_split_shift': False,
+                'open_time_2': None,
+                'close_time_2': None,
                 'source': 'WEEKLY_SCHEDULE',
                 'reason': None,
                 'is_overnight': False,
+                'is_overnight_2': False,
             }
 
         is_overnight = (
@@ -108,22 +124,36 @@ class BranchScheduleService:
             working_hours.close_time is not None and
             working_hours.close_time < working_hours.open_time
         )
+        has_split_shift = bool(getattr(working_hours, 'has_split_shift', False))
+        open_time_2 = getattr(working_hours, 'open_time_2', None) if has_split_shift else None
+        close_time_2 = getattr(working_hours, 'close_time_2', None) if has_split_shift else None
+        is_overnight_2 = (
+            has_split_shift and
+            open_time_2 is not None and
+            close_time_2 is not None and
+            close_time_2 < open_time_2
+        )
         return {
             'date': target_date,
             'is_open': True,
             'is_24_hours': False,
             'open_time': working_hours.open_time,
             'close_time': working_hours.close_time,
+            'has_split_shift': has_split_shift,
+            'open_time_2': open_time_2,
+            'close_time_2': close_time_2,
             'source': 'WEEKLY_SCHEDULE',
             'reason': None,
             'is_overnight': is_overnight,
+            'is_overnight_2': is_overnight_2,
         }
 
     @classmethod
     def is_branch_open_at(cls, branch: Branch, target_dt: datetime) -> bool:
         """
         Evaluates whether a branch is open at a specific localized datetime.
-        Handles Rule 1 (branch timezone) and Rule 4 (overnight schedule resolution).
+        Handles Rule 1 (branch timezone), Rule 4 (overnight schedule resolution),
+        and split shift / two-batch daily operations.
         """
         branch_tz = cls.get_branch_timezone(branch)
         if timezone.is_aware(target_dt):
@@ -141,20 +171,36 @@ class BranchScheduleService:
                 return True
             op = today_sched['open_time']
             cl = today_sched['close_time']
-            if not today_sched['is_overnight']:
-                if op <= local_time <= cl:
-                    return True
-            else:
-                # Overnight: open today from op until midnight
-                if local_time >= op:
-                    return True
+            if op and cl:
+                if not today_sched['is_overnight']:
+                    if op <= local_time <= cl:
+                        return True
+                else:
+                    # Overnight: open today from op until midnight
+                    if local_time >= op:
+                        return True
+
+            # Check shift 2 if split shift
+            if today_sched.get('has_split_shift'):
+                op2 = today_sched.get('open_time_2')
+                cl2 = today_sched.get('close_time_2')
+                if op2 and cl2:
+                    if not today_sched.get('is_overnight_2'):
+                        if op2 <= local_time <= cl2:
+                            return True
+                    else:
+                        if local_time >= op2:
+                            return True
 
         # Check yesterday's schedule for overnight spillover into early morning
         yesterday_date = local_date - timedelta(days=1)
         yesterday_sched = cls.get_effective_schedule_for_date(branch, yesterday_date)
-        if yesterday_sched['is_open'] and yesterday_sched['is_overnight']:
-            # Spills over until cl
-            if local_time <= yesterday_sched['close_time']:
-                return True
+        if yesterday_sched['is_open']:
+            if yesterday_sched.get('is_overnight') and yesterday_sched.get('close_time'):
+                if local_time <= yesterday_sched['close_time']:
+                    return True
+            if yesterday_sched.get('has_split_shift') and yesterday_sched.get('is_overnight_2') and yesterday_sched.get('close_time_2'):
+                if local_time <= yesterday_sched['close_time_2']:
+                    return True
 
         return False

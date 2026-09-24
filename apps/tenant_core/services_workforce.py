@@ -141,10 +141,13 @@ class TrainerAvailabilityService:
                         f"Trainer is unavailable from {exc.start_time} to {exc.end_time} on {target_date}."
                     ), {'code': 'SCHEDULE_EXCEPTION_PARTIAL_ABSENT'}
             else:
-                # Special shift override
+                # Special shift or availability override
                 if exc.start_time and exc.end_time:
                     if target_start_time >= exc.start_time and target_end_time <= exc.end_time:
                         has_special_shift = True
+                else:
+                    # Full day override (e.g. WEEKLY_OFF_OVERRIDE or TEMPORARY_AVAILABILITY covering entire day)
+                    has_special_shift = True
 
         # 4. Working Schedule Check (if no special shift override was applied)
         if not has_special_shift:
