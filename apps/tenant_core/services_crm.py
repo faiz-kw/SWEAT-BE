@@ -44,10 +44,68 @@ from .models_crm import (
     CRMStageSlaPolicy,
     CRMTrialReminderPolicy,
 )
+from .models_govern import InAppNotification, NotificationTemplate
 from .services_workforce import TrainerAvailabilityService
 from .services_reliability import record_business_audit, enqueue_outbox_event
 
 logger = logging.getLogger(__name__)
+
+
+def send_in_app_notification(
+    organization: Organization,
+    user: TenantUser,
+    notification_type: str,
+    title: str,
+    message: str,
+    data: Optional[Dict[str, Any]] = None,
+    deep_link: str = '',
+    idempotency_key: Optional[str] = None,
+    db_alias: Optional[str] = None,
+) -> InAppNotification:
+    """
+    Authoritative in-app notification creator with idempotency and template resolution.
+    """
+    alias = db_alias or get_tenant_db_alias() or 'default'
+    if idempotency_key:
+        existing = InAppNotification.objects.using(alias).filter(
+            organization=organization,
+            user=user,
+            idempotency_key=idempotency_key,
+        ).first()
+        if existing:
+            return existing
+
+    try:
+        tmpl = NotificationTemplate.objects.using(alias).filter(
+            organization=organization,
+            event_type=notification_type,
+            is_active=True,
+        ).first()
+        if tmpl and tmpl.body:
+            payload_data = data or {}
+            msg_text = tmpl.body
+            for k, v in payload_data.items():
+                msg_text = msg_text.replace(f"{{{{{k}}}}}", str(v) if v is not None else '')
+            message = msg_text
+            if tmpl.subject:
+                subj_text = tmpl.subject
+                for k, v in payload_data.items():
+                    subj_text = subj_text.replace(f"{{{{{k}}}}}", str(v) if v is not None else '')
+                title = subj_text
+    except Exception as e:
+        logger.warning("Error resolving NotificationTemplate for %s: %s", notification_type, e)
+
+    return InAppNotification.objects.using(alias).create(
+        organization=organization,
+        user=user,
+        notification_type=notification_type,
+        title=title,
+        message=message,
+        data=data or {},
+        deep_link=deep_link,
+        idempotency_key=idempotency_key,
+        is_read=False,
+    )
 
 # Valid transitions state machine
 VALID_LEAD_TRANSITIONS = {
@@ -204,12 +262,62 @@ class CRMLeadService:
 
             # Record initial assignment if specified
             if assigned_sales_user:
-                LeadAssignment.objects.using(alias).create(
+                initial_assign = LeadAssignment.objects.using(alias).create(
                     lead=lead,
                     assigned_to_user=assigned_sales_user,
                     assigned_by_user=actor_user,
                     assignment_type='SALES',
                     status='ACTIVE',
+                )
+                record_business_audit(
+                    organization=organization,
+                    branch=branch,
+                    actor_type='EMPLOYEE' if actor_user else 'SYSTEM',
+                    actor_user=actor_user,
+                    module='crm',
+                    action_code='CRM_LEAD_ASSIGNED',
+                    entity_type='LeadAssignment',
+                    entity_id=initial_assign.id,
+                    event_description=f"Assigned lead {lead.first_name} {lead.last_name} to {assigned_sales_user.email}",
+                    after_data={
+                        'lead_id': str(lead.id),
+                        'assigned_to_user_id': str(assigned_sales_user.id),
+                        'branch_id': str(branch.id) if branch else None,
+                        'assignment_type': 'SALES',
+                    },
+                    db_alias=alias,
+                )
+                enqueue_outbox_event(
+                    organization=organization,
+                    event_type='crm.lead.assigned',
+                    aggregate_type='Lead',
+                    aggregate_id=lead.id,
+                    payload={
+                        'lead_id': str(lead.id),
+                        'assigned_user_id': str(assigned_sales_user.id),
+                        'branch_id': str(branch.id) if branch else None,
+                        'assigned_by': str(actor_user.id) if actor_user else None,
+                        'assignment_type': 'SALES',
+                        'created_at': timezone.now().isoformat(),
+                    },
+                    db_alias=alias,
+                )
+                send_in_app_notification(
+                    organization=organization,
+                    user=assigned_sales_user,
+                    notification_type='LEAD_ASSIGNED',
+                    title='New Lead Assigned',
+                    message=f"A new lead has been assigned to you: {lead.first_name} {lead.last_name} — {branch.name if branch else 'General'}",
+                    data={
+                        'lead_id': str(lead.id),
+                        'lead_name': f"{lead.first_name} {lead.last_name}",
+                        'branch_name': branch.name if branch else 'General',
+                        'branch_id': str(branch.id) if branch else None,
+                        'assigned_by': actor_user.email if actor_user else 'System',
+                    },
+                    deep_link=f"/crm/leads?lead_id={lead.id}",
+                    idempotency_key=f"lead_assigned:{lead.id}:{assigned_sales_user.id}:initial",
+                    db_alias=alias,
                 )
 
             # Record initial marketing attribution if supplied and has actual data
@@ -836,18 +944,37 @@ class CRMLeadService:
         lead: Lead,
         assigned_to_user: TenantUser,
         assignment_type: str = 'SALES',
+        notes: str = '',
         actor_user: Optional[TenantUser] = None,
         db_alias: Optional[str] = None,
     ) -> LeadAssignment:
         alias = db_alias or get_tenant_db_alias() or 'default'
 
+        # Security & Tenant Isolation checks
+        if assigned_to_user.organization_id != lead.organization_id:
+            raise ValidationError("Target user does not belong to the same organization.")
+        if assigned_to_user.status != 'ACTIVE' or not assigned_to_user.is_login_allowed:
+            raise ValidationError("Target user is inactive or login is disabled.")
+
         with transaction.atomic(using=alias):
-            # Deactivate previous active assignment of same type
-            LeadAssignment.objects.using(alias).filter(
+            # Check for existing active assignment to the same user (Idempotent replay protection)
+            existing_active = LeadAssignment.objects.using(alias).filter(
                 lead=lead,
                 assignment_type=assignment_type,
                 status='ACTIVE',
-            ).update(status='INACTIVE', unassigned_at=timezone.now())
+            ).first()
+
+            if existing_active and existing_active.assigned_to_user_id == assigned_to_user.id:
+                # Same user already actively assigned - do not duplicate
+                return existing_active
+
+            prev_user = existing_active.assigned_to_user if existing_active else None
+
+            # Deactivate previous active assignment of same type
+            if existing_active:
+                existing_active.status = 'INACTIVE'
+                existing_active.unassigned_at = timezone.now()
+                existing_active.save(using=alias, update_fields=['status', 'unassigned_at', 'updated_at'])
 
             new_assign = LeadAssignment.objects.using(alias).create(
                 lead=lead,
@@ -864,7 +991,121 @@ class CRMLeadService:
                 lead.assigned_trainer_user = assigned_to_user
                 lead.save(using=alias, update_fields=['assigned_trainer_user', 'updated_at'])
 
+            # Audit & Outbox
+            action_code = 'CRM_LEAD_REASSIGNED' if prev_user else 'CRM_LEAD_ASSIGNED'
+            record_business_audit(
+                organization=lead.organization,
+                branch=lead.branch,
+                actor_user=actor_user,
+                module='crm',
+                action_code=action_code,
+                entity_type='LeadAssignment',
+                entity_id=new_assign.id,
+                event_description=f"Assigned lead {lead.first_name} {lead.last_name} to {assigned_to_user.email}" + (f" (reassigned from {prev_user.email})" if prev_user else ""),
+                before_data={'assigned_to_user_id': str(prev_user.id) if prev_user else None},
+                after_data={'assigned_to_user_id': str(assigned_to_user.id), 'assignment_type': assignment_type},
+                db_alias=alias,
+            )
+
+            enqueue_outbox_event(
+                organization=lead.organization,
+                event_type='crm.lead.assigned',
+                aggregate_type='Lead',
+                aggregate_id=lead.id,
+                payload={
+                    'lead_id': str(lead.id),
+                    'assigned_user_id': str(assigned_to_user.id),
+                    'previous_user_id': str(prev_user.id) if prev_user else None,
+                    'branch_id': str(lead.branch_id) if lead.branch else None,
+                    'assigned_by': str(actor_user.id) if actor_user else None,
+                    'assignment_type': assignment_type,
+                    'created_at': timezone.now().isoformat(),
+                },
+                db_alias=alias,
+            )
+
+            send_in_app_notification(
+                organization=lead.organization,
+                user=assigned_to_user,
+                notification_type='LEAD_ASSIGNED',
+                title='New Lead Assigned',
+                message=f"A new lead has been assigned to you: {lead.first_name} {lead.last_name} — {lead.branch.name if lead.branch else 'General'}",
+                data={
+                    'lead_id': str(lead.id),
+                    'lead_name': f"{lead.first_name} {lead.last_name}",
+                    'branch_name': lead.branch.name if lead.branch else 'General',
+                    'branch_id': str(lead.branch_id) if lead.branch else None,
+                    'previous_user_id': str(prev_user.id) if prev_user else None,
+                    'assigned_by': actor_user.email if actor_user else 'System',
+                },
+                deep_link=f"/crm/leads?lead_id={lead.id}",
+                idempotency_key=f"lead_assigned:{lead.id}:{assigned_to_user.id}:{new_assign.id}",
+                db_alias=alias,
+            )
+
             return new_assign
+
+    @classmethod
+    def unassign_lead(
+        cls,
+        lead: Lead,
+        assignment_type: str = 'SALES',
+        actor_user: Optional[TenantUser] = None,
+        db_alias: Optional[str] = None,
+    ) -> Optional[LeadAssignment]:
+        alias = db_alias or get_tenant_db_alias() or 'default'
+        with transaction.atomic(using=alias):
+            active_assign = LeadAssignment.objects.using(alias).filter(
+                lead=lead,
+                assignment_type=assignment_type,
+                status='ACTIVE',
+            ).first()
+
+            if not active_assign:
+                return None
+
+            active_assign.status = 'INACTIVE'
+            active_assign.unassigned_at = timezone.now()
+            active_assign.save(using=alias, update_fields=['status', 'unassigned_at', 'updated_at'])
+
+            prev_user = active_assign.assigned_to_user
+            if assignment_type == 'SALES':
+                lead.assigned_sales_user = None
+                lead.save(using=alias, update_fields=['assigned_sales_user', 'updated_at'])
+            elif assignment_type == 'TRAINER':
+                lead.assigned_trainer_user = None
+                lead.save(using=alias, update_fields=['assigned_trainer_user', 'updated_at'])
+
+            record_business_audit(
+                organization=lead.organization,
+                branch=lead.branch,
+                actor_user=actor_user,
+                module='crm',
+                action_code='CRM_LEAD_UNASSIGNED',
+                entity_type='Lead',
+                entity_id=lead.id,
+                event_description=f"Unassigned {assignment_type} agent {prev_user.email} from lead {lead.first_name} {lead.last_name}",
+                before_data={'assigned_to_user_id': str(prev_user.id)},
+                after_data={'assigned_to_user_id': None},
+                db_alias=alias,
+            )
+
+            enqueue_outbox_event(
+                organization=lead.organization,
+                event_type='crm.lead.unassigned',
+                aggregate_type='Lead',
+                aggregate_id=lead.id,
+                payload={
+                    'lead_id': str(lead.id),
+                    'unassigned_user_id': str(prev_user.id),
+                    'unassigned_by': str(actor_user.id) if actor_user else None,
+                    'assignment_type': assignment_type,
+                    'created_at': timezone.now().isoformat(),
+                },
+                db_alias=alias,
+            )
+
+            return active_assign
 
     @classmethod
     def resolve_trial_booking_policy(

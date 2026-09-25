@@ -41,6 +41,7 @@ from config.routers import get_tenant_db_alias
 from .models_org import Organization, Branch
 from .models_users import TenantUser
 from .models_workforce import TrainerProfile
+from .models_govern import InAppNotification
 from .models_crm import (
     LeadSource,
     Lead,
@@ -83,6 +84,7 @@ from .serializers_crm import (
     CRMTrialReminderPolicySerializer,
     CRMAttentionPolicySerializer,
     CRMAgentAssignmentConfigSerializer,
+    InAppNotificationSerializer,
 )
 from .models_attention import CRMAttentionPolicy
 from .models_communication import CommunicationMessage, CommunicationStatusEvent
@@ -377,6 +379,14 @@ class LeadViewSet(viewsets.ModelViewSet):
                 return qs.none()
             qs = qs.filter(branch_id=branch_id)
 
+        assigned_to_me = self.request.query_params.get('assigned_to_me')
+        if assigned_to_me and str(assigned_to_me).lower() in ('true', '1'):
+            qs = qs.filter(assigned_sales_user=self.request.user)
+
+        unassigned = self.request.query_params.get('unassigned')
+        if unassigned and str(unassigned).lower() in ('true', '1'):
+            qs = qs.filter(assigned_sales_user__isnull=True)
+
         assigned_user = self.request.query_params.get('assigned_sales_user_id')
         if assigned_user:
             qs = qs.filter(assigned_sales_user_id=assigned_user)
@@ -426,6 +436,17 @@ class LeadViewSet(viewsets.ModelViewSet):
                     branch = branch_obj
             else:
                 raise PermissionDenied("A branch selection is required for branch-scoped staff.")
+
+        assigned_sales_user = serializer.validated_data.get('assigned_sales_user')
+        if assigned_sales_user:
+            if assigned_sales_user.organization_id != org.id:
+                raise ValidationError({"assigned_sales_user": "Assigned agent must belong to the same organization."})
+            if assigned_sales_user.status != 'ACTIVE' or not assigned_sales_user.is_login_allowed:
+                raise ValidationError({"assigned_sales_user": "Assigned agent is inactive or not allowed to log in."})
+            if branch:
+                agent_permitted = get_user_effective_branch_ids(assigned_sales_user, alias)
+                if agent_permitted is not None and str(branch.id) not in agent_permitted:
+                    raise ValidationError({"assigned_sales_user": f"Agent {assigned_sales_user.email} is not eligible for branch '{branch.name}'."})
 
         lead = CRMLeadService.create_lead(
             organization=org,
@@ -664,26 +685,52 @@ class LeadViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='assign')
     def assign(self, request, pk=None):
         alias = _get_db(request)
+        org = _get_org(request)
         lead = self.get_object()
         user_id = request.data.get('assigned_to_user_id')
         assignment_type = request.data.get('assignment_type', 'SALES')
+        notes = request.data.get('notes', '')
 
-        if not user_id:
-            return Response({'error': 'assigned_to_user_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+        # Explicit unassign
+        if not user_id or str(user_id).lower() in ('unassign', 'none', 'null', ''):
+            updated_lead = CRMLeadService.unassign_lead(
+                lead=lead,
+                assignment_type=assignment_type,
+                actor_user=request.user,
+                reason=notes or 'Unassigned via CRM',
+                db_alias=alias,
+            )
+            return Response(LeadSerializer(updated_lead).data)
 
         try:
-            target_user = TenantUser.objects.using(alias).get(id=user_id)
+            target_user = TenantUser.objects.using(alias).get(id=user_id, organization=org)
         except TenantUser.DoesNotExist:
-            return Response({'error': 'Target user not found'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({'error': 'Target user not found or not in organization'}, status=status.HTTP_404_NOT_FOUND)
 
-        assignment = CRMLeadService.assign_lead(
-            lead=lead,
-            assigned_to_user=target_user,
-            assignment_type=assignment_type,
-            actor_user=request.user,
-            db_alias=alias,
-        )
-        return Response(LeadAssignmentSerializer(assignment).data)
+        if target_user.status != 'ACTIVE' or not target_user.is_login_allowed:
+            return Response({'error': 'Assigned agent is inactive or not allowed to log in'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Branch eligibility
+        if lead.branch_id:
+            agent_permitted = get_user_effective_branch_ids(target_user, alias)
+            if agent_permitted is not None and str(lead.branch_id) not in agent_permitted:
+                return Response(
+                    {'error': f"Agent is not authorized for branch '{lead.branch.name if lead.branch else lead.branch_id}'"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        try:
+            assignment = CRMLeadService.assign_lead(
+                lead=lead,
+                assigned_to_user=target_user,
+                assignment_type=assignment_type,
+                notes=notes,
+                actor_user=request.user,
+                db_alias=alias,
+            )
+            return Response(LeadAssignmentSerializer(assignment).data)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=True, methods=['post'], url_path='book-trial')
     def book_trial(self, request, pk=None):
@@ -762,7 +809,10 @@ class LeadViewSet(viewsets.ModelViewSet):
             )
             if not allowed:
                 raise PermissionDenied(f"Permission denied: crm.leads.edit required ({reason})")
-            serializer = LeadAttributionSerializer(data=request.data)
+            data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
+            if 'lead' not in data:
+                data['lead'] = str(lead.id)
+            serializer = LeadAttributionSerializer(data=data)
             serializer.is_valid(raise_exception=True)
             attr = CRMLeadService.record_lead_attribution(
                 lead=lead,
@@ -790,7 +840,10 @@ class LeadViewSet(viewsets.ModelViewSet):
             )
             if not allowed:
                 raise PermissionDenied(f"Permission denied: crm.leads.edit required ({reason})")
-            serializer = LeadActivitySerializer(data=request.data)
+            data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
+            if 'lead' not in data:
+                data['lead'] = str(lead.id)
+            serializer = LeadActivitySerializer(data=data)
             serializer.is_valid(raise_exception=True)
             act = CRMLeadService.record_lead_activity(
                 lead=lead,
@@ -3019,4 +3072,54 @@ class CRMDashboardViewSet(viewsets.ViewSet):
         except Exception as e:
             logger.exception("CRM Dashboard aggregation failed")
             return Response({'error': 'Failed to load CRM dashboard metrics'}, status=500)
+
+
+class InAppNotificationViewSet(viewsets.ModelViewSet):
+    serializer_class = InAppNotificationSerializer
+    permission_classes = [RequireActiveTenantAndOrg]
+    filter_backends = [filters.OrderingFilter]
+    ordering = ['-created_at']
+
+    def get_queryset(self):
+        alias = _get_db(self.request)
+        org = _get_org(self.request)
+        user = self.request.user
+        qs = InAppNotification.objects.using(alias).filter(user=user)
+        if org:
+            qs = qs.filter(organization=org)
+
+        unread_only = self.request.query_params.get('unread')
+        if unread_only and str(unread_only).lower() in ('true', '1'):
+            qs = qs.filter(is_read=False)
+        return qs
+
+    @action(detail=False, methods=['get'], url_path='unread-count')
+    def unread_count(self, request):
+        alias = _get_db(request)
+        org = _get_org(request)
+        qs = InAppNotification.objects.using(alias).filter(user=request.user, is_read=False)
+        if org:
+            qs = qs.filter(organization=org)
+        return Response({'unread_count': qs.count()})
+
+    @action(detail=True, methods=['post'], url_path='mark-read')
+    def mark_read(self, request, pk=None):
+        alias = _get_db(request)
+        notification = self.get_object()
+        if not notification.is_read:
+            notification.is_read = True
+            notification.read_at = timezone.now()
+            notification.save(using=alias, update_fields=['is_read', 'read_at'])
+        return Response(InAppNotificationSerializer(notification).data)
+
+    @action(detail=False, methods=['post'], url_path='mark-all-read')
+    def mark_all_read(self, request):
+        alias = _get_db(request)
+        org = _get_org(request)
+        now = timezone.now()
+        qs = InAppNotification.objects.using(alias).filter(user=request.user, is_read=False)
+        if org:
+            qs = qs.filter(organization=org)
+        count = qs.update(is_read=True, read_at=now)
+        return Response({'marked_read': count})
 

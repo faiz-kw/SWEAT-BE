@@ -63,6 +63,7 @@ from .views_crm import (
     CommunicationMessageViewSet,
     CRMCampaignPerformanceViewSet,
     CRMDashboardViewSet,
+    InAppNotificationViewSet,
 )
 from .views_automation import (
     AutomationWorkflowViewSet,
@@ -298,6 +299,8 @@ router.register(r'processing-purposes', ProcessingPurposeViewSet, basename='proc
 router.register(r'consent-records', ConsentRecordViewSet, basename='consent-record')
 router.register(r'privacy-requests', PrivacyRequestViewSet, basename='privacy-request')
 router.register(r'integrations', TenantIntegrationViewSet, basename='integration')
+router.register(r'in-app-notifications', InAppNotificationViewSet, basename='in-app-notification')
+router.register(r'notifications', InAppNotificationViewSet, basename='notification')
 
 app_name = 'tenant_core'
 

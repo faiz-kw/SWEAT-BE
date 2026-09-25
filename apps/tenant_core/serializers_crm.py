@@ -328,14 +328,32 @@ class LeadAssignmentSerializer(serializers.ModelSerializer):
 
 class LeadNoteSerializer(serializers.ModelSerializer):
     created_by_name = serializers.SerializerMethodField()
+    content = serializers.CharField(write_only=True, required=False)
+    note_text = serializers.CharField(required=False)
 
     class Meta:
         model = LeadNote
         fields = '__all__'
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_by_user', 'created_at', 'updated_at']
+
+    def validate(self, attrs):
+        if 'content' in attrs and not attrs.get('note_text'):
+            attrs['note_text'] = attrs.pop('content')
+        elif 'content' in attrs:
+            attrs.pop('content')
+        if not attrs.get('note_text'):
+            raise serializers.ValidationError({'note_text': 'This field is required.'})
+        return attrs
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret['content'] = instance.note_text
+        return ret
 
     def get_created_by_name(self, obj):
         u = obj.created_by_user
+        if not u:
+            return 'Staff'
         return f"{u.first_name} {u.last_name}".strip() or u.email
 
 
@@ -449,9 +467,16 @@ class TrialBookingSerializer(serializers.ModelSerializer):
         tp = obj.assigned_trainer_profile
         if not tp:
             return 'Unassigned'
-        if tp.user:
-            return f"{tp.user.first_name} {tp.user.last_name}".strip() or tp.trainer_code
-        return tp.trainer_code
+        ep = getattr(tp, 'employee_profile', None)
+        if ep:
+            up = getattr(ep, 'user_profile', None)
+            if up:
+                fn = up.first_name_snapshot or (up.user.first_name if getattr(up, 'user', None) else '')
+                ln = up.last_name_snapshot or (up.user.last_name if getattr(up, 'user', None) else '')
+                full = f"{fn} {ln}".strip()
+                if full:
+                    return full
+        return getattr(tp, 'trainer_code', 'Trainer')
 
     def get_class_name(self, obj):
         if not obj.class_occurrence_id:
@@ -607,4 +632,25 @@ class CRMAgentAssignmentConfigSerializer(serializers.ModelSerializer):
         model = CRMAgentAssignmentConfig
         fields = '__all__'
         read_only_fields = ['id', 'created_at', 'updated_at', 'organization']
+
+
+class InAppNotificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        from .models_govern import InAppNotification
+        model = InAppNotification
+        fields = [
+            'id',
+            'organization',
+            'user',
+            'notification_type',
+            'title',
+            'message',
+            'data',
+            'deep_link',
+            'is_read',
+            'read_at',
+            'idempotency_key',
+            'created_at',
+        ]
+        read_only_fields = ['id', 'organization', 'user', 'created_at']
 

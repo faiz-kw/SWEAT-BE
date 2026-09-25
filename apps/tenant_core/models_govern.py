@@ -5,6 +5,7 @@ Tables: organization_settings, branch_settings, notification_templates
 
 import uuid
 from django.db import models
+from django.utils import timezone
 from .models_org import Organization, Branch
 from .models_users import TenantUser
 
@@ -128,6 +129,7 @@ class NotificationTemplate(models.Model):
         ('PAYMENT_RECEIVED', 'Payment Received'),
         ('PAYMENT_FAILED', 'Payment Failed'),
         ('LEAD_WELCOME', 'Lead Welcome'),
+        ('LEAD_ASSIGNED', 'Lead Assigned to Agent'),
         ('TRIAL_SCHEDULED', 'Trial Scheduled'),
         ('CUSTOM', 'Custom'),
     ]
@@ -238,3 +240,34 @@ class BranchOperatingException(models.Model):
 
     def __str__(self):
         return f"{self.branch.name} Exception on {self.exception_date} ({'Closed' if self.is_closed else 'Special Hours'})"
+
+
+class InAppNotification(models.Model):
+    """
+    In-app notifications for staff (lead assignments, alerts, follow-up reminders).
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='in_app_notifications')
+    user = models.ForeignKey(TenantUser, on_delete=models.CASCADE, related_name='in_app_notifications')
+    notification_type = models.CharField(max_length=50, default='LEAD_ASSIGNED')
+    title = models.CharField(max_length=200)
+    message = models.TextField()
+    data = models.JSONField(default=dict, blank=True)
+    deep_link = models.CharField(max_length=255, blank=True, default='')
+    is_read = models.BooleanField(default=False)
+    read_at = models.DateTimeField(null=True, blank=True)
+    idempotency_key = models.CharField(max_length=255, null=True, blank=True, db_index=True)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        app_label = 'tenant_core'
+        db_table = 'in_app_notifications'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user', 'is_read', '-created_at'], name='idx_notif_user_read'),
+            models.Index(fields=['organization', '-created_at'], name='idx_notif_org_created'),
+            models.Index(fields=['idempotency_key'], name='idx_notif_idem_key'),
+        ]
+
+    def __str__(self):
+        return f"Notification({self.user_id}: {self.title} [read={self.is_read}])"

@@ -12,7 +12,7 @@ from .models_rbac import (
     RolePermissionSetItem, RoleAssignment, BranchModule,
 )
 
-from .models_govern import OrganizationSettings, BranchSettings, NotificationTemplate
+from .models_govern import OrganizationSettings, BranchSettings, NotificationTemplate, InAppNotification
 
 from .models_privacy import (
     ProcessingPurpose, ConsentRecord, PrivacyRequest, TenantAuditEvent,
@@ -61,7 +61,7 @@ __all__ = [
     'RolePermissionSet', 'RoleModuleAccess', 'RoleSubmoduleAccess',
     'RolePermissionSetItem', 'RoleAssignment', 'BranchModule',
     # Govern
-    'OrganizationSettings', 'BranchSettings', 'NotificationTemplate',
+    'OrganizationSettings', 'BranchSettings', 'NotificationTemplate', 'InAppNotification',
     # Privacy
     'ProcessingPurpose', 'ConsentRecord', 'PrivacyRequest', 'TenantAuditEvent',
     # Infra
