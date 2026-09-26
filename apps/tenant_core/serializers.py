@@ -26,20 +26,145 @@ class LocationSerializer(serializers.ModelSerializer):
 
 class BranchSerializer(serializers.ModelSerializer):
     location_name = serializers.CharField(source='location.name', read_only=True)
-    city = serializers.CharField(source='location.city', read_only=True)
+    city = serializers.CharField(required=False, allow_blank=True, default='')
+    company_entity_name = serializers.CharField(source='company_entity.name', read_only=True, default=None)
     operating_hours = serializers.SerializerMethodField()
+    is_active = serializers.SerializerMethodField()
+    can_delete = serializers.SerializerMethodField()
+    delete_blocked_reason = serializers.SerializerMethodField()
 
     class Meta:
         model = Branch
-        fields = ['id', 'organization', 'company_entity', 'location', 'location_name', 'city', 'code', 'name',
-                  'address', 'address_line_1', 'address_line_2', 'latitude', 'longitude',
-                  'geofence_radius_meters', 'geofence_enforcement', 'timezone',
-                  'phone', 'email', 'capacity', 'business_open_time', 'business_close_time', 'operating_hours',
-                  'status', 'created_at']
-        read_only_fields = ['id', 'created_at']
+        fields = [
+            'id', 'organization', 'company_entity', 'company_entity_name',
+            'location', 'location_name', 'city', 'code', 'name',
+            'address', 'address_line_1', 'address_line_2', 'latitude', 'longitude',
+            'geofence_radius_meters', 'geofence_enforcement', 'timezone',
+            'phone', 'email', 'capacity', 'business_open_time', 'business_close_time',
+            'operating_hours', 'is_passport_eligible', 'status', 'is_active',
+            'can_delete', 'delete_blocked_reason',
+            'activated_at', 'deactivated_at', 'deactivation_reason', 'created_at'
+        ]
+        read_only_fields = [
+            'id', 'organization', 'location', 'can_delete', 'delete_blocked_reason',
+            'created_at', 'activated_at', 'deactivated_at'
+        ]
+        validators = []
+        extra_kwargs = {
+            'code': {'required': True},
+            'name': {'required': True},
+        }
+
+    def _get_deletion_status(self, obj):
+        if hasattr(obj, '_cached_deletion_status'):
+            return obj._cached_deletion_status
+        db = obj._state.db or 'default'
+        try:
+            from .models_classes import ClassOccurrence
+            from .models_bookings import Booking
+            from .models_memberships import Membership
+            from .models_crm import Lead
+            from .models_users import UserBranch
+            from django.db.models import Q
+
+            if ClassOccurrence.objects.using(db).filter(branch=obj).exists():
+                res = (False, "This branch has scheduled or historical classes. Deactivate it instead.")
+            elif Booking.objects.using(db).filter(occurrence__branch=obj).exists():
+                res = (False, "This branch has booking records. Deactivate it instead.")
+            elif Membership.objects.using(db).filter(Q(home_branch=obj) | Q(purchase_branch=obj)).exists():
+                res = (False, "This branch has associated memberships. Deactivate it instead.")
+            elif Lead.objects.using(db).filter(branch=obj).exists():
+                res = (False, "This branch has associated CRM leads. Deactivate it instead.")
+            elif UserBranch.objects.using(db).filter(branch=obj).exists():
+                res = (False, "This branch has assigned staff members. Deactivate it instead.")
+            else:
+                res = (True, None)
+        except Exception:
+            res = (False, "This branch has operational dependencies. Deactivate it instead.")
+        obj._cached_deletion_status = res
+        return res
+
+    def get_can_delete(self, obj):
+        can_del, _ = self._get_deletion_status(obj)
+        return can_del
+
+    def get_delete_blocked_reason(self, obj):
+        _, reason = self._get_deletion_status(obj)
+        return reason
 
     def get_operating_hours(self, obj):
         return f"{obj.business_open_time} - {obj.business_close_time}" if obj.business_open_time else "06:00 - 22:00"
+
+    def get_is_active(self, obj):
+        return obj.status == 'ACTIVE'
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        if instance.location:
+            ret['city'] = instance.location.city or instance.location.name or ''
+        elif not ret.get('city'):
+            ret['city'] = ''
+        return ret
+
+    def create(self, validated_data):
+        validated_data.pop('city', None)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        validated_data.pop('city', None)
+        return super().update(instance, validated_data)
+
+    def validate_code(self, value):
+        cleaned = str(value or '').strip().upper()
+        if not cleaned:
+            raise serializers.ValidationError("Branch code is required.")
+        import re
+        if not re.match(r'^[A-Z0-9_-]+$', cleaned):
+            raise serializers.ValidationError(
+                "Branch code must contain only uppercase letters, numbers, underscores, and hyphens."
+            )
+        return cleaned
+
+    def validate_name(self, value):
+        cleaned = str(value or '').strip()
+        if not cleaned:
+            raise serializers.ValidationError("Branch name cannot be blank.")
+        return cleaned
+
+    def validate_capacity(self, value):
+        if value is not None and value < 0:
+            raise serializers.ValidationError("Capacity must be greater than or equal to 0.")
+        return value
+
+    def validate_geofence_radius_meters(self, value):
+        if value is not None and value < 0:
+            raise serializers.ValidationError("Geofence radius must be greater than or equal to 0.")
+        return value
+
+    def validate_timezone(self, value):
+        if not value:
+            return 'Asia/Kolkata'
+        import zoneinfo
+        try:
+            zoneinfo.ZoneInfo(value.strip())
+        except Exception:
+            raise serializers.ValidationError(f"'{value}' is not a valid IANA timezone identifier.")
+        return value.strip()
+
+    def validate(self, attrs):
+        open_time = attrs.get('business_open_time')
+        close_time = attrs.get('business_close_time')
+        if open_time and close_time and open_time >= close_time:
+            raise serializers.ValidationError({
+                "business_close_time": "Closing time must be after opening time."
+            })
+        lat = attrs.get('latitude')
+        lng = attrs.get('longitude')
+        if lat is not None and (lat < -90 or lat > 90):
+            raise serializers.ValidationError({"latitude": "Latitude must be between -90 and 90."})
+        if lng is not None and (lng < -180 or lng > 180):
+            raise serializers.ValidationError({"longitude": "Longitude must be between -180 and 180."})
+        return attrs
 
 
 class DepartmentSerializer(serializers.ModelSerializer):

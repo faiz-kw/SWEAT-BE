@@ -7,6 +7,9 @@ Enforces real-time database-driven RBAC authorization and branch/resource scopin
 import logging
 import uuid
 from django.db import transaction
+from django.db.models import Q
+from django.db.models.deletion import ProtectedError, RestrictedError
+from django.utils import timezone
 from rest_framework import viewsets, permissions, status
 from rest_framework.views import APIView
 from rest_framework.decorators import action
@@ -295,18 +298,290 @@ def _get_request_org(request, db: str):
 
 
 class BranchViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
-    """Branches managed by tenant org admin. Scoped to user's branch if not org-wide."""
-    permission_classes = [RequireActiveTenantAndOrg]
+    """
+    Branches managed by tenant org admin.
+    Authorized via centralized RBAC against core.settings.*.
+    Audited on all mutations with before/after state snapshots.
+    """
+    permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
+    required_module = 'core'
+    required_submodule = 'settings'
+    action_permission_map = {
+        'list': 'core.settings.view',
+        'retrieve': 'core.settings.view',
+        'create': 'core.settings.edit',
+        'update': 'core.settings.edit',
+        'partial_update': 'core.settings.edit',
+        'destroy': 'core.settings.edit',
+        'deactivate': 'core.settings.edit',
+        'reactivate': 'core.settings.edit',
+    }
     serializer_class = BranchSerializer
     queryset = Branch.objects.all()
 
     def get_queryset(self):
         db = self.get_db()
         org = _get_request_org(self.request, db)
-        qs = Branch.objects.using(db).all()
+        qs = Branch.objects.using(db).select_related('location', 'company_entity').all()
         if org:
             qs = qs.filter(organization=org)
+        status_param = self.request.query_params.get('status')
+        if status_param:
+            qs = qs.filter(status=status_param.upper())
+        is_active_param = self.request.query_params.get('is_active')
+        if is_active_param is not None:
+            if str(is_active_param).lower() in ('true', '1'):
+                qs = qs.filter(status='ACTIVE')
+            elif str(is_active_param).lower() in ('false', '0'):
+                qs = qs.exclude(status='ACTIVE')
         return self.filter_queryset_by_scope(qs)
+
+    def perform_create(self, serializer):
+        db = self.get_db()
+        org = _get_request_org(self.request, db)
+        if not org:
+            raise PermissionDenied("Active organization context is required to create a branch.")
+
+        code = serializer.validated_data.get('code')
+        if Branch.objects.using(db).filter(organization=org, code=code).exists():
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({'code': f"A branch with code '{code}' already exists in this organization."})
+
+        # Resolve or create Location
+        location = serializer.validated_data.get('location')
+        if not location:
+            city_name = str(serializer.validated_data.pop('city', None) or self.request.data.get('city') or 'Main').strip()
+            loc_code = f"LOC-{city_name.upper().replace(' ', '-')[:20]}"
+            from .models_org import Location
+            location = Location.objects.using(db).filter(organization=org, city__iexact=city_name).first()
+            if not location:
+                location = Location.objects.using(db).create(
+                    organization=org,
+                    name=city_name,
+                    city=city_name,
+                    code=loc_code,
+                    status='ACTIVE',
+                )
+
+        with transaction.atomic(using=db):
+            branch = serializer.save(organization=org, location=location)
+
+            # Auto-seed default 7-day working hours for the new branch if none exist
+            from .models_govern import BranchWorkingHours
+            for dow in range(1, 8):
+                BranchWorkingHours.objects.using(db).get_or_create(
+                    branch=branch,
+                    day_of_week=dow,
+                    defaults={
+                        'open_time': branch.business_open_time or '06:00',
+                        'close_time': branch.business_close_time or '22:00',
+                        'is_open': True,
+                    }
+                )
+
+            emit_audit_event(
+                action='CREATE',
+                resource_type='Branch',
+                resource_id=str(branch.pk),
+                request=self.request,
+                instance=branch,
+                before_state=None,
+                after_state=snapshot_model_state(branch),
+                db_alias=db,
+            )
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        db = self.get_db()
+        fresh = Branch.objects.using(db).select_related('location', 'company_entity').get(pk=instance.pk)
+        return Response(self.get_serializer(fresh).data)
+
+    def perform_update(self, serializer):
+        db = self.get_db()
+        instance = serializer.instance
+        self.validate_branch_scope(instance.id)
+
+        code = serializer.validated_data.get('code')
+        if code and Branch.objects.using(db).filter(organization=instance.organization, code=code).exclude(pk=instance.pk).exists():
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({'code': f"A branch with code '{code}' already exists in this organization."})
+
+        city_name = serializer.validated_data.pop('city', None)
+        if not city_name:
+            city_name = self.request.data.get('city')
+
+        extra_kwargs = {}
+        if city_name:
+            city_name = str(city_name).strip()
+            from .models_org import Location
+            if instance.location:
+                is_exclusive = Branch.objects.using(db).filter(location=instance.location).exclude(pk=instance.pk).count() == 0
+                if is_exclusive:
+                    instance.location.city = city_name
+                    instance.location.name = city_name
+                    instance.location.save(using=db)
+                    extra_kwargs['location'] = instance.location
+                else:
+                    loc = Location.objects.using(db).filter(organization=instance.organization, city__iexact=city_name).first()
+                    if not loc:
+                        loc_code = f"LOC-{city_name.upper().replace(' ', '-')[:20]}"
+                        loc = Location.objects.using(db).create(
+                            organization=instance.organization,
+                            name=city_name,
+                            city=city_name,
+                            code=loc_code,
+                            status='ACTIVE',
+                        )
+                    extra_kwargs['location'] = loc
+            else:
+                loc = Location.objects.using(db).filter(organization=instance.organization, city__iexact=city_name).first()
+                if not loc:
+                    loc_code = f"LOC-{city_name.upper().replace(' ', '-')[:20]}"
+                    loc = Location.objects.using(db).create(
+                        organization=instance.organization,
+                        name=city_name,
+                        city=city_name,
+                        code=loc_code,
+                        status='ACTIVE',
+                    )
+                extra_kwargs['location'] = loc
+
+        with transaction.atomic(using=db):
+            before_state = snapshot_model_state(instance)
+            updated_branch = serializer.save(**extra_kwargs)
+            after_state = snapshot_model_state(updated_branch)
+            emit_audit_event(
+                action='UPDATE',
+                resource_type='Branch',
+                resource_id=str(updated_branch.pk),
+                request=self.request,
+                instance=updated_branch,
+                before_state=before_state,
+                after_state=after_state,
+                db_alias=db,
+            )
+
+    def destroy(self, request, *args, **kwargs):
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except (ProtectedError, RestrictedError):
+            return Response(
+                {
+                    "code": "BRANCH_HAS_HISTORY",
+                    "detail": "This branch has operational history and cannot be deleted. Deactivate it instead.",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception as e:
+            detail_msg = getattr(e, 'detail', str(e))
+            if isinstance(detail_msg, dict):
+                detail_msg = detail_msg.get('detail', str(detail_msg))
+            elif isinstance(detail_msg, list):
+                detail_msg = detail_msg[0]
+            return Response(
+                {
+                    "code": "BRANCH_HAS_HISTORY",
+                    "detail": str(detail_msg),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+    def perform_destroy(self, instance):
+        db = self.get_db()
+        self.validate_branch_scope(instance.id)
+
+        # Protect historical business records from destructive deletion
+        from .models_classes import ClassOccurrence
+        from .models_bookings import Booking
+        from .models_memberships import Membership
+        from .models_crm import Lead
+        from .models_users import UserBranch
+
+        has_classes = ClassOccurrence.objects.using(db).filter(branch=instance).exists()
+        has_bookings = Booking.objects.using(db).filter(occurrence__branch=instance).exists()
+        has_memberships = Membership.objects.using(db).filter(Q(home_branch=instance) | Q(purchase_branch=instance)).exists()
+        has_leads = Lead.objects.using(db).filter(branch=instance).exists()
+        has_staff = UserBranch.objects.using(db).filter(branch=instance).exists()
+
+        if has_classes or has_bookings or has_memberships or has_leads or has_staff:
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError(
+                "This branch has operational history (classes, bookings, leads, staff, or memberships) and cannot be deleted. "
+                "Deactivate it instead."
+            )
+
+        with transaction.atomic(using=db):
+            # Clean up branch's owned configuration child records before deleting the branch itself
+            from .models_govern import BranchWorkingHours, BranchOperatingException
+            BranchWorkingHours.objects.using(db).filter(branch=instance).delete()
+            BranchOperatingException.objects.using(db).filter(branch=instance).delete()
+
+            before_state = snapshot_model_state(instance)
+            emit_audit_event(
+                action='DELETE',
+                resource_type='Branch',
+                resource_id=str(instance.pk),
+                request=self.request,
+                instance=instance,
+                before_state=before_state,
+                after_state=None,
+                db_alias=db,
+            )
+            instance.delete(using=db)
+
+    @action(detail=True, methods=['post'], url_path='deactivate')
+    def deactivate(self, request, pk=None):
+        branch = self.get_object()
+        self.validate_branch_scope(branch.id)
+        db = self.get_db()
+        reason = request.data.get('reason', 'Deactivated by administrator.')
+        with transaction.atomic(using=db):
+            before_state = snapshot_model_state(branch)
+            branch.status = 'INACTIVE'
+            branch.deactivated_at = timezone.now()
+            branch.deactivation_reason = reason
+            branch.save(using=db)
+            after_state = snapshot_model_state(branch)
+            emit_audit_event(
+                action='DEACTIVATE',
+                resource_type='Branch',
+                resource_id=str(branch.pk),
+                request=request,
+                instance=branch,
+                before_state=before_state,
+                after_state=after_state,
+                db_alias=db,
+            )
+        return Response(self.get_serializer(branch).data)
+
+    @action(detail=True, methods=['post'], url_path='reactivate')
+    def reactivate(self, request, pk=None):
+        branch = self.get_object()
+        self.validate_branch_scope(branch.id)
+        db = self.get_db()
+        with transaction.atomic(using=db):
+            before_state = snapshot_model_state(branch)
+            branch.status = 'ACTIVE'
+            branch.activated_at = timezone.now()
+            branch.deactivated_at = None
+            branch.deactivation_reason = ''
+            branch.save(using=db)
+            after_state = snapshot_model_state(branch)
+            emit_audit_event(
+                action='REACTIVATE',
+                resource_type='Branch',
+                resource_id=str(branch.pk),
+                request=request,
+                instance=branch,
+                before_state=before_state,
+                after_state=after_state,
+                db_alias=db,
+            )
+        return Response(self.get_serializer(branch).data)
 
 
 class DepartmentViewSet(TenantDBMixin, viewsets.ModelViewSet):
@@ -1190,6 +1465,14 @@ class CompanyEntityViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
     permission_classes = [RequireActiveTenantAndOrg]
     serializer_class = CompanyEntitySerializer
     queryset = CompanyEntity.objects.all()
+
+    def get_queryset(self):
+        db = self.get_db()
+        org = _get_request_org(self.request, db)
+        qs = CompanyEntity.objects.using(db).all()
+        if org:
+            qs = qs.filter(organization=org)
+        return qs
 
 
 class UserBranchViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
