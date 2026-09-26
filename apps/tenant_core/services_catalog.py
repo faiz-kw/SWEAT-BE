@@ -46,12 +46,16 @@ class PackageCatalogService:
         category_id: Optional[str] = None,
         description: Optional[str] = None,
         trial_allowed: bool = False,
+        delivery_mode: str = 'GROUP',
+        display_order: int = 0,
         status: str = 'ACTIVE',
         actor: Optional[TenantUser] = None,
         db_alias: Optional[str] = None,
+        available_branch_ids: Optional[list] = None,
     ) -> Program:
         alias = db_alias or 'default'
-        from .models_catalog import ProgramType
+        from .models_catalog import ProgramType, ProgramBranchAvailability
+        from .models_org import Branch
 
         pt_instance = None
         legacy_code = None
@@ -82,9 +86,21 @@ class PackageCatalogService:
             category_id=category_id,
             description=description,
             trial_allowed=trial_allowed,
+            delivery_mode=delivery_mode or 'GROUP',
+            display_order=display_order or 0,
             status=status,
         )
         program.save(using=alias)
+
+        if available_branch_ids is not None:
+            for b_id in available_branch_ids:
+                branch = Branch.objects.using(alias).filter(id=b_id, organization=organization).first()
+                if branch:
+                    ProgramBranchAvailability.objects.using(alias).update_or_create(
+                        program=program,
+                        branch=branch,
+                        defaults={'is_active': True}
+                    )
 
         record_business_audit(
             organization=organization,
@@ -94,7 +110,7 @@ class PackageCatalogService:
             entity_id=program.id,
             actor_user=actor,
             event_description=f"Created program {program.name} ({program.code})",
-            after_data={'code': program.code, 'name': program.name, 'program_type': legacy_code or (pt_instance.code if pt_instance else None)},
+            after_data={'code': program.code, 'name': program.name, 'program_type': legacy_code or (pt_instance.code if pt_instance else None), 'delivery_mode': program.delivery_mode},
             db_alias=alias,
         )
         return program
@@ -760,8 +776,7 @@ class CRMProgramEligibilityService:
         category_id: Optional[str] = None,
         alias: str = 'default',
     ):
-        from .models_catalog import Program
-        from django.db.models import Q
+        from .models_catalog import Program, ProgramBranchAvailability
 
         qs = Program.objects.using(alias).all()
         if organization:
@@ -772,50 +787,26 @@ class CRMProgramEligibilityService:
             qs = qs.filter(category_id=category_id)
 
         if not branch_id or str(branch_id).lower() in ('all', ''):
-            return qs.order_by('name')
+            return qs.order_by('display_order', 'name')
+
+        pba_progs = ProgramBranchAvailability.objects.using(alias).filter(
+            branch_id=branch_id, is_active=True
+        ).values_list('program_id', flat=True)
+
+        if context == 'management':
+            return qs.filter(id__in=pba_progs).order_by('display_order', 'name')
 
         if context == 'lead_interest':
-            # Lead interest: programs offered at this branch or org-wide.
-            from .models_classes import ClassTemplate, ClassOccurrence
-            from .models_catalog import PackageBranchAvailability
-
-            branch_prog_ids = set()
-            try:
-                pba_progs = PackageBranchAvailability.objects.using(alias).filter(
-                    branch_id=branch_id, status='ENABLED'
-                ).values_list('package__program_id', flat=True)
-                branch_prog_ids.update([pid for pid in pba_progs if pid])
-            except Exception:
-                pass
-
-            try:
-                tmpl_progs = ClassTemplate.objects.using(alias).filter(
-                    branch_id=branch_id, is_active=True
-                ).values_list('program_id', flat=True)
-                branch_prog_ids.update([pid for pid in tmpl_progs if pid])
-            except Exception:
-                pass
-
-            try:
-                occ_progs = ClassOccurrence.objects.using(alias).filter(
-                    branch_id=branch_id, status__in=['SCHEDULED', 'OPEN', 'CONFIRMED']
-                ).values_list('class_template__program_id', flat=True)
-                branch_prog_ids.update([pid for pid in occ_progs if pid])
-            except Exception:
-                pass
-
-            if branch_prog_ids:
-                scoped_qs = qs.filter(id__in=branch_prog_ids)
-                if scoped_qs.exists():
-                    return scoped_qs.order_by('name')
-
-            # Fall back to all active organization programs so lead can express interest
-            return qs.order_by('name')
+            # Lead interest: strictly programs available at this branch.
+            # If none are available, return empty queryset without silent global fallback.
+            return qs.filter(id__in=pba_progs).order_by('display_order', 'name')
 
         elif context == 'trial':
+            # Trial: must have trial_allowed=True AND be active at branch
             from .models_classes import ClassOccurrence
+            from django.utils import timezone
             today = timezone.now().date()
-            trial_prog_ids = set(
+            trial_occ_progs = set(
                 ClassOccurrence.objects.using(alias).filter(
                     branch_id=branch_id,
                     occurrence_date__gte=today,
@@ -823,21 +814,97 @@ class CRMProgramEligibilityService:
                     status__in=['SCHEDULED', 'OPEN', 'CONFIRMED']
                 ).values_list('class_template__program_id', flat=True)
             )
-            trial_progs = qs.filter(Q(id__in=trial_prog_ids) | Q(trial_allowed=True))
-            if trial_progs.exists():
-                return trial_progs.order_by('name')
-            return qs.order_by('name')
+            trial_qs = qs.filter(id__in=pba_progs, trial_allowed=True)
+            if trial_occ_progs:
+                trial_qs = trial_qs.filter(id__in=trial_occ_progs)
+            return trial_qs.order_by('display_order', 'name')
 
         elif context == 'conversion':
             from .models_catalog import PackageBranchAvailability
-            pba_progs = PackageBranchAvailability.objects.using(alias).filter(
+            pba_progs_list = list(pba_progs)
+            pba_package_progs = PackageBranchAvailability.objects.using(alias).filter(
                 branch_id=branch_id, status='ENABLED'
             ).values_list('package__program_id', flat=True)
-            if pba_progs:
-                conv_qs = qs.filter(id__in=pba_progs)
-                if conv_qs.exists():
-                    return conv_qs.order_by('name')
-            return qs.order_by('name')
+            return qs.filter(id__in=pba_progs_list).filter(id__in=pba_package_progs).order_by('display_order', 'name')
 
-        return qs.order_by('name')
+        return qs.order_by('display_order', 'name')
+
+
+class CatalogReconciliationService:
+    """
+    Idempotent service to safely backfill missing Program.category associations
+    from legacy ProgramType records, and normalize Program.delivery_mode to canonical
+    engine service structures (GROUP_CLASS, INDIVIDUAL_SERVICE, OPEN_ACCESS).
+    """
+    @classmethod
+    @transaction.atomic
+    def backfill_program_categories(cls, organization=None, alias='default') -> Dict[str, Any]:
+        from config.routers import set_tenant_db_alias, get_tenant_db_alias
+        from .models_catalog import Program, ProgramCategory, ProgramType
+        from .serializers_catalog import _generate_unique_code
+
+        prev_alias = get_tenant_db_alias()
+        set_tenant_db_alias(alias)
+        try:
+            qs = Program.objects.using(alias).select_related('program_type', 'organization').all()
+            if organization:
+                qs = qs.filter(organization=organization)
+
+            missing_cat_programs = list(qs.filter(category__isnull=True, program_type__isnull=False))
+            backfilled_count = 0
+            created_categories = []
+            updated_programs = []
+
+            for prog in missing_cat_programs:
+                pt = prog.program_type
+                org = prog.organization
+                cat = ProgramCategory.objects.using(alias).filter(organization=org, name__iexact=pt.name).first()
+                if not cat:
+                    cat = ProgramCategory.objects.using(alias).filter(organization=org, code__iexact=pt.code).first()
+                if not cat:
+                    cat_code = _generate_unique_code(ProgramCategory, org, pt.name, db_alias=alias)
+                    cat = ProgramCategory.objects.using(alias).create(
+                        organization=org,
+                        name=pt.name,
+                        code=cat_code,
+                        description=pt.description,
+                        display_order=pt.display_order,
+                        status=pt.status,
+                    )
+                    created_categories.append({'id': str(cat.id), 'code': cat.code, 'name': cat.name})
+
+                prog.category = cat
+                prog.save(using=alias, update_fields=['category', 'updated_at'])
+                backfilled_count += 1
+                updated_programs.append({
+                    'program_id': str(prog.id),
+                    'program_code': prog.code,
+                    'program_name': prog.name,
+                    'category_id': str(cat.id),
+                    'category_name': cat.name,
+                    'program_type_id': str(pt.id),
+                    'program_type_name': pt.name,
+                })
+
+            # Normalize delivery_mode to engine service structures
+            mode_map = {
+                'GROUP': 'GROUP_CLASS',
+                'PERSONAL_TRAINING': 'INDIVIDUAL_SERVICE',
+                'OPEN_GYM': 'OPEN_ACCESS',
+                'HYBRID': 'GROUP_CLASS',
+            }
+            normalized_mode_count = 0
+            for legacy_mode, canonical_mode in mode_map.items():
+                updated = qs.filter(delivery_mode=legacy_mode).update(delivery_mode=canonical_mode)
+                normalized_mode_count += updated
+
+            return {
+                'backfilled_programs_count': backfilled_count,
+                'updated_programs': updated_programs,
+                'created_categories': created_categories,
+                'normalized_mode_count': normalized_mode_count,
+            }
+        finally:
+            set_tenant_db_alias(prev_alias)
+
 

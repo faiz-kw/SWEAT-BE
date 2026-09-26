@@ -6,8 +6,9 @@ import re
 from rest_framework import serializers
 from .models_catalog import (
     TermsDocument, TermsDocumentVersion, TermsAcceptance,
-    ProgramCategory, ProgramType, Program, Package, PackageVersion,
-    PackagePrice, PackageBranchAvailability, PackageEntitlementDefinition,
+    ProgramCategory, ProgramType, Program, ProgramBranchAvailability,
+    Package, PackageVersion, PackagePrice, PackageBranchAvailability,
+    PackageEntitlementDefinition,
 )
 
 
@@ -122,6 +123,7 @@ class TermsAcceptanceSerializer(serializers.ModelSerializer):
 
 class ProgramTypeSerializer(serializers.ModelSerializer):
     code = serializers.CharField(required=False, allow_blank=True, max_length=100)
+    name = serializers.CharField(required=True, max_length=150)
     programs_count = serializers.SerializerMethodField()
 
     class Meta:
@@ -135,11 +137,44 @@ class ProgramTypeSerializer(serializers.ModelSerializer):
             'code': {'required': False, 'allow_blank': True},
         }
 
+    def validate_code(self, value):
+        cleaned = str(value or '').strip().upper()
+        if not cleaned:
+            return cleaned
+        if not re.match(r'^[A-Z0-9_-]+$', cleaned):
+            raise serializers.ValidationError("Program Type code must contain only uppercase letters, numbers, underscores, and hyphens.")
+        return cleaned
+
+    def validate_name(self, value):
+        cleaned = str(value or '').strip()
+        if not cleaned:
+            raise serializers.ValidationError("Program Type name is required.")
+        return cleaned
+
+    def validate(self, attrs):
+        req = self.context.get('request')
+        from .views_catalog import _get_org, _get_db
+        alias = _get_db(req) if req else (self.context.get('db_alias') or 'default')
+        org = getattr(req, 'organization', None) or (self.instance.organization if self.instance else None) or self.context.get('organization')
+        if not org and req:
+            org = _get_org(req)
+        code = attrs.get('code')
+        if code and org:
+            qs = ProgramType.objects.using(alias).filter(organization=org, code=code)
+            if self.instance:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError({'code': f"A Program Type with code '{code}' already exists."})
+        return attrs
+
     def create(self, validated_data):
         if not validated_data.get('code'):
             req = self.context.get('request')
             alias = getattr(getattr(req, 'user', None), '_db_alias', None) or self.context.get('db_alias')
             org = validated_data.get('organization') or getattr(req, 'organization', None) or self.context.get('organization')
+            if not org and req:
+                from .views_catalog import _get_org
+                org = _get_org(req)
             validated_data['code'] = _generate_unique_code(ProgramType, org, validated_data.get('name', 'PROGRAM_TYPE'), db_alias=alias)
         return super().create(validated_data)
 
@@ -154,6 +189,7 @@ class ProgramTypeSerializer(serializers.ModelSerializer):
 
 class ProgramCategorySerializer(serializers.ModelSerializer):
     code = serializers.CharField(required=False, allow_blank=True, max_length=100)
+    name = serializers.CharField(required=True, max_length=150)
     programs_count = serializers.SerializerMethodField()
 
     class Meta:
@@ -167,11 +203,44 @@ class ProgramCategorySerializer(serializers.ModelSerializer):
             'code': {'required': False, 'allow_blank': True},
         }
 
+    def validate_code(self, value):
+        cleaned = str(value or '').strip().upper()
+        if not cleaned:
+            return cleaned
+        if not re.match(r'^[A-Z0-9_-]+$', cleaned):
+            raise serializers.ValidationError("Program Category code must contain only uppercase letters, numbers, underscores, and hyphens.")
+        return cleaned
+
+    def validate_name(self, value):
+        cleaned = str(value or '').strip()
+        if not cleaned:
+            raise serializers.ValidationError("Program Category name is required.")
+        return cleaned
+
+    def validate(self, attrs):
+        req = self.context.get('request')
+        from .views_catalog import _get_org, _get_db
+        alias = _get_db(req) if req else (self.context.get('db_alias') or 'default')
+        org = getattr(req, 'organization', None) or (self.instance.organization if self.instance else None) or self.context.get('organization')
+        if not org and req:
+            org = _get_org(req)
+        code = attrs.get('code')
+        if code and org:
+            qs = ProgramCategory.objects.using(alias).filter(organization=org, code=code)
+            if self.instance:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError({'code': f"A Program Category with code '{code}' already exists."})
+        return attrs
+
     def create(self, validated_data):
         if not validated_data.get('code'):
             req = self.context.get('request')
             alias = getattr(getattr(req, 'user', None), '_db_alias', None) or self.context.get('db_alias')
             org = validated_data.get('organization') or getattr(req, 'organization', None) or self.context.get('organization')
+            if not org and req:
+                from .views_catalog import _get_org
+                org = _get_org(req)
             validated_data['code'] = _generate_unique_code(ProgramCategory, org, validated_data.get('name', 'CATEGORY'), db_alias=alias)
         return super().create(validated_data)
 
@@ -184,38 +253,220 @@ class ProgramCategorySerializer(serializers.ModelSerializer):
         return obj.programs.count()
 
 
+class ProgramBranchAvailabilitySerializer(serializers.ModelSerializer):
+    program_name = serializers.CharField(source='program.name', read_only=True)
+    program_code = serializers.CharField(source='program.code', read_only=True)
+    branch_name = serializers.CharField(source='branch.name', read_only=True)
+    branch_code = serializers.CharField(source='branch.code', read_only=True)
+
+    class Meta:
+        model = ProgramBranchAvailability
+        fields = [
+            'id', 'program', 'program_name', 'program_code',
+            'branch', 'branch_name', 'branch_code',
+            'is_active', 'effective_from', 'effective_to',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def validate(self, attrs):
+        program = attrs.get('program') or (self.instance.program if self.instance else None)
+        branch = attrs.get('branch') or (self.instance.branch if self.instance else None)
+        if program and branch:
+            if program.organization_id != branch.organization_id:
+                raise serializers.ValidationError("Program and branch must belong to the same organization.")
+            if branch.status in ('INACTIVE', 'CLOSED'):
+                raise serializers.ValidationError({'branch': f"Branch '{branch.name}' is inactive or closed and cannot be assigned."})
+        return attrs
+
+
 class ProgramSerializer(serializers.ModelSerializer):
     code = serializers.CharField(required=False, allow_blank=True, max_length=100)
+    name = serializers.CharField(required=True, max_length=200)
+    category = serializers.PrimaryKeyRelatedField(
+        queryset=ProgramCategory.objects.all(), required=False, allow_null=True
+    )
     category_name = serializers.CharField(source='category.name', read_only=True)
+    category_code = serializers.CharField(source='category.code', read_only=True)
+    program_type = serializers.PrimaryKeyRelatedField(
+        queryset=ProgramType.objects.all(), required=False, allow_null=True
+    )
     program_type_name = serializers.CharField(source='program_type.name', read_only=True)
     program_type_code = serializers.CharField(source='program_type.code', read_only=True)
+    available_branch_ids = serializers.ListField(
+        child=serializers.UUIDField(), required=False, write_only=False
+    )
+    available_branches = serializers.SerializerMethodField()
     packages_count = serializers.SerializerMethodField()
 
     class Meta:
         model = Program
         fields = [
-            'id', 'organization', 'category', 'category_name',
-            'code', 'name', 'description', 'program_type',
-            'program_type_name', 'program_type_code',
-            'trial_allowed', 'status', 'packages_count', 'created_at', 'updated_at',
+            'id', 'organization', 'category', 'category_name', 'category_code',
+            'code', 'name', 'description', 'delivery_mode', 'display_order',
+            'program_type', 'program_type_name', 'program_type_code',
+            'trial_allowed', 'status', 'packages_count',
+            'available_branch_ids', 'available_branches',
+            'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
         extra_kwargs = {
             'code': {'required': False, 'allow_blank': True},
         }
 
+    def validate_code(self, value):
+        cleaned = str(value or '').strip().upper()
+        if not cleaned:
+            return cleaned
+        if not re.match(r'^[A-Z0-9_-]+$', cleaned):
+            raise serializers.ValidationError("Program code must contain only uppercase letters, numbers, underscores, and hyphens.")
+        return cleaned
+
+    def validate_name(self, value):
+        cleaned = str(value or '').strip()
+        if not cleaned:
+            raise serializers.ValidationError("Program name is required.")
+        return cleaned
+
+    def validate(self, attrs):
+        req = self.context.get('request')
+        from .views_catalog import _get_org, _get_db
+        alias = _get_db(req) if req else (self.context.get('db_alias') or 'default')
+        org = getattr(req, 'organization', None) or (self.instance.organization if self.instance else None) or self.context.get('organization')
+        if not org and req:
+            org = _get_org(req)
+
+        # 1. Resolve canonical Category (primary) and ProgramType (compatibility)
+        cat = attrs.get('category') or (self.instance.category if self.instance else None)
+        pt = attrs.get('program_type') or (self.instance.program_type if self.instance else None)
+
+        if cat:
+            if cat.organization_id != org.id:
+                raise serializers.ValidationError({'category': "Program Category does not belong to this organization."})
+            if not self.instance and cat.status != 'ACTIVE':
+                raise serializers.ValidationError({'category': f"Program Category '{cat.name}' is inactive and cannot be selected for a new program."})
+        elif pt:
+            # Compatibility bridge for legacy callers/tests
+            if pt.organization_id != org.id:
+                raise serializers.ValidationError({'program_type': "Program Type does not belong to this organization."})
+            if not self.instance and pt.status != 'ACTIVE':
+                raise serializers.ValidationError({'program_type': f"Program Type '{pt.name}' is inactive and cannot be selected for a new program."})
+            from .models_catalog import ProgramCategory
+            matching_cat = ProgramCategory.objects.using(alias).filter(organization=org, name__iexact=pt.name).first()
+            if not matching_cat:
+                matching_cat = ProgramCategory.objects.using(alias).filter(organization=org, code__iexact=pt.code).first()
+            if not matching_cat:
+                cat_code = _generate_unique_code(ProgramCategory, org, pt.name, db_alias=alias)
+                matching_cat = ProgramCategory.objects.using(alias).create(
+                    organization=org,
+                    name=pt.name,
+                    code=cat_code,
+                    description=pt.description,
+                    display_order=pt.display_order,
+                    status=pt.status,
+                )
+            attrs['category'] = matching_cat
+        else:
+            raise serializers.ValidationError({'category': "Program Category is required."})
+
+        # 2. Normalize delivery_mode (Service Structure engine semantics)
+        dm = attrs.get('delivery_mode')
+        if dm:
+            dm_norm = {
+                'GROUP': 'GROUP_CLASS',
+                'GROUP_CLASS': 'GROUP_CLASS',
+                'PERSONAL_TRAINING': 'INDIVIDUAL_SERVICE',
+                'INDIVIDUAL_SERVICE': 'INDIVIDUAL_SERVICE',
+                'OPEN_GYM': 'OPEN_ACCESS',
+                'OPEN_ACCESS': 'OPEN_ACCESS',
+                'HYBRID': 'GROUP_CLASS',
+            }.get(str(dm).upper(), dm)
+            attrs['delivery_mode'] = dm_norm
+
+        code = attrs.get('code')
+        if code and org:
+            qs = Program.objects.using(alias).filter(organization=org, code=code)
+            if self.instance:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError({'code': f"A Program with code '{code}' already exists in this organization."})
+
+        branch_ids = attrs.get('available_branch_ids')
+        if branch_ids and org:
+            from .models_org import Branch
+            for bid in branch_ids:
+                br = Branch.objects.using(alias).filter(pk=bid).first()
+                if not br or br.organization_id != org.id:
+                    raise serializers.ValidationError({'available_branch_ids': f"Branch with ID '{bid}' does not belong to this organization."})
+                if br.status in ('INACTIVE', 'CLOSED'):
+                    raise serializers.ValidationError({'available_branch_ids': f"Branch '{br.name}' is inactive and cannot be assigned."})
+
+        return attrs
+
     def create(self, validated_data):
+        branch_ids = validated_data.pop('available_branch_ids', None)
+        req = self.context.get('request')
+        alias = getattr(getattr(req, 'user', None), '_db_alias', None) or self.context.get('db_alias') or 'default'
+        org = validated_data.get('organization') or getattr(req, 'organization', None) or self.context.get('organization')
+        if not org and req:
+            from .views_catalog import _get_org
+            org = _get_org(req)
         if not validated_data.get('code'):
-            req = self.context.get('request')
-            alias = getattr(getattr(req, 'user', None), '_db_alias', None) or self.context.get('db_alias')
-            org = validated_data.get('organization') or getattr(req, 'organization', None) or self.context.get('organization')
             validated_data['code'] = _generate_unique_code(Program, org, validated_data.get('name', 'PROGRAM'), db_alias=alias)
-        return super().create(validated_data)
+
+        program = super().create(validated_data)
+        self._sync_branch_availability(program, branch_ids, alias, org)
+        return program
 
     def update(self, instance, validated_data):
+        branch_ids = validated_data.pop('available_branch_ids', None)
         if 'code' in validated_data and not validated_data['code']:
             validated_data.pop('code')
-        return super().update(instance, validated_data)
+        req = self.context.get('request')
+        alias = getattr(getattr(req, 'user', None), '_db_alias', None) or self.context.get('db_alias') or instance._state.db or 'default'
+        org = instance.organization
+
+        program = super().update(instance, validated_data)
+        if branch_ids is not None:
+            self._sync_branch_availability(program, branch_ids, alias, org)
+        return program
+
+    def _sync_branch_availability(self, program, branch_ids, alias, org):
+        if branch_ids is None:
+            return
+        from .models_catalog import ProgramBranchAvailability
+        # Activate selected branches
+        for bid in branch_ids:
+            pba, created = ProgramBranchAvailability.objects.using(alias).get_or_create(
+                program=program, branch_id=bid,
+                defaults={'is_active': True}
+            )
+            if not created and not pba.is_active:
+                pba.is_active = True
+                pba.save(using=alias)
+
+        # Deactivate unselected branches
+        ProgramBranchAvailability.objects.using(alias).filter(
+            program=program
+        ).exclude(branch_id__in=branch_ids).update(is_active=False)
+
+    def get_available_branches(self, obj):
+        alias = obj._state.db or 'default'
+        from .models_catalog import ProgramBranchAvailability
+        pbas = ProgramBranchAvailability.objects.using(alias).filter(
+            program=obj, is_active=True
+        ).select_related('branch')
+        return [
+            {'id': str(pba.branch_id), 'code': pba.branch.code, 'name': pba.branch.name}
+            for pba in pbas if pba.branch and pba.branch.status == 'ACTIVE'
+        ]
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        branches = self.get_available_branches(instance)
+        ret['available_branches'] = branches
+        ret['available_branch_ids'] = [b['id'] for b in branches]
+        return ret
 
     def get_packages_count(self, obj):
         return obj.packages.count()
@@ -236,11 +487,17 @@ class ProgramSerializer(serializers.ModelSerializer):
                 if org:
                     from .models_catalog import ProgramType
                     alias = getattr(getattr(req, 'user', None), '_db_alias', None) or 'default'
-                    pt, _ = ProgramType.objects.using(alias).get_or_create(
+                    pt = ProgramType.objects.using(alias).filter(
                         organization=org,
-                        code=raw_pt.upper().strip(),
-                        defaults={'name': raw_pt.replace('_', ' ').title(), 'status': 'ACTIVE'}
-                    )
+                        code__iexact=raw_pt.strip()
+                    ).first()
+                    if not pt:
+                        pt = ProgramType.objects.using(alias).create(
+                            organization=org,
+                            code=raw_pt.upper().strip(),
+                            name=raw_pt.replace('_', ' ').title(),
+                            status='ACTIVE'
+                        )
                     ret['program_type'] = pt
         return ret
 

@@ -241,9 +241,21 @@ class Program(models.Model):
         ProgramType, db_column='program_type_id', on_delete=models.SET_NULL, null=True, blank=True, related_name='programs'
     )
     legacy_program_type = models.CharField(db_column='program_type', max_length=40, default='MEMBERSHIP')
+    DELIVERY_MODE_CHOICES = [
+        ('GROUP_CLASS', 'Group Class'),
+        ('INDIVIDUAL_SERVICE', 'Individual Service / PT'),
+        ('OPEN_ACCESS', 'Open Access / Gym Floor'),
+        ('GROUP', 'Group Class (Legacy)'),
+        ('PERSONAL_TRAINING', 'Personal Training (Legacy)'),
+        ('OPEN_GYM', 'Open Gym Access (Legacy)'),
+        ('HYBRID', 'Hybrid / Online (Legacy)'),
+    ]
+
     code = models.CharField(max_length=100)
     name = models.CharField(max_length=200)
     description = models.TextField(null=True, blank=True)
+    delivery_mode = models.CharField(max_length=30, choices=DELIVERY_MODE_CHOICES, default='GROUP_CLASS', blank=True)
+    display_order = models.IntegerField(default=0)
     trial_allowed = models.BooleanField(default=False)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='ACTIVE')
     created_at = models.DateTimeField(default=timezone.now)
@@ -261,10 +273,42 @@ class Program(models.Model):
             models.Index(fields=['organization', 'status'], name='idx_prog_org_status'),
             models.Index(fields=['category', 'status'], name='idx_prog_cat_status'),
             models.Index(fields=['program_type', 'status'], name='idx_prog_type_status'),
+            models.Index(fields=['organization', 'display_order'], name='idx_prog_org_order'),
         ]
 
     def __str__(self):
         return f"{self.name} ({self.code})"
+
+
+class ProgramBranchAvailability(models.Model):
+    """
+    Authoritative operational branch availability for programs.
+    Defines at which branches a Program is operationally active and available.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    program = models.ForeignKey(
+        Program, on_delete=models.CASCADE, related_name='branch_availabilities'
+    )
+    branch = models.ForeignKey(
+        'Branch', on_delete=models.PROTECT, related_name='program_availabilities'
+    )
+    is_active = models.BooleanField(default=True)
+    effective_from = models.DateTimeField(null=True, blank=True)
+    effective_to = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'program_branch_availabilities'
+        unique_together = [('program', 'branch')]
+        indexes = [
+            models.Index(fields=['branch', 'is_active'], name='idx_progbr_avail_br_act'),
+            models.Index(fields=['program', 'is_active'], name='idx_progbr_avail_pr_act'),
+        ]
+
+    def __str__(self):
+        status_str = "Active" if self.is_active else "Inactive"
+        return f"{self.program.name} @ {self.branch.name} ({status_str})"
 
 
 class Package(models.Model):

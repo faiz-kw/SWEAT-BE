@@ -79,6 +79,29 @@ class ClassBranchAvailabilitySerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
 
+    def validate(self, attrs):
+        class_template = attrs.get('class_template') or getattr(self.instance, 'class_template', None)
+        branch = attrs.get('branch') or getattr(self.instance, 'branch', None)
+        status_val = attrs.get('status') or getattr(self.instance, 'status', 'ENABLED')
+
+        if class_template and branch and status_val == 'ENABLED' and class_template.program:
+            from .models_catalog import ProgramBranchAvailability
+            request = self.context.get('request')
+            alias = getattr(request, '_tenant_db_alias', None) or 'default'
+            if hasattr(branch, '_state') and branch._state.db:
+                alias = branch._state.db
+
+            is_available = ProgramBranchAvailability.objects.using(alias).filter(
+                program=class_template.program,
+                branch=branch,
+                is_active=True
+            ).exists()
+            if not is_available:
+                raise serializers.ValidationError({
+                    'branch': f"Cannot make class '{class_template.name}' available at '{branch.name}' because its program '{class_template.program.name}' is not active at this branch."
+                })
+        return attrs
+
 
 class ClassTemplateSerializer(serializers.ModelSerializer):
     code = serializers.CharField(required=False, allow_blank=True, max_length=100)

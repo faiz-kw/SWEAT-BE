@@ -38,8 +38,9 @@ from .models_crm import (
 
 from .models_catalog import (
     TermsDocument, TermsDocumentVersion, TermsAcceptance,
-    ProgramCategory, ProgramType, Program, Package, PackageVersion,
-    PackagePrice, PackageBranchAvailability, PackageEntitlementDefinition,
+    ProgramCategory, ProgramType, Program, ProgramBranchAvailability,
+    Package, PackageVersion, PackagePrice, PackageBranchAvailability,
+    PackageEntitlementDefinition,
 )
 
 from .models_classes import (
@@ -79,7 +80,7 @@ __all__ = [
     # Module C: Terms & Legal
     'TermsDocument', 'TermsDocumentVersion', 'TermsAcceptance',
     # Module D: Programs, Packages & Catalog
-    'ProgramCategory', 'ProgramType', 'Program', 'Package', 'PackageVersion',
+    'ProgramCategory', 'ProgramType', 'Program', 'ProgramBranchAvailability', 'Package', 'PackageVersion',
     'PackagePrice', 'PackageBranchAvailability', 'PackageEntitlementDefinition',
     # Module E: Group Classes, Scheduling, Content Studio & Demand Planning
     'ClassCategory', 'ClassTemplate', 'ClassPrice', 'ClassBranchAvailability',

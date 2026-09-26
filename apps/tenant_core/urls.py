@@ -76,6 +76,7 @@ from .views_catalog import (
     ProgramCategoryViewSet,
     ProgramTypeViewSet,
     ProgramViewSet,
+    ProgramBranchAvailabilityViewSet,
     PackageViewSet,
     PackageVersionViewSet,
     PackagePriceViewSet,
@@ -231,6 +232,8 @@ router.register(r'terms-acceptances', TermsAcceptanceViewSet, basename='terms-ac
 router.register(r'program-categories', ProgramCategoryViewSet, basename='program-category')
 router.register(r'program-types', ProgramTypeViewSet, basename='program-type')
 router.register(r'programs', ProgramViewSet, basename='program')
+router.register(r'program-branch-availability', ProgramBranchAvailabilityViewSet, basename='program-branch-availability')
+router.register(r'program-branch-availabilities', ProgramBranchAvailabilityViewSet, basename='program-branch-availabilities')
 router.register(r'packages', PackageViewSet, basename='package')
 router.register(r'package-versions', PackageVersionViewSet, basename='package-version')
 router.register(r'package-prices', PackagePriceViewSet, basename='package-price')
