@@ -241,24 +241,20 @@ class ProgramViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         alias = _get_db(self.request)
         org = _get_org(self.request)
-        qs = Program.objects.using(alias).filter(organization=org)
         cat_id = self.request.query_params.get('category_id')
-        status_param = self.request.query_params.get('status')
+        status_param = self.request.query_params.get('status', 'ACTIVE')
         branch_id = self.request.query_params.get('branch_id')
+        context = self.request.query_params.get('context', 'lead_interest')
 
-        if cat_id:
-            qs = qs.filter(category_id=cat_id)
-        if status_param:
-            qs = qs.filter(status=status_param)
-        if branch_id:
-            # Check programs associated with packages available at this branch
-            from .models_catalog import PackageBranchAvailability
-            branch_avail = PackageBranchAvailability.objects.using(alias).filter(branch_id=branch_id)
-            if branch_avail.exists():
-                branch_prog_ids = branch_avail.filter(status='ENABLED').values_list('package__program_id', flat=True)
-                qs = qs.filter(id__in=branch_prog_ids)
-
-        return qs.order_by('name')
+        from .services_catalog import CRMProgramEligibilityService
+        return CRMProgramEligibilityService.resolve_programs(
+            organization=org,
+            branch_id=branch_id,
+            context=context,
+            status=status_param,
+            category_id=cat_id,
+            alias=alias,
+        )
 
     def perform_create(self, serializer):
         org = _get_org(self.request)

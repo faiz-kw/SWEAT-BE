@@ -536,3 +536,197 @@ class MembershipLifecycleService:
             )
 
         return req
+
+    @classmethod
+    @transaction.atomic
+    def unfreeze_membership(
+        cls,
+        membership: Membership,
+        reason_text: Optional[str] = None,
+        approved_by_user: Optional[TenantUser] = None,
+        db_alias: Optional[str] = None,
+    ) -> Membership:
+        """
+        Prematurely or normally unfreezes a frozen membership, marking active freeze completed and restoring ACTIVE status.
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        freeze = MembershipFreeze.objects.using(alias).filter(
+            membership=membership,
+            status='ACTIVE'
+        ).first()
+        if freeze:
+            freeze.status = 'COMPLETED'
+            freeze.save(using=alias, update_fields=['status', 'updated_at'])
+
+        old_status = membership.status
+        membership.status = 'ACTIVE'
+        membership.save(using=alias, update_fields=['status', 'updated_at'])
+
+        MembershipStatusHistory.objects.using(alias).create(
+            membership=membership,
+            from_status=old_status,
+            to_status='ACTIVE',
+            reason_code='UNFREEZE_APPLIED',
+            reason_text=reason_text or "Membership unfreezed by staff.",
+            changed_by_user=approved_by_user,
+        )
+        return membership
+
+    @classmethod
+    @transaction.atomic
+    def extend_membership(
+        cls,
+        membership: Membership,
+        days: int,
+        reason_text: Optional[str] = None,
+        approved_by_user: Optional[TenantUser] = None,
+        db_alias: Optional[str] = None,
+    ) -> Membership:
+        """
+        Extends the validity end date of a membership by N days.
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        if days <= 0:
+            raise ValidationError("Extension days must be greater than zero.")
+
+        old_end = membership.end_date
+        new_end = old_end + timedelta(days=days)
+        membership.end_date = new_end
+        old_st = membership.status
+        if membership.status == 'EXPIRED' and new_end >= timezone.now().date():
+            membership.status = 'ACTIVE'
+        membership.save(using=alias, update_fields=['end_date', 'status', 'updated_at'])
+
+        end_dt = timezone.make_aware(datetime.combine(new_end, datetime.max.time()))
+        membership.entitlements.filter(status__in=['ACTIVE', 'EXPIRED']).update(valid_until=end_dt, status='ACTIVE')
+
+        MembershipStatusHistory.objects.using(alias).create(
+            membership=membership,
+            from_status=old_st,
+            to_status=membership.status,
+            reason_code='EXTENSION_APPLIED',
+            reason_text=reason_text or f"Extended by {days} days from {old_end} to {new_end}.",
+            changed_by_user=approved_by_user,
+        )
+        return membership
+
+    @classmethod
+    @transaction.atomic
+    def transfer_home_branch(
+        cls,
+        membership: Membership,
+        target_branch: Branch,
+        reason_text: Optional[str] = None,
+        actor_user: Optional[TenantUser] = None,
+        db_alias: Optional[str] = None,
+    ) -> MembershipBranchHistory:
+        """
+        Transfers the home branch of a membership and updates the member's preferred branch.
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        from_branch = membership.home_branch
+        membership.home_branch = target_branch
+        membership.save(using=alias, update_fields=['home_branch', 'updated_at'])
+
+        profile = membership.user_profile
+        if profile:
+            profile.preferred_branch = target_branch
+            profile.save(using=alias, update_fields=['preferred_branch', 'updated_at'])
+
+        hist = MembershipBranchHistory.objects.using(alias).create(
+            membership=membership,
+            from_branch=from_branch,
+            to_branch=target_branch,
+            change_type='TRANSFER',
+            reason=reason_text or f"Transferred home branch from {from_branch.name} to {target_branch.name}",
+            changed_by_user=actor_user,
+        )
+        return hist
+
+    @classmethod
+    @transaction.atomic
+    def cancel_membership(
+        cls,
+        membership: Membership,
+        reason_text: Optional[str] = None,
+        actor_user: Optional[TenantUser] = None,
+        db_alias: Optional[str] = None,
+    ) -> Membership:
+        """
+        Cancels an active membership, expires active entitlements, and records status history.
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        old_st = membership.status
+        membership.status = 'CANCELLED'
+        membership.cancelled_at = timezone.now()
+        membership.save(using=alias, update_fields=['status', 'cancelled_at', 'updated_at'])
+
+        membership.entitlements.filter(status='ACTIVE').update(status='EXPIRED')
+
+        MembershipStatusHistory.objects.using(alias).create(
+            membership=membership,
+            from_status=old_st,
+            to_status='CANCELLED',
+            reason_code='MEMBER_CANCELLATION',
+            reason_text=reason_text or "Membership cancelled by staff.",
+            changed_by_user=actor_user,
+        )
+        return membership
+
+    @classmethod
+    @transaction.atomic
+    def adjust_entitlement(
+        cls,
+        membership: Membership,
+        entitlement_type: str,
+        units_delta: Decimal,
+        reason_code: str = 'ADMIN_ADJUSTMENT',
+        reason_text: Optional[str] = None,
+        actor_user: Optional[TenantUser] = None,
+        db_alias: Optional[str] = None,
+    ) -> MembershipEntitlementLedger:
+        """
+        Staff controlled adjustment of entitlement units with immutable ledger entry and balance_after.
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        ent = MembershipEntitlement.objects.using(alias).select_for_update().filter(
+            membership=membership,
+            entitlement_type=entitlement_type,
+        ).first()
+
+        if not ent:
+            now_dt = timezone.now()
+            end_dt = timezone.make_aware(datetime.combine(membership.end_date, datetime.max.time()))
+            ent = MembershipEntitlement.objects.using(alias).create(
+                membership=membership,
+                entitlement_type=entitlement_type,
+                allocated_units=Decimal('0.00'),
+                consumed_units=Decimal('0.00'),
+                is_unlimited=False,
+                valid_from=now_dt,
+                valid_until=end_dt,
+                status='ACTIVE',
+            )
+
+        if units_delta >= Decimal('0.00'):
+            ent.allocated_units = (ent.allocated_units or Decimal('0.00')) + units_delta
+            if ent.status == 'EXHAUSTED':
+                ent.status = 'ACTIVE'
+        else:
+            ent.consumed_units += abs(units_delta)
+            if ent.allocated_units and ent.consumed_units >= ent.allocated_units:
+                ent.status = 'EXHAUSTED'
+
+        ent.save(using=alias, update_fields=['allocated_units', 'consumed_units', 'status', 'updated_at'])
+        balance_after = ent.remaining_units
+
+        ledger = MembershipEntitlementLedger.objects.using(alias).create(
+            membership_entitlement=ent,
+            transaction_type='ADJUSTMENT',
+            units=units_delta,
+            reason_code=reason_code,
+            reason_text=reason_text or f"Manual adjustment of {units_delta} units",
+            balance_after=balance_after,
+            created_by_user=actor_user,
+        )
+        return ledger

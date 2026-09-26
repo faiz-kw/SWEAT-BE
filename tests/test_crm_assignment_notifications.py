@@ -125,6 +125,36 @@ class CRMAssignmentAndCouponTestSuite(APITestCase):
             is_active=True
         )
 
+        # Seed canonical Lead Handling permission and attach to standard CRM roles
+        mod_cat, _ = ModuleCatalog.objects.using(DB).get_or_create(
+            module_code='crm',
+            defaults={'name': 'CRM Module', 'code': 'crm', 'display_order': 1}
+        )
+        perm_leads_edit, _ = Permission.objects.using(DB).get_or_create(
+            permission_code='crm.leads.edit',
+            defaults={
+                'source_permission_id': uuid.uuid4(),
+                'module': mod_cat,
+                'code': 'crm.leads.edit',
+                'label': 'Edit Leads',
+                'action': 'edit',
+                'is_active': True,
+            }
+        )
+        for r in (self.role_admin, self.role_sales, self.role_manager):
+            ps = RolePermissionSet.objects.using(DB).create(
+                role=r,
+                organization=self.org,
+                name=f"{r.code}_pset",
+                is_active=True,
+            )
+            RolePermissionSetItem.objects.using(DB).create(
+                permission_set=ps,
+                permission=perm_leads_edit,
+                granted=True,
+                is_allowed=True,
+            )
+
         # 4. Users
         self.admin_user = TenantUser.objects.using(DB).create(
             organization=self.org,

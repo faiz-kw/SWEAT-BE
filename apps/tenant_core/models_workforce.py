@@ -86,6 +86,34 @@ class UserProfile(models.Model):
             models.Index(fields=['preferred_branch'], name='idx_uprof_pref_branch'),
         ]
 
+    @property
+    def is_customer_member(self) -> bool:
+        """
+        Positive verification if this profile represents an actual customer/member.
+        Staff-only profiles return False.
+        """
+        if self.member_number and str(self.member_number).strip():
+            return True
+        if self.acquisition_source and str(self.acquisition_source).strip():
+            return True
+        alias = self._state.db or 'default'
+        try:
+            if self.memberships.using(alias).exists():
+                return True
+        except Exception:
+            pass
+        try:
+            if self.lead_conversions.using(alias).exists():
+                return True
+        except Exception:
+            pass
+        try:
+            if self.orders.using(alias).exists():
+                return True
+        except Exception:
+            pass
+        return False
+
     def __str__(self):
         return f"UserProfile({self.user.email} - {self.member_number or 'No Member#'})"
 

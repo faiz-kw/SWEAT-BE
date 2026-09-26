@@ -60,6 +60,7 @@ class TenantUserSerializer(serializers.ModelSerializer):
     }
 
     full_name = serializers.CharField(read_only=True)
+    username = serializers.CharField(required=False, allow_null=True, allow_blank=False)
     role = serializers.SerializerMethodField()
     role_name = serializers.SerializerMethodField()
     roles = serializers.SerializerMethodField()
@@ -78,7 +79,7 @@ class TenantUserSerializer(serializers.ModelSerializer):
     class Meta:
         model = TenantUser
         fields = [
-            'id', 'organization', 'email', 'first_name', 'last_name', 'phone',
+            'id', 'organization', 'username', 'email', 'first_name', 'last_name', 'phone',
             'status', 'is_login_allowed', 'home_branch', 'deactivated_at',
             'deactivated_by', 'deactivation_reason', 'suspended_until',
             'last_login_at', 'created_at',
@@ -90,6 +91,26 @@ class TenantUserSerializer(serializers.ModelSerializer):
         extra_kwargs = {
             'organization': {'required': False},
         }
+
+    def validate_username(self, value):
+        if value is None:
+            return value
+        cleaned = str(value).strip().lower()
+        if not cleaned:
+            raise serializers.ValidationError("Username cannot be empty.")
+        if len(cleaned) < 3 or len(cleaned) > 150:
+            raise serializers.ValidationError("Username must be between 3 and 150 characters.")
+        import re
+        if not re.match(r'^[a-z0-9_.-]+$', cleaned):
+            raise serializers.ValidationError("Username can only contain alphanumeric characters, dots, underscores, and hyphens.")
+
+        db = self.context.get('db_alias') or (self.instance._state.db if self.instance else 'default')
+        qs = TenantUser.objects.using(db).filter(username__iexact=cleaned)
+        if self.instance:
+            qs = qs.exclude(id=self.instance.id)
+        if qs.exists():
+            raise serializers.ValidationError("This username is already taken.")
+        return cleaned
 
     def get_reports_to_id(self, obj):
         try:

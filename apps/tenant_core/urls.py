@@ -131,6 +131,7 @@ from .views_memberships import (
     MembershipChangePolicyViewSet,
     MembershipChangeRequestViewSet,
 )
+from .views_members import MemberViewSet
 from .views_bookings import (
     BookingViewSet,
     BookingPolicySetViewSet,
@@ -181,6 +182,7 @@ router.register(r'attendance-records', AttendanceRecordViewSet, basename='attend
 router.register(r'access-events', AccessEventViewSet, basename='access-event')
 
 router.register(r'memberships', MembershipViewSet, basename='membership')
+router.register(r'members', MemberViewSet, basename='member')
 router.register(r'membership-entitlements', MembershipEntitlementViewSet, basename='membership-entitlement')
 router.register(r'membership-entitlement-ledgers', MembershipEntitlementLedgerViewSet, basename='membership-entitlement-ledger')
 router.register(r'membership-freezes', MembershipFreezeViewSet, basename='membership-freeze')

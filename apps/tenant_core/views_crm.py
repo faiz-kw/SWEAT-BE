@@ -120,7 +120,7 @@ def _get_org(request):
         alias = _get_db(request)
         if user and getattr(user, 'organization_id', None):
             return Organization.objects.using(alias).filter(id=user.organization_id).first()
-        return Organization.objects.using(alias).filter(status='ACTIVE').first()
+        return Organization.objects.using(alias).filter(status='ACTIVE').order_by('-created_at').first()
     return org
 
 
@@ -335,6 +335,7 @@ class LeadViewSet(viewsets.ModelViewSet):
         'book_trial': 'crm.leads.edit',
         'metadata': 'crm.leads.view',
         'eligible_agents': 'crm.leads.view',
+        'eligible_assignees': 'crm.leads.view',
         'search_referrers': 'crm.leads.view',
         'check_duplicates': 'crm.leads.view',
         'timeline': 'crm.leads.view',
@@ -437,16 +438,28 @@ class LeadViewSet(viewsets.ModelViewSet):
             else:
                 raise PermissionDenied("A branch selection is required for branch-scoped staff.")
 
+        assignment_mode = str(self.request.data.get('assignment_mode') or 'MANUAL').upper()
+        if assignment_mode not in ('MANUAL', 'AUTO'):
+            assignment_mode = 'MANUAL'
+
         assigned_sales_user = serializer.validated_data.get('assigned_sales_user')
-        if assigned_sales_user:
-            if assigned_sales_user.organization_id != org.id:
-                raise ValidationError({"assigned_sales_user": "Assigned agent must belong to the same organization."})
-            if assigned_sales_user.status != 'ACTIVE' or not assigned_sales_user.is_login_allowed:
-                raise ValidationError({"assigned_sales_user": "Assigned agent is inactive or not allowed to log in."})
-            if branch:
-                agent_permitted = get_user_effective_branch_ids(assigned_sales_user, alias)
-                if agent_permitted is not None and str(branch.id) not in agent_permitted:
-                    raise ValidationError({"assigned_sales_user": f"Agent {assigned_sales_user.email} is not eligible for branch '{branch.name}'."})
+        if assigned_sales_user and assignment_mode == 'MANUAL':
+            from .services_lead_assignment import LeadAssignmentEligibilityService
+            is_valid, validation_err = LeadAssignmentEligibilityService.validate_assignee_eligibility(
+                organization=org,
+                user=assigned_sales_user,
+                branch=branch,
+                db_alias=alias,
+            )
+            if not is_valid:
+                from rest_framework.exceptions import ValidationError as DRFValidationError
+                raise DRFValidationError({"assigned_sales_user": f"Selected representative is not eligible: {validation_err}"})
+
+        extra_fields = {
+            k: v for k, v in serializer.validated_data.items()
+            if k not in ('first_name', 'last_name', 'phone_normalized', 'email_normalized', 'branch', 'lead_source', 'assigned_sales_user', 'attribution')
+        }
+        extra_fields['assignment_mode'] = assignment_mode
 
         lead = CRMLeadService.create_lead(
             organization=org,
@@ -456,12 +469,9 @@ class LeadViewSet(viewsets.ModelViewSet):
             email=serializer.validated_data.get('email_normalized'),
             branch=branch,
             lead_source=serializer.validated_data.get('lead_source'),
-            assigned_sales_user=serializer.validated_data.get('assigned_sales_user'),
+            assigned_sales_user=assigned_sales_user if assignment_mode == 'MANUAL' else None,
             actor_user=getattr(self.request, 'user', None),
-            extra_fields={
-                k: v for k, v in serializer.validated_data.items()
-                if k not in ('first_name', 'last_name', 'phone_normalized', 'email_normalized', 'branch', 'lead_source', 'assigned_sales_user', 'attribution')
-            },
+            extra_fields=extra_fields,
             attribution_data=serializer.validated_data.get('attribution'),
             db_alias=alias,
         )
@@ -511,77 +521,38 @@ class LeadViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'], url_path='eligible-agents')
     def eligible_agents(self, request):
+        return self._get_eligible_assignees_response(request, default_include_unavailable=False)
+
+    @action(detail=False, methods=['get'], url_path='eligible-assignees')
+    def eligible_assignees(self, request):
+        return self._get_eligible_assignees_response(request, default_include_unavailable=True)
+
+    def _get_eligible_assignees_response(self, request, default_include_unavailable=False):
         alias = _get_db(request)
         org = _get_org(request)
         if not org:
             return Response([])
 
-        config = CRMAgentAssignmentConfig.objects.using(alias).filter(organization=org).first()
-        allowed_roles = (
-            config.allowed_role_codes
-            if config and config.allowed_role_codes
-            else ['SALES_REP', 'BRANCH_MANAGER', 'FRONT_DESK', 'ORG_ADMIN']
-        )
-        excluded_users = set(config.excluded_user_ids if config and config.excluded_user_ids else [])
-        require_branch = config.require_branch_match if config is not None else True
-
-        qs = TenantUser.objects.using(alias).filter(
-            organization=org,
-            status='ACTIVE',
-            is_login_allowed=True,
-        )
-
-        if excluded_users:
-            qs = qs.exclude(id__in=list(excluded_users))
-
-        if allowed_roles:
-            qs = qs.filter(
-                role_assignments__role__code__in=allowed_roles,
-                role_assignments__status='ACTIVE',
-                role_assignments__is_active=True,
-            )
-
         query_params = getattr(request, 'query_params', getattr(request, 'GET', {}))
         branch_id = query_params.get('branch_id')
-        if branch_id and require_branch:
-            qs = qs.filter(
-                Q(home_branch_id=branch_id) |
-                Q(branch_assignments__branch_id=branch_id, branch_assignments__status='ACTIVE', branch_assignments__is_active=True) |
-                Q(branch_assignments__scope_type='ALL', branch_assignments__status='ACTIVE', branch_assignments__is_active=True) |
-                Q(role_assignments__branch_id=branch_id, role_assignments__status='ACTIVE', role_assignments__is_active=True) |
-                Q(role_assignments__scope_type='ORGANIZATION', role_assignments__status='ACTIVE', role_assignments__is_active=True) |
-                Q(role_assignments__role__scope='ORG', role_assignments__status='ACTIVE', role_assignments__is_active=True)
-            )
+        inc_param = query_params.get('include_unavailable')
+        if inc_param is not None:
+            include_unavailable = str(inc_param).lower() in ('true', '1', 'yes')
+        else:
+            include_unavailable = default_include_unavailable
 
-        qs = qs.distinct().prefetch_related('role_assignments__role', 'home_branch')
+        branch_obj = None
+        if branch_id:
+            branch_obj = Branch.objects.using(alias).filter(id=branch_id, organization=org).first()
 
-        agents = []
-        for u in qs.order_by('first_name', 'last_name'):
-            active_ras = [
-                ra for ra in u.role_assignments.all()
-                if ra.status == 'ACTIVE' and ra.is_active
-            ]
-            # Prioritize matching allowed_roles if possible
-            matched_ra = next((ra for ra in active_ras if ra.role.code in allowed_roles), None)
-            if not matched_ra and active_ras:
-                matched_ra = active_ras[0]
-
-            role_code = matched_ra.role.code if matched_ra else None
-            role_name = matched_ra.role.name if matched_ra else (u.user_type or 'Staff')
-
-            agents.append({
-                'id': str(u.id),
-                'name': f"{u.first_name} {u.last_name}".strip() or u.email,
-                'email': u.email,
-                'phone': u.phone,
-                'user_type': u.user_type,
-                'role_code': role_code,
-                'role_name': role_name,
-                'home_branch_id': str(u.home_branch_id) if u.home_branch_id else None,
-                'home_branch_name': u.home_branch.name if u.home_branch else None,
-            })
-
-        return Response(agents)
+        from .services_lead_assignment import LeadAssignmentEligibilityService
+        reps = LeadAssignmentEligibilityService.get_eligible_representatives(
+            organization=org,
+            branch=branch_obj,
+            db_alias=alias,
+            include_unavailable=include_unavailable,
+        )
+        return Response(reps)
 
     @action(detail=False, methods=['get'], url_path='search-referrers')
     def search_referrers(self, request):
@@ -2762,6 +2733,13 @@ class CRMAgentAssignmentConfigViewSet(viewsets.ViewSet):
                 'allowed_role_codes': updated_config.allowed_role_codes,
                 'excluded_user_ids': updated_config.excluded_user_ids,
                 'require_branch_match': updated_config.require_branch_match,
+                'allow_all_staff_fallback': updated_config.allow_all_staff_fallback,
+                'assignment_mode_allowed': updated_config.assignment_mode_allowed,
+                'default_assignment_mode': updated_config.default_assignment_mode,
+                'auto_assignment_strategy': updated_config.auto_assignment_strategy,
+                'allow_unassigned_fallback': updated_config.allow_unassigned_fallback,
+                'consider_leave_availability': updated_config.consider_leave_availability,
+                'notify_manager_on_unassigned': updated_config.notify_manager_on_unassigned,
             },
             db_alias=alias,
         )

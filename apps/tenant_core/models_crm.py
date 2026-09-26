@@ -362,6 +362,25 @@ class LeadAssignment(models.Model):
         db_column='assigned_by_user_id',
     )
     assignment_type = models.CharField(max_length=20, choices=ASSIGNMENT_TYPES, default='SALES')
+    assignment_source = models.CharField(max_length=20, choices=[('MANUAL', 'Manual'), ('AUTO', 'Auto')], default='MANUAL')
+    assignment_strategy = models.CharField(max_length=40, blank=True, default='')
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='lead_assignments',
+        db_column='branch_id',
+    )
+    previous_assignment = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='subsequent_assignments',
+        db_column='previous_assignment_id',
+    )
+    reason = models.TextField(blank=True, default='')
     assigned_at = models.DateTimeField(default=timezone.now)
     unassigned_at = models.DateTimeField(null=True, blank=True)
     status = models.CharField(max_length=20, choices=STATUSES, default='ACTIVE')
@@ -1105,6 +1124,32 @@ class CRMAgentAssignmentConfig(models.Model):
     allow_all_staff_fallback = models.BooleanField(default=True)
     # Require branch matching (only show agents matching lead branch unless org-wide scope)
     require_branch_match = models.BooleanField(default=True)
+    # Mode allowed: MANUAL, AUTO, BOTH
+    assignment_mode_allowed = models.CharField(
+        max_length=20,
+        choices=[('MANUAL', 'Manual Only'), ('AUTO', 'Auto Only'), ('BOTH', 'Both Manual & Auto')],
+        default='BOTH',
+    )
+    # Default assignment mode when registering a lead
+    default_assignment_mode = models.CharField(
+        max_length=20,
+        choices=[('MANUAL', 'Manual'), ('AUTO', 'Auto Assign')],
+        default='MANUAL',
+    )
+    # Strategy: ROUND_ROBIN, LEAST_OPEN_LEADS, MANUAL_ONLY
+    auto_assignment_strategy = models.CharField(
+        max_length=40,
+        choices=[('ROUND_ROBIN', 'Round Robin'), ('LEAST_OPEN_LEADS', 'Least Open Leads'), ('MANUAL_ONLY', 'Manual Only')],
+        default='ROUND_ROBIN',
+    )
+    # Allow lead to be created as UNASSIGNED when no representative is available
+    allow_unassigned_fallback = models.BooleanField(default=True)
+    # Check workforce schedule exceptions (leave / time-off)
+    consider_leave_availability = models.BooleanField(default=True)
+    # Send in-app notification to branch/org manager when no agent is available
+    notify_manager_on_unassigned = models.BooleanField(default=True)
+    # Concurrency-safe round robin state dictionary: { "<branch_id>": "<last_assigned_user_id>" }
+    round_robin_state = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 

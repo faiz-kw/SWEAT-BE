@@ -222,6 +222,34 @@ class CRMLeadService:
             gst_number = extra.pop('gst_number', None)
             pan_number = extra.pop('pan_number', None)
             attribution_from_extra = extra.pop('attribution', None)
+            assignment_mode = extra.pop('assignment_mode', 'MANUAL')
+
+            assignment_strategy = ''
+            assignment_source = 'MANUAL'
+            assignment_reason = ''
+
+            if assignment_mode == 'AUTO':
+                assignment_source = 'AUTO'
+                from .services_lead_assignment import LeadAutoAssignmentService
+                resolved_user, strategy, reason_msg = LeadAutoAssignmentService.resolve_assignee(
+                    organization=organization,
+                    branch=branch,
+                    db_alias=alias,
+                )
+                assigned_sales_user = resolved_user
+                assignment_strategy = strategy
+                assignment_reason = reason_msg or ''
+
+            elif assigned_sales_user:
+                from .services_lead_assignment import LeadAssignmentEligibilityService
+                is_valid, validation_err = LeadAssignmentEligibilityService.validate_assignee_eligibility(
+                    organization=organization,
+                    user=assigned_sales_user,
+                    branch=branch,
+                    db_alias=alias,
+                )
+                if not is_valid:
+                    raise ValidationError(f"Selected representative is not eligible: {validation_err}")
 
             if email:
                 email = validate_lead_email(email, required=False)
@@ -260,63 +288,15 @@ class CRMLeadService:
                 changed_by_user=actor_user,
             )
 
-            # Record initial assignment if specified
-            if assigned_sales_user:
-                initial_assign = LeadAssignment.objects.using(alias).create(
+            if assigned_sales_user or assignment_mode == 'AUTO':
+                from .services_lead_assignment import LeadAssignmentExecutionService
+                LeadAssignmentExecutionService.execute_assignment(
                     lead=lead,
                     assigned_to_user=assigned_sales_user,
-                    assigned_by_user=actor_user,
-                    assignment_type='SALES',
-                    status='ACTIVE',
-                )
-                record_business_audit(
-                    organization=organization,
-                    branch=branch,
-                    actor_type='EMPLOYEE' if actor_user else 'SYSTEM',
+                    assignment_source=assignment_source,
+                    assignment_strategy=assignment_strategy,
+                    reason=assignment_reason,
                     actor_user=actor_user,
-                    module='crm',
-                    action_code='CRM_LEAD_ASSIGNED',
-                    entity_type='LeadAssignment',
-                    entity_id=initial_assign.id,
-                    event_description=f"Assigned lead {lead.first_name} {lead.last_name} to {assigned_sales_user.email}",
-                    after_data={
-                        'lead_id': str(lead.id),
-                        'assigned_to_user_id': str(assigned_sales_user.id),
-                        'branch_id': str(branch.id) if branch else None,
-                        'assignment_type': 'SALES',
-                    },
-                    db_alias=alias,
-                )
-                enqueue_outbox_event(
-                    organization=organization,
-                    event_type='crm.lead.assigned',
-                    aggregate_type='Lead',
-                    aggregate_id=lead.id,
-                    payload={
-                        'lead_id': str(lead.id),
-                        'assigned_user_id': str(assigned_sales_user.id),
-                        'branch_id': str(branch.id) if branch else None,
-                        'assigned_by': str(actor_user.id) if actor_user else None,
-                        'assignment_type': 'SALES',
-                        'created_at': timezone.now().isoformat(),
-                    },
-                    db_alias=alias,
-                )
-                send_in_app_notification(
-                    organization=organization,
-                    user=assigned_sales_user,
-                    notification_type='LEAD_ASSIGNED',
-                    title='New Lead Assigned',
-                    message=f"A new lead has been assigned to you: {lead.first_name} {lead.last_name} — {branch.name if branch else 'General'}",
-                    data={
-                        'lead_id': str(lead.id),
-                        'lead_name': f"{lead.first_name} {lead.last_name}",
-                        'branch_name': branch.name if branch else 'General',
-                        'branch_id': str(branch.id) if branch else None,
-                        'assigned_by': actor_user.email if actor_user else 'System',
-                    },
-                    deep_link=f"/crm/leads?lead_id={lead.id}",
-                    idempotency_key=f"lead_assigned:{lead.id}:{assigned_sales_user.id}:initial",
                     db_alias=alias,
                 )
 
@@ -947,6 +927,7 @@ class CRMLeadService:
         notes: str = '',
         actor_user: Optional[TenantUser] = None,
         db_alias: Optional[str] = None,
+        **kwargs,
     ) -> LeadAssignment:
         alias = db_alias or get_tenant_db_alias() or 'default'
 
@@ -955,6 +936,17 @@ class CRMLeadService:
             raise ValidationError("Target user does not belong to the same organization.")
         if assigned_to_user.status != 'ACTIVE' or not assigned_to_user.is_login_allowed:
             raise ValidationError("Target user is inactive or login is disabled.")
+
+        if assignment_type == 'SALES':
+            from .services_lead_assignment import LeadAssignmentEligibilityService
+            is_valid, validation_err = LeadAssignmentEligibilityService.validate_assignee_eligibility(
+                organization=lead.organization,
+                user=assigned_to_user,
+                branch=lead.branch,
+                db_alias=alias,
+            )
+            if not is_valid:
+                raise ValidationError(f"Selected representative is not eligible: {validation_err}")
 
         with transaction.atomic(using=alias):
             # Check for existing active assignment to the same user (Idempotent replay protection)
@@ -981,6 +973,11 @@ class CRMLeadService:
                 assigned_to_user=assigned_to_user,
                 assigned_by_user=actor_user,
                 assignment_type=assignment_type,
+                assignment_source=kwargs.get('assignment_source', 'MANUAL'),
+                assignment_strategy=kwargs.get('assignment_strategy', ''),
+                branch=lead.branch,
+                previous_assignment=existing_active,
+                reason=notes or kwargs.get('reason', ''),
                 status='ACTIVE',
             )
 
@@ -1399,6 +1396,14 @@ class CRMLeadService:
             )
             if not allowed:
                 raise ValidationError(reason or "Booking policy does not allow trial for this session.")
+
+            # Enforce single active trial per lead: a lead cannot have multiple active trials concurrently
+            existing_active_trial = TrialBooking.objects.using(alias).filter(
+                lead=lead,
+                status__in=['BOOKED', 'CONFIRMED', 'SCHEDULED'],
+            ).exclude(confirmation_status__in=['CANCELLED', 'DECLINED']).first()
+            if existing_active_trial:
+                raise ValidationError("This lead already has an active trial booked. Reschedule or cancel the existing trial before booking a new session.")
 
             # Duplicate booking check: lead already has active trial for this occurrence
             existing_active = TrialBooking.objects.using(alias).filter(
@@ -2518,9 +2523,20 @@ class LeadConversionService:
         if existing_user:
             try:
                 profile = existing_user.profile
+                # Ensure customer member markers are set if previously missing (e.g. staff becoming member)
+                updated_fields = []
+                if not profile.member_number:
+                    profile.member_number = f"MEM-{uuid.uuid4().hex[:6].upper()}"
+                    updated_fields.append('member_number')
+                if not profile.acquisition_source:
+                    profile.acquisition_source = 'CRM_CONVERSION'
+                    updated_fields.append('acquisition_source')
+                if updated_fields:
+                    profile.save(using=alias, update_fields=updated_fields)
             except UserProfile.DoesNotExist:
                 profile = UserProfile.objects.using(alias).create(
                     user=existing_user,
+                    member_number=f"MEM-{uuid.uuid4().hex[:6].upper()}",
                     first_name_snapshot=existing_user.first_name,
                     last_name_snapshot=existing_user.last_name,
                     preferred_branch=branch,
@@ -2571,6 +2587,7 @@ class LeadConversionService:
 
             profile = UserProfile.objects.using(alias).create(
                 user=new_user,
+                member_number=f"MEM-{uuid.uuid4().hex[:6].upper()}",
                 first_name_snapshot=lead.first_name,
                 last_name_snapshot=lead.last_name,
                 preferred_branch=branch,

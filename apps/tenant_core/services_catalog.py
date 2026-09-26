@@ -741,3 +741,103 @@ class TermsLegalService:
             db_alias=alias,
         )
         return acceptance
+
+
+class CRMProgramEligibilityService:
+    """
+    Authoritative program catalog resolution service across CRM contexts:
+      - 'lead_interest': Active programs available for lead/prospect interest at a branch/organization.
+      - 'trial': Active programs with valid trial capabilities/occurrences for booking.
+      - 'conversion': Active programs with published package versions and active package pricing.
+    """
+    @classmethod
+    def resolve_programs(
+        cls,
+        organization: Optional[Organization] = None,
+        branch_id: Optional[str] = None,
+        context: str = 'lead_interest',
+        status: Optional[str] = 'ACTIVE',
+        category_id: Optional[str] = None,
+        alias: str = 'default',
+    ):
+        from .models_catalog import Program
+        from django.db.models import Q
+
+        qs = Program.objects.using(alias).all()
+        if organization:
+            qs = qs.filter(organization=organization)
+        if status:
+            qs = qs.filter(status=status)
+        if category_id:
+            qs = qs.filter(category_id=category_id)
+
+        if not branch_id or str(branch_id).lower() in ('all', ''):
+            return qs.order_by('name')
+
+        if context == 'lead_interest':
+            # Lead interest: programs offered at this branch or org-wide.
+            from .models_classes import ClassTemplate, ClassOccurrence
+            from .models_catalog import PackageBranchAvailability
+
+            branch_prog_ids = set()
+            try:
+                pba_progs = PackageBranchAvailability.objects.using(alias).filter(
+                    branch_id=branch_id, status='ENABLED'
+                ).values_list('package__program_id', flat=True)
+                branch_prog_ids.update([pid for pid in pba_progs if pid])
+            except Exception:
+                pass
+
+            try:
+                tmpl_progs = ClassTemplate.objects.using(alias).filter(
+                    branch_id=branch_id, is_active=True
+                ).values_list('program_id', flat=True)
+                branch_prog_ids.update([pid for pid in tmpl_progs if pid])
+            except Exception:
+                pass
+
+            try:
+                occ_progs = ClassOccurrence.objects.using(alias).filter(
+                    branch_id=branch_id, status__in=['SCHEDULED', 'OPEN', 'CONFIRMED']
+                ).values_list('class_template__program_id', flat=True)
+                branch_prog_ids.update([pid for pid in occ_progs if pid])
+            except Exception:
+                pass
+
+            if branch_prog_ids:
+                scoped_qs = qs.filter(id__in=branch_prog_ids)
+                if scoped_qs.exists():
+                    return scoped_qs.order_by('name')
+
+            # Fall back to all active organization programs so lead can express interest
+            return qs.order_by('name')
+
+        elif context == 'trial':
+            from .models_classes import ClassOccurrence
+            today = timezone.now().date()
+            trial_prog_ids = set(
+                ClassOccurrence.objects.using(alias).filter(
+                    branch_id=branch_id,
+                    occurrence_date__gte=today,
+                    trial_capacity__gt=0,
+                    status__in=['SCHEDULED', 'OPEN', 'CONFIRMED']
+                ).values_list('class_template__program_id', flat=True)
+            )
+            trial_progs = qs.filter(Q(id__in=trial_prog_ids) | Q(trial_allowed=True))
+            if trial_progs.exists():
+                return trial_progs.order_by('name')
+            return qs.order_by('name')
+
+        elif context == 'conversion':
+            from .models_catalog import PackageBranchAvailability
+            pba_progs = PackageBranchAvailability.objects.using(alias).filter(
+                branch_id=branch_id, status='ENABLED'
+            ).values_list('package__program_id', flat=True)
+            if pba_progs:
+                conv_qs = qs.filter(id__in=pba_progs)
+                if conv_qs.exists():
+                    return conv_qs.order_by('name')
+            return qs.order_by('name')
+
+        return qs.order_by('name')
+

@@ -181,9 +181,9 @@ class TenantScopeMixin:
         if not active_assignments:
             return False, []
 
-        # If any active role has ORG scope, user has full organization visibility
+        # If any active role has ORG or ORGANIZATION scope, user has full organization visibility
         for ra in active_assignments:
-            if ra.role.is_active and ra.role.scope == 'ORG':
+            if ra.role.is_active and ra.role.scope in ('ORG', 'ORGANIZATION'):
                 return True, []
 
         # Otherwise, collect assigned branch IDs
@@ -277,11 +277,36 @@ class LocationViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
     queryset = Location.objects.all()
 
 
+def _get_request_org(request, db: str):
+    """
+    Resolves the canonical Organization for the requesting user/request within the tenant DB.
+    """
+    org = getattr(request, 'organization', None)
+    if org:
+        return org
+    user = getattr(request, 'user', None)
+    if user and hasattr(user, 'organization') and user.organization:
+        return user.organization
+    if user and getattr(user, 'organization_id', None):
+        from .models_org import Organization
+        return Organization.objects.using(db).filter(id=user.organization_id).first()
+    from .models_org import Organization
+    return Organization.objects.using(db).filter(status='ACTIVE').first()
+
+
 class BranchViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
     """Branches managed by tenant org admin. Scoped to user's branch if not org-wide."""
     permission_classes = [RequireActiveTenantAndOrg]
     serializer_class = BranchSerializer
     queryset = Branch.objects.all()
+
+    def get_queryset(self):
+        db = self.get_db()
+        org = _get_request_org(self.request, db)
+        qs = Branch.objects.using(db).all()
+        if org:
+            qs = qs.filter(organization=org)
+        return self.filter_queryset_by_scope(qs)
 
 
 class DepartmentViewSet(TenantDBMixin, viewsets.ModelViewSet):
@@ -292,6 +317,14 @@ class DepartmentViewSet(TenantDBMixin, viewsets.ModelViewSet):
     permission_prefix = 'core.departments'
     serializer_class = DepartmentSerializer
     queryset = Department.objects.all()
+
+    def get_queryset(self):
+        db = self.get_db()
+        org = _get_request_org(self.request, db)
+        qs = Department.objects.using(db).all()
+        if org:
+            qs = qs.filter(organization=org)
+        return qs
 
 
 class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
@@ -315,6 +348,36 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
         db = self.get_db()
         qs = TenantUser.objects.using(db).select_related('organization', 'home_branch').all()
         qs = self.filter_queryset_by_scope(qs)
+
+        # Strictly exclude customer members from Administration -> Users (Staff & User Management).
+        # Customer members must only be managed within the Members Module.
+        from django.db.models import Q, Exists, OuterRef
+        from .models_rbac import RoleAssignment
+        from .models_workforce import EmployeeProfile
+
+        has_staff_role = RoleAssignment.objects.using(db).filter(
+            user=OuterRef('pk'),
+            is_active=True
+        ).exclude(role__code__iexact='MEMBER').exclude(role__name__iexact='MEMBER')
+
+        has_employee_profile = EmployeeProfile.objects.using(db).filter(
+            user_profile__user=OuterRef('pk')
+        )
+
+        qs = qs.exclude(
+            user_type__iexact='MEMBER'
+        ).exclude(
+            role_assignments__role__code__iexact='MEMBER',
+            role_assignments__is_active=True
+        ).exclude(
+            (
+                (Q(profile__member_number__isnull=False) & ~Q(profile__member_number=''))
+                | (Q(profile__acquisition_source__isnull=False) & ~Q(profile__acquisition_source=''))
+                | Q(profile__memberships__isnull=False)
+            ),
+            ~Exists(has_staff_role),
+            ~Exists(has_employee_profile)
+        ).distinct()
 
         branch_param = self.request.query_params.get('branch') or self.request.query_params.get('location')
         if branch_param and branch_param != 'all':
@@ -409,7 +472,24 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
                     raise ValidationError({'branch_id': 'Select a valid branch.'})
                 self.validate_branch_scope(br_obj.id)
             old_branch_id = instance.home_branch_id
+            old_username = instance.username
             super().perform_update(serializer)
+
+            instance.refresh_from_db(using=db)
+            if instance.username != old_username:
+                from .services_reliability import record_business_audit
+                record_business_audit(
+                    organization=instance.organization,
+                    actor_user=self.request.user if hasattr(self.request, 'user') and self.request.user.is_authenticated else None,
+                    module='core',
+                    action_code='TENANT_USER_USERNAME_UPDATED',
+                    entity_type='TenantUser',
+                    entity_id=instance.id,
+                    event_description=f"Username updated from '{old_username}' to '{instance.username}' for {instance.email}",
+                    before_data={'username': old_username},
+                    after_data={'username': instance.username},
+                    db_alias=db,
+                )
 
             if br_obj:
                 instance.home_branch = br_obj
@@ -614,7 +694,12 @@ class RoleViewSet(TenantDBMixin, viewsets.ModelViewSet):
     queryset = Role.objects.all()
 
     def get_queryset(self):
-        qs = super().get_queryset()
+        db = self.get_db()
+        org = _get_request_org(self.request, db)
+        from .models_rbac import Role
+        qs = Role.objects.using(db).all()
+        if org:
+            qs = qs.filter(organization=org)
         include_inactive = self.request.query_params.get('include_inactive')
         if include_inactive in ('true', '1'):
             return qs
