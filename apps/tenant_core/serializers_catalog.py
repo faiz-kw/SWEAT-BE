@@ -3,6 +3,8 @@ DRF Serializers for Layer 2: Module C (Terms) & Module D (Programs / Packages / 
 """
 
 import re
+from decimal import Decimal
+from django.db import models
 from rest_framework import serializers
 from .models_catalog import (
     TermsDocument, TermsDocumentVersion, TermsAcceptance,
@@ -519,6 +521,74 @@ class PackagePriceSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'created_by_user', 'sale_price', 'tax_percentage', 'total_price', 'created_at', 'updated_at']
 
+    def validate(self, attrs):
+        req = self.context.get('request')
+        alias = getattr(getattr(req, 'user', None), '_db_alias', None) or self.context.get('db_alias') or 'default'
+
+        pkg_ver = attrs.get('package_version') or (self.instance.package_version if self.instance else None)
+        if pkg_ver:
+            if not self.instance and pkg_ver.status in ('ACTIVE', 'RETIRED'):
+                raise serializers.ValidationError({
+                    'package_version': f"Package version {pkg_ver.version_number} is {pkg_ver.status} and immutable. Create a new package version to configure pricing."
+                })
+            elif self.instance and self.instance.package_version.status in ('ACTIVE', 'RETIRED'):
+                raise serializers.ValidationError({
+                    'package_version': f"Package version {self.instance.package_version.version_number} is {self.instance.package_version.status} and immutable. Create a new package version to modify pricing."
+                })
+
+        base_price = attrs.get('base_price')
+        if base_price is not None and base_price < Decimal('0.00'):
+            raise serializers.ValidationError({'base_price': "Price cannot be negative."})
+
+        tax_percent = attrs.get('tax_percent')
+        if tax_percent is not None and tax_percent < Decimal('0.00'):
+            raise serializers.ValidationError({'tax_percent': "Tax percentage cannot be negative."})
+
+        eff_from = attrs.get('effective_from') or (self.instance.effective_from if self.instance else timezone.now())
+        eff_until = attrs.get('effective_until') if 'effective_until' in attrs else (self.instance.effective_until if self.instance else None)
+        if eff_from and eff_until and eff_until <= eff_from:
+            raise serializers.ValidationError({'effective_until': "effective_until must be after effective_from."})
+
+        branch = attrs.get('branch') if 'branch' in attrs else (self.instance.branch if self.instance else None)
+        if branch and pkg_ver:
+            pkg_org_id = pkg_ver.package.organization_id
+            if branch.organization_id != pkg_org_id:
+                raise serializers.ValidationError({'branch': "Branch does not belong to the same organization as the package."})
+            if branch.status in ('INACTIVE', 'CLOSED'):
+                raise serializers.ValidationError({'branch': f"Branch '{branch.name}' is inactive or closed and cannot be assigned."})
+
+        # Check conflicting active prices with overlapping effective dates
+        if pkg_ver:
+            currency = attrs.get('currency') or (self.instance.currency if self.instance else 'INR')
+            price_status = attrs.get('status') or (self.instance.status if self.instance else 'ACTIVE')
+            if price_status == 'ACTIVE':
+                overlapping = PackagePrice.objects.using(alias).filter(
+                    package_version=pkg_ver,
+                    branch=branch,
+                    currency=currency,
+                    status='ACTIVE',
+                )
+                if self.instance:
+                    overlapping = overlapping.exclude(pk=self.instance.pk)
+                
+                # Check date overlap
+                if eff_until:
+                    overlapping = overlapping.filter(
+                        models.Q(effective_until__isnull=True, effective_from__lte=eff_until) |
+                        models.Q(effective_until__gte=eff_from, effective_from__lte=eff_until)
+                    )
+                else:
+                    overlapping = overlapping.filter(
+                        models.Q(effective_until__isnull=True) |
+                        models.Q(effective_until__gte=eff_from)
+                    )
+                if overlapping.exists():
+                    raise serializers.ValidationError({
+                        'effective_from': "An active price for this package version, branch, and currency already covers this overlapping effective date window."
+                    })
+
+        return attrs
+
 
 class PackageBranchAvailabilitySerializer(serializers.ModelSerializer):
     branch_name = serializers.CharField(source='branch.name', read_only=True)
@@ -532,6 +602,37 @@ class PackageBranchAvailabilitySerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
 
+    def validate(self, attrs):
+        package = attrs.get('package') or (self.instance.package if self.instance else None)
+        branch = attrs.get('branch') or (self.instance.branch if self.instance else None)
+
+        if not package:
+            raise serializers.ValidationError({'package': "Package is required."})
+        if not branch:
+            raise serializers.ValidationError({'branch': "Branch is required."})
+
+        if package.organization_id != branch.organization_id:
+            raise serializers.ValidationError("Package and branch must belong to the same organization.")
+
+        if branch.status in ('INACTIVE', 'CLOSED'):
+            raise serializers.ValidationError({'branch': f"Branch '{branch.name}' is inactive or closed and cannot be assigned."})
+
+        # Validate prerequisite: Package's Program must be available at that branch
+        req = self.context.get('request')
+        alias = getattr(getattr(req, 'user', None), '_db_alias', None) or self.context.get('db_alias') or 'default'
+        from .models_catalog import ProgramBranchAvailability
+        has_prog_avail = ProgramBranchAvailability.objects.using(alias).filter(
+            program=package.program,
+            branch=branch,
+            is_active=True,
+        ).exists()
+        if not has_prog_avail:
+            raise serializers.ValidationError({
+                'branch': f"Program '{package.program.name}' is not available at branch '{branch.name}'."
+            })
+
+        return attrs
+
 
 class PackageEntitlementDefinitionSerializer(serializers.ModelSerializer):
     class Meta:
@@ -542,6 +643,42 @@ class PackageEntitlementDefinitionSerializer(serializers.ModelSerializer):
             'configuration', 'status', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def validate(self, attrs):
+        pkg_ver = attrs.get('package_version') or (self.instance.package_version if self.instance else None)
+        if pkg_ver:
+            if not self.instance and pkg_ver.status in ('ACTIVE', 'RETIRED'):
+                raise serializers.ValidationError({
+                    'package_version': f"Package version {pkg_ver.version_number} is {pkg_ver.status} and immutable. Create a new package version to configure entitlements."
+                })
+            elif self.instance and self.instance.package_version.status in ('ACTIVE', 'RETIRED'):
+                raise serializers.ValidationError({
+                    'package_version': f"Package version {self.instance.package_version.version_number} is {self.instance.package_version.status} and immutable. Create a new package version to modify entitlements."
+                })
+
+        is_unlimited = attrs.get('is_unlimited', self.instance.is_unlimited if self.instance else False)
+        allocated_units = attrs.get('allocated_units', self.instance.allocated_units if self.instance else None)
+
+        if not is_unlimited and (allocated_units is None or allocated_units <= 0):
+            raise serializers.ValidationError({
+                'allocated_units': "Must specify allocated units greater than zero or mark as unlimited."
+            })
+
+        if allocated_units is not None and allocated_units < 0:
+            raise serializers.ValidationError({'allocated_units': "Allocated units cannot be negative."})
+
+        extra_unit_price = attrs.get('extra_unit_price')
+        if extra_unit_price is not None and extra_unit_price < Decimal('0.00'):
+            raise serializers.ValidationError({'extra_unit_price': "Extra unit price cannot be negative."})
+
+        ent_type = attrs.get('entitlement_type') or (self.instance.entitlement_type if self.instance else None)
+        valid_types = [choice[0] for choice in PackageEntitlementDefinition.ENTITLEMENT_TYPE_CHOICES]
+        if ent_type and ent_type not in valid_types:
+            raise serializers.ValidationError({
+                'entitlement_type': f"Invalid entitlement type '{ent_type}'. Allowed types: {', '.join(valid_types)}"
+            })
+
+        return attrs
 
 
 class PackageVersionSerializer(serializers.ModelSerializer):
@@ -563,11 +700,42 @@ class PackageVersionSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'version_number', 'created_by_user', 'created_at', 'updated_at']
 
+    def validate(self, attrs):
+        if self.instance and self.instance.status in ('ACTIVE', 'RETIRED'):
+            immutable_fields = [
+                'name_snapshot', 'duration_value', 'duration_unit', 'total_days',
+                'validity_days', 'is_trial_package', 'is_trial', 'only_for_trial'
+            ]
+            for f in immutable_fields:
+                if f in attrs and getattr(self.instance, f) != attrs[f]:
+                    raise serializers.ValidationError({
+                        f: f"PackageVersion {self.instance.version_number} is {self.instance.status} and immutable. Field '{f}' cannot be changed. Create a new version."
+                    })
+
+        total_days = attrs.get('total_days', self.instance.total_days if self.instance else None)
+        if total_days is not None and total_days <= 0:
+            raise serializers.ValidationError({'total_days': "Total days must be greater than 0."})
+
+        duration_value = attrs.get('duration_value', self.instance.duration_value if self.instance else None)
+        if duration_value is not None and duration_value <= 0:
+            raise serializers.ValidationError({'duration_value': "Duration value must be greater than 0."})
+
+        eff_from = attrs.get('effective_from', self.instance.effective_from if self.instance else None)
+        eff_until = attrs.get('effective_until', self.instance.effective_until if self.instance else None)
+        if eff_from and eff_until and eff_until <= eff_from:
+            raise serializers.ValidationError({'effective_until': "effective_until must be after effective_from."})
+
+        return attrs
+
 
 class PackageSerializer(serializers.ModelSerializer):
     code = serializers.CharField(required=False, allow_blank=True, max_length=100)
-    program = serializers.PrimaryKeyRelatedField(queryset=Program.objects.all(), required=False, allow_null=True)
+    program = serializers.PrimaryKeyRelatedField(queryset=Program.objects.all(), required=True)
     program_name = serializers.CharField(source='program.name', read_only=True)
+    available_branch_ids = serializers.ListField(
+        child=serializers.UUIDField(), required=False, write_only=False
+    )
+    available_branches = serializers.SerializerMethodField()
     latest_version = serializers.SerializerMethodField()
     active_version = serializers.SerializerMethodField()
     versions = PackageVersionSerializer(many=True, read_only=True)
@@ -578,7 +746,8 @@ class PackageSerializer(serializers.ModelSerializer):
         model = Package
         fields = [
             'id', 'organization', 'program', 'program_name',
-            'code', 'name', 'status', 'latest_version', 'active_version',
+            'code', 'name', 'status', 'available_branch_ids', 'available_branches',
+            'latest_version', 'active_version',
             'versions', 'versions_count',
             'branch_availabilities', 'created_at', 'updated_at',
         ]
@@ -586,44 +755,159 @@ class PackageSerializer(serializers.ModelSerializer):
         extra_kwargs = {
             'code': {'required': False, 'allow_blank': True},
         }
-        validators = []
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, 'copy') else dict(data)
+        if self.instance and self.instance.code:
+            data['code'] = self.instance.code
+        elif not data.get('code'):
+            req = self.context.get('request')
+            from .views_catalog import _get_org, _get_db
+            alias = _get_db(req) if req else (self.context.get('db_alias') or 'default')
+            org = getattr(req, 'organization', None) or (self.instance.organization if self.instance else None) or self.context.get('organization')
+            if not org and req:
+                org = _get_org(req)
+            data['code'] = _generate_unique_code(Package, org, data.get('name') or 'PKG', db_alias=alias)
+        return super().to_internal_value(data)
+
+    def validate_code(self, value):
+        cleaned = str(value or '').strip().upper()
+        if not cleaned:
+            return cleaned
+        if not re.match(r'^[A-Z0-9_-]+$', cleaned):
+            raise serializers.ValidationError("Package code must contain only uppercase letters, numbers, underscores, and hyphens.")
+        return cleaned
+
+    def validate_name(self, value):
+        cleaned = str(value or '').strip()
+        if not cleaned:
+            raise serializers.ValidationError("Package name is required.")
+        return cleaned
+
+    def validate(self, attrs):
+        req = self.context.get('request')
+        from .views_catalog import _get_org, _get_db
+        alias = _get_db(req) if req else (self.context.get('db_alias') or 'default')
+        org = getattr(req, 'organization', None) or (self.instance.organization if self.instance else None) or self.context.get('organization')
+        if not org and req:
+            org = _get_org(req)
+
+        # 1. Program validation
+        program = attrs.get('program') or (self.instance.program if self.instance else None)
+        if not program:
+            raise serializers.ValidationError({'program': "Program is required."})
+
+        if program.organization_id != org.id:
+            raise serializers.ValidationError({'program': "Program does not belong to this organization."})
+
+        if not self.instance and program.status != 'ACTIVE':
+            raise serializers.ValidationError({
+                'program': f"Program '{program.name}' is {program.status} and cannot be used for new packages."
+            })
+
+        # 2. Code uniqueness in organization
+        code = attrs.get('code')
+        if code and org:
+            qs = Package.objects.using(alias).filter(organization=org, code=code)
+            if self.instance:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError({'code': f"A Package with code '{code}' already exists in this organization."})
+
+        # 3. Available branches validation (Program prerequisite check)
+        branch_ids = attrs.get('available_branch_ids')
+        if branch_ids is not None and org:
+            from .models_org import Branch
+            from .models_catalog import ProgramBranchAvailability
+            for bid in branch_ids:
+                br = Branch.objects.using(alias).filter(pk=bid).first()
+                if not br or br.organization_id != org.id:
+                    raise serializers.ValidationError({
+                        'available_branch_ids': f"Branch with ID '{bid}' does not belong to this organization."
+                    })
+                if br.status in ('INACTIVE', 'CLOSED'):
+                    raise serializers.ValidationError({
+                        'available_branch_ids': f"Branch '{br.name}' is inactive or closed and cannot be assigned."
+                    })
+                # Verify program is available at this branch
+                has_prog_avail = ProgramBranchAvailability.objects.using(alias).filter(
+                    program=program, branch=br, is_active=True
+                ).exists()
+                if not has_prog_avail:
+                    raise serializers.ValidationError({
+                        'available_branch_ids': f"Program '{program.name}' is not available at branch '{br.name}'. Enable the program at this branch first."
+                    })
+
+        return attrs
 
     def create(self, validated_data):
+        branch_ids = validated_data.pop('available_branch_ids', None)
+        req = self.context.get('request')
+        alias = getattr(getattr(req, 'user', None), '_db_alias', None) or self.context.get('db_alias') or 'default'
+        org = validated_data.get('organization') or getattr(req, 'organization', None) or self.context.get('organization')
+        if not org and req:
+            from .views_catalog import _get_org
+            org = _get_org(req)
+
         if not validated_data.get('code'):
-            req = self.context.get('request')
-            alias = getattr(getattr(req, 'user', None), '_db_alias', None) or self.context.get('db_alias')
-            org = validated_data.get('organization') or getattr(req, 'organization', None) or self.context.get('organization')
             validated_data['code'] = _generate_unique_code(Package, org, validated_data.get('name', 'PACKAGE'), db_alias=alias)
-        return super().create(validated_data)
+
+        package = super().create(validated_data)
+        self._sync_branch_availability(package, branch_ids, alias, org)
+        return package
 
     def update(self, instance, validated_data):
-        if 'code' in validated_data and not validated_data['code']:
-            validated_data.pop('code')
-        return super().update(instance, validated_data)
+        branch_ids = validated_data.pop('available_branch_ids', None)
+        validated_data.pop('code', None)
+
+        req = self.context.get('request')
+        alias = getattr(getattr(req, 'user', None), '_db_alias', None) or self.context.get('db_alias') or instance._state.db or 'default'
+        org = instance.organization
+
+        package = super().update(instance, validated_data)
+        if branch_ids is not None:
+            self._sync_branch_availability(package, branch_ids, alias, org)
+        return package
+
+    def _sync_branch_availability(self, package, branch_ids, alias, org):
+        if branch_ids is None:
+            return
+        from .models_catalog import PackageBranchAvailability
+        # Enable selected branches
+        for bid in branch_ids:
+            pba, created = PackageBranchAvailability.objects.using(alias).get_or_create(
+                package=package, branch_id=bid,
+                defaults={'status': 'ENABLED'}
+            )
+            if not created and pba.status != 'ENABLED':
+                pba.status = 'ENABLED'
+                pba.save(using=alias)
+
+        # Disable unselected branches
+        PackageBranchAvailability.objects.using(alias).filter(
+            package=package
+        ).exclude(branch_id__in=branch_ids).update(status='DISABLED')
+
+    def get_available_branches(self, obj):
+        alias = obj._state.db or 'default'
+        from .models_catalog import PackageBranchAvailability
+        pbas = PackageBranchAvailability.objects.using(alias).filter(
+            package=obj, status='ENABLED'
+        ).select_related('branch')
+        return [
+            {'id': str(pba.branch_id), 'code': pba.branch.code, 'name': pba.branch.name}
+            for pba in pbas if pba.branch and pba.branch.status == 'ACTIVE'
+        ]
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        branches = self.get_available_branches(instance)
+        ret['available_branches'] = branches
+        ret['available_branch_ids'] = [b['id'] for b in branches]
+        return ret
 
     def get_versions_count(self, obj):
         return obj.versions.count()
-
-    def to_internal_value(self, data):
-        data = data.copy()
-        if 'program' not in data or not data['program']:
-            req = self.context.get('request')
-            alias = getattr(getattr(req, 'user', None), '_db_alias', None) or 'default'
-            org = getattr(req, 'organization', None) or (getattr(req.user, 'organization', None) if req and hasattr(req, 'user') else None)
-            if org:
-                from .models_catalog import Program
-                prog = Program.objects.using(alias).filter(organization=org).first()
-                if not prog:
-                    from .services_catalog import PackageCatalogService
-                    prog = PackageCatalogService.create_program(
-                        organization=org,
-                        code='DEFAULT',
-                        name='Default Program',
-                        status='ACTIVE',
-                        db_alias=alias,
-                    )
-                data['program'] = str(prog.id)
-        return super().to_internal_value(data)
 
     def get_latest_version(self, obj):
         latest = obj.versions.order_by('-version_number').first()
@@ -645,7 +929,9 @@ class PackageSerializer(serializers.ModelSerializer):
         if active:
             prices = [
                 {
+                    'id': str(p.id),
                     'branch_id': str(p.branch_id) if p.branch_id else None,
+                    'branch_name': p.branch.name if p.branch else None,
                     'currency': p.currency,
                     'base_price': str(p.base_price),
                     'sale_price': str(p.base_price),
@@ -659,8 +945,10 @@ class PackageSerializer(serializers.ModelSerializer):
             ]
             entitlements = [
                 {
+                    'id': str(e.id),
                     'entitlement_type': e.entitlement_type,
                     'allocated_units': str(e.allocated_units) if e.allocated_units is not None else None,
+                    'is_unlimited': e.is_unlimited,
                     'extra_unit_price': str(e.extra_unit_price) if e.extra_unit_price is not None else None,
                 }
                 for e in active.entitlement_definitions.filter(status='ACTIVE')
@@ -680,3 +968,4 @@ class PackageSerializer(serializers.ModelSerializer):
                 'entitlements': entitlements,
             }
         return None
+

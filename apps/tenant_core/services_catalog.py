@@ -13,7 +13,7 @@ Key Rules Enforced:
 import uuid
 from decimal import Decimal
 from typing import Optional, Dict, Any, List
-from django.db import transaction
+from django.db import transaction, models
 from django.utils import timezone
 from django.core.exceptions import ValidationError
 
@@ -27,6 +27,21 @@ from .models_users import TenantUser
 from .models_crm import Lead
 from .models_workforce import UserProfile
 from .services_reliability import record_business_audit, enqueue_outbox_event
+
+
+def _get_alias(db_alias=None, obj=None):
+    from config.routers import get_tenant_db_alias, set_tenant_db_alias
+    if db_alias:
+        set_tenant_db_alias(db_alias)
+        return db_alias
+    tenant_alias = get_tenant_db_alias()
+    if tenant_alias:
+        return tenant_alias
+    if obj and getattr(obj, '_state', None) and getattr(obj._state, 'db', None):
+        target = obj._state.db
+        set_tenant_db_alias(target)
+        return target
+    return 'default'
 
 
 class PackageCatalogService:
@@ -53,7 +68,7 @@ class PackageCatalogService:
         db_alias: Optional[str] = None,
         available_branch_ids: Optional[list] = None,
     ) -> Program:
-        alias = db_alias or 'default'
+        alias = _get_alias(db_alias, organization)
         from .models_catalog import ProgramType, ProgramBranchAvailability
         from .models_org import Branch
 
@@ -124,7 +139,7 @@ class PackageCatalogService:
         db_alias: Optional[str] = None,
         **updates,
     ) -> Program:
-        alias = db_alias or 'default'
+        alias = _get_alias(db_alias, program)
         from .models_catalog import ProgramType
 
         before_data = {'name': program.name, 'status': program.status}
@@ -172,23 +187,37 @@ class PackageCatalogService:
     def create_package(
         cls,
         organization: Organization,
-        code: str,
-        name: str,
+        code: Optional[str] = None,
+        name: Optional[str] = None,
+        program: Optional[Program] = None,
         program_id: Optional[str] = None,
         status: str = 'ACTIVE',
         actor: Optional[TenantUser] = None,
         db_alias: Optional[str] = None,
+        available_branch_ids: Optional[list] = None,
     ) -> Package:
-        alias = db_alias or 'default'
-        program = None
-        if program_id:
-            program = Program.objects.using(alias).filter(id=program_id).first()
-            if not program:
+        alias = _get_alias(db_alias, organization)
+        from .serializers_catalog import _generate_unique_code
+
+        # If name was passed as second positional argument without code
+        if name is None and code is not None:
+            name = code
+            code = None
+
+        name = (name or '').strip()
+        if not code:
+            code = _generate_unique_code(Package, organization, name or 'PKG', db_alias=alias)
+
+        if program:
+            program_obj = program
+        elif program_id:
+            program_obj = Program.objects.using(alias).filter(id=program_id).first()
+            if not program_obj:
                 raise ValidationError(f"Program with id '{program_id}' does not exist.")
         else:
-            program = Program.objects.using(alias).filter(organization=organization).first()
-            if not program:
-                program = cls.create_program(
+            program_obj = Program.objects.using(alias).filter(organization=organization).first()
+            if not program_obj:
+                program_obj = cls.create_program(
                     organization=organization,
                     code='DEFAULT',
                     name='Default Program',
@@ -198,12 +227,20 @@ class PackageCatalogService:
 
         package = Package(
             organization=organization,
-            program=program,
+            program=program_obj,
             code=code.strip().upper(),
-            name=name.strip(),
+            name=name,
             status=status,
         )
         package.save(using=alias)
+
+        if available_branch_ids:
+            from .models_catalog import PackageBranchAvailability
+            for b_id in available_branch_ids:
+                PackageBranchAvailability.objects.using(alias).update_or_create(
+                    package=package, branch_id=b_id,
+                    defaults={'status': 'ENABLED'}
+                )
 
         record_business_audit(
             organization=organization,
@@ -212,8 +249,8 @@ class PackageCatalogService:
             entity_type='Package',
             entity_id=package.id,
             actor_user=actor,
-            event_description=f"Created package {package.name} ({package.code}) under program {program.code}",
-            after_data={'code': package.code, 'name': package.name, 'program_id': str(program.id)},
+            event_description=f"Created package {package.name} ({package.code}) under program {program_obj.code}",
+            after_data={'code': package.code, 'name': package.name, 'program_id': str(program_obj.id)},
             db_alias=alias,
         )
         return package
@@ -272,7 +309,7 @@ class PackageCatalogService:
         status: str = 'DRAFT',
         db_alias: Optional[str] = None,
     ) -> PackageVersion:
-        alias = db_alias or 'default'
+        alias = _get_alias(db_alias, package)
         latest_version = PackageVersion.objects.using(alias).filter(
             package=package
         ).order_by('-version_number').first()
@@ -335,12 +372,16 @@ class PackageCatalogService:
         effective_from: Optional[timezone.datetime] = None,
         db_alias: Optional[str] = None,
     ) -> PackageVersion:
-        alias = db_alias or 'default'
+        alias = _get_alias(db_alias)
         with transaction.atomic(using=alias):
+            # 1. Lock target version and package
             pkg_ver = PackageVersion.objects.using(alias).select_for_update().get(id=package_version_id)
-            now = timezone.now()
+            pkg = Package.objects.using(alias).select_for_update().get(id=pkg_ver.package_id)
 
-            # Validate that prices and entitlements are defined before publishing
+            if pkg.status == 'ARCHIVED':
+                raise ValidationError("Cannot publish version for an ARCHIVED package.")
+
+            # 2. Validate that prices and entitlements are defined before publishing
             price_count = PackagePrice.objects.using(alias).filter(package_version=pkg_ver, status='ACTIVE').count()
             if price_count == 0:
                 raise ValidationError("Cannot publish package version without at least one active package price.")
@@ -351,11 +392,13 @@ class PackageCatalogService:
             if entitlement_count == 0:
                 raise ValidationError("Cannot publish package version without at least one entitlement definition.")
 
-            # Retire prior active versions
-            prior_active = PackageVersion.objects.using(alias).filter(
-                package=pkg_ver.package,
+            now = timezone.now()
+
+            # 3. Lock and retire any currently active versions for this package
+            prior_active = list(PackageVersion.objects.using(alias).select_for_update().filter(
+                package=pkg,
                 status='ACTIVE'
-            ).exclude(id=pkg_ver.id)
+            ).exclude(id=pkg_ver.id))
 
             for prior in prior_active:
                 prior.status = 'RETIRED'
@@ -373,6 +416,7 @@ class PackageCatalogService:
                     db_alias=alias,
                 )
 
+            # 4. Activate target version
             pkg_ver.status = 'ACTIVE'
             pkg_ver.published_at = now
             pkg_ver.effective_from = effective_from or now
@@ -398,6 +442,137 @@ class PackageCatalogService:
                 db_alias=alias,
             )
             return pkg_ver
+
+    @classmethod
+    def retire_package_version(
+        cls,
+        package_version_id: str,
+        actor: TenantUser,
+        db_alias: Optional[str] = None,
+    ) -> PackageVersion:
+        alias = _get_alias(db_alias)
+        with transaction.atomic(using=alias):
+            pkg_ver = PackageVersion.objects.using(alias).select_for_update().get(id=package_version_id)
+            if pkg_ver.status != 'ACTIVE':
+                raise ValidationError(f"Cannot retire version in status '{pkg_ver.status}'. Only ACTIVE versions can be retired.")
+            now = timezone.now()
+            pkg_ver.status = 'RETIRED'
+            pkg_ver.effective_until = now
+            pkg_ver.save(using=alias, update_fields=['status', 'effective_until', 'updated_at'])
+
+            record_business_audit(
+                organization=pkg_ver.package.organization,
+                module='core',
+                action_code='PACKAGE_VERSION_RETIRED',
+                entity_type='PackageVersion',
+                entity_id=pkg_ver.id,
+                actor_user=actor,
+                event_description=f"Retired package version {pkg_ver}",
+                after_data={'status': 'RETIRED', 'effective_until': now.isoformat()},
+                db_alias=alias,
+            )
+            return pkg_ver
+
+    @classmethod
+    def reuse_package_version(
+        cls,
+        package_version_id: str,
+        actor: TenantUser,
+        db_alias: Optional[str] = None,
+    ) -> PackageVersion:
+        """
+        Clones an existing (typically RETIRED) version into a new DRAFT with the next version number.
+        Deep-copies prices, entitlements, and access rules so historical versions remain immutable.
+        """
+        alias = _get_alias(db_alias)
+        with transaction.atomic(using=alias):
+            source = PackageVersion.objects.using(alias).select_for_update().get(id=package_version_id)
+            latest_version = PackageVersion.objects.using(alias).filter(
+                package=source.package
+            ).order_by('-version_number').first()
+            next_ver = (latest_version.version_number + 1) if latest_version else 1
+
+            new_version = PackageVersion(
+                package=source.package,
+                version_number=next_ver,
+                name_snapshot=f"{source.package.name} v{next_ver}",
+                description_snapshot=source.description_snapshot,
+                duration_value=source.duration_value,
+                duration_unit=source.duration_unit,
+                total_days=source.total_days,
+                validity_days=source.validity_days,
+                is_trial_package=source.is_trial_package,
+                is_trial=source.is_trial,
+                only_for_trial=source.only_for_trial,
+                show_on_web=source.show_on_web,
+                show_on_app=source.show_on_app,
+                effective_from=timezone.now(),
+                effective_until=None,
+                status='DRAFT',
+                created_by_user=actor,
+            )
+            new_version.save(using=alias)
+
+            # Deep clone child prices
+            for price in source.prices.using(alias).filter(status='ACTIVE'):
+                PackagePrice.objects.using(alias).create(
+                    package_version=new_version,
+                    branch=price.branch,
+                    currency=price.currency,
+                    base_price=price.base_price,
+                    display_price=price.display_price,
+                    prices_include_tax=price.prices_include_tax,
+                    tax_percent=price.tax_percent,
+                    effective_from=timezone.now(),
+                    status='ACTIVE',
+                    created_by_user=actor,
+                )
+
+            # Deep clone child entitlement definitions
+            for ent in source.entitlement_definitions.using(alias).filter(status='ACTIVE'):
+                PackageEntitlementDefinition.objects.using(alias).create(
+                    package_version=new_version,
+                    entitlement_type=ent.entitlement_type,
+                    allocated_units=ent.allocated_units,
+                    is_unlimited=ent.is_unlimited,
+                    extra_unit_price=ent.extra_unit_price,
+                    validity_days=ent.validity_days,
+                    reference_type=ent.reference_type,
+                    reference_id=ent.reference_id,
+                    configuration=ent.configuration,
+                    status='ACTIVE',
+                )
+
+            # Deep clone class access rules if available
+            try:
+                from .models_classes import PackageClassAccessRule
+                for rule in source.class_access_rules.using(alias).filter(status='ACTIVE'):
+                    PackageClassAccessRule.objects.using(alias).create(
+                        package_version=new_version,
+                        class_template=rule.class_template,
+                        class_category=rule.class_category,
+                        branch=rule.branch,
+                        access_type=rule.access_type,
+                        entitlement_type=rule.entitlement_type,
+                        units_per_booking=rule.units_per_booking,
+                        status='ACTIVE',
+                    )
+            except Exception:
+                pass
+
+            record_business_audit(
+                organization=source.package.organization,
+                module='core',
+                action_code='PACKAGE_VERSION_REUSED',
+                entity_type='PackageVersion',
+                entity_id=new_version.id,
+                actor_user=actor,
+                event_description=f"Created Version {next_ver} draft from Version {source.version_number}",
+                before_data={'source_version_id': str(source.id), 'source_version_number': source.version_number},
+                after_data={'new_version_id': str(new_version.id), 'new_version_number': next_ver, 'status': 'DRAFT'},
+                db_alias=alias,
+            )
+            return new_version
 
     @classmethod
     def modify_package_version_safely(
@@ -519,10 +694,11 @@ class PackageCatalogService:
         prices_include_tax: bool = False,
         tax_percent: Decimal = Decimal('0.000'),
         effective_from: Optional[timezone.datetime] = None,
+        effective_until: Optional[timezone.datetime] = None,
         status: str = 'ACTIVE',
         db_alias: Optional[str] = None,
     ) -> PackagePrice:
-        alias = db_alias or 'default'
+        alias = _get_alias(db_alias, package_version)
         if branch is None and branch_id:
             branch = Branch.objects.using(alias).filter(id=branch_id).first()
         if base_price < Decimal('0.00'):
@@ -539,6 +715,7 @@ class PackageCatalogService:
             prices_include_tax=prices_include_tax,
             tax_percent=tax_percent,
             effective_from=effective_from,
+            effective_until=effective_until,
             status=status,
             created_by_user=actor,
         )
@@ -574,7 +751,7 @@ class PackageCatalogService:
         actor: Optional[TenantUser] = None,
         db_alias: Optional[str] = None,
     ) -> PackageEntitlementDefinition:
-        alias = db_alias or 'default'
+        alias = _get_alias(db_alias, package_version)
         if not is_unlimited and (allocated_units is None or allocated_units <= 0):
             raise ValidationError("Must specify allocated_units > 0 or set is_unlimited=True")
 
@@ -604,6 +781,77 @@ class PackageCatalogService:
             db_alias=alias,
         )
         return ent
+
+    @classmethod
+    def resolve_package_price(
+        cls,
+        package_version: Any,
+        branch: Optional[Any] = None,
+        as_of: Optional[timezone.datetime] = None,
+        db_alias: Optional[str] = None,
+    ) -> Optional[PackagePrice]:
+        """
+        Authoritatively resolves effective PackagePrice for a PackageVersion:
+        1. Exact branch-specific active price effective as of timestamp
+        2. Fall back to organization/default active price (branch=None)
+        """
+        alias = _get_alias(db_alias)
+        now = as_of or timezone.now()
+        from .models_catalog import PackageVersion, PackagePrice
+        from .models_org import Branch
+
+        if not isinstance(package_version, PackageVersion):
+            package_version = PackageVersion.objects.using(alias).get(id=package_version)
+
+        branch_obj = None
+        if branch:
+            if isinstance(branch, Branch):
+                branch_obj = branch
+            else:
+                branch_obj = Branch.objects.using(alias).filter(id=branch).first()
+
+        qs = PackagePrice.objects.using(alias).filter(
+            package_version=package_version,
+            status='ACTIVE',
+            effective_from__lte=now,
+        ).filter(
+            models.Q(effective_until__isnull=True) | models.Q(effective_until__gte=now)
+        )
+
+        if branch_obj:
+            branch_price = qs.filter(branch=branch_obj).order_by('-effective_from').first()
+            if branch_price:
+                return branch_price
+
+        # Fallback to global/default price (branch is null)
+        return qs.filter(branch__isnull=True).order_by('-effective_from').first()
+
+    @classmethod
+    def retire_package_version(
+        cls,
+        package_version_id: str,
+        actor: Optional[TenantUser] = None,
+        db_alias: Optional[str] = None,
+    ) -> PackageVersion:
+        alias = _get_alias(db_alias)
+        with transaction.atomic(using=alias):
+            from .models_catalog import PackageVersion
+            pkg_ver = PackageVersion.objects.using(alias).select_for_update().get(id=package_version_id)
+            pkg_ver.status = 'RETIRED'
+            pkg_ver.effective_until = timezone.now()
+            pkg_ver.save(using=alias, update_fields=['status', 'effective_until', 'updated_at'])
+            record_business_audit(
+                organization=pkg_ver.package.organization,
+                module='core',
+                action_code='PACKAGE_VERSION_RETIRED',
+                entity_type='PackageVersion',
+                entity_id=pkg_ver.id,
+                actor_user=actor,
+                event_description=f"Manually retired package version {pkg_ver}",
+                after_data={'status': 'RETIRED', 'effective_until': pkg_ver.effective_until.isoformat()},
+                db_alias=alias,
+            )
+            return pkg_ver
 
     create_package_price = add_package_price
     create_entitlement_definition = add_entitlement_definition

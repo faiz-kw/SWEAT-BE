@@ -609,7 +609,9 @@ class BookingsModuleTargetedTests(TestCase):
         # Member purchased V1
         _, prof, m, _ = self._create_member("scen18", pkg_ver=self.pkg_v1)
 
-        # Now catalog creates V2 with class_template1 EXCLUDED
+        # Now catalog creates V2 with class_template1 EXCLUDED (retiring V1 first)
+        self.pkg_v1.status = "RETIRED"
+        self.pkg_v1.save(using=self.db)
         pkg_v2 = PackageVersion.objects.using(self.db).create(
             package=self.package,
             version_number=2,

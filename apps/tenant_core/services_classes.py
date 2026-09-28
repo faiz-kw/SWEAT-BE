@@ -127,6 +127,19 @@ class ClassSchedulingService:
         if branch.status != 'ACTIVE':
             raise ValidationError(f"Branch '{branch.name}' is not ACTIVE.")
 
+        # Validate program active and available at branch
+        if class_template.program:
+            if class_template.program.status != 'ACTIVE':
+                raise ValidationError(f"Cannot schedule class '{class_template.name}' because its program '{class_template.program.name}' is not ACTIVE.")
+            from .models_catalog import ProgramBranchAvailability
+            is_pba_active = ProgramBranchAvailability.objects.using(alias).filter(
+                program=class_template.program,
+                branch=branch,
+                is_active=True
+            ).exists()
+            if not is_pba_active:
+                raise ValidationError(f"Cannot schedule class '{class_template.name}' at '{branch.name}' because its program '{class_template.program.name}' is not active at this branch.")
+
         # Rule 11: Validate against branch weekly working hours
         day_names = {1: 'Monday', 2: 'Tuesday', 3: 'Wednesday', 4: 'Thursday', 5: 'Friday', 6: 'Saturday', 7: 'Sunday'}
         for dow in (days_of_week or []):
@@ -271,6 +284,19 @@ class ClassSchedulingService:
 
         if branch.status != 'ACTIVE':
             raise ValidationError(f"Branch '{branch.name}' is not ACTIVE.")
+
+        # Validate program active and available at branch
+        if class_template.program:
+            if class_template.program.status != 'ACTIVE':
+                raise ValidationError(f"Cannot create occurrence for class '{class_template.name}' because its program '{class_template.program.name}' is not ACTIVE.")
+            from .models_catalog import ProgramBranchAvailability
+            is_pba_active = ProgramBranchAvailability.objects.using(alias).filter(
+                program=class_template.program,
+                branch=branch,
+                is_active=True
+            ).exists()
+            if not is_pba_active:
+                raise ValidationError(f"Cannot create occurrence for class '{class_template.name}' at '{branch.name}' because its program '{class_template.program.name}' is not active at this branch.")
 
         eff = BranchScheduleService.get_effective_schedule_for_date(branch, occurrence_date, alias)
         if eff.get('source') in ('EXCEPTION', 'WEEKLY_SCHEDULE') and not eff.get('is_open'):

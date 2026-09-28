@@ -347,6 +347,19 @@ class Package(models.Model):
     def __str__(self):
         return f"{self.name} ({self.code})"
 
+    def get_active_version(self, as_of=None):
+        now = as_of or timezone.now()
+        alias = getattr(self, '_state', None) and getattr(self._state, 'db', None)
+        qs = self.versions.all()
+        if alias:
+            qs = qs.using(alias)
+        return qs.filter(
+            status='ACTIVE',
+            effective_from__lte=now,
+        ).filter(
+            models.Q(effective_until__isnull=True) | models.Q(effective_until__gte=now)
+        ).order_by('-version_number').first()
+
 
 class PackageVersion(models.Model):
     """
@@ -402,7 +415,12 @@ class PackageVersion(models.Model):
             models.CheckConstraint(
                 condition=models.Q(total_days__gt=0),
                 name='chk_package_version_total_days_gt_zero'
-            )
+            ),
+            models.UniqueConstraint(
+                fields=['package'],
+                condition=models.Q(status='ACTIVE'),
+                name='chk_single_active_package_version_per_package'
+            ),
         ]
 
     def clean(self):
@@ -434,6 +452,21 @@ class PackageVersion(models.Model):
         if self.status == 'ACTIVE' and not self.published_at:
             self.published_at = timezone.now()
 
+        # Enforce single ACTIVE version invariant at model level
+        if self.status == 'ACTIVE':
+            db = kwargs.get('using') or self._state.db or 'default'
+            other_active = PackageVersion.objects.using(db).filter(
+                package_id=self.package_id,
+                status='ACTIVE'
+            )
+            if self.pk:
+                other_active = other_active.exclude(pk=self.pk)
+            if other_active.exists():
+                raise ValidationError(
+                    f"Package '{self.package_id}' already has an ACTIVE version. "
+                    "Only one version may be ACTIVE at a time. Retire the previous version before activating."
+                )
+
         # Enforce immutability of ACTIVE / RETIRED package versions
         if not self._state.adding and self.pk:
             db = kwargs.get('using') or self._state.db or 'default'
@@ -442,7 +475,8 @@ class PackageVersion(models.Model):
                 immutable_fields = [
                     'package_id', 'version_number', 'name_snapshot',
                     'duration_value', 'duration_unit', 'total_days',
-                    'is_trial', 'only_for_trial'
+                    'validity_days', 'is_trial', 'only_for_trial',
+                    'show_on_web', 'show_on_app'
                 ]
                 for f in immutable_fields:
                     if getattr(self, f) != getattr(orig, f):

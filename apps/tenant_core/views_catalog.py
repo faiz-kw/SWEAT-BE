@@ -8,6 +8,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.core.exceptions import ValidationError
+from django.utils import timezone
 
 from .context import get_tenant_db_alias
 from .models_catalog import (
@@ -674,6 +675,10 @@ class PackageViewSet(viewsets.ModelViewSet):
         'update': 'core.settings.edit',
         'partial_update': 'core.settings.edit',
         'destroy': 'core.settings.edit',
+        'deactivate': 'core.settings.edit',
+        'reactivate': 'core.settings.edit',
+        'archive': 'core.settings.edit',
+        'restore': 'core.settings.edit',
         'create_version': 'core.settings.edit',
         'publish_version': 'core.settings.edit',
         'clone_modify_version': 'core.settings.edit',
@@ -682,37 +687,192 @@ class PackageViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         alias = _get_db(self.request)
         org = _get_org(self.request)
+
+        if getattr(self, 'swagger_fake_view', False):
+            return Package.objects.none()
+
+        # For detail actions, return all packages for this tenant organization without filtering by status
+        if getattr(self, 'detail', False) or self.action in [
+            'retrieve', 'update', 'partial_update', 'destroy',
+            'deactivate', 'reactivate', 'archive', 'restore',
+            'create_version', 'publish_version', 'clone_modify_version'
+        ]:
+            return Package.objects.using(alias).filter(organization=org).prefetch_related(
+                'versions__prices', 'versions__entitlement_definitions', 'branch_availabilities__branch'
+            )
+
         qs = Package.objects.using(alias).filter(organization=org)
         program_id = self.request.query_params.get('program_id')
         status_param = self.request.query_params.get('status')
+        branch_id = self.request.query_params.get('branch_id')
+
         if program_id:
             qs = qs.filter(program_id=program_id)
-        if status_param:
-            qs = qs.filter(status=status_param)
-        return qs.prefetch_related('versions__prices', 'versions__entitlement_definitions', 'branch_availabilities__branch').order_by('name')
+        if status_param and status_param.upper() not in ('ALL', ''):
+            qs = qs.filter(status=status_param.upper())
+        if branch_id:
+            qs = qs.filter(branch_availabilities__branch_id=branch_id, branch_availabilities__status='ENABLED')
+
+        return qs.prefetch_related(
+            'versions__prices', 'versions__entitlement_definitions', 'branch_availabilities__branch'
+        ).order_by('name')
 
     def perform_create(self, serializer):
+        from .services_reliability import record_business_audit
         alias = _get_db(self.request)
         org = _get_org(self.request)
-        prog = serializer.validated_data.get('program')
-        if not prog:
-            prog = Program.objects.using(alias).filter(organization=org).first()
-            if not prog:
-                prog = PackageCatalogService.create_program(
-                    organization=org,
-                    code='DEFAULT',
-                    name='Default Program',
-                    status='ACTIVE',
-                    db_alias=alias,
-                )
-            serializer.save(organization=org, program=prog)
-        else:
-            serializer.save(organization=org)
+        instance = serializer.save(organization=org)
+        record_business_audit(
+            organization=org,
+            module='core',
+            action_code='PACKAGE_CREATED',
+            entity_type='Package',
+            entity_id=instance.id,
+            actor_user=self.request.user,
+            event_description=f"Created package {instance.name} ({instance.code}) under program {instance.program.name}",
+            after_data={'code': instance.code, 'name': instance.name, 'program_id': str(instance.program_id), 'status': instance.status},
+            db_alias=alias,
+        )
 
     def perform_update(self, serializer):
+        from .services_reliability import record_business_audit
         alias = _get_db(self.request)
+        before_data = {'name': serializer.instance.name, 'status': serializer.instance.status}
         instance = serializer.save()
-        PackageCatalogService.update_package(instance, actor=self.request.user, db_alias=alias)
+        record_business_audit(
+            organization=instance.organization,
+            module='core',
+            action_code='PACKAGE_UPDATED',
+            entity_type='Package',
+            entity_id=instance.id,
+            actor_user=self.request.user,
+            event_description=f"Updated package {instance.name} ({instance.code})",
+            before_data=before_data,
+            after_data={'name': instance.name, 'status': instance.status},
+            db_alias=alias,
+        )
+
+    @action(detail=True, methods=['post'], url_path='deactivate')
+    def deactivate(self, request, pk=None):
+        from .services_reliability import record_business_audit
+        alias = _get_db(request)
+        instance = self.get_object()
+        instance.status = 'INACTIVE'
+        instance.save(using=alias)
+        record_business_audit(
+            organization=instance.organization,
+            module='core',
+            action_code='PACKAGE_DEACTIVATED',
+            entity_type='Package',
+            entity_id=instance.id,
+            actor_user=request.user,
+            event_description=f"Deactivated package {instance.name} ({instance.code})",
+            after_data={'status': 'INACTIVE'},
+            db_alias=alias,
+        )
+        return Response(self.get_serializer(instance).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='reactivate')
+    def reactivate(self, request, pk=None):
+        from .services_reliability import record_business_audit
+        alias = _get_db(request)
+        instance = self.get_object()
+        instance.status = 'ACTIVE'
+        instance.save(using=alias)
+        record_business_audit(
+            organization=instance.organization,
+            module='core',
+            action_code='PACKAGE_REACTIVATED',
+            entity_type='Package',
+            entity_id=instance.id,
+            actor_user=request.user,
+            event_description=f"Reactivated package {instance.name} ({instance.code})",
+            after_data={'status': 'ACTIVE'},
+            db_alias=alias,
+        )
+        return Response(self.get_serializer(instance).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='archive')
+    def archive(self, request, pk=None):
+        from .services_reliability import record_business_audit
+        alias = _get_db(request)
+        instance = self.get_object()
+        instance.status = 'ARCHIVED'
+        instance.save(using=alias)
+        record_business_audit(
+            organization=instance.organization,
+            module='core',
+            action_code='PACKAGE_ARCHIVED',
+            entity_type='Package',
+            entity_id=instance.id,
+            actor_user=request.user,
+            event_description=f"Archived package {instance.name} ({instance.code})",
+            after_data={'status': 'ARCHIVED'},
+            db_alias=alias,
+        )
+        return Response(self.get_serializer(instance).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='restore')
+    def restore(self, request, pk=None):
+        from .services_reliability import record_business_audit
+        alias = _get_db(request)
+        instance = self.get_object()
+        instance.status = 'INACTIVE'
+        instance.save(using=alias)
+        record_business_audit(
+            organization=instance.organization,
+            module='core',
+            action_code='PACKAGE_RESTORED',
+            entity_type='Package',
+            entity_id=instance.id,
+            actor_user=request.user,
+            event_description=f"Restored package {instance.name} ({instance.code}) from archive to inactive",
+            after_data={'status': 'INACTIVE'},
+            db_alias=alias,
+        )
+        return Response(self.get_serializer(instance).data, status=status.HTTP_200_OK)
+
+    def destroy(self, request, *args, **kwargs):
+        from .services_reliability import record_business_audit
+        from .models_memberships import Membership
+        from .models_commerce import OrderItem
+        alias = _get_db(request)
+        instance = self.get_object()
+
+        # Check references: Versions, Memberships, Orders
+        has_versions = instance.versions.using(alias).exists()
+        has_memberships = Membership.objects.using(alias).filter(package=instance).exists()
+        has_orders = OrderItem.objects.using(alias).filter(package=instance).exists()
+
+        if has_versions or has_memberships or has_orders:
+            reasons = []
+            if has_versions:
+                reasons.append("versions")
+            if has_memberships:
+                reasons.append("active or historical memberships")
+            if has_orders:
+                reasons.append("orders")
+            return Response(
+                {
+                    'error': f"Cannot delete package that has associated {', '.join(reasons)}. Archive or deactivate it instead.",
+                    'code': 'PACKAGE_HAS_HISTORY'
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        PackageBranchAvailability.objects.using(alias).filter(package=instance).delete()
+        record_business_audit(
+            organization=instance.organization,
+            module='core',
+            action_code='PACKAGE_DELETED',
+            entity_type='Package',
+            entity_id=instance.id,
+            actor_user=request.user,
+            event_description=f"Deleted package {instance.name} ({instance.code})",
+            before_data={'code': instance.code, 'name': instance.name},
+            db_alias=alias,
+        )
+        return super().destroy(request, *args, **kwargs)
 
     @action(detail=True, methods=['post'], url_path='create-version')
     def create_version(self, request, pk=None):
@@ -742,38 +902,45 @@ class PackageViewSet(viewsets.ModelViewSet):
                 PackageCatalogService.create_package_price(
                     package_version=ver,
                     currency=request.data.get('currency', 'INR'),
-                    base_price=sale_price,
-                    display_price=request.data.get('display_price'),
+                    base_price=Decimal(str(sale_price)),
+                    display_price=Decimal(str(request.data['display_price'])) if request.data.get('display_price') else None,
                     prices_include_tax=request.data.get('prices_include_tax', True),
-                    tax_percent=request.data.get('tax_percentage', request.data.get('tax_percent', 0)),
+                    tax_percent=Decimal(str(request.data.get('tax_percentage', request.data.get('tax_percent', 0)))),
                     branch_id=request.data.get('branch_id'),
                     actor=request.user,
                     db_alias=alias,
                 )
 
-            # Optional passport / session entitlements (Step 9 mapping)
+            # Optional entitlements
             max_sessions = request.data.get('max_sessions') or request.data.get('allocated_units')
-            if max_sessions is not None:
+            is_unlimited_home = request.data.get('is_unlimited_home', False) or request.data.get('home_is_unlimited', False)
+            if is_unlimited_home or max_sessions is not None:
                 PackageCatalogService.create_entitlement_definition(
                     package_version=ver,
                     entitlement_type='HOME_BRANCH_SESSION',
-                    allocated_units=Decimal(str(max_sessions)),
+                    allocated_units=Decimal(str(max_sessions)) if (max_sessions is not None and not is_unlimited_home) else None,
+                    is_unlimited=bool(is_unlimited_home),
                     actor=request.user,
                     db_alias=alias,
                 )
             passport_sessions = request.data.get('passport_sessions')
             passport_cost = request.data.get('passport_cost') or request.data.get('passport_extra_cost')
-            if passport_sessions is not None or passport_cost is not None:
+            is_unlimited_cross = request.data.get('is_unlimited_cross', False) or request.data.get('cross_is_unlimited', False)
+            if is_unlimited_cross or passport_sessions is not None or passport_cost is not None:
                 PackageCatalogService.create_entitlement_definition(
                     package_version=ver,
                     entitlement_type='CROSS_BRANCH_SESSION',
-                    allocated_units=Decimal(str(passport_sessions or 0)),
-                    extra_unit_price=Decimal(str(passport_cost)) if passport_cost is not None else None,
+                    allocated_units=Decimal(str(passport_sessions or 0)) if (passport_sessions is not None and not is_unlimited_cross) else (Decimal('0') if not is_unlimited_cross else None),
+                    is_unlimited=bool(is_unlimited_cross),
+                    extra_unit_price=Decimal(str(passport_cost)) if passport_cost is not None else Decimal('0.00'),
                     actor=request.user,
                     db_alias=alias,
                 )
 
             if request.data.get('publish_immediately', False):
+                PackageVersion.objects.using(alias).filter(
+                    package=package, status='ACTIVE'
+                ).exclude(id=ver.id).update(status='RETIRED', effective_until=timezone.now())
                 ver = PackageCatalogService.publish_package_version(
                     package_version_id=ver.id,
                     actor=request.user,
@@ -821,20 +988,119 @@ class PackageViewSet(viewsets.ModelViewSet):
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
-class PackageVersionViewSet(viewsets.ReadOnlyModelViewSet):
+class PackageVersionViewSet(viewsets.ModelViewSet):
     serializer_class = PackageVersionSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
     required_module = 'core'
     required_submodule = 'settings'
     required_permission = 'core.settings.view'
+    permission_action_map = {
+        'create': 'core.settings.edit',
+        'update': 'core.settings.edit',
+        'partial_update': 'core.settings.edit',
+        'destroy': 'core.settings.edit',
+        'publish': 'core.settings.edit',
+        'retire': 'core.settings.edit',
+        'reuse': 'core.settings.edit',
+    }
 
     def get_queryset(self):
         alias = _get_db(self.request)
-        qs = PackageVersion.objects.using(alias).all()
+        org = _get_org(self.request)
+        qs = PackageVersion.objects.using(alias).filter(package__organization=org)
         pkg_id = self.request.query_params.get('package_id')
+        status_param = self.request.query_params.get('status')
         if pkg_id:
             qs = qs.filter(package_id=pkg_id)
+        if status_param:
+            qs = qs.filter(status=status_param.upper())
         return qs.prefetch_related('prices', 'entitlement_definitions').order_by('-version_number')
+
+    def update(self, request, *args, **kwargs):
+        instance = self.get_object()
+        if instance.status in ('ACTIVE', 'RETIRED'):
+            return Response(
+                {
+                    'error': f"Package version {instance.version_number} is {instance.status} and immutable. Create a new version to modify commercial terms.",
+                    'code': 'VERSION_IMMUTABLE'
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        return super().update(request, *args, **kwargs)
+
+    def partial_update(self, request, *args, **kwargs):
+        instance = self.get_object()
+        if instance.status in ('ACTIVE', 'RETIRED'):
+            return Response(
+                {
+                    'error': f"Package version {instance.version_number} is {instance.status} and immutable. Create a new version to modify commercial terms.",
+                    'code': 'VERSION_IMMUTABLE'
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        return super().partial_update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        from .models_memberships import Membership
+        from .models_commerce import OrderItem
+        alias = _get_db(request)
+        instance = self.get_object()
+        if instance.status != 'DRAFT':
+            return Response(
+                {
+                    'error': f"Cannot delete package version in status {instance.status}. Only DRAFT versions can be deleted; retire published versions instead.",
+                    'code': 'VERSION_NOT_DRAFT'
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if Membership.objects.using(alias).filter(package_version=instance).exists() or OrderItem.objects.using(alias).filter(package_version=instance).exists():
+            return Response(
+                {'error': "Cannot delete version that has associated memberships or orders.", 'code': 'VERSION_HAS_HISTORY'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        return super().destroy(request, *args, **kwargs)
+
+    @action(detail=True, methods=['post'], url_path='publish')
+    def publish(self, request, pk=None):
+        alias = _get_db(request)
+        instance = self.get_object()
+        try:
+            published = PackageCatalogService.publish_package_version(
+                package_version_id=str(instance.id),
+                actor=request.user,
+                db_alias=alias,
+            )
+            return Response(PackageVersionSerializer(published).data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'], url_path='retire')
+    def retire(self, request, pk=None):
+        alias = _get_db(request)
+        instance = self.get_object()
+        try:
+            retired = PackageCatalogService.retire_package_version(
+                package_version_id=str(instance.id),
+                actor=request.user,
+                db_alias=alias,
+            )
+            return Response(PackageVersionSerializer(retired).data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'], url_path='reuse')
+    def reuse(self, request, pk=None):
+        alias = _get_db(request)
+        instance = self.get_object()
+        try:
+            reused = PackageCatalogService.reuse_package_version(
+                package_version_id=str(instance.id),
+                actor=request.user,
+                db_alias=alias,
+            )
+            return Response(PackageVersionSerializer(reused).data, status=status.HTTP_201_CREATED)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class PackagePriceViewSet(viewsets.ModelViewSet):
@@ -852,11 +1118,12 @@ class PackagePriceViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         alias = _get_db(self.request)
-        qs = PackagePrice.objects.using(alias).all()
+        org = _get_org(self.request)
+        qs = PackagePrice.objects.using(alias).filter(package_version__package__organization=org)
         ver_id = self.request.query_params.get('package_version_id')
         if ver_id:
             qs = qs.filter(package_version_id=ver_id)
-        return qs.order_by('-effective_from')
+        return qs.select_related('branch', 'package_version').order_by('-effective_from')
 
     def create(self, request, *args, **kwargs):
         alias = _get_db(request)
@@ -927,14 +1194,48 @@ class PackageBranchAvailabilityViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         alias = _get_db(self.request)
-        qs = PackageBranchAvailability.objects.using(alias).all()
+        org = _get_org(self.request)
+        qs = PackageBranchAvailability.objects.using(alias).filter(package__organization=org)
         pkg_id = self.request.query_params.get('package_id')
         branch_id = self.request.query_params.get('branch_id')
         if pkg_id:
             qs = qs.filter(package_id=pkg_id)
         if branch_id:
             qs = qs.filter(branch_id=branch_id)
-        return qs.select_related('branch')
+        return qs.select_related('branch', 'package').order_by('package__name', 'branch__name')
+
+    def perform_create(self, serializer):
+        from .services_reliability import record_business_audit
+        alias = _get_db(self.request)
+        instance = serializer.save()
+        record_business_audit(
+            organization=instance.package.organization,
+            module='core',
+            action_code='PACKAGE_BRANCH_AVAILABILITY_CREATED',
+            entity_type='PackageBranchAvailability',
+            entity_id=instance.id,
+            actor_user=self.request.user,
+            event_description=f"Linked package {instance.package.name} to branch {instance.branch.name} ({instance.status})",
+            after_data={'package_id': str(instance.package_id), 'branch_id': str(instance.branch_id), 'status': instance.status},
+            db_alias=alias,
+        )
+
+    def perform_update(self, serializer):
+        from .services_reliability import record_business_audit
+        alias = _get_db(self.request)
+        instance = serializer.save()
+        record_business_audit(
+            organization=instance.package.organization,
+            module='core',
+            action_code='PACKAGE_BRANCH_AVAILABILITY_UPDATED',
+            entity_type='PackageBranchAvailability',
+            entity_id=instance.id,
+            actor_user=self.request.user,
+            event_description=f"Updated branch availability for package {instance.package.name} at branch {instance.branch.name} ({instance.status})",
+            after_data={'status': instance.status},
+            db_alias=alias,
+        )
+
 
 
 class ProgramBranchAvailabilityViewSet(viewsets.ModelViewSet):

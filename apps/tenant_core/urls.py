@@ -238,6 +238,7 @@ router.register(r'packages', PackageViewSet, basename='package')
 router.register(r'package-versions', PackageVersionViewSet, basename='package-version')
 router.register(r'package-prices', PackagePriceViewSet, basename='package-price')
 router.register(r'package-branch-availability', PackageBranchAvailabilityViewSet, basename='package-branch-availability')
+router.register(r'package-branch-availabilities', PackageBranchAvailabilityViewSet, basename='package-branch-availabilities')
 
 router.register(r'package-entitlement-definitions', PackageEntitlementDefinitionViewSet, basename='package-entitlement-definition')
 

@@ -415,6 +415,28 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             'bookings'
         ).order_by('start_at').distinct()
 
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        alias = _get_db(self.request)
+        membership_id = self.request.query_params.get('membership_id')
+        user_profile_id = self.request.query_params.get('user_profile_id')
+        if membership_id:
+            from .models_memberships import Membership
+            try:
+                context['membership'] = Membership.objects.using(alias).select_related(
+                    'package_version__package', 'package', 'home_branch'
+                ).prefetch_related('entitlements').get(id=membership_id)
+            except Exception:
+                pass
+        if user_profile_id:
+            from .models_crm import UserProfile
+            try:
+                context['user_profile'] = UserProfile.objects.using(alias).get(id=user_profile_id)
+            except Exception:
+                pass
+        context['db_alias'] = alias
+        return context
+
     def perform_create(self, serializer):
         occ = serializer.save(is_manual=True)
         alias = _get_db(self.request)

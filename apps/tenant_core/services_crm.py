@@ -123,35 +123,47 @@ VALID_LEAD_TRANSITIONS = {
     'LOST': ['NEW_LEAD', 'INTERESTED'],  # Can be reactivated
 }
 
-GMAIL_REGEX = re.compile(r'^[a-zA-Z0-9._%+-]+@gmail\.com$', re.IGNORECASE)
+# Standard email validation — accepts any syntactically valid address.
+# Domain is NOT restricted; any valid domain (gmail, outlook, company, etc.) is accepted.
+# We use Django's built-in EmailValidator rather than a custom regex to avoid RFC edge cases.
+from django.core.validators import validate_email as _django_validate_email
+from django.core.exceptions import ValidationError as DjangoValidationError
+
+EMAIL_SIMPLE_REGEX = re.compile(
+    r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$',
+    re.IGNORECASE
+)
 
 
 def validate_lead_email(email: Optional[str], required: bool = False) -> Optional[str]:
     """
-    Validates that a lead email is a syntactically valid @gmail.com address.
+    Validates that a lead email is syntactically valid.
+    Accepts any valid domain (gmail.com, outlook.com, yahoo.com, company domains, etc.).
     Rules:
-    - Domain must be exactly gmail.com (case-insensitive)
-    - Rejects other domains (yahoo, outlook, company, etc.)
-    - Rejects malformed addresses (e.g. rahul@gmail, @gmail.com, rahul@gmail.co, user@gmail.com.fake.com)
+    - Any syntactically valid email is accepted
     - Strips whitespace. Rejects internal spaces.
     - Returns normalized lowercased email string.
+    - Optional by default (required=False).
     """
     if not email:
         if required:
-            raise ValidationError('Please enter a valid Gmail address.')
+            raise ValidationError('Please enter a valid email address.')
         return None
 
     cleaned = str(email).strip()
     if not cleaned:
         if required:
-            raise ValidationError('Please enter a valid Gmail address.')
+            raise ValidationError('Please enter a valid email address.')
         return None
 
     if ' ' in cleaned:
-        raise ValidationError('Please enter a valid Gmail address.')
+        raise ValidationError('Email address cannot contain spaces.')
 
-    if not GMAIL_REGEX.match(cleaned):
-        raise ValidationError('Please enter a valid Gmail address.')
+    # Use Django\'s built-in email validator for robust RFC compliance
+    try:
+        _django_validate_email(cleaned)
+    except DjangoValidationError:
+        raise ValidationError('Please enter a valid email address.')
 
     return cleaned.lower()
 

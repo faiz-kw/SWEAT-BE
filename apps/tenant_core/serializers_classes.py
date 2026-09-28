@@ -207,6 +207,27 @@ class ClassScheduleRuleSerializer(serializers.ModelSerializer):
             if getattr(branch, 'status', None) and branch.status != 'ACTIVE':
                 raise serializers.ValidationError({"branch": f"Branch '{branch.name}' is not ACTIVE."})
 
+            class_template = attrs.get('class_template') or getattr(self.instance, 'class_template', None)
+            if class_template and class_template.program:
+                from .models_catalog import ProgramBranchAvailability
+                from .context import get_tenant_db_alias
+                chk_alias = get_tenant_db_alias() or 'default'
+                if hasattr(branch, '_state') and branch._state.db:
+                    chk_alias = branch._state.db
+                if class_template.program.status != 'ACTIVE':
+                    raise serializers.ValidationError({
+                        "branch": f"Cannot schedule class '{class_template.name}' because its program '{class_template.program.name}' is not ACTIVE."
+                    })
+                is_pba_active = ProgramBranchAvailability.objects.using(chk_alias).filter(
+                    program=class_template.program,
+                    branch=branch,
+                    is_active=True
+                ).exists()
+                if not is_pba_active:
+                    raise serializers.ValidationError({
+                        "branch": f"Cannot schedule class '{class_template.name}' at '{branch.name}' because its program '{class_template.program.name}' is not active at this branch."
+                    })
+
             # Check branch working hours
             from .models_govern import BranchWorkingHours, BranchOperatingException
             from .context import get_tenant_db_alias
@@ -272,6 +293,43 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
     waitlist_count = serializers.SerializerMethodField()
     start_time = serializers.TimeField(write_only=True, required=False)
     end_time = serializers.TimeField(write_only=True, required=False)
+    is_eligible = serializers.SerializerMethodField()
+    ineligibility_reason = serializers.SerializerMethodField()
+    ineligibility_code = serializers.SerializerMethodField()
+
+    def _get_eligibility(self, obj):
+        if not hasattr(obj, '_cached_eligibility'):
+            membership = self.context.get('membership')
+            user_profile = self.context.get('user_profile')
+            db_alias = self.context.get('db_alias')
+            if membership or user_profile:
+                from .services_bookings import BookingWaitlistAttendanceService
+                obj._cached_eligibility = BookingWaitlistAttendanceService.evaluate_occurrence_eligibility(
+                    occurrence=obj,
+                    membership=membership,
+                    user_profile=user_profile,
+                    db_alias=db_alias,
+                )
+            else:
+                obj._cached_eligibility = {'eligible': True, 'reason_code': None, 'reason_message': None}
+        return obj._cached_eligibility
+
+    def get_is_eligible(self, obj):
+        return self._get_eligibility(obj)['eligible']
+
+    def get_ineligibility_reason(self, obj):
+        return self._get_eligibility(obj)['reason_message']
+
+    def get_ineligibility_code(self, obj):
+        return self._get_eligibility(obj)['reason_code']
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        if instance.start_at:
+            ret['start_time'] = instance.start_at.strftime('%H:%M:%S')
+        if instance.end_at:
+            ret['end_time'] = instance.end_at.strftime('%H:%M:%S')
+        return ret
 
     def get_trainer_checked_in(self, obj):
         try:
@@ -354,7 +412,7 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
             'waitlist_capacity', 'booking_open_at', 'booking_close_at',
             'cancellation_cutoff_at', 'status', 'is_manual', 'is_override',
             'trainers', 'trainer_checked_in', 'trainer_check_in_details', 'booking_count', 'waitlist_count',
-            'active_content', 'created_at', 'updated_at'
+            'active_content', 'is_eligible', 'ineligibility_reason', 'ineligibility_code', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
         extra_kwargs = {

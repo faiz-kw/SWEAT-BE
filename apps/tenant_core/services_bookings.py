@@ -30,16 +30,124 @@ from .context import get_current_tenant_db_alias
 class BookingWaitlistAttendanceService:
 
     @classmethod
-    def can_member_book(cls, user_profile: UserProfile, organization, db_alias: str = None) -> tuple:
+    def resolve_booking_policy(cls, occurrence: ClassOccurrence, db_alias: str = None) -> BookingPolicySet:
+        """
+        Canonical resolution hierarchy:
+        1. Occurrence override (occurrence=occurrence)
+        2. ClassTemplate (class_template=occurrence.class_template)
+        3. Program (program=occurrence.class_template.program)
+        4. Branch (branch=occurrence.branch)
+        5. Organization default (organization=occurrence.class_template.category.organization)
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        org = occurrence.class_template.category.organization
+
+        # 1. Occurrence override
+        policy = BookingPolicySet.objects.using(alias).filter(occurrence=occurrence, status='ACTIVE').first()
+        if policy:
+            return policy
+
+        # 2. ClassTemplate
+        policy = BookingPolicySet.objects.using(alias).filter(class_template=occurrence.class_template, status='ACTIVE').first()
+        if policy:
+            return policy
+
+        # 3. Program
+        if occurrence.class_template.program:
+            policy = BookingPolicySet.objects.using(alias).filter(program=occurrence.class_template.program, status='ACTIVE').first()
+            if policy:
+                return policy
+
+        # 4. Branch
+        policy = BookingPolicySet.objects.using(alias).filter(branch=occurrence.branch, status='ACTIVE').first()
+        if policy:
+            return policy
+
+        # 5. Organization default
+        return (
+            BookingPolicySet.objects.using(alias).filter(
+                organization=org, branch__isnull=True, program__isnull=True,
+                class_template__isnull=True, occurrence__isnull=True, status='ACTIVE'
+            ).first()
+            or BookingPolicySet.objects.using(alias).filter(organization=org, status='ACTIVE').first()
+        )
+
+    @classmethod
+    def resolve_cancellation_rule(cls, booking: Booking, db_alias: str = None) -> BookingCancellationRule:
+        """
+        Canonical cancellation rule resolution:
+        1. Applied policy set rules
+        2. ClassTemplate rule
+        3. Program rule
+        4. Branch rule
+        5. Organization default rule
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        occ = booking.occurrence
+        org = occ.class_template.category.organization
+
+        policy = cls.resolve_booking_policy(occ, db_alias=alias)
+        if policy:
+            rule = BookingCancellationRule.objects.using(alias).filter(booking_policy_set=policy, status='ACTIVE').order_by('priority').first()
+            if rule:
+                return rule
+
+        rule = BookingCancellationRule.objects.using(alias).filter(class_template=occ.class_template, status='ACTIVE').order_by('priority').first()
+        if rule:
+            return rule
+
+        if occ.class_template.program:
+            rule = BookingCancellationRule.objects.using(alias).filter(program=occ.class_template.program, status='ACTIVE').order_by('priority').first()
+            if rule:
+                return rule
+
+        rule = BookingCancellationRule.objects.using(alias).filter(branch=booking.branch, status='ACTIVE').order_by('priority').first()
+        if rule:
+            return rule
+
+        return BookingCancellationRule.objects.using(alias).filter(organization=org, status='ACTIVE').order_by('priority').first()
+
+    @classmethod
+    def resolve_attendance_policy(cls, occurrence: ClassOccurrence, db_alias: str = None) -> AttendancePolicySet:
+        """
+        Canonical attendance policy resolution:
+        1. ClassTemplate
+        2. Program
+        3. Branch
+        4. Organization
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        org = occurrence.class_template.category.organization
+
+        policy = AttendancePolicySet.objects.using(alias).filter(class_template=occurrence.class_template, status='ACTIVE').first()
+        if policy:
+            return policy
+
+        if occurrence.class_template.program:
+            policy = AttendancePolicySet.objects.using(alias).filter(program=occurrence.class_template.program, status='ACTIVE').first()
+            if policy:
+                return policy
+
+        policy = AttendancePolicySet.objects.using(alias).filter(branch=occurrence.branch, status='ACTIVE').first()
+        if policy:
+            return policy
+
+        return AttendancePolicySet.objects.using(alias).filter(organization=org, status='ACTIVE').first()
+
+    @classmethod
+    def can_member_book(cls, user_profile: UserProfile, organization, occurrence: ClassOccurrence = None, db_alias: str = None) -> tuple:
         """
         Asks the attendance / no-show restriction service if the member is permitted to book.
         Returns (is_allowed: bool, reason: str).
         """
         alias = db_alias or get_current_tenant_db_alias() or 'default'
-        attendance_policy = AttendancePolicySet.objects.using(alias).filter(
-            organization=organization,
-            status='ACTIVE'
-        ).first()
+        if occurrence:
+            attendance_policy = cls.resolve_attendance_policy(occurrence, db_alias=alias)
+        else:
+            attendance_policy = AttendancePolicySet.objects.using(alias).filter(
+                organization=organization,
+                status='ACTIVE'
+            ).first()
 
         if not attendance_policy:
             return True, ""
@@ -152,6 +260,178 @@ class BookingWaitlistAttendanceService:
         }
 
     @classmethod
+    def evaluate_occurrence_eligibility(
+        cls,
+        occurrence: ClassOccurrence,
+        membership: Membership = None,
+        user_profile: UserProfile = None,
+        db_alias: str = None,
+    ) -> dict:
+        """
+        Authoritatively evaluates whether an occurrence is bookable for a specific membership and user.
+        Returns:
+            {'eligible': bool, 'reason_code': str | None, 'reason_message': str | None}
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        now = timezone.now()
+
+        # 1. Occurrence Lifecycle Status
+        if occurrence.status == 'CANCELLED':
+            return {
+                'eligible': False,
+                'reason_code': 'OCCURRENCE_CANCELLED',
+                'reason_message': 'This class session is cancelled.',
+            }
+        if occurrence.status == 'COMPLETED':
+            return {
+                'eligible': False,
+                'reason_code': 'OCCURRENCE_COMPLETED',
+                'reason_message': 'This class session is already completed.',
+            }
+        if occurrence.start_at and occurrence.start_at <= now:
+            return {
+                'eligible': False,
+                'reason_code': 'PAST_OCCURRENCE',
+                'reason_message': 'This class session has already started or ended.',
+            }
+
+        # 2. Program Branch Availability
+        from .models_catalog import ProgramBranchAvailability
+        if occurrence.class_template and occurrence.class_template.program:
+            pba = ProgramBranchAvailability.objects.using(alias).filter(
+                program=occurrence.class_template.program,
+                branch=occurrence.branch
+            ).first()
+            if pba and not pba.is_active:
+                return {
+                    'eligible': False,
+                    'reason_code': 'PROGRAM_UNAVAILABLE_AT_BRANCH',
+                    'reason_message': f"Program is not permitted at branch '{occurrence.branch.name}'.",
+                }
+
+        # 3. Class Branch Availability
+        from .models_classes import ClassBranchAvailability
+        cba = ClassBranchAvailability.objects.using(alias).filter(
+            class_template=occurrence.class_template,
+            branch=occurrence.branch
+        ).first()
+        if cba and cba.status != 'ACTIVE':
+            return {
+                'eligible': False,
+                'reason_code': 'CLASS_UNAVAILABLE_AT_BRANCH',
+                'reason_message': f"Class is not active at branch '{occurrence.branch.name}'.",
+            }
+
+        # 4. Membership Specific Validations (if membership provided)
+        if membership:
+            if membership.status != 'ACTIVE':
+                return {
+                    'eligible': False,
+                    'reason_code': 'MEMBERSHIP_INACTIVE',
+                    'reason_message': 'Selected membership is not active.',
+                }
+            if membership.end_date and membership.end_date < now.date():
+                return {
+                    'eligible': False,
+                    'reason_code': 'MEMBERSHIP_EXPIRED',
+                    'reason_message': 'Selected membership has expired.',
+                }
+
+            # Package Branch Availability
+            from .models_catalog import PackageBranchAvailability
+            pkg = membership.package_version.package if membership.package_version else membership.package
+            if pkg:
+                pba_qs = PackageBranchAvailability.objects.using(alias).filter(package=pkg)
+                if pba_qs.exists() and not pba_qs.filter(branch=occurrence.branch, status='ENABLED').exists():
+                    return {
+                        'eligible': False,
+                        'reason_code': 'BRANCH_NOT_PERMITTED',
+                        'reason_message': f"Your package is not valid at '{occurrence.branch.name}'.",
+                    }
+
+            # Package Class Access Rule
+            if membership.package_version:
+                access_res = cls.resolve_package_class_access(membership.package_version, occurrence, db_alias=alias)
+                if not access_res.get('allowed'):
+                    return {
+                        'eligible': False,
+                        'reason_code': 'PACKAGE_CLASS_EXCLUDED',
+                        'reason_message': access_res.get('reason') or "Membership package does not include this class.",
+                    }
+
+            # Cross-branch Entitlement
+            is_cross_branch = bool(membership.home_branch and occurrence.branch_id != membership.home_branch_id)
+            ent_qs = membership.entitlements.using(alias).filter(status='ACTIVE')
+            if is_cross_branch:
+                cross_ent = ent_qs.filter(
+                    models.Q(entitlement_type='CROSS_BRANCH_SESSION') | models.Q(entitlement_type='CROSS_BRANCH'),
+                    models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
+                ).first()
+                if not cross_ent:
+                    return {
+                        'eligible': False,
+                        'reason_code': 'NO_CROSS_BRANCH_ENTITLEMENT',
+                        'reason_message': f"No cross-branch session entitlements available for '{occurrence.branch.name}'.",
+                    }
+            else:
+                home_ent = ent_qs.filter(
+                    models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units')),
+                    entitlement_type='HOME_BRANCH_SESSION'
+                ).first() or ent_qs.filter(
+                    models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
+                ).first()
+                if not home_ent:
+                    return {
+                        'eligible': False,
+                        'reason_code': 'NO_ENTITLEMENT_REMAINING',
+                        'reason_message': 'No remaining sessions available in membership.',
+                    }
+
+        # 5. User Duplicate Booking Check
+        if user_profile:
+            has_booking = occurrence.bookings.using(alias).filter(
+                user_profile=user_profile,
+                status__in=['CONFIRMED', 'RESERVED', 'WAITLISTED']
+            ).exists()
+            if has_booking:
+                return {
+                    'eligible': False,
+                    'reason_code': 'ALREADY_BOOKED',
+                    'reason_message': 'Member already has an active booking or waitlist entry for this class.',
+                }
+
+        # 6. Capacity Check
+        from .models_crm import TrialBooking
+        trial_enrolled = TrialBooking.objects.using(alias).filter(
+            class_occurrence_id=occurrence.id,
+            status__in=['BOOKED', 'CONFIRMED', 'ATTENDED']
+        ).count()
+        enrolled_count = occurrence.bookings.using(alias).filter(
+            status__in=['CONFIRMED', 'RESERVED', 'COMPLETED']
+        ).count() + trial_enrolled
+
+        if enrolled_count >= occurrence.capacity:
+            if not occurrence.class_template.allow_waitlist or occurrence.waitlist_capacity <= 0:
+                return {
+                    'eligible': False,
+                    'reason_code': 'CLASS_FULL',
+                    'reason_message': 'Class session is at full capacity.',
+                }
+            wl_count = occurrence.bookings.using(alias).filter(status='WAITLISTED').count()
+            if wl_count >= occurrence.waitlist_capacity:
+                return {
+                    'eligible': False,
+                    'reason_code': 'WAITLIST_FULL',
+                    'reason_message': 'Class capacity and waitlist are both full.',
+                }
+
+        return {
+            'eligible': True,
+            'reason_code': None,
+            'reason_message': None,
+        }
+
+    @classmethod
     def create_booking(
         cls,
         user_profile: UserProfile,
@@ -186,15 +466,12 @@ class BookingWaitlistAttendanceService:
                 raise ValidationError(f"User already has an active booking ({existing.booking_number}) for this class occurrence.")
 
             # 3. Check Attendance / No-Show restrictions via restriction service
-            can_book, restriction_reason = cls.can_member_book(user_profile, organization, db_alias=alias)
+            can_book, restriction_reason = cls.can_member_book(user_profile, organization, occurrence=occurrence, db_alias=alias)
             if not can_book:
                 raise ValidationError(restriction_reason)
 
-            # 4. Check Booking Policy
-            booking_policy = BookingPolicySet.objects.using(alias).filter(
-                organization=organization,
-                status='ACTIVE'
-            ).first()
+            # 4. Check Booking Policy via canonical hierarchy
+            booking_policy = cls.resolve_booking_policy(occurrence, db_alias=alias)
 
             if booking_policy:
                 now = timezone.now()
@@ -257,23 +534,67 @@ class BookingWaitlistAttendanceService:
             # Generate unique booking number
             booking_number = f"BK-{timezone.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
 
-            # 6. Check Occurrence Capacity dynamically
+            # 6. Check Occurrence Capacity dynamically (shared across members and trials)
             enrolled_count = Booking.objects.using(alias).filter(
                 occurrence=occurrence,
                 status__in=['CONFIRMED', 'RESERVED', 'COMPLETED']
             ).count()
-            is_capacity_available = enrolled_count < occurrence.capacity
+            from .models_crm import TrialBooking
+            trial_enrolled = TrialBooking.objects.using(alias).filter(
+                class_occurrence_id=occurrence.id,
+                status__in=['BOOKED', 'CONFIRMED', 'ATTENDED']
+            ).count()
+            total_enrolled = enrolled_count + trial_enrolled
+            is_capacity_available = total_enrolled < occurrence.capacity
+
+            if is_capacity_available and booking_type == 'TRIAL':
+                # Trial quota check
+                existing_trials = Booking.objects.using(alias).filter(
+                    occurrence=occurrence,
+                    booking_type='TRIAL',
+                    status__in=['CONFIRMED', 'RESERVED', 'COMPLETED']
+                ).count() + trial_enrolled
+                if existing_trials >= occurrence.trial_capacity:
+                    is_capacity_available = False
 
             if is_capacity_available:
                 entitlement = None
                 if booking_type == 'MEMBER':
+                    is_cross_branch = bool(membership.home_branch and occurrence.branch_id != membership.home_branch_id)
+                    if is_cross_branch:
+                        from .models_catalog import PackageBranchAvailability
+                        pkg = membership.package_version.package if membership.package_version else membership.package
+                        if pkg:
+                            pba_qs = PackageBranchAvailability.objects.using(alias).filter(package=pkg)
+                            if pba_qs.exists() and not pba_qs.filter(branch=occurrence.branch, status='ENABLED').exists():
+                                raise ValidationError(f"Membership package does not permit access to '{occurrence.branch.name}'.")
+
                     ent_qs = membership.entitlements.using(alias).filter(status='ACTIVE')
                     if ent_type_filter:
                         ent_qs = ent_qs.filter(entitlement_type=ent_type_filter)
 
-                    ent = ent_qs.filter(
-                        models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
-                    ).first()
+                    if is_cross_branch and not ent_type_filter:
+                        cross_ent = ent_qs.filter(
+                            models.Q(entitlement_type='CROSS_BRANCH_SESSION') | models.Q(entitlement_type='CROSS_BRANCH'),
+                            models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
+                        ).first()
+                        if not cross_ent:
+                            raise ValidationError("No cross-branch session entitlements available for booking outside home branch.")
+                        ent = cross_ent
+                    else:
+                        if not ent_type_filter:
+                            home_ent = ent_qs.filter(
+                                models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units')),
+                                entitlement_type='HOME_BRANCH_SESSION'
+                            ).first()
+                            ent = home_ent or ent_qs.filter(
+                                models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
+                            ).first()
+                        else:
+                            ent = ent_qs.filter(
+                                models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
+                            ).first()
+
                     if not ent:
                         raise ValidationError("No membership entitlement sessions available.")
 
@@ -407,11 +728,8 @@ class BookingWaitlistAttendanceService:
             diff_minutes = int((occurrence.start_at - now).total_seconds() / 60)
             old_status = booking.status
 
-            # Find applied cancellation rule
-            applied_rule = BookingCancellationRule.objects.using(alias).filter(
-                organization=organization,
-                status='ACTIVE'
-            ).order_by('priority').first()
+            # Find applied cancellation rule via canonical resolution
+            applied_rule = cls.resolve_cancellation_rule(booking, db_alias=alias)
 
             session_action = 'RESTORE'
             session_units = Decimal('1.00')
@@ -419,6 +737,8 @@ class BookingWaitlistAttendanceService:
             within_cutoff = diff_minutes > 60
 
             if applied_rule:
+                if applied_rule.min_minutes_before is not None:
+                    within_cutoff = diff_minutes >= applied_rule.min_minutes_before
                 session_action = applied_rule.session_action
                 if applied_rule.cancellation_type == 'TREATED_AS_NO_SHOW':
                     treated_as_no_show = True
@@ -539,10 +859,27 @@ class BookingWaitlistAttendanceService:
         alias = db_alias or get_current_tenant_db_alias() or 'default'
         with transaction.atomic(using=alias):
             occurrence = ClassOccurrence.objects.using(alias).select_for_update().get(id=occurrence.id)
+
+            # Policy resolution & promotion cutoff check
+            policy = cls.resolve_booking_policy(occurrence, db_alias=alias)
+            if policy:
+                if not policy.auto_waitlist_promotion:
+                    return None
+                if policy.waitlist_close_minutes_before:
+                    diff_minutes = (occurrence.start_at - timezone.now()).total_seconds() / 60
+                    if diff_minutes < policy.waitlist_close_minutes_before:
+                        return None
+
+            from .models_crm import TrialBooking
+            trial_enrolled = TrialBooking.objects.using(alias).filter(
+                class_occurrence_id=occurrence.id,
+                status__in=['BOOKED', 'CONFIRMED', 'ATTENDED']
+            ).count()
             enrolled_count = Booking.objects.using(alias).filter(
                 occurrence=occurrence,
                 status__in=['CONFIRMED', 'RESERVED', 'COMPLETED']
-            ).count()
+            ).count() + trial_enrolled
+
             if enrolled_count >= occurrence.capacity:
                 return None
 
@@ -571,7 +908,7 @@ class BookingWaitlistAttendanceService:
                     continue
 
                 # 2. Revalidate attendance restriction
-                can_book, restriction_reason = cls.can_member_book(cand_prof, organization, db_alias=alias)
+                can_book, restriction_reason = cls.can_member_book(cand_prof, organization, occurrence=occurrence, db_alias=alias)
                 if not can_book:
                     candidate.status = 'CANCELLED'
                     candidate.waitlist_position = None
@@ -630,12 +967,30 @@ class BookingWaitlistAttendanceService:
                     units_to_consume = access_res.get('units') or Decimal('1.00')
                     ent_type_filter = access_res.get('entitlement_type')
 
+                    is_cross_branch = bool(membership.home_branch and occurrence.branch_id != membership.home_branch_id)
                     ent_qs = membership.entitlements.using(alias).filter(status='ACTIVE')
                     if ent_type_filter:
                         ent_qs = ent_qs.filter(entitlement_type=ent_type_filter)
-                    ent = ent_qs.filter(
-                        models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
-                    ).first()
+
+                    if is_cross_branch and not ent_type_filter:
+                        cross_ent = ent_qs.filter(
+                            models.Q(entitlement_type='CROSS_BRANCH_SESSION') | models.Q(entitlement_type='CROSS_BRANCH'),
+                            models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
+                        ).first()
+                        ent = cross_ent
+                    else:
+                        if not ent_type_filter:
+                            home_ent = ent_qs.filter(
+                                models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units')),
+                                entitlement_type='HOME_BRANCH_SESSION'
+                            ).first()
+                            ent = home_ent or ent_qs.filter(
+                                models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
+                            ).first()
+                        else:
+                            ent = ent_qs.filter(
+                                models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
+                            ).first()
 
                     if not ent:
                         candidate.status = 'CANCELLED'
@@ -998,7 +1353,7 @@ class BookingWaitlistAttendanceService:
                 booking.status = 'NO_SHOW'
                 booking.save(using=alias, update_fields=['status', 'updated_at'])
 
-                policy = AttendancePolicySet.objects.using(alias).filter(organization=organization, status='ACTIVE').first()
+                policy = cls.resolve_attendance_policy(occurrence, db_alias=alias)
                 if policy:
                     member_state = MemberAttendanceState.objects.using(alias).filter(
                         user_profile=user_profile,
@@ -1014,6 +1369,47 @@ class BookingWaitlistAttendanceService:
                     member_state.consecutive_no_show_count += 1
                     member_state.active_no_show_count += 1
                     member_state.last_no_show_at = now
+
+                    # Evaluate AttendancePenaltyRule for entitlement deduction / restoration
+                    penalty_rule = AttendancePenaltyRule.objects.using(alias).filter(
+                        attendance_policy_set=policy,
+                        status='ACTIVE'
+                    ).order_by('priority').first()
+
+                    if penalty_rule:
+                        if penalty_rule.additional_penalty_units and penalty_rule.additional_penalty_units > 0 and booking.membership and booking.entitlement:
+                            MembershipLifecycleService.consume_entitlement(
+                                membership=booking.membership,
+                                entitlement_type=booking.entitlement.entitlement_type,
+                                units=penalty_rule.additional_penalty_units,
+                                reason_text=f"No-show policy penalty deduction ({penalty_rule.rule_code})",
+                                created_by_user=marked_by_user,
+                                db_alias=alias,
+                            )
+                        if penalty_rule.restore_booked_session and booking.membership and booking.entitlement:
+                            MembershipLifecycleService.reverse_entitlement(
+                                membership=booking.membership,
+                                entitlement_type=booking.entitlement.entitlement_type,
+                                units=Decimal('1.00'),
+                                booking_id=booking.id,
+                                reason_text="No-show session restored per policy rule",
+                                created_by_user=marked_by_user,
+                                db_alias=alias,
+                            )
+
+                        AttendancePolicyEvent.objects.using(alias).create(
+                            user_profile=user_profile,
+                            booking=booking,
+                            attendance_record=record,
+                            attendance_policy_set=policy,
+                            attendance_penalty_rule=penalty_rule,
+                            event_type='PENALTY_APPLIED',
+                            no_show_sequence=member_state.consecutive_no_show_count,
+                            sessions_deducted=penalty_rule.additional_penalty_units or Decimal('0.00'),
+                            reason=f"No-show penalty rule '{penalty_rule.rule_code}' applied",
+                            triggered_by_type='SYSTEM',
+                            created_at=now
+                        )
 
                     # Evaluate restriction threshold
                     if member_state.consecutive_no_show_count >= policy.restriction_threshold:

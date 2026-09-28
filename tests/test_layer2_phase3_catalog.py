@@ -429,12 +429,22 @@ class Layer2Phase3CatalogTestCase(APITestCase):
         """Verify PackageViewSet REST APIs and custom actions."""
         token = self.get_token(self.admin_user)
 
+        prog = PackageCatalogService.create_program(
+            organization=self.org,
+            code='API-PROG',
+            name='API Program',
+            status='ACTIVE',
+            actor=self.admin_user,
+            db_alias='tenant_test',
+        )
+
         # 1. Create Package via API
         resp = self.client.post(
             '/api/v1/tenant/packages/',
             {
                 'code': 'API-PKG',
                 'name': 'API Package',
+                'program': str(prog.id),
             },
             HTTP_AUTHORIZATION=f'Bearer {token}',
         )

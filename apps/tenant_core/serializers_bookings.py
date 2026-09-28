@@ -136,6 +136,8 @@ class BookingListSerializer(serializers.ModelSerializer):
     occurrence_end_at = serializers.DateTimeField(source='occurrence.end_at', read_only=True)
     branch_name = serializers.CharField(source='branch.name', read_only=True)
     package_name = serializers.CharField(source='membership.package.name', read_only=True, allow_null=True)
+    parq_status = serializers.SerializerMethodField()
+    attendance_record = serializers.SerializerMethodField()
 
     class Meta:
         model = Booking
@@ -147,6 +149,7 @@ class BookingListSerializer(serializers.ModelSerializer):
             'branch', 'branch_name',
             'membership', 'package_name',
             'entitlement',
+            'parq_status', 'attendance_record',
             'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'booking_number', 'booked_at', 'cancelled_at', 'completed_at', 'created_at', 'updated_at']
@@ -161,6 +164,30 @@ class BookingListSerializer(serializers.ModelSerializer):
 
     def get_user_profile_email(self, obj):
         return obj.user_profile.user.email if (obj.user_profile and obj.user_profile.user) else None
+
+    def get_parq_status(self, obj):
+        if not obj.user_profile:
+            return 'NOT_REQUIRED'
+        from .models_crm import IntakeSubmission
+        alias = obj._state.db or 'default'
+        has_sub = IntakeSubmission.objects.using(alias).filter(user_profile=obj.user_profile).exists()
+        return 'CLEARED' if has_sub else 'PENDING'
+
+    def get_attendance_record(self, obj):
+        alias = obj._state.db or 'default'
+        att = obj.attendance_records.using(alias).first()
+        if not att:
+            return None
+        return {
+            'id': str(att.id),
+            'status': att.status,
+            'check_in_status': att.check_in_status,
+            'check_in_method': att.check_in_method,
+            'check_in_at': att.check_in_at.isoformat() if att.check_in_at else None,
+            'face_verified': att.face_verified,
+            'is_within_geofence': att.is_within_geofence,
+            'trainer_selfie_url': att.trainer_selfie_url,
+        }
 
 
 class BookingSerializer(serializers.ModelSerializer):
@@ -181,6 +208,8 @@ class BookingSerializer(serializers.ModelSerializer):
     status_history = BookingStatusHistorySerializer(many=True, read_only=True)
     cancellations = BookingCancellationSerializer(many=True, read_only=True)
     waitlist_events = BookingWaitlistEventSerializer(many=True, read_only=True)
+    parq_status = serializers.SerializerMethodField()
+    attendance_record = serializers.SerializerMethodField()
 
     class Meta:
         model = Booking
@@ -203,6 +232,30 @@ class BookingSerializer(serializers.ModelSerializer):
 
     def get_member_number(self, obj):
         return obj.user_profile.member_number if obj.user_profile else None
+
+    def get_parq_status(self, obj):
+        if not obj.user_profile:
+            return 'NOT_REQUIRED'
+        from .models_crm import IntakeSubmission
+        alias = obj._state.db or 'default'
+        has_sub = IntakeSubmission.objects.using(alias).filter(user_profile=obj.user_profile).exists()
+        return 'CLEARED' if has_sub else 'PENDING'
+
+    def get_attendance_record(self, obj):
+        alias = obj._state.db or 'default'
+        att = obj.attendance_records.using(alias).first()
+        if not att:
+            return None
+        return {
+            'id': str(att.id),
+            'status': att.status,
+            'check_in_status': att.check_in_status,
+            'check_in_method': att.check_in_method,
+            'check_in_at': att.check_in_at.isoformat() if att.check_in_at else None,
+            'face_verified': att.face_verified,
+            'is_within_geofence': att.is_within_geofence,
+            'trainer_selfie_url': att.trainer_selfie_url,
+        }
 
 
 class AttendanceRecordSerializer(serializers.ModelSerializer):
