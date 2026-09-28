@@ -621,9 +621,32 @@ class MembershipLifecycleService:
         db_alias: Optional[str] = None,
     ) -> MembershipBranchHistory:
         """
-        Transfers the home branch of a membership and updates the member's preferred branch.
+        Transfers the home branch of a membership and updates the member's preferred branch
+        with operational availability validation (active branch, program availability, package availability).
         """
         alias = db_alias or get_current_tenant_db_alias() or 'default'
+        from .models_catalog import ProgramBranchAvailability, PackageBranchAvailability
+
+        if getattr(target_branch, 'status', 'ACTIVE') != 'ACTIVE':
+            raise ValidationError(f"Target branch '{target_branch.name}' is inactive and cannot receive membership transfers.")
+
+        if membership.home_branch_id == target_branch.id:
+            raise ValidationError(f"Member is already assigned to '{target_branch.name}' as home branch.")
+
+        # Program branch availability check
+        prog = membership.program or (membership.package.program if membership.package else None)
+        if prog:
+            prog_avail = ProgramBranchAvailability.objects.using(alias).filter(program=prog, branch=target_branch).first()
+            if prog_avail and not prog_avail.is_active:
+                raise ValidationError(f"Program '{prog.name}' is not operationally active at '{target_branch.name}'.")
+
+        # Package branch availability check
+        pkg = membership.package
+        if pkg:
+            pkg_avail = PackageBranchAvailability.objects.using(alias).filter(package=pkg, branch=target_branch).first()
+            if pkg_avail and pkg_avail.status == 'DISABLED':
+                raise ValidationError(f"Package '{pkg.name}' is disabled at '{target_branch.name}'.")
+
         from_branch = membership.home_branch
         membership.home_branch = target_branch
         membership.save(using=alias, update_fields=['home_branch', 'updated_at'])
@@ -638,7 +661,7 @@ class MembershipLifecycleService:
             from_branch=from_branch,
             to_branch=target_branch,
             change_type='TRANSFER',
-            reason=reason_text or f"Transferred home branch from {from_branch.name} to {target_branch.name}",
+            reason=reason_text or f"Transferred home branch from {from_branch.name if from_branch else 'None'} to {target_branch.name}",
             changed_by_user=actor_user,
         )
         return hist

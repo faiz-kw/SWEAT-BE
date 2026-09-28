@@ -1576,9 +1576,9 @@ class IntakeQuestionOptionViewSet(viewsets.ModelViewSet):
 class IntakeSubmissionViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = IntakeSubmissionSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'crm'
-    required_submodule = 'leads'
-    required_permission = 'crm.leads.view'
+    required_module = 'cs'
+    required_submodule = 'member-health'
+    required_permission = 'cs.member-health.view'
     ordering = ['-submitted_at']
 
     def get_queryset(self):

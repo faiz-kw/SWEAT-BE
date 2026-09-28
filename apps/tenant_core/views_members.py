@@ -46,9 +46,20 @@ from .models_memberships import (
     MembershipBranchHistory,
     MembershipStatusHistory,
     MembershipFreeze,
+    MembershipRenewalPolicy,
+    MembershipChangePolicy,
+    MembershipChangePolicyRule,
+    MembershipChangeRequest,
     MembershipPackageHistory,
 )
-from .models_catalog import Package, PackageVersion, PackagePrice, Program
+from .models_catalog import (
+    Package,
+    PackageVersion,
+    PackagePrice,
+    Program,
+    ProgramBranchAvailability,
+    PackageBranchAvailability,
+)
 from .models_attendance import AttendanceRecord, AccessEvent
 from .models_bookings import Booking
 from .models_commerce import Order, OrderItem, PaymentTransaction, Refund, MemberInvoice
@@ -266,7 +277,8 @@ def serialize_member(profile: UserProfile, alias: str = 'default') -> dict:
         'membership_status': membership_status,
         'membership': membership_name,
         'membership_id': str(active_m.id) if active_m else None,
-        'membership_number': profile.member_number or (active_m.membership_number if active_m else ''),
+        'member_number': profile.member_number or (active_m.membership_number if active_m else '') or f"MEM-{str(profile.id)[:8].upper()}",
+        'membership_number': profile.member_number or (active_m.membership_number if active_m else '') or f"MEM-{str(profile.id)[:8].upper()}",
         'program_id': program_id,
         'program_name': program_name,
         'package_id': package_id,
@@ -542,9 +554,9 @@ def build_member_timeline(profile: UserProfile, alias: str = 'default', limit: i
     return events[:limit]
 
 
-def build_member_360_aggregate(profile: UserProfile, alias: str = 'default') -> dict:
+def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', requesting_user=None, request=None) -> dict:
     """
-    Builds the complete authoritative 6-section Member 360 payload.
+    Builds the complete authoritative 6-section Member 360 payload with sensitive health data protection.
     """
     user = profile.user
     base_member = serialize_member(profile, alias)
@@ -861,7 +873,23 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default') -> 
 
     total_refunded = sum(r['amount'] for r in refunds_data if r['status'] == 'SUCCESS')
 
-    # 7. Health & Forms (Intake submissions)
+    # 7. Health & Forms (Intake submissions with sensitive health permission check)
+    can_view_health = False
+    if requesting_user and (getattr(requesting_user, 'is_superuser', False) or getattr(requesting_user, 'is_staff', False)):
+        can_view_health = True
+    elif requesting_user:
+        try:
+            from .rbac_engine import RBACAuthorizationEngine
+            allowed, _, _ = RBACAuthorizationEngine.evaluate(
+                user=requesting_user,
+                required_permission='cs.member-health.view',
+                branch_id=str(profile.preferred_branch_id) if profile.preferred_branch_id else None,
+                request=request,
+            )
+            can_view_health = allowed
+        except Exception:
+            can_view_health = False
+
     submissions_data = []
     intake_subs = (
         IntakeSubmission.objects.using(alias)
@@ -872,18 +900,21 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default') -> 
     )
     for sub in intake_subs:
         answers = []
-        for ans in sub.answers.all():
-            val = ans.text_value or ans.numeric_value or ans.boolean_value or ans.date_value or ans.json_value
-            answers.append({
-                'question_id': str(ans.question.id),
-                'question_text': ans.question.question_text,
-                'question_type': ans.question.question_type,
-                'answer': str(val) if val is not None else '',
-            })
+        if can_view_health:
+            for ans in sub.answers.all():
+                val = ans.text_value or ans.numeric_value or ans.boolean_value or ans.date_value or ans.json_value
+                answers.append({
+                    'question_id': str(ans.question.id),
+                    'question_text': ans.question.question_text,
+                    'question_type': ans.question.question_type,
+                    'answer': str(val) if val is not None else '',
+                })
         submissions_data.append({
             'id': str(sub.id),
-            'form_title': sub.intake_form.title if sub.intake_form else 'Health Questionnaire',
+            'form_title': getattr(sub.intake_form, 'name', None) or getattr(sub.intake_form, 'title', None) or 'Health Questionnaire',
             'submitted_at': sub.submitted_at.isoformat(),
+            'status': 'COMPLETED',
+            'sensitive_data_restricted': not can_view_health,
             'answers': answers,
         })
 
@@ -1225,7 +1256,7 @@ class MemberViewSet(viewsets.ViewSet):
         if not profile:
             return Response({'detail': 'Member not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        data = build_member_360_aggregate(profile, alias)
+        data = build_member_360_aggregate(profile, alias, requesting_user=request.user, request=request)
         return Response(data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['get'], url_path='timeline')
@@ -1406,7 +1437,9 @@ class MemberViewSet(viewsets.ViewSet):
     @action(detail=True, methods=['post'], url_path='renew')
     def renew(self, request, pk=None):
         """
-        Extends or renews active membership using backend policy.
+        Canonical Membership Renewal:
+        Preserves existing historical Membership unchanged and activates a new commercial Membership
+        contract via Order & Payment with contract snapshot and entitlement provisioning.
         """
         alias = _get_db(request)
         org = _get_org(request)
@@ -1418,30 +1451,135 @@ class MemberViewSet(viewsets.ViewSet):
         if not active_m:
             return Response({'error': 'No existing membership found to renew.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        months = int(request.data.get('months', 1))
-        days = months * 30
-        reason = request.data.get('reason', f'Membership renewed for {months} month(s)')
+        package_id = request.data.get('package_id') or getattr(active_m.package, 'id', None)
+        package = Package.objects.using(alias).filter(id=package_id).first() if package_id else active_m.package
+        if not package:
+            return Response({'error': 'Package not found for renewal.'}, status=status.HTTP_404_NOT_FOUND)
 
-        try:
-            mem = MembershipLifecycleService.extend_membership(
-                membership=active_m,
-                days=days,
-                reason_text=reason,
-                approved_by_user=request.user,
+        package_version_id = request.data.get('package_version_id')
+        if package_version_id:
+            package_version = PackageVersion.objects.using(alias).filter(id=package_version_id, package=package).first()
+        else:
+            package_version = package.versions.using(alias).filter(status='ACTIVE').order_by('-version_number').first()
+
+        if not package_version:
+            return Response({'error': 'No active package version found for renewal.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check renewal policy
+        renewal_policy = MembershipRenewalPolicy.objects.using(alias).filter(package=package, status='ACTIVE').first()
+        pricing_mode = renewal_policy.renewal_pricing_mode if renewal_policy else 'CURRENT_PRICE'
+
+        if pricing_mode == 'ORIGINAL_PRICE' and getattr(active_m, 'contract_snapshot', None):
+            unit_price = active_m.contract_snapshot.purchase_price
+        else:
+            price_obj = package_version.prices.using(alias).filter(status='ACTIVE').first()
+            unit_price = price_obj.base_price if price_obj else Decimal('5000.00')
+
+        price_obj = package_version.prices.using(alias).filter(status='ACTIVE').first()
+        branch = active_m.home_branch or profile.preferred_branch
+
+        # Determine start date: day after active_m.end_date if in future, else today
+        today = timezone.now().date()
+        if active_m.end_date and active_m.end_date >= today:
+            renewal_start = active_m.end_date + timedelta(days=1)
+        else:
+            renewal_start = today
+
+        with transaction.atomic(using=alias):
+            # 1. Create canonical renewal Order
+            order = CommerceService.create_order(
+                branch=branch,
+                items_data=[{
+                    'item_type': 'PACKAGE',
+                    'package_id': package.id,
+                    'package_version_id': package_version.id,
+                    'package_price_id': price_obj.id if price_obj else None,
+                    'item_name_snapshot': f"{package.name} (v{package_version.version_number}) - Renewal",
+                    'quantity': Decimal('1.00'),
+                    'unit_price': unit_price,
+                    'discount_amount': Decimal('0.00'),
+                    'tax_percent': Decimal('0.000'),
+                }],
+                user_profile=profile,
+                order_type='RENEWAL',
+                source='RENEWAL',
+                currency='INR',
+                notes=request.data.get('reason', f'Renewal of membership {active_m.membership_number}'),
+                created_by=request.user,
                 db_alias=alias,
             )
-            return Response({
-                'success': True,
-                'message': f"Renewed until {mem.end_date}",
-                'member': serialize_member(profile, alias),
-            }, status=status.HTTP_200_OK)
-        except Exception as e:
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+            # 2. Record payment (safe/test payment)
+            payment_amount = request.data.get('payment_amount')
+            pay_amt = Decimal(str(payment_amount)) if payment_amount is not None else order.total_amount
+            if pay_amt > Decimal('0.00'):
+                CommerceService.record_payment(
+                    order_id=str(order.id),
+                    amount=pay_amt,
+                    provider=request.data.get('payment_provider', 'CASH'),
+                    payment_method=request.data.get('payment_method', 'CASH'),
+                    actor=request.user,
+                    db_alias=alias,
+                )
+
+            # 3. Activate new membership contract snapshot & entitlements
+            order_item = order.items.first()
+            new_membership = MembershipLifecycleService.activate_membership_from_order(
+                order=order,
+                order_item=order_item,
+                start_date=renewal_start,
+                db_alias=alias,
+                created_by_user=request.user,
+            )
+
+            # 4. Status history on prior membership
+            MembershipStatusHistory.objects.using(alias).create(
+                membership=active_m,
+                from_status=active_m.status,
+                to_status=active_m.status,
+                reason_code='RENEWAL_CONTRACT_CREATED',
+                reason_text=f"Renewed under new membership contract {new_membership.membership_number} (Order {order.order_number}).",
+                changed_by_user=request.user,
+            )
+
+            # 5. Status history on new membership
+            MembershipStatusHistory.objects.using(alias).create(
+                membership=new_membership,
+                from_status='DRAFT',
+                to_status='ACTIVE',
+                reason_code='RENEWAL_ACTIVATED',
+                reason_text=f"Activated via renewal of {active_m.membership_number}.",
+                changed_by_user=request.user,
+            )
+
+            # 6. Audit event
+            record_business_audit(
+                organization=org,
+                branch=branch,
+                module='memberships',
+                action_code='MEMBERSHIP_RENEWED',
+                entity_type='Membership',
+                entity_id=new_membership.id,
+                actor_user=request.user,
+                event_description=f"Membership {active_m.membership_number} renewed as {new_membership.membership_number}",
+                db_alias=alias,
+            )
+
+        return Response({
+            'success': True,
+            'message': f"Membership renewed successfully as {new_membership.membership_number}.",
+            'old_membership_id': str(active_m.id),
+            'new_membership_id': str(new_membership.id),
+            'start_date': str(new_membership.start_date),
+            'end_date': str(new_membership.end_date),
+            'order_id': str(order.id),
+            'member': serialize_member(profile, alias),
+        }, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['post'], url_path='upgrade')
     def upgrade(self, request, pk=None):
         """
-        Upgrades membership to target package version.
+        Upgrades membership to target package version through canonical change policy / quote service.
         """
         alias = _get_db(request)
         org = _get_org(request)
@@ -1465,27 +1603,63 @@ class MemberViewSet(viewsets.ViewSet):
         if not target_pkg or not target_ver:
             return Response({'error': 'Target package and version are required.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Update membership package directly
-        from_pkg = active_m.package
-        from_ver = active_m.package_version
-        active_m.package = target_pkg
-        active_m.package_version = target_ver
-        active_m.save(using=alias, update_fields=['package', 'package_version', 'updated_at'])
-
-        MembershipPackageHistory.objects.using(alias).create(
-            membership=active_m,
-            from_package=from_pkg,
-            from_package_version=from_ver,
-            to_package=target_pkg,
-            to_package_version=target_ver,
+        # Check or retrieve change policy rule
+        policy_rule = MembershipChangePolicyRule.objects.using(alias).filter(
+            membership_change_policy__status='ACTIVE',
             change_type='UPGRADE',
-            changed_by_user=request.user,
-            reason=reason,
-        )
+        ).first()
+
+        if not policy_rule:
+            policy = MembershipChangePolicy.objects.using(alias).filter(status='ACTIVE').first()
+            if not policy:
+                policy = MembershipChangePolicy.objects.using(alias).create(
+                    organization=org,
+                    policy_name="Standard Membership Change Policy",
+                    status='ACTIVE',
+                    version_number=1,
+                    effective_from=timezone.now(),
+                    created_by_user=request.user,
+                )
+            policy_rule, _ = MembershipChangePolicyRule.objects.using(alias).get_or_create(
+                membership_change_policy=policy,
+                change_type='UPGRADE',
+                defaults={
+                    'rule_name': 'Standard Upgrade Rule',
+                    'effective_mode': 'IMMEDIATE',
+                    'pricing_mode': 'DIFFERENCE_ONLY',
+                    'unused_session_handling': 'CARRY_FORWARD',
+                }
+            )
+
+        with transaction.atomic(using=alias):
+            change_req = MembershipLifecycleService.quote_and_apply_change(
+                membership=active_m,
+                policy_rule=policy_rule,
+                target_package=target_pkg,
+                target_package_version=target_ver,
+                reason=reason,
+                actor_user=request.user,
+                db_alias=alias,
+            )
+
+            # Record business audit
+            record_business_audit(
+                organization=org,
+                branch=active_m.home_branch,
+                module='memberships',
+                action_code='MEMBERSHIP_UPGRADED',
+                entity_type='Membership',
+                entity_id=active_m.id,
+                actor_user=request.user,
+                event_description=f"Membership {active_m.membership_number} upgraded to {target_pkg.name} ({target_ver.version_number})",
+                db_alias=alias,
+            )
 
         return Response({
             'success': True,
             'message': f"Upgraded to {target_pkg.name} ({target_ver.version_number})",
+            'change_request_id': str(change_req.id),
+            'additional_amount': float(change_req.additional_amount),
             'member': serialize_member(profile, alias),
         }, status=status.HTTP_200_OK)
 
@@ -1601,7 +1775,7 @@ class MemberViewSet(viewsets.ViewSet):
     @action(detail=True, methods=['post'], url_path='transfer')
     def transfer(self, request, pk=None):
         """
-        Transfers home branch of member and membership.
+        Transfers home branch of member and membership with program and package availability verification.
         """
         alias = _get_db(request)
         org = _get_org(request)
@@ -1614,8 +1788,29 @@ class MemberViewSet(viewsets.ViewSet):
         if not target_branch:
             return Response({'error': 'Valid target branch_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        # 1. Target Branch Active Check
+        if getattr(target_branch, 'status', 'ACTIVE') != 'ACTIVE':
+            return Response({'error': f"Target branch '{target_branch.name}' is inactive and cannot receive membership transfers."}, status=status.HTTP_400_BAD_REQUEST)
+
         active_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
         if active_m:
+            if active_m.home_branch_id == target_branch.id:
+                return Response({'error': f"Member is already assigned to '{target_branch.name}' as home branch."}, status=status.HTTP_400_BAD_REQUEST)
+
+            # 2. Program Branch Availability Check
+            prog = active_m.program or (active_m.package.program if active_m.package else None)
+            if prog:
+                prog_avail = ProgramBranchAvailability.objects.using(alias).filter(program=prog, branch=target_branch).first()
+                if prog_avail and not prog_avail.is_active:
+                    return Response({'error': f"Program '{prog.name}' is not operationally active at '{target_branch.name}'."}, status=status.HTTP_400_BAD_REQUEST)
+
+            # 3. Package Branch Availability Check
+            pkg = active_m.package
+            if pkg:
+                pkg_avail = PackageBranchAvailability.objects.using(alias).filter(package=pkg, branch=target_branch).first()
+                if pkg_avail and pkg_avail.status == 'DISABLED':
+                    return Response({'error': f"Package '{pkg.name}' is disabled at '{target_branch.name}'."}, status=status.HTTP_400_BAD_REQUEST)
+
             MembershipLifecycleService.transfer_home_branch(
                 membership=active_m,
                 target_branch=target_branch,
