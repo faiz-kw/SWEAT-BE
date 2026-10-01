@@ -37,7 +37,14 @@ def normalize_field_data(field_data):
 def map_answers(field_data, field_mappings, field_defaults=None):
     answers = normalize_field_data(field_data)
     mapped = {}
-    defaults = field_defaults or {}
+    defaults = {
+        k: v for k, v in (field_defaults or {}).items()
+        if k not in {
+            'full_name', 'first_name', 'last_name',
+            'email', 'phone',
+            'consent_whatsapp', 'consent_email', 'consent_sms',
+        }
+    }
     for destination, source in field_mappings.items():
         if destination not in DESTINATION_FIELDS:
             raise ValueError('Unsupported CRM destination field.')

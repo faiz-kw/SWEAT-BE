@@ -67,9 +67,21 @@ class MappingSerializer(serializers.ModelSerializer):
         defaults = value('field_defaults', {})
         if not isinstance(defaults, dict):
             raise serializers.ValidationError({'field_defaults': 'Field defaults must be an object of field-to-value pairs.'})
+        DISALLOWED_DEFAULT_FIELDS = {
+            'full_name', 'first_name', 'last_name',
+            'email', 'phone',
+            'consent_whatsapp', 'consent_email', 'consent_sms',
+        }
         for k, v in defaults.items():
             if k not in DESTINATION_FIELDS:
                 raise serializers.ValidationError({'field_defaults': f"'{k}' is not a supported CRM destination field."})
+            if k in DISALLOWED_DEFAULT_FIELDS:
+                if k in {'full_name', 'first_name', 'last_name'}:
+                    raise serializers.ValidationError({'field_defaults': f"Default values are not permitted for name fields ('{DESTINATION_FIELDS.get(k, k)}'). Each lead must provide their own name."})
+                if k in {'email', 'phone'}:
+                    raise serializers.ValidationError({'field_defaults': f"Default values are not permitted for contact fields ('{DESTINATION_FIELDS.get(k, k)}'). Shared contact details cause duplicate collisions and data leakage."})
+                if k.startswith('consent_'):
+                    raise serializers.ValidationError({'field_defaults': f"Default values cannot grant consent ('{DESTINATION_FIELDS.get(k, k)}'). Consent must be affirmatively granted by the customer in the form."})
             if not isinstance(v, (str, int, float, bool)) or len(str(v)) > 200:
                 raise serializers.ValidationError({'field_defaults': 'Default values must be simple values up to 200 characters.'})
 
@@ -295,6 +307,20 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
             'simulator_enabled': simulator_enabled(),
             'simulator_requirement': 'Development/test deployment, DEBUG enabled, META_LEAD_SIMULATOR_ENABLED enabled and COMMUNICATIONS_OUTBOUND_ENABLED disabled.',
             'destination_fields': [{'value': k, 'label': v} for k, v in DESTINATION_FIELDS.items()],
+            'allowed_default_fields': [
+                {'value': k, 'label': v}
+                for k, v in DESTINATION_FIELDS.items()
+                if k not in {
+                    'full_name', 'first_name', 'last_name',
+                    'email', 'phone',
+                    'consent_whatsapp', 'consent_email', 'consent_sms',
+                }
+            ],
+            'disallowed_default_fields': [
+                'full_name', 'first_name', 'last_name',
+                'email', 'phone',
+                'consent_whatsapp', 'consent_email', 'consent_sms',
+            ],
             'branch_modes': [{'value': k, 'label': v} for k, v in MetaLeadMapping._meta.get_field('branch_mode').choices],
             'unmatched_branch_policies': [{'value': k, 'label': v} for k, v in MetaLeadMapping.UNMATCHED_BRANCH_POLICIES],
             'repeat_policies': [{'value': k, 'label': v} for k, v in MetaLeadMapping._meta.get_field('repeat_policy').choices],

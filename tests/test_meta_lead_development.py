@@ -328,3 +328,36 @@ class MetaDevelopmentTests(TestCase):
         self.assertTrue(len(results) >= 1)
         self.assertEqual(results[0]['action_code'], 'META_MAPPING_UPDATED')
         self.assertEqual(results[0]['actor_name'], 'Admin')
+
+    def test_disallowed_field_defaults_validation(self):
+        # Disallow contact defaults (email, phone)
+        res = self.client.patch(f'/meta-lead-mappings/{self.mapping.id}/', {
+            'field_defaults': {'email': 'fallback@example.com'},
+            'expected_version': self.mapping.version
+        }, format='json')
+        self.assertEqual(res.status_code, 400)
+        self.assertIn('field_defaults', res.data)
+
+        # Disallow identity defaults (full_name, first_name)
+        res = self.client.patch(f'/meta-lead-mappings/{self.mapping.id}/', {
+            'field_defaults': {'full_name': 'Default User'},
+            'expected_version': self.mapping.version
+        }, format='json')
+        self.assertEqual(res.status_code, 400)
+        self.assertIn('field_defaults', res.data)
+
+        # Disallow consent defaults (consent_whatsapp, consent_email)
+        res = self.client.patch(f'/meta-lead-mappings/{self.mapping.id}/', {
+            'field_defaults': {'consent_whatsapp': True},
+            'expected_version': self.mapping.version
+        }, format='json')
+        self.assertEqual(res.status_code, 400)
+        self.assertIn('field_defaults', res.data)
+
+        # Allowed defaults (e.g. fitness_goal, country)
+        res = self.client.patch(f'/meta-lead-mappings/{self.mapping.id}/', {
+            'field_defaults': {'fitness_goal': 'Strength Training', 'country': 'India'},
+            'expected_version': self.mapping.version
+        }, format='json')
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data['field_defaults'], {'fitness_goal': 'Strength Training', 'country': 'India'})
