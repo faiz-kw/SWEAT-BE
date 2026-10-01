@@ -382,16 +382,17 @@ def build_member_timeline(profile: UserProfile, alias: str = 'default', limit: i
             })
 
         for trial in TrialBooking.objects.using(alias).filter(lead=lead).order_by('-created_at')[:5]:
+            trial_status = getattr(trial, 'status', getattr(trial, 'current_status', 'BOOKED'))
             events.append({
                 'id': f"trial-{trial.id}",
                 'category': 'CRM',
-                'event_type': f"TRIAL_{trial.current_status}",
-                'title': f"Trial {trial.current_status.replace('_', ' ').title()}",
+                'event_type': f"TRIAL_{trial_status}",
+                'title': f"Trial {str(trial_status).replace('_', ' ').title()}",
                 'description': f"Trial booking scheduled for {trial.scheduled_start.date() if trial.scheduled_start else 'upcoming'}",
                 'occurred_at': trial.created_at.isoformat() if trial.created_at else timezone.now().isoformat(),
                 'actor': 'Staff',
                 'badge_color': 'teal',
-                'metadata': {'trial_id': str(trial.id), 'status': trial.current_status},
+                'metadata': {'trial_id': str(trial.id), 'status': trial_status},
             })
 
     # Lead Conversions

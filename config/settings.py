@@ -56,11 +56,14 @@ else:
             stacklevel=2,
         )
 
-ALLOWED_HOSTS = [
-    h.strip()
-    for h in os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1,testserver').split(',')
-    if h.strip()
-]
+if DEBUG:
+    ALLOWED_HOSTS = ['*']
+else:
+    ALLOWED_HOSTS = [
+        h.strip()
+        for h in os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1,testserver').split(',')
+        if h.strip()
+    ]
 
 # ---------------------------------------------------------------------------
 # Application definition
@@ -466,6 +469,10 @@ CELERY_BEAT_SCHEDULE = {
     'master-renew-due-subscriptions': {
         'task': 'apps.master.tasks.renew_due_subscriptions_async',
         'schedule': float(os.getenv('CELERY_SCHEDULE_RENEWALS_SECONDS', '3600.0')),  # hourly
+    },
+    'master-generate-rolling-occurrences': {
+        'task': 'apps.master.tasks.generate_all_tenants_rolling_occurrences_async',
+        'schedule': float(os.getenv('CELERY_SCHEDULE_OCCURRENCES_SECONDS', '86400.0')),  # daily rolling 30-day horizon
     },
 }
 

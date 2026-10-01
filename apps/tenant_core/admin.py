@@ -12,7 +12,7 @@ from .models_org import Organization, CompanyEntity, Location, Branch
 from .models_users import TenantUser, Department, UserBranch, UserDepartment
 from .models_workforce import UserProfile
 from .models_rbac import Role, RoleAssignment, ModuleCatalog, Permission
-from .models_govern import OrganizationSettings, BranchSettings, NotificationTemplate
+from .models_govern import OrganizationSettings, BranchSettings, NotificationTemplate, InAppNotification
 from .models_privacy import ProcessingPurpose, ConsentRecord, PrivacyRequest, TenantAuditEvent
 from .models_infra import File, Integration, LegacyEntityMap
 from .models_catalog import (
@@ -950,6 +950,30 @@ class UserProfileAdmin(TenantModelAdmin):
 
 
 # ============================================================================
+# Notifications & Templates
+# ============================================================================
+
+@admin.register(NotificationTemplate)
+class NotificationTemplateAdmin(TenantModelAdmin):
+    list_display = ['name', 'channel', 'event_type', 'language', 'version', 'is_active', 'is_default', 'branch']
+    list_filter = ['channel', 'event_type', 'is_active', 'is_default', 'language']
+    search_fields = ['name', 'subject', 'body', 'event_code']
+    list_select_related = ['organization', 'branch']
+    readonly_fields = ['id', 'created_at', 'updated_at']
+    list_per_page = 25
+
+
+@admin.register(InAppNotification)
+class InAppNotificationAdmin(TenantModelAdmin):
+    list_display = ['title', 'user', 'notification_type', 'is_read', 'read_at', 'created_at']
+    list_filter = ['is_read', 'notification_type', 'created_at']
+    search_fields = ['title', 'message', 'user__email', 'user__first_name', 'user__last_name', 'deep_link', 'idempotency_key']
+    list_select_related = ['user', 'organization']
+    readonly_fields = ['id', 'created_at']
+    list_per_page = 25
+
+
+# ============================================================================
 # Governance, Settings & Infra (Registered with TenantModelAdmin)
 # ============================================================================
 
@@ -961,7 +985,6 @@ admin.site.register(ModuleCatalog, TenantModelAdmin)
 admin.site.register(Permission, TenantModelAdmin)
 admin.site.register(OrganizationSettings, TenantModelAdmin)
 admin.site.register(BranchSettings, TenantModelAdmin)
-admin.site.register(NotificationTemplate, TenantModelAdmin)
 admin.site.register(ProcessingPurpose, TenantModelAdmin)
 admin.site.register(ConsentRecord, TenantModelAdmin)
 admin.site.register(PrivacyRequest, TenantModelAdmin)

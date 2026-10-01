@@ -482,7 +482,7 @@ class CommunicationService:
         active_trials = TrialBooking.objects.using(alias).filter(
             status__in=['BOOKED', 'CONFIRMED'],
             scheduled_start__gt=now,
-        ).select_related('lead', 'lead__organization', 'branch')
+        ).exclude(confirmation_status__in=['CANCELLED', 'DECLINED']).select_related('lead', 'lead__organization', 'branch')
 
         for trial in active_trials:
             org = trial.lead.organization

@@ -239,8 +239,14 @@ class RBACAuthorizationEngine:
             if not role.is_active:
                 continue
 
+            is_org_scope = (
+                getattr(ra, 'scope_type', '') in ('ORGANIZATION', 'ALL')
+                or getattr(role, 'scope', '') == 'ORG'
+                or (ra.branch_id is None and getattr(ra, 'scope_type', 'ORGANIZATION') != 'BRANCH')
+            )
+
             if target_branch is not None:
-                if role.scope == 'ORG' or (ra.branch_id and str(ra.branch_id) == str(target_branch.id)):
+                if is_org_scope or (ra.branch_id and str(ra.branch_id) == str(target_branch.id)):
                     matching_roles.append(role)
             else:
                 # Org-level resource or unspecified branch: include all active roles

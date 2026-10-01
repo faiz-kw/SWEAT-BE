@@ -315,7 +315,7 @@ class BookingWaitlistAttendanceService:
             class_template=occurrence.class_template,
             branch=occurrence.branch
         ).first()
-        if cba and cba.status != 'ACTIVE':
+        if cba and cba.status not in ('ACTIVE', 'ENABLED'):
             return {
                 'eligible': False,
                 'reason_code': 'CLASS_UNAVAILABLE_AT_BRANCH',
@@ -1121,6 +1121,12 @@ class BookingWaitlistAttendanceService:
             # 3. Validate new occurrence
             if to_occ_locked.start_at <= timezone.now():
                 raise ValidationError("Cannot reschedule to a past class occurrence.")
+
+            if not from_occ_locked.class_template.allow_reschedule:
+                raise ValidationError("Rescheduling is not permitted for this class.")
+
+            if not to_occ_locked.class_template.allow_reschedule:
+                raise ValidationError("Rescheduling is not permitted for the target class.")
 
             # Check duplicate on target occurrence
             existing_target = Booking.objects.using(alias).filter(

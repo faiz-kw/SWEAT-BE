@@ -29,6 +29,7 @@ TENANT_EXEMPT_PREFIXES = (
     '/api/v1/platform/',
     '/api/v1/auth/',
     '/api/v1/webhooks/',
+    '/api/v1/mobile/',
     '/admin/',
     '/api/schema/',
     '/api/docs/',

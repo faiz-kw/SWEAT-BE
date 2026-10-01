@@ -7,6 +7,7 @@ from decimal import Decimal
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.pagination import PageNumberPagination
 from django.core.exceptions import ValidationError
 from django.utils import timezone
 
@@ -27,6 +28,12 @@ from .services_catalog import PackageCatalogService, TermsLegalService
 from .permissions import RequireActiveTenantAndOrg, TenantRBACPermission
 
 logger = logging.getLogger(__name__)
+
+
+class CatalogPagination(PageNumberPagination):
+    page_size = 50
+    page_size_query_param = 'page_size'
+    max_page_size = 200
 
 
 def _get_db(request):
@@ -434,6 +441,7 @@ class ProgramCategoryViewSet(viewsets.ModelViewSet):
 
 class ProgramViewSet(viewsets.ModelViewSet):
     serializer_class = ProgramSerializer
+    pagination_class = CatalogPagination
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
     required_module = 'core'
     required_submodule = 'settings'
@@ -990,6 +998,7 @@ class PackageViewSet(viewsets.ModelViewSet):
 
 class PackageVersionViewSet(viewsets.ModelViewSet):
     serializer_class = PackageVersionSerializer
+    pagination_class = CatalogPagination
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
     required_module = 'core'
     required_submodule = 'settings'
@@ -1004,16 +1013,67 @@ class PackageVersionViewSet(viewsets.ModelViewSet):
         'reuse': 'core.settings.edit',
     }
 
+    def get_permissions(self):
+        # Reading packages catalog is allowed for all active staff (for lead intake, sales, conversions)
+        if self.action in ['list', 'retrieve']:
+            return [RequireActiveTenantAndOrg()]
+        return super().get_permissions()
+
     def get_queryset(self):
         alias = _get_db(self.request)
         org = _get_org(self.request)
         qs = PackageVersion.objects.using(alias).filter(package__organization=org)
         pkg_id = self.request.query_params.get('package_id')
+        program_id = self.request.query_params.get('program_id')
+        branch_id = self.request.query_params.get('branch_id')
         status_param = self.request.query_params.get('status')
+        sellable_only = self.request.query_params.get('sellable_only')
+
         if pkg_id:
             qs = qs.filter(package_id=pkg_id)
+        if program_id:
+            qs = qs.filter(package__program_id=program_id)
         if status_param:
             qs = qs.filter(status=status_param.upper())
+        elif str(sellable_only).lower() in ('true', '1'):
+            from django.utils import timezone
+            from django.db.models import Q
+            now = timezone.now()
+            qs = qs.filter(
+                status='ACTIVE',
+                package__status='ACTIVE',
+                only_for_trial=False,
+            ).filter(
+                Q(effective_from__isnull=True) | Q(effective_from__lte=now)
+            ).filter(
+                Q(effective_until__isnull=True) | Q(effective_until__gte=now)
+            )
+
+        if branch_id:
+            from .models_catalog import PackageBranchAvailability, ProgramBranchAvailability
+            from django.utils import timezone
+            from django.db.models import Q
+            now = timezone.now()
+
+            # Ensure program is active and available at this branch
+            pba_progs = ProgramBranchAvailability.objects.using(alias).filter(
+                branch_id=branch_id, is_active=True
+            ).values_list('program_id', flat=True)
+            qs = qs.filter(package__program_id__in=pba_progs)
+
+            pba_enabled = PackageBranchAvailability.objects.using(alias).filter(
+                branch_id=branch_id, status='ENABLED'
+            ).filter(
+                Q(available_from__isnull=True) | Q(available_from__lte=now)
+            ).filter(
+                Q(available_until__isnull=True) | Q(available_until__gte=now)
+            ).values_list('package_id', flat=True)
+
+            restricted_pkg_ids = PackageBranchAvailability.objects.using(alias).values_list('package_id', flat=True).distinct()
+            qs = qs.filter(
+                Q(package_id__in=pba_enabled) | ~Q(package_id__in=restricted_pkg_ids)
+            )
+
         return qs.prefetch_related('prices', 'entitlement_definitions').order_by('-version_number')
 
     def update(self, request, *args, **kwargs):

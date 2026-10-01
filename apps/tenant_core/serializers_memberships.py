@@ -313,6 +313,9 @@ class MembershipPackageHistorySerializer(serializers.ModelSerializer):
 
 class MembershipSerializer(serializers.ModelSerializer):
     member_name = serializers.SerializerMethodField()
+    member_number = serializers.SerializerMethodField()
+    member_phone = serializers.SerializerMethodField()
+    member_email = serializers.SerializerMethodField()
     package_name = serializers.ReadOnlyField(source='package.name')
     home_branch_name = serializers.ReadOnlyField(source='home_branch.name')
     purchase_branch_name = serializers.ReadOnlyField(source='purchase_branch.name')
@@ -325,6 +328,9 @@ class MembershipSerializer(serializers.ModelSerializer):
             'id',
             'user_profile',
             'member_name',
+            'member_number',
+            'member_phone',
+            'member_email',
             'program',
             'package',
             'package_name',
@@ -355,6 +361,21 @@ class MembershipSerializer(serializers.ModelSerializer):
             first = obj.user_profile.first_name_snapshot or ''
             last = obj.user_profile.last_name_snapshot or ''
             return f"{first} {last}".strip() or str(obj.user_profile.id)
+        return ''
+
+    def get_member_number(self, obj) -> str:
+        if obj.user_profile:
+            return obj.user_profile.member_number or f"MEM-{str(obj.user_profile.id)[:8].upper()}"
+        return ''
+
+    def get_member_phone(self, obj) -> str:
+        if obj.user_profile and hasattr(obj.user_profile, 'user') and obj.user_profile.user:
+            return getattr(obj.user_profile.user, 'phone', '') or ''
+        return ''
+
+    def get_member_email(self, obj) -> str:
+        if obj.user_profile and hasattr(obj.user_profile, 'user') and obj.user_profile.user:
+            return getattr(obj.user_profile.user, 'email', '') or ''
         return ''
 
 

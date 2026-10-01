@@ -528,3 +528,29 @@ def sync_tenant_catalogs_async(self) -> dict:
         logger.exception("Error during scheduled tenant catalog synchronization: %s", exc)
         return {'status': 'FAILED', 'error': str(exc)}
 
+
+@shared_task(
+    bind=True,
+    name='apps.master.tasks.generate_all_tenants_rolling_occurrences_async',
+    acks_late=True,
+)
+def generate_all_tenants_rolling_occurrences_async(self, days_ahead: int = 30) -> dict:
+    """
+    Scheduled orchestrator: iterates all ACTIVE tenants and triggers rolling occurrence generation.
+    Enforces daily idempotent rolling session population from active schedule rules.
+    """
+    from apps.master.models_tenant import Tenant
+    from apps.tenant_core.tasks import generate_rolling_occurrences_task
+
+    active_tenants = Tenant.objects.using('default').filter(status='ACTIVE')
+    results = []
+    for t in active_tenants:
+        try:
+            res = generate_rolling_occurrences_task(tenant_id=str(t.id), days_ahead=days_ahead)
+            results.append({'tenant_id': str(t.id), 'result': res})
+        except Exception as exc:
+            logger.exception("Error generating rolling occurrences for tenant %s: %s", t.id, exc)
+            results.append({'tenant_id': str(t.id), 'error': str(exc)})
+    return {'tenants_count': len(results), 'results': results}
+
+

@@ -48,7 +48,7 @@ DEFAULT_ROLES_CONFIG: Dict[str, dict] = {
             'members.transfers.view', 'members.transfers.create',
             # CRM
             'crm.dashboard.view',
-            'crm.leads.view', 'crm.leads.create', 'crm.leads.edit',
+            'crm.leads.view', 'crm.leads.create', 'crm.leads.edit', 'crm.leads.convert',
             'crm.pipeline.view', 'crm.pipeline.create', 'crm.pipeline.edit',
             'crm.trials.view', 'crm.trials.create', 'crm.trials.edit',
             'crm.follow-ups.view', 'crm.follow-ups.create', 'crm.follow-ups.edit',
@@ -83,8 +83,8 @@ DEFAULT_ROLES_CONFIG: Dict[str, dict] = {
             'members.memberships.view',
             'members.attendance.view', 'members.attendance.create', 'members.attendance.edit',
             'members.renewals.view',
-            # CRM (Walk-ins, Enquiries, Trials)
-            'crm.leads.view', 'crm.leads.create', 'crm.leads.edit',
+            # CRM (Walk-ins, Enquiries, Trials, Conversions)
+            'crm.leads.view', 'crm.leads.create', 'crm.leads.edit', 'crm.leads.convert',
             'crm.trials.view', 'crm.trials.create', 'crm.trials.edit',
             'crm.follow-ups.view', 'crm.follow-ups.create', 'crm.follow-ups.edit',
             'crm.communications.view', 'crm.communications.send',
@@ -149,7 +149,7 @@ DEFAULT_ROLES_CONFIG: Dict[str, dict] = {
             'core.settings.view', 'core.files.view', 'core.users.view',
             # CRM Full
             'crm.dashboard.view',
-            'crm.leads.view', 'crm.leads.create', 'crm.leads.edit', 'crm.leads.delete',
+            'crm.leads.view', 'crm.leads.create', 'crm.leads.edit', 'crm.leads.delete', 'crm.leads.convert',
             'crm.pipeline.view', 'crm.pipeline.create', 'crm.pipeline.edit',
             'crm.trials.view', 'crm.trials.create', 'crm.trials.edit',
             'crm.campaigns.view',
@@ -235,6 +235,27 @@ def sync_default_role_permissions(
         (sm.module.module_code.lower(), sm.submodule_code.lower()): sm
         for sm in SubmoduleCatalog.objects.using(db_alias).select_related('module').all()
     }
+
+    # Pre-seed any permissions from DEFAULT_ROLES_CONFIG that don't exist yet in tenant DB
+    for r_conf in DEFAULT_ROLES_CONFIG.values():
+        for p_code in r_conf.get('permissions', []):
+            if p_code.lower() not in all_perms:
+                parts = p_code.split('.')
+                mod_code = parts[0]
+                submod_code = parts[1] if len(parts) > 2 else None
+                mod_obj = all_modules.get(mod_code.lower())
+                submod_obj = all_submodules.get((mod_code.lower(), submod_code.lower())) if submod_code else None
+                p_obj, _ = Permission.objects.using(db_alias).get_or_create(
+                    permission_code=p_code,
+                    defaults={
+                        'module': mod_obj,
+                        'submodule': submod_obj,
+                        'code': p_code,
+                        'label': p_code.replace('.', ' ').title(),
+                        'action': parts[-1],
+                    }
+                )
+                all_perms[p_code.lower()] = p_obj
 
     results = {}
 

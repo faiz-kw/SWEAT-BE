@@ -159,7 +159,12 @@ class LeadAttentionService:
             policy = cls.get_attention_policy(lead.organization, db_alias=alias)
 
         # Terminal stages do not need operational attention
-        if lead.current_status in TERMINAL_STAGES:
+        from .models_crm import LeadConversion
+        if (
+            lead.current_status in TERMINAL_STAGES
+            or getattr(lead, 'converted_user_profile_id', None) is not None
+            or LeadConversion.objects.using(alias).filter(lead=lead).exists()
+        ):
             return cls._empty_attention_response(lead, now)
 
         # Compute canonical stage SLA
@@ -503,6 +508,7 @@ class LeadAttentionService:
         sla_info: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Returns clean non-stuck attention response."""
+        is_converted = lead.current_status == 'CONVERTED' or getattr(lead, 'converted_user_profile_id', None) is not None
         stage_age_sec = sla_info['stage_age_seconds'] if sla_info else 0
         sla_due = sla_info['sla_due_at'].isoformat() if sla_info and sla_info.get('sla_due_at') else None
 
@@ -518,7 +524,7 @@ class LeadAttentionService:
             'last_activity_at': None,
             'next_followup_at': None,
             'reasons': [],
-            'recommended_action': {
+            'recommended_action': None if is_converted else {
                 'action_code': 'REVIEW_LEAD',
                 'display_name': 'Review Lead',
                 'reason': 'Lead is on track with scheduled touchpoints.',

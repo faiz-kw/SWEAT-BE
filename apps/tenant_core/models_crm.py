@@ -185,6 +185,13 @@ class Lead(models.Model):
     consent_whatsapp = models.BooleanField(default=True)
     consent_email = models.BooleanField(default=True)
     consent_sms = models.BooleanField(default=True)
+    first_response_at = models.DateTimeField(null=True, blank=True)
+    first_response_time_seconds = models.PositiveIntegerField(null=True, blank=True)
+    response_sla_status = models.CharField(
+        max_length=20,
+        choices=[('PENDING', 'Pending'), ('MET', 'Met'), ('BREACHED', 'Breached')],
+        default='PENDING',
+    )
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -1161,4 +1168,59 @@ class CRMAgentAssignmentConfig(models.Model):
 
     def __str__(self):
         return f"CRMAgentAssignmentConfig({self.organization_id}: roles={self.allowed_role_codes})"
+
+
+class CRMStageAutomationRule(models.Model):
+    """
+    Configurable stage automation rule triggered by CRM domain events
+    (e.g., FOLLOWUP_COMPLETED, TRIAL_BOOKED, TRIAL_RESCHEDULED, TRIAL_ATTENDED,
+    TRIAL_NO_SHOW, TRIAL_CANCELLED, LEAD_CONVERTED).
+    """
+    TRIGGER_EVENTS = [
+        ('FOLLOWUP_COMPLETED', 'Follow-up Task Completed'),
+        ('TRIAL_BOOKED', 'Trial Session Booked'),
+        ('TRIAL_RESCHEDULED', 'Trial Session Rescheduled'),
+        ('TRIAL_ATTENDED', 'Trial Session Attended'),
+        ('TRIAL_NO_SHOW', 'Trial Session Marked No-Show'),
+        ('TRIAL_CANCELLED', 'Trial Session Cancelled'),
+        ('LEAD_CONVERTED', 'Lead Converted to Member'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey(
+        Organization,
+        on_delete=models.CASCADE,
+        related_name='crm_stage_automation_rules',
+        db_column='organization_id',
+    )
+    name = models.CharField(max_length=200)
+    trigger_event = models.CharField(max_length=50, choices=TRIGGER_EVENTS)
+    from_stage = models.CharField(
+        max_length=50,
+        default='ANY',
+        help_text="Source stage code e.g. 'NEW_LEAD' or 'ANY'",
+    )
+    to_stage = models.CharField(
+        max_length=50,
+        choices=Lead.STATUSES,
+        help_text="Target stage code e.g. 'INTERESTED'",
+    )
+    conditions = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Optional conditions e.g. {'task_types': ['CALL'], 'positive_outcome_only': True, 'outcome_keywords': ['interested', 'trial', 'proceed']}",
+    )
+    priority = models.PositiveIntegerField(default=0)
+    is_enabled = models.BooleanField(default=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        app_label = 'tenant_core'
+        db_table = 'crm_stage_automation_rules'
+        ordering = ['priority', 'created_at']
+
+    def __str__(self):
+        return f"Rule({self.name}: {self.trigger_event} [{self.from_stage}->{self.to_stage}])"
+
 

@@ -34,6 +34,8 @@ from .models_crm import (
     LeadActivity, IntakeForm, IntakeQuestion, IntakeQuestionOption,
     IntakeSubmission, IntakeAnswer, TrialBooking, TrialStatusHistory,
     LeadConversion, SalesFollowupTask, LeadCommercialProfile,
+    CRMStageSlaPolicy, CRMTrialReminderPolicy, CRMAgentAssignmentConfig,
+    CRMStageAutomationRule,
 )
 
 from .models_catalog import (
@@ -76,7 +78,9 @@ __all__ = [
     'LeadSource', 'Lead', 'LeadStatusHistory', 'LeadAssignment', 'LeadNote',
     'LeadActivity', 'IntakeForm', 'IntakeQuestion', 'IntakeQuestionOption',
     'IntakeSubmission', 'IntakeAnswer', 'TrialBooking', 'TrialStatusHistory',
-    'LeadConversion', 'SalesFollowupTask',
+    'LeadConversion', 'SalesFollowupTask', 'LeadCommercialProfile',
+    'CRMStageSlaPolicy', 'CRMTrialReminderPolicy', 'CRMAgentAssignmentConfig',
+    'CRMStageAutomationRule',
     # Module C: Terms & Legal
     'TermsDocument', 'TermsDocumentVersion', 'TermsAcceptance',
     # Module D: Programs, Packages & Catalog

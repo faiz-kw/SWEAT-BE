@@ -686,6 +686,25 @@ class PackageVersionSerializer(serializers.ModelSerializer):
     entitlement_definitions = PackageEntitlementDefinitionSerializer(many=True, read_only=True)
     package_code = serializers.CharField(source='package.code', read_only=True)
     package_name = serializers.CharField(source='package.name', read_only=True)
+    effective_price = serializers.SerializerMethodField()
+    currency = serializers.SerializerMethodField()
+
+    def get_effective_price(self, obj):
+        req = self.context.get('request')
+        branch_id = req.query_params.get('branch_id') if req else None
+        active_prices = [p for p in obj.prices.all() if p.status == 'ACTIVE']
+        if branch_id:
+            bp = next((p for p in active_prices if str(p.branch_id) == str(branch_id)), None)
+            if bp:
+                return str(bp.base_price)
+        gp = next((p for p in active_prices if p.branch_id is None), None)
+        if gp:
+            return str(gp.base_price)
+        return str(active_prices[0].base_price) if active_prices else None
+
+    def get_currency(self, obj):
+        active_prices = [p for p in obj.prices.all() if p.status == 'ACTIVE']
+        return active_prices[0].currency if active_prices else 'INR'
 
     class Meta:
         model = PackageVersion
@@ -695,7 +714,7 @@ class PackageVersionSerializer(serializers.ModelSerializer):
             'total_days', 'validity_days', 'is_trial_package', 'is_trial',
             'only_for_trial', 'show_on_web', 'show_on_app',
             'effective_from', 'effective_until', 'published_at',
-            'status', 'prices', 'entitlement_definitions',
+            'status', 'prices', 'effective_price', 'currency', 'entitlement_definitions',
             'created_by_user', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'version_number', 'created_by_user', 'created_at', 'updated_at']

@@ -234,26 +234,29 @@ class CRMLeadService:
             gst_number = extra.pop('gst_number', None)
             pan_number = extra.pop('pan_number', None)
             attribution_from_extra = extra.pop('attribution', None)
-            assignment_mode = extra.pop('assignment_mode', 'MANUAL')
+            assignment_mode = extra.pop('assignment_mode', None)
+
+            from .models_crm import CRMAgentAssignmentConfig
+            from .services_lead_assignment import (
+                LeadAutoAssignmentService,
+                LeadAssignmentEligibilityService,
+                LeadAssignmentExecutionService,
+            )
+
+            config = CRMAgentAssignmentConfig.objects.using(alias).filter(organization=organization).first()
+            mode_allowed = config.assignment_mode_allowed if config else 'BOTH'
+            strategy = config.auto_assignment_strategy if config else 'ROUND_ROBIN'
+            allow_unassigned_fallback = config.allow_unassigned_fallback if config else True
 
             assignment_strategy = ''
             assignment_source = 'MANUAL'
             assignment_reason = ''
 
-            if assignment_mode == 'AUTO':
-                assignment_source = 'AUTO'
-                from .services_lead_assignment import LeadAutoAssignmentService
-                resolved_user, strategy, reason_msg = LeadAutoAssignmentService.resolve_assignee(
-                    organization=organization,
-                    branch=branch,
-                    db_alias=alias,
-                )
-                assigned_sales_user = resolved_user
-                assignment_strategy = strategy
-                assignment_reason = reason_msg or ''
-
-            elif assigned_sales_user:
-                from .services_lead_assignment import LeadAssignmentEligibilityService
+            # Evaluate configured assignment policy across 4 business rules:
+            # Rule A: User manually selects an assignee
+            if assigned_sales_user:
+                if mode_allowed == 'AUTO':
+                    raise ValidationError("Manual representative selection is disallowed by tenant CRM configuration (Auto-assignment only).")
                 is_valid, validation_err = LeadAssignmentEligibilityService.validate_assignee_eligibility(
                     organization=organization,
                     user=assigned_sales_user,
@@ -262,6 +265,42 @@ class CRMLeadService:
                 )
                 if not is_valid:
                     raise ValidationError(f"Selected representative is not eligible: {validation_err}")
+                assignment_source = 'MANUAL'
+                assignment_reason = 'Manual selection on lead intake'
+
+            # Rule B: User explicitly selects Auto Assign
+            elif assignment_mode == 'AUTO':
+                if mode_allowed == 'MANUAL':
+                    raise ValidationError("Auto-assignment is disallowed by tenant CRM configuration (Manual only).")
+                assignment_source = 'AUTO'
+                resolved_user, strat, reason_msg = LeadAutoAssignmentService.resolve_assignee(
+                    organization=organization,
+                    branch=branch,
+                    db_alias=alias,
+                )
+                assigned_sales_user = resolved_user
+                assignment_strategy = strat
+                assignment_reason = reason_msg or 'Auto-assignment'
+
+            # Rule C: No assignee selected AND policy permits automatic fallback
+            elif mode_allowed in ('BOTH', 'AUTO') and strategy != 'MANUAL_ONLY':
+                assignment_source = 'AUTO'
+                resolved_user, strat, reason_msg = LeadAutoAssignmentService.resolve_assignee(
+                    organization=organization,
+                    branch=branch,
+                    db_alias=alias,
+                )
+                assigned_sales_user = resolved_user
+                assignment_strategy = strat
+                assignment_reason = reason_msg or 'Automatic round-robin assignment'
+
+            # Rule D: Policy says manual is mandatory and no assignee selected
+            else:
+                if not allow_unassigned_fallback:
+                    raise ValidationError("An assigned representative is required by tenant CRM assignment policy.")
+                assigned_sales_user = None
+                assignment_source = 'MANUAL'
+                assignment_reason = 'Created unassigned (Manual assignment required)'
 
             if email:
                 email = validate_lead_email(email, required=False)
@@ -300,17 +339,16 @@ class CRMLeadService:
                 changed_by_user=actor_user,
             )
 
-            if assigned_sales_user or assignment_mode == 'AUTO':
-                from .services_lead_assignment import LeadAssignmentExecutionService
-                LeadAssignmentExecutionService.execute_assignment(
-                    lead=lead,
-                    assigned_to_user=assigned_sales_user,
-                    assignment_source=assignment_source,
-                    assignment_strategy=assignment_strategy,
-                    reason=assignment_reason,
-                    actor_user=actor_user,
-                    db_alias=alias,
-                )
+            # Authoritative assignment execution (records LeadAssignment, LeadActivity, Audit, Outbox, Notification)
+            LeadAssignmentExecutionService.execute_assignment(
+                lead=lead,
+                assigned_to_user=assigned_sales_user,
+                assignment_source=assignment_source,
+                assignment_strategy=assignment_strategy,
+                reason=assignment_reason,
+                actor_user=actor_user,
+                db_alias=alias,
+            )
 
             # Record initial marketing attribution if supplied and has actual data
             attr_payload = attribution_data or attribution_from_extra
@@ -466,51 +504,109 @@ class CRMLeadService:
         alias = db_alias or get_tenant_db_alias() or 'default'
         now = timezone.now()
 
-        # When was the current stage entered?
+        # 1. RESPONSE SLA (First response time from lead intake)
+        resp_policy = CRMStageSlaPolicy.objects.using(alias).filter(
+            organization=lead.organization,
+            canonical_stage='NEW_LEAD',
+            is_enabled=True,
+        ).first()
+
+        resp_target_val = resp_policy.response_target_value if resp_policy else 15
+        resp_target_unit = resp_policy.response_target_unit if resp_policy else 'MINUTES'
+        multiplier = 60 if resp_target_unit == 'MINUTES' else (3600 if resp_target_unit == 'HOURS' else 86400)
+        resp_delta = timedelta(seconds=resp_target_val * multiplier)
+        response_due_at = lead.created_at + resp_delta
+
+        # If lead has not yet frozen response SLA, check if a qualifying response was recorded
+        if lead.response_sla_status == 'PENDING':
+            qualifying_task = SalesFollowupTask.objects.using(alias).filter(
+                lead=lead, status='COMPLETED'
+            ).order_by('updated_at').first()
+            if qualifying_task:
+                from .services_stage_automation import CRMStageAutomationService
+                CRMStageAutomationService.record_response_sla(
+                    lead=lead,
+                    response_at=qualifying_task.updated_at,
+                    db_alias=alias,
+                )
+            else:
+                qualifying_act = LeadActivity.objects.using(alias).filter(
+                    lead=lead,
+                    activity_type__in=['CALL', 'EMAIL', 'WHATSAPP', 'MEETING', 'FOLLOW_UP'],
+                ).order_by('activity_at').first()
+                if qualifying_act:
+                    from .services_stage_automation import CRMStageAutomationService
+                    CRMStageAutomationService.record_response_sla(
+                        lead=lead,
+                        response_at=qualifying_act.activity_at,
+                        db_alias=alias,
+                    )
+
+        if lead.response_sla_status in ('MET', 'BREACHED'):
+            resp_status = lead.response_sla_status
+            first_resp_at = lead.first_response_at.isoformat() if lead.first_response_at else None
+            resp_time_sec = lead.first_response_time_seconds
+        else:
+            resp_status = 'BREACHED' if now > response_due_at else 'PENDING'
+            first_resp_at = None
+            resp_time_sec = None
+
+        # 2. STAGE SLA (Duration spent in current stage, resets on transition)
         latest_transition = LeadStatusHistory.objects.using(alias).filter(
             lead=lead, to_status=lead.current_status
         ).order_by('-changed_at').first()
         stage_entered_at = latest_transition.changed_at if latest_transition else lead.created_at
         stage_age_seconds = max(0, int((now - stage_entered_at).total_seconds()))
 
-        # Look up tenant's SLA policy for this canonical stage
-        policy = CRMStageSlaPolicy.objects.using(alias).filter(
+        stage_policy = CRMStageSlaPolicy.objects.using(alias).filter(
             organization=lead.organization,
             canonical_stage=lead.current_status,
             is_enabled=True,
         ).first()
 
-        if not policy:
-            return {
-                'stage_entered_at': stage_entered_at.isoformat(),
-                'stage_age_seconds': stage_age_seconds,
-                'sla_policy_id': None,
-                'sla_target_value': None,
-                'sla_target_unit': None,
-                'sla_due_at': None,
-                'sla_status': 'DISABLED',
-            }
-
-        if policy.response_target_unit == 'MINUTES':
-            delta = timedelta(minutes=policy.response_target_value)
-        elif policy.response_target_unit == 'HOURS':
-            delta = timedelta(hours=policy.response_target_value)
-        elif policy.response_target_unit == 'DAYS':
-            delta = timedelta(days=policy.response_target_value)
+        if stage_policy:
+            stg_val = stage_policy.response_target_value
+            stg_unit = stage_policy.response_target_unit
+            stg_mult = 60 if stg_unit == 'MINUTES' else (3600 if stg_unit == 'HOURS' else 86400)
+            stage_due_at = stage_entered_at + timedelta(seconds=stg_val * stg_mult)
+            stage_sla_status = 'BREACHED' if now > stage_due_at else 'ON_TRACK'
+            stage_target_val = stg_val
+            stage_target_unit = stg_unit
+            stage_due_str = stage_due_at.isoformat()
+            sla_policy_id = str(stage_policy.id)
         else:
-            delta = timedelta(minutes=policy.response_target_value)
-
-        sla_due_at = stage_entered_at + delta
-        sla_status = 'BREACHED' if now > sla_due_at else 'ON_TRACK'
+            stage_due_at = None
+            stage_sla_status = 'DISABLED'
+            stage_target_val = None
+            stage_target_unit = None
+            stage_due_str = None
+            sla_policy_id = None
 
         return {
             'stage_entered_at': stage_entered_at.isoformat(),
             'stage_age_seconds': stage_age_seconds,
-            'sla_policy_id': str(policy.id),
-            'sla_target_value': policy.response_target_value,
-            'sla_target_unit': policy.response_target_unit,
-            'sla_due_at': sla_due_at.isoformat(),
-            'sla_status': sla_status,
+            'sla_policy_id': sla_policy_id,
+            'sla_target_value': stage_target_val,
+            'sla_target_unit': stage_target_unit,
+            'sla_due_at': stage_due_str,
+            'sla_status': stage_sla_status,
+            'response_sla': {
+                'status': resp_status,
+                'target_value': resp_target_val,
+                'target_unit': resp_target_unit,
+                'due_at': response_due_at.isoformat(),
+                'first_response_at': first_resp_at,
+                'first_response_time_seconds': resp_time_sec,
+            },
+            'stage_sla': {
+                'canonical_stage': lead.current_status,
+                'status': stage_sla_status,
+                'stage_entered_at': stage_entered_at.isoformat(),
+                'stage_age_seconds': stage_age_seconds,
+                'target_value': stage_target_val,
+                'target_unit': stage_target_unit,
+                'due_at': stage_due_str,
+            },
         }
 
     @classmethod
@@ -774,20 +870,18 @@ class CRMLeadService:
             if 'phone' in fields_to_update and fields_to_update['phone']:
                 fields_to_update['phone_normalized'] = validate_lead_phone(fields_to_update.pop('phone'))
 
-            assigned_sales_user = fields_to_update.get('assigned_sales_user')
+            assigned_sales_user = fields_to_update.pop('assigned_sales_user', None)
             if assigned_sales_user is not None and assigned_sales_user != lead.assigned_sales_user:
-                # Update assignment history
-                LeadAssignment.objects.using(alias).filter(
-                    lead=lead, assignment_type='SALES', status='ACTIVE'
-                ).update(status='INACTIVE', unassigned_at=timezone.now())
-                if assigned_sales_user:
-                    LeadAssignment.objects.using(alias).create(
-                        lead=lead,
-                        assigned_to_user=assigned_sales_user,
-                        assigned_by_user=actor_user,
-                        assignment_type='SALES',
-                        status='ACTIVE',
-                    )
+                from .services_lead_assignment import LeadAssignmentExecutionService
+                LeadAssignmentExecutionService.execute_assignment(
+                    lead=lead,
+                    assigned_to_user=assigned_sales_user,
+                    assignment_source='MANUAL',
+                    assignment_strategy='',
+                    reason='Updated via CRM lead edit',
+                    actor_user=actor_user,
+                    db_alias=alias,
+                )
 
             if fields_to_update.get('current_status') == 'CONVERTED' and lead.current_status != 'CONVERTED':
                 from .models_crm import LeadConversion
@@ -855,8 +949,11 @@ class CRMLeadService:
             if old_status == new_status:
                 return lead
 
+            from .models_crm import LeadConversion
+            if old_status == 'CONVERTED' or (new_status != 'CONVERTED' and (getattr(lead, 'converted_user_profile_id', None) or LeadConversion.objects.using(alias).filter(lead=lead).exists())):
+                raise ValidationError("This lead has already been converted to a member. The CRM sales journey is terminal.")
+
             if new_status == 'CONVERTED':
-                from .models_crm import LeadConversion
                 if not LeadConversion.objects.using(alias).filter(lead=lead).exists():
                     raise ValidationError(
                         "Manual transition to CONVERTED is forbidden. "
@@ -962,6 +1059,18 @@ class CRMLeadService:
 
         with transaction.atomic(using=alias):
             # Check for existing active assignment to the same user (Idempotent replay protection)
+            if assignment_type == 'SALES':
+                from .services_lead_assignment import LeadAssignmentExecutionService
+                return LeadAssignmentExecutionService.execute_assignment(
+                    lead=lead,
+                    assigned_to_user=assigned_to_user,
+                    assignment_source=kwargs.get('assignment_source', 'MANUAL'),
+                    assignment_strategy=kwargs.get('assignment_strategy', ''),
+                    reason=notes or kwargs.get('reason', ''),
+                    actor_user=actor_user,
+                    db_alias=alias,
+                )
+
             existing_active = LeadAssignment.objects.using(alias).filter(
                 lead=lead,
                 assignment_type=assignment_type,
@@ -993,64 +1102,9 @@ class CRMLeadService:
                 status='ACTIVE',
             )
 
-            if assignment_type == 'SALES':
-                lead.assigned_sales_user = assigned_to_user
-                lead.save(using=alias, update_fields=['assigned_sales_user', 'updated_at'])
-            elif assignment_type == 'TRAINER':
+            if assignment_type == 'TRAINER':
                 lead.assigned_trainer_user = assigned_to_user
                 lead.save(using=alias, update_fields=['assigned_trainer_user', 'updated_at'])
-
-            # Audit & Outbox
-            action_code = 'CRM_LEAD_REASSIGNED' if prev_user else 'CRM_LEAD_ASSIGNED'
-            record_business_audit(
-                organization=lead.organization,
-                branch=lead.branch,
-                actor_user=actor_user,
-                module='crm',
-                action_code=action_code,
-                entity_type='LeadAssignment',
-                entity_id=new_assign.id,
-                event_description=f"Assigned lead {lead.first_name} {lead.last_name} to {assigned_to_user.email}" + (f" (reassigned from {prev_user.email})" if prev_user else ""),
-                before_data={'assigned_to_user_id': str(prev_user.id) if prev_user else None},
-                after_data={'assigned_to_user_id': str(assigned_to_user.id), 'assignment_type': assignment_type},
-                db_alias=alias,
-            )
-
-            enqueue_outbox_event(
-                organization=lead.organization,
-                event_type='crm.lead.assigned',
-                aggregate_type='Lead',
-                aggregate_id=lead.id,
-                payload={
-                    'lead_id': str(lead.id),
-                    'assigned_user_id': str(assigned_to_user.id),
-                    'previous_user_id': str(prev_user.id) if prev_user else None,
-                    'branch_id': str(lead.branch_id) if lead.branch else None,
-                    'assigned_by': str(actor_user.id) if actor_user else None,
-                    'assignment_type': assignment_type,
-                    'created_at': timezone.now().isoformat(),
-                },
-                db_alias=alias,
-            )
-
-            send_in_app_notification(
-                organization=lead.organization,
-                user=assigned_to_user,
-                notification_type='LEAD_ASSIGNED',
-                title='New Lead Assigned',
-                message=f"A new lead has been assigned to you: {lead.first_name} {lead.last_name} — {lead.branch.name if lead.branch else 'General'}",
-                data={
-                    'lead_id': str(lead.id),
-                    'lead_name': f"{lead.first_name} {lead.last_name}",
-                    'branch_name': lead.branch.name if lead.branch else 'General',
-                    'branch_id': str(lead.branch_id) if lead.branch else None,
-                    'previous_user_id': str(prev_user.id) if prev_user else None,
-                    'assigned_by': actor_user.email if actor_user else 'System',
-                },
-                deep_link=f"/crm/leads?lead_id={lead.id}",
-                idempotency_key=f"lead_assigned:{lead.id}:{assigned_to_user.id}:{new_assign.id}",
-                db_alias=alias,
-            )
 
             return new_assign
 
@@ -1149,7 +1203,23 @@ class CRMLeadService:
             if not policy.allow_trial:
                 return False, "Trials are not permitted by booking policy for this session."
             if policy.max_trial_bookings and lead:
-                used_trials = TrialBooking.objects.using(alias).filter(lead=lead).exclude(status__in=['CANCELLED', 'RESCHEDULED']).count()
+                # Count distinct logical trial journeys that have been consumed or are active
+                # Rescheduled or replaced trials in the same journey must never count as additional consumed trials
+                active_or_consumed_trials = TrialBooking.objects.using(alias).filter(
+                    lead=lead
+                ).exclude(status__in=['CANCELLED', 'RESCHEDULED', 'DECLINED']).exclude(confirmation_status__in=['CANCELLED', 'DECLINED'])
+                used_root_ids = set()
+                for tb in active_or_consumed_trials:
+                    curr = tb
+                    visited = {curr.id}
+                    while curr.rescheduled_from_id:
+                        parent = TrialBooking.objects.using(alias).filter(id=curr.rescheduled_from_id).first()
+                        if not parent or parent.id in visited:
+                            break
+                        visited.add(parent.id)
+                        curr = parent
+                    used_root_ids.add(curr.id)
+                used_trials = len(used_root_ids)
                 if used_trials >= policy.max_trial_bookings:
                     return False, f"Maximum trial limit reached: maximum of {policy.max_trial_bookings} exceeded for this lead."
             if occurrence:
@@ -1281,6 +1351,16 @@ class CRMLeadService:
                 else:
                     trainer_name = tp.trainer_code
 
+            tz_name = getattr(occ.branch, 'timezone', None) or 'Asia/Kolkata'
+            try:
+                from zoneinfo import ZoneInfo
+                branch_tz = ZoneInfo(tz_name)
+            except Exception:
+                branch_tz = None
+
+            start_time_str = occ.start_at.astimezone(branch_tz).strftime('%H:%M') if branch_tz else occ.start_at.strftime('%H:%M')
+            end_time_str = occ.end_at.astimezone(branch_tz).strftime('%H:%M') if branch_tz else occ.end_at.strftime('%H:%M')
+
             slots.append({
                 'occurrence_id': str(occ.id),
                 'class_template_id': str(occ.class_template_id),
@@ -1292,8 +1372,8 @@ class CRMLeadService:
                 'occurrence_date': occ.occurrence_date.isoformat(),
                 'start_at': occ.start_at.isoformat(),
                 'end_at': occ.end_at.isoformat(),
-                'start_time': occ.start_at.strftime('%H:%M'),
-                'end_time': occ.end_at.strftime('%H:%M'),
+                'start_time': start_time_str,
+                'end_time': end_time_str,
                 'delivery_mode': occ.delivery_mode,
                 'booking_capacity': effective_capacity,
                 'capacity': effective_capacity,
@@ -1312,6 +1392,7 @@ class CRMLeadService:
                 'is_available': policy_allowed and remaining_capacity > 0 and remaining_trial_capacity > 0,
                 'trainer_id': trainer_id,
                 'trainer_name': trainer_name,
+                'allow_reschedule': occ.class_template.allow_reschedule,
             })
 
         return slots
@@ -1353,8 +1434,9 @@ class CRMLeadService:
             if lead.organization_id != branch.organization_id:
                 raise ValidationError("Lead and Branch belong to different organizations.")
 
-            if lead.current_status == 'CONVERTED':
-                raise ValidationError("Converted leads are members and cannot book prospect trials. Use member booking.")
+            from .models_crm import LeadConversion
+            if lead.current_status == 'CONVERTED' or getattr(lead, 'converted_user_profile_id', None) or LeadConversion.objects.using(alias).filter(lead=lead).exists():
+                raise ValidationError("This lead has already been converted to a member. The CRM sales journey is terminal. Bookings must be made via the Member schedule.")
 
             try:
                 occ = ClassOccurrence.objects.using(alias).select_for_update().get(id=class_occurrence_id)
@@ -1472,12 +1554,12 @@ class CRMLeadService:
                 changed_by_user=actor_user,
             )
 
-            # Sync lead status
-            cls.transition_lead_status(
+            # Configurable stage automation for TRIAL_BOOKED
+            from .services_stage_automation import CRMStageAutomationService
+            CRMStageAutomationService.evaluate_and_transition(
                 lead=lead,
-                new_status='TRIAL_BOOKED',
-                reason_code='TRIAL_SCHEDULED',
-                reason_text=f"Trial booked for {scheduled_start}",
+                trigger_event='TRIAL_BOOKED',
+                context={'trial': trial, 'scheduled_start': scheduled_start},
                 actor_user=actor_user,
                 db_alias=alias,
             )
@@ -1588,6 +1670,8 @@ class CRMLeadService:
     ) -> TrialBooking:
         alias = db_alias or get_tenant_db_alias() or 'default'
         with transaction.atomic(using=alias):
+            if trial.status in ['ATTENDED', 'CANCELLED', 'RESCHEDULED', 'NO_SHOW']:
+                raise ValidationError(f"Cannot request reschedule for trial in '{trial.status}' status.")
             trial.confirmation_status = 'RESCHEDULE_REQUESTED'
             if reason:
                 trial.cancellation_reason = reason
@@ -1634,7 +1718,7 @@ class CRMLeadService:
             # Re-lock trial record
             trial = TrialBooking.objects.using(alias).select_for_update().get(id=trial.id)
 
-            if trial.status in ['ATTENDED', 'CANCELLED']:
+            if trial.status in ['ATTENDED', 'CANCELLED', 'RESCHEDULED', 'NO_SHOW']:
                 raise ValidationError(f"Cannot reschedule trial in '{trial.status}' status.")
 
             # Max reschedules check
@@ -1667,6 +1751,14 @@ class CRMLeadService:
 
             if not new_occ.class_template.allow_trial:
                 raise ValidationError("Trials are not permitted for this class.")
+
+            if trial.class_occurrence_id:
+                old_occ = ClassOccurrence.objects.using(alias).filter(id=trial.class_occurrence_id).first()
+                if old_occ and not old_occ.class_template.allow_reschedule:
+                    raise ValidationError("Rescheduling is not permitted for this class.")
+
+            if not new_occ.class_template.allow_reschedule:
+                raise ValidationError("Rescheduling is not permitted for the target class.")
 
             branch_avail = ClassBranchAvailability.objects.using(alias).filter(
                 class_template=new_occ.class_template,
@@ -1748,12 +1840,12 @@ class CRMLeadService:
                 changed_by_user=actor_user,
             )
 
-            # Sync lead status to TRIAL_BOOKED
-            cls.transition_lead_status(
+            # Configurable stage automation for TRIAL_RESCHEDULED
+            from .services_stage_automation import CRMStageAutomationService
+            CRMStageAutomationService.evaluate_and_transition(
                 lead=trial.lead,
-                new_status='TRIAL_BOOKED',
-                reason_code='TRIAL_RESCHEDULED',
-                reason_text=f"Rescheduled from {old_start} to {new_occ.start_at}",
+                trigger_event='TRIAL_RESCHEDULED',
+                context={'trial': trial, 'new_start': new_occ.start_at},
                 actor_user=actor_user,
                 db_alias=alias,
             )
@@ -1794,6 +1886,77 @@ class CRMLeadService:
             return trial
 
     @classmethod
+    def get_canonical_active_trial(
+        cls,
+        lead: Lead,
+        db_alias: Optional[str] = None,
+    ) -> Optional[TrialBooking]:
+        alias = db_alias or get_tenant_db_alias() or 'default'
+        # An active trial has an active status and is not cancelled/declined
+        active_candidates = list(TrialBooking.objects.using(alias).filter(
+            lead=lead,
+            status__in=['BOOKED', 'CONFIRMED', 'SCHEDULED'],
+        ).exclude(confirmation_status__in=['CANCELLED', 'DECLINED']).select_related(
+            'branch', 'assigned_trainer_profile'
+        ).order_by('-created_at'))
+
+        # If there are candidates, filter out any that were superseded (i.e. another active trial has rescheduled_from = candidate)
+        for trial in active_candidates:
+            has_active_replacement = TrialBooking.objects.using(alias).filter(
+                rescheduled_from=trial,
+                status__in=['BOOKED', 'CONFIRMED', 'SCHEDULED']
+            ).exclude(confirmation_status__in=['CANCELLED', 'DECLINED']).exists()
+            if not has_active_replacement:
+                return trial
+        return None
+
+    @classmethod
+    def get_journey_stats(
+        cls,
+        trial: TrialBooking,
+        db_alias: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        alias = db_alias or get_tenant_db_alias() or 'default'
+        curr = trial
+        visited = {curr.id}
+        while curr.rescheduled_from_id:
+            parent = TrialBooking.objects.using(alias).filter(id=curr.rescheduled_from_id).first()
+            if not parent or parent.id in visited:
+                break
+            visited.add(parent.id)
+            curr = parent
+        root_id = curr.id
+
+        journey_ids = {root_id}
+        to_check = [root_id]
+        while to_check:
+            cid = to_check.pop()
+            children = list(TrialBooking.objects.using(alias).filter(rescheduled_from_id=cid).values_list('id', flat=True))
+            for ch_id in children:
+                if ch_id not in journey_ids:
+                    journey_ids.add(ch_id)
+                    to_check.append(ch_id)
+
+        chained_reschedules = max(0, len(journey_ids) - 1)
+        history_reschedules = TrialStatusHistory.objects.using(alias).filter(
+            trial_booking_id__in=journey_ids, to_status='RESCHEDULED'
+        ).count()
+
+        used = max(chained_reschedules, history_reschedules)
+
+        from .models_bookings import BookingPolicySet
+        bp = BookingPolicySet.objects.using(alias).filter(organization=trial.lead.organization, status='ACTIVE').first()
+        max_resched = bp.max_reschedules if (bp and bp.max_reschedules is not None) else 3
+        remaining = max(0, max_resched - used)
+
+        return {
+            'root_id': str(root_id),
+            'reschedules_used': used,
+            'reschedules_remaining': remaining,
+            'max_reschedules': max_resched,
+        }
+
+    @classmethod
     def cancel_trial(
         cls,
         trial: TrialBooking,
@@ -1803,7 +1966,7 @@ class CRMLeadService:
     ) -> TrialBooking:
         alias = db_alias or get_tenant_db_alias() or 'default'
         with transaction.atomic(using=alias):
-            if trial.status in ['ATTENDED', 'CANCELLED']:
+            if trial.status in ['ATTENDED', 'CANCELLED', 'RESCHEDULED']:
                 raise ValidationError(f"Cannot cancel trial in '{trial.status}' status.")
 
             old_status = trial.status
@@ -1827,11 +1990,11 @@ class CRMLeadService:
             ).exclude(id=trial.id).exists()
 
             if not has_other_active and trial.lead.current_status in ['TRIAL_BOOKED', 'TRIAL_CONFIRMED']:
-                cls.transition_lead_status(
+                from .services_stage_automation import CRMStageAutomationService
+                CRMStageAutomationService.evaluate_and_transition(
                     lead=trial.lead,
-                    new_status='FOLLOW_UP_PENDING',
-                    reason_code='TRIAL_CANCELLED',
-                    reason_text=f"Trial cancelled: {reason or 'Customer request'}",
+                    trigger_event='TRIAL_CANCELLED',
+                    context={'trial': trial, 'reason': reason},
                     actor_user=actor_user,
                     db_alias=alias,
                 )
@@ -1861,20 +2024,128 @@ class CRMLeadService:
             return trial
 
     @classmethod
+    def validate_attendance_window(
+        cls,
+        trial: TrialBooking,
+        actor_user: Optional[TenantUser] = None,
+        allow_override: bool = False,
+        db_alias: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str]]:
+        alias = db_alias or get_tenant_db_alias() or 'default'
+        from .models_classes import ClassOccurrence
+        from .models_bookings import BookingPolicySet, AttendancePolicySet
+        from .services_bookings import BookingWaitlistAttendanceService
+
+        occ = None
+        if trial.class_occurrence_id:
+            occ = ClassOccurrence.objects.using(alias).filter(id=trial.class_occurrence_id).first()
+
+        start_time = occ.start_at if occ else trial.scheduled_start
+        end_time = occ.end_at if occ else trial.scheduled_end
+        if not start_time:
+            return True, None
+
+        now = timezone.now()
+
+        # Resolve policies
+        if occ:
+            booking_policy = BookingWaitlistAttendanceService.resolve_booking_policy(occ, db_alias=alias)
+            attendance_policy = BookingWaitlistAttendanceService.resolve_attendance_policy(occ, db_alias=alias)
+        else:
+            org = trial.lead.organization if trial.lead else (trial.branch.organization if trial.branch else None)
+            booking_policy = BookingPolicySet.objects.using(alias).filter(organization=org, status='ACTIVE').first() if org else None
+            attendance_policy = AttendancePolicySet.objects.using(alias).filter(organization=org, status='ACTIVE').first() if org else None
+
+        branch = trial.branch
+        branch_settings = getattr(branch, 'settings', None) if branch else None
+        org = trial.lead.organization if trial.lead else (branch.organization if branch else None)
+        org_settings = getattr(org, 'settings', None) if org else None
+        att_config = {}
+        if branch_settings and branch_settings.attendance_config is not None:
+            att_config = branch_settings.attendance_config or {}
+        elif org_settings and org_settings.attendance_config is not None:
+            att_config = org_settings.attendance_config or {}
+
+        # Early window
+        early_mins = 0
+        for key in ['early_check_in_window_minutes', 'early_window_minutes', 'attendance_window_minutes', 'check_in_window_minutes']:
+            if key in att_config and att_config[key] is not None:
+                try:
+                    early_mins = int(att_config[key])
+                    break
+                except (ValueError, TypeError):
+                    pass
+
+        window_start = start_time - timedelta(minutes=early_mins)
+
+        # Late window / cutoff
+        late_mins = None
+        if booking_policy and booking_policy.late_entry_minutes is not None:
+            late_mins = booking_policy.late_entry_minutes
+        elif 'late_check_in_window_minutes' in att_config and att_config['late_check_in_window_minutes'] is not None:
+            try:
+                late_mins = int(att_config['late_check_in_window_minutes'])
+            except (ValueError, TypeError):
+                pass
+
+        if late_mins is not None:
+            window_end = max(start_time + timedelta(minutes=late_mins), end_time or start_time)
+        elif end_time:
+            window_end = end_time
+        else:
+            window_end = start_time + timedelta(hours=2)
+
+        # Front-desk / staff override check
+        if allow_override:
+            can_override = bool(att_config.get('allow_front_desk_override', False))
+            if actor_user and (getattr(actor_user, 'is_superuser', False) or getattr(actor_user, 'is_platform_admin', False)):
+                can_override = True
+            if can_override:
+                return True, None
+
+        if now < window_start:
+            return False, f"Cannot mark attendance: session is scheduled for {start_time.strftime('%Y-%m-%d %H:%M')}. Attendance marking window has not opened yet."
+
+        if now > window_end:
+            return False, f"Cannot mark attendance: attendance window for this session has closed."
+
+        return True, None
+
+    @classmethod
     def mark_trial_attended(
         cls,
         trial: TrialBooking,
         notes: Optional[str] = None,
         actor_user: Optional[TenantUser] = None,
+        allow_override: bool = False,
         db_alias: Optional[str] = None,
     ) -> TrialBooking:
         alias = db_alias or get_tenant_db_alias() or 'default'
         from .models_crm import CRMTrialReminderPolicy
         from .models_crm import SalesFollowupTask
+        from .models_communication import CommunicationMessage
 
         with transaction.atomic(using=alias):
             if trial.status in ['ATTENDED', 'NO_SHOW', 'CANCELLED', 'RESCHEDULED']:
                 raise ValidationError(f"Cannot mark trial attended from '{trial.status}' status.")
+            if trial.confirmation_status in ['CANCELLED', 'DECLINED']:
+                raise ValidationError(f"Cannot mark trial attended: booking confirmation is '{trial.confirmation_status}'.")
+            has_replacement = TrialBooking.objects.using(alias).filter(
+                rescheduled_from=trial,
+                status__in=['BOOKED', 'CONFIRMED', 'SCHEDULED'],
+            ).exclude(confirmation_status__in=['CANCELLED', 'DECLINED']).exists()
+            if has_replacement:
+                raise ValidationError("Cannot mark attendance on a trial that has been replaced. Please attend the active replacement trial.")
+
+            # Authoritative attendance time window validation
+            is_valid_window, window_err = cls.validate_attendance_window(
+                trial=trial,
+                actor_user=actor_user,
+                allow_override=allow_override,
+                db_alias=alias,
+            )
+            if not is_valid_window:
+                raise ValidationError(window_err)
 
             old_status = trial.status
             trial.status = 'ATTENDED'
@@ -1891,10 +2162,17 @@ class CRMLeadService:
                 changed_by_user=actor_user,
             )
 
-            cls.transition_lead_status(
+            # Cancel any pending unsent pre-session reminders for this trial
+            CommunicationMessage.objects.using(alias).filter(
+                related_trial=trial,
+                status__in=['QUEUED', 'PENDING', 'SCHEDULED'],
+            ).update(status='CANCELLED')
+
+            from .services_stage_automation import CRMStageAutomationService
+            CRMStageAutomationService.evaluate_and_transition(
                 lead=trial.lead,
-                new_status='TRIAL_ATTENDED',
-                reason_code='TRIAL_ATTENDED',
+                trigger_event='TRIAL_ATTENDED',
+                context={'trial': trial},
                 actor_user=actor_user,
                 db_alias=alias,
             )
@@ -1962,6 +2240,14 @@ class CRMLeadService:
         with transaction.atomic(using=alias):
             if trial.status in ['ATTENDED', 'NO_SHOW', 'CANCELLED', 'RESCHEDULED']:
                 raise ValidationError(f"Cannot mark trial no-show from '{trial.status}' status.")
+            if trial.confirmation_status in ['CANCELLED', 'DECLINED']:
+                raise ValidationError(f"Cannot mark trial no-show: booking confirmation is '{trial.confirmation_status}'.")
+            has_replacement = TrialBooking.objects.using(alias).filter(
+                rescheduled_from=trial,
+                status__in=['BOOKED', 'CONFIRMED', 'SCHEDULED'],
+            ).exclude(confirmation_status__in=['CANCELLED', 'DECLINED']).exists()
+            if has_replacement:
+                raise ValidationError("Cannot mark no-show on a trial that has been replaced. Please manage the active replacement trial.")
 
             old_status = trial.status
             trial.status = 'NO_SHOW'
@@ -1977,10 +2263,11 @@ class CRMLeadService:
                 changed_by_user=actor_user,
             )
 
-            cls.transition_lead_status(
+            from .services_stage_automation import CRMStageAutomationService
+            CRMStageAutomationService.evaluate_and_transition(
                 lead=trial.lead,
-                new_status='NO_SHOW',
-                reason_code='TRIAL_NO_SHOW',
+                trigger_event='TRIAL_NO_SHOW',
+                context={'trial': trial},
                 actor_user=actor_user,
                 db_alias=alias,
             )
@@ -2046,6 +2333,16 @@ class CRMLeadService:
         schedule = []
         now = timezone.now()
 
+        # Check if trial is cancelled, rescheduled, or superseded by an active replacement
+        is_superseded = trial.status in ['CANCELLED', 'RESCHEDULED'] or trial.confirmation_status in ['CANCELLED', 'DECLINED']
+        if not is_superseded:
+            is_superseded = TrialBooking.objects.using(alias).filter(
+                rescheduled_from=trial,
+                status__in=['BOOKED', 'CONFIRMED', 'SCHEDULED'],
+            ).exclude(confirmation_status__in=['CANCELLED', 'DECLINED']).exists()
+
+        is_concluded = trial.status in ['ATTENDED', 'NO_SHOW', 'CONVERTED']
+
         # Immediate confirmation point
         schedule.append({
             'id': f"rem-{trial.id}-immediate",
@@ -2075,6 +2372,13 @@ class CRMLeadService:
                 target_dt = trial.scheduled_start - timedelta(minutes=mins)
                 is_past = now >= target_dt
 
+                if is_superseded:
+                    point_status = 'CANCELLED' if trial.status == 'CANCELLED' else 'SUPERSEDED'
+                elif is_concluded:
+                    point_status = 'PAST' if is_past else 'CANCELLED'
+                else:
+                    point_status = 'PAST' if is_past else 'PENDING'
+
                 schedule.append({
                     'id': f"rem-{trial.id}-{idx}",
                     'type': 'REMINDER',
@@ -2082,7 +2386,7 @@ class CRMLeadService:
                     'offset_unit': unit,
                     'channel': ch,
                     'scheduled_at': target_dt.isoformat(),
-                    'status': 'PAST' if is_past else 'PENDING',
+                    'status': point_status,
                 })
 
         schedule.sort(key=lambda s: s['scheduled_at'])
@@ -2330,6 +2634,22 @@ class CRMLeadService:
                 after_data={'task_id': str(task.id), 'status': 'COMPLETED', 'outcome': outcome},
                 db_alias=alias,
             )
+
+            # Freeze Response SLA and evaluate configurable stage automation
+            if task.lead:
+                from .services_stage_automation import CRMStageAutomationService
+                CRMStageAutomationService.record_response_sla(
+                    lead=task.lead,
+                    responding_user=effective_actor,
+                    db_alias=alias,
+                )
+                CRMStageAutomationService.evaluate_and_transition(
+                    lead=task.lead,
+                    trigger_event='FOLLOWUP_COMPLETED',
+                    context={'task': task, 'outcome': outcome or task.outcome, 'task_type': task.task_type},
+                    actor_user=effective_actor,
+                    db_alias=alias,
+                )
 
             return task
 
@@ -2579,12 +2899,12 @@ class LeadConversionService:
                 last_name=lead.last_name,
                 display_name=f"{lead.first_name} {lead.last_name}".strip(),
                 user_type='MEMBER',
-                status='INVITED',
+                status='ACTIVE',
                 is_login_allowed=True,
                 home_branch=branch,
             )
-            # password_hash set to unusable string — invite/activation flow sets password later
-            new_user.password_hash = '!unusable'
+            # Default password for newly converted member accounts
+            new_user.set_password('Sweat@2026!')
             new_user.save(using=alias)
 
             # Assign to branch
@@ -2658,6 +2978,16 @@ class LeadConversionService:
         if program.status not in ('ACTIVE',):
             raise ValidationError(f"Program '{program.name}' is {program.status} and not available for purchase.")
 
+        # Program branch availability check
+        from .models_catalog import ProgramBranchAvailability
+        all_prog_avail = ProgramBranchAvailability.objects.using(db_alias).filter(program=program)
+        if all_prog_avail.exists():
+            prog_avail = all_prog_avail.filter(branch=branch, is_active=True).first()
+            if not prog_avail:
+                raise ValidationError(
+                    f"Program '{program.name}' is not available at branch '{branch.name}'."
+                )
+
         # Branch availability check
         all_branch_avail = PackageBranchAvailability.objects.using(db_alias).filter(package=pkg)
         avail_qs = all_branch_avail.filter(branch=branch)
@@ -2717,7 +3047,8 @@ class LeadConversionService:
         """
         alias = db_alias or get_tenant_db_alias() or 'default'
 
-        if lead.current_status == 'CONVERTED':
+        from .models_crm import LeadConversion
+        if lead.current_status == 'CONVERTED' or getattr(lead, 'converted_user_profile_id', None) or LeadConversion.objects.using(alias).filter(lead=lead).exists():
             return {
                 'eligible': False,
                 'reason': 'already_converted',
@@ -2869,6 +3200,7 @@ class LeadConversionService:
                 'duration_value': pv.duration_value,
                 'duration_unit': pv.duration_unit,
                 'total_days': pv.total_days,
+                'validity_days': pv.validity_days or pv.total_days,
                 'status': pv.status,
             },
             'package_price': {
@@ -2977,114 +3309,111 @@ class LeadConversionService:
         idem_key = f"lead_conversion:{lead.id}:{attempt_key}"
 
         def _do_conversion():
-            # ── Guard: already converted (terminal state) ───────────────
-            if lead.current_status == 'CONVERTED':
-                raise LeadAlreadyConvertedError(
-                    f"Lead {lead.id} is already CONVERTED. "
-                    "If this is a renewal, create a new order via the membership service."
+            with transaction.atomic(using=alias):
+                # ── Guard: lock and check lead inside tenant atomic transaction ──
+                lead_locked = Lead.objects.using(alias).select_for_update().get(id=lead.id)
+                from .models_crm import LeadConversion
+                if lead_locked.current_status == 'CONVERTED' or getattr(lead_locked, 'converted_user_profile_id', None) or LeadConversion.objects.using(alias).filter(lead=lead_locked).exists():
+                    raise LeadAlreadyConvertedError(
+                        f"This lead has already been converted to a member. The CRM sales journey is terminal."
+                    )
+
+                # ── Phase 1: Catalog + Identity ─────────────────────────────
+                branch = Branch.objects.using(alias).get(id=branch_id)
+
+                pv, package_price, program = cls._resolve_purchasable_version(
+                    package_version_id, branch, alias
                 )
+                pkg = pv.package
 
-            # ── Phase 1: Catalog + Identity ─────────────────────────────
-            branch = Branch.objects.using(alias).select_for_update().get(id=branch_id)
-
-            pv, package_price, program = cls._resolve_purchasable_version(
-                package_version_id, branch, alias
-            )
-            pkg = pv.package
-
-            # ── Identity resolution ─────────────────────────────────────
-            user_profile, identity_created = cls.resolve_or_create_member_identity(
-                lead=lead,
-                branch=branch,
-                actor_user=actor_user,
-                db_alias=alias,
-            )
-
-            # ── Build order items_data ──────────────────────────────────
-            unit_price = package_price.base_price
-            tax_pct = package_price.tax_percent if not package_price.prices_include_tax else _D('0.000')
-
-            items_data = [{
-                'item_type': 'PACKAGE',
-                'package_id': str(pkg.id),
-                'package_version_id': str(pv.id),
-                'package_price_id': str(package_price.id),
-                'item_name_snapshot': f"{program.name} — {pkg.name} (v{pv.version_number})",
-                'quantity': '1.00',
-                'unit_price': str(unit_price),
-                'tax_percent': str(tax_pct),
-                'discount_amount': '0.00',
-            }]
-
-            # ── Check for existing unfinalized order from interrupted conversion attempt ──
-            existing_candidates = Order.objects.using(alias).filter(
-                lead=lead,
-                items__package_version_id=str(pv.id),
-                status__in=['PENDING_PAYMENT', 'PAID'],
-            ).order_by('-created_at')
-
-            existing_order = None
-            for cand in existing_candidates:
-                if cand.status == 'PENDING_PAYMENT':
-                    existing_order = cand
-                    break
-                elif cand.status == 'PAID':
-                    # Only reuse paid order if membership was NOT yet activated (recovery scenario)
-                    if not Membership.objects.using(alias).filter(source_order=cand).exists():
-                        existing_order = cand
-                        break
-
-            if existing_order:
-                order = existing_order
-            else:
-                order = CommerceService.create_order(
+                # ── Identity resolution ─────────────────────────────────────
+                user_profile, identity_created = cls.resolve_or_create_member_identity(
+                    lead=lead_locked,
                     branch=branch,
-                    items_data=items_data,
-                    user_profile=user_profile,
-                    lead=lead,
-                    sold_by=actor_user,
-                    order_type='NEW_MEMBERSHIP',
-                    source='SALES',
-                    notes=f"CRM Lead conversion: {lead.first_name} {lead.last_name}",
-                    created_by=actor_user,
+                    actor_user=actor_user,
                     db_alias=alias,
                 )
 
-            order_item = order.items.using(alias).filter(item_type='PACKAGE').first()
+                # ── Build order items_data ──────────────────────────────────
+                unit_price = package_price.base_price
+                tax_pct = package_price.tax_percent if not package_price.prices_include_tax else _D('0.000')
 
-            # ── Optional coupon redemption BEFORE payment (if order pending) ──
-            if order.status == 'PENDING_PAYMENT' and coupon_code and coupon_code.strip():
-                from .services_discounts import DiscountCouponEngineService
-                try:
-                    DiscountCouponEngineService.redeem_coupon(
-                        order=order,
-                        code_str=coupon_code,
+                items_data = [{
+                    'item_type': 'PACKAGE',
+                    'package_id': str(pkg.id),
+                    'package_version_id': str(pv.id),
+                    'package_price_id': str(package_price.id),
+                    'item_name_snapshot': f"{program.name} — {pkg.name} (v{pv.version_number})",
+                    'quantity': '1.00',
+                    'unit_price': str(unit_price),
+                    'tax_percent': str(tax_pct),
+                    'discount_amount': '0.00',
+                }]
+
+                # ── Check for existing unfinalized order from interrupted conversion attempt ──
+                existing_candidates = Order.objects.using(alias).filter(
+                    lead=lead_locked,
+                    items__package_version_id=str(pv.id),
+                    status__in=['PENDING_PAYMENT', 'PAID'],
+                ).order_by('-created_at')
+
+                existing_order = None
+                for cand in existing_candidates:
+                    if cand.status == 'PENDING_PAYMENT':
+                        existing_order = cand
+                        break
+                    elif cand.status == 'PAID':
+                        # Only reuse paid order if membership was NOT yet activated (recovery scenario)
+                        if not Membership.objects.using(alias).filter(source_order=cand).exists():
+                            existing_order = cand
+                            break
+
+                if existing_order:
+                    order = existing_order
+                else:
+                    order = CommerceService.create_order(
+                        branch=branch,
+                        items_data=items_data,
                         user_profile=user_profile,
-                        created_by_user=actor_user,
+                        lead=lead_locked,
+                        sold_by=actor_user,
+                        order_type='NEW_MEMBERSHIP',
+                        source='SALES',
+                        notes=f"CRM Lead conversion: {lead.first_name} {lead.last_name}",
+                        created_by=actor_user,
                         db_alias=alias,
                     )
-                    order.refresh_from_db(using=alias)
-                except ValidationError as e:
-                    raise ValidationError(f"Coupon error: {e.message if hasattr(e, 'message') else str(e)}")
 
-            # Validate submitted amount vs authoritative order total
-            if amount < order.total_amount:
-                raise ValidationError(
-                    f"Payment amount {amount} is less than required total {order.total_amount}. "
-                    "Full payment required before membership activation."
-                )
+                order_item = order.items.using(alias).filter(item_type='PACKAGE').first()
 
-            # ── Idempotency key for the payment txn ────────────────────
-            payment_idem_key = f"payment-{idem_key}"
+                # ── Optional coupon redemption BEFORE payment (if order pending) ──
+                if order.status == 'PENDING_PAYMENT' and coupon_code and coupon_code.strip():
+                    from .services_discounts import DiscountCouponEngineService
+                    try:
+                        DiscountCouponEngineService.redeem_coupon(
+                            order=order,
+                            code_str=coupon_code,
+                            user_profile=user_profile,
+                            created_by_user=actor_user,
+                            db_alias=alias,
+                        )
+                        order.refresh_from_db(using=alias)
+                    except ValidationError as e:
+                        raise ValidationError(f"Coupon error: {e.message if hasattr(e, 'message') else str(e)}")
 
-            # ── Phase 2: Atomic finalization ────────────────────────────
-            with transaction.atomic(using=alias):
-                # Lock the order and lead
+                # Validate submitted amount vs authoritative order total
+                if amount < order.total_amount:
+                    raise ValidationError(
+                        f"Payment amount {amount} is less than required total {order.total_amount}. "
+                        "Full payment required before membership activation."
+                    )
+
+                # ── Idempotency key for the payment txn ────────────────────
+                payment_idem_key = f"payment-{idem_key}"
+
+                # ── Phase 2: Finalization ────────────────────────────
+                # Lock the order (Lead is already locked above)
                 order = Order.objects.using(alias).select_for_update().get(id=order.id)
-                lead_locked = Lead.objects.using(alias).select_for_update().get(id=lead.id)
-
-                if lead_locked.current_status == 'CONVERTED':
-                    raise LeadAlreadyConvertedError("Lead was converted concurrently.")
 
                 if order.status == 'PAID':
                     # Post-payment recovery: payment was already completed, retrieve records
@@ -3140,12 +3469,26 @@ class LeadConversionService:
                     conversion_source='CRM_WIZARD',
                 )
 
-                # Transition Lead to CONVERTED (terminal)
-                CRMLeadService.transition_lead_status(
+                # Set converted_user_profile on Lead
+                lead_locked.converted_user_profile = user_profile
+                lead_locked.save(using=alias, update_fields=['converted_user_profile', 'updated_at'])
+
+                # Auto-complete pending followup tasks for the converted lead
+                from .models_crm import SalesFollowupTask
+                SalesFollowupTask.objects.using(alias).filter(
                     lead=lead_locked,
-                    new_status='CONVERTED',
-                    reason_code='LEAD_CONVERTED',
-                    reason_text=f"Converted via membership purchase. Order: {order.order_number}",
+                    status='PENDING',
+                ).update(
+                    status='COMPLETED',
+                    outcome='Lead successfully converted to active member.',
+                )
+
+                # Transition Lead to CONVERTED via configurable stage automation rule
+                from .services_stage_automation import CRMStageAutomationService
+                CRMStageAutomationService.evaluate_and_transition(
+                    lead=lead_locked,
+                    trigger_event='LEAD_CONVERTED',
+                    context={'conversion': conversion, 'order': order},
                     actor_user=actor_user,
                     db_alias=alias,
                 )

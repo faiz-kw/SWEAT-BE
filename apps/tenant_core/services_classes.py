@@ -17,7 +17,8 @@ Key Rules Enforced:
 
 import uuid
 from decimal import Decimal
-from datetime import date, datetime, timedelta, time
+from datetime import date, datetime, timedelta, time, timezone as dt_timezone
+from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, List
 from django.db import transaction, models
 from django.db.models import Q
@@ -230,9 +231,17 @@ class ClassSchedulingService:
                         curr += timedelta(days=1)
                         continue
 
-                # Construct timestamps
-                start_dt = timezone.make_aware(datetime.combine(curr, rule.start_time))
-                end_dt = timezone.make_aware(datetime.combine(curr, rule.end_time))
+                # Construct timestamps localized to branch timezone then stored as UTC
+                tz_name = getattr(rule.branch, 'timezone', None) or 'Asia/Kolkata'
+                try:
+                    branch_tz = ZoneInfo(tz_name)
+                except Exception:
+                    branch_tz = ZoneInfo('Asia/Kolkata')
+
+                local_start = datetime.combine(curr, rule.start_time).replace(tzinfo=branch_tz)
+                start_dt = local_start.astimezone(dt_timezone.utc)
+                local_end = datetime.combine(curr, rule.end_time).replace(tzinfo=branch_tz)
+                end_dt = local_end.astimezone(dt_timezone.utc)
 
                 # Check existence before inserting to prevent duplicate generation
                 exists = ClassOccurrence.objects.using(alias).filter(
@@ -312,8 +321,16 @@ class ClassSchedulingService:
                     f"Class end time {end_time.strftime('%H:%M')} is after branch closing time {eff['close_time'].strftime('%H:%M')}."
                 )
 
-        start_dt = timezone.make_aware(datetime.combine(occurrence_date, start_time))
-        end_dt = timezone.make_aware(datetime.combine(occurrence_date, end_time))
+        tz_name = getattr(branch, 'timezone', None) or 'Asia/Kolkata'
+        try:
+            branch_tz = ZoneInfo(tz_name)
+        except Exception:
+            branch_tz = ZoneInfo('Asia/Kolkata')
+
+        local_start = datetime.combine(occurrence_date, start_time).replace(tzinfo=branch_tz)
+        start_dt = local_start.astimezone(dt_timezone.utc)
+        local_end = datetime.combine(occurrence_date, end_time).replace(tzinfo=branch_tz)
+        end_dt = local_end.astimezone(dt_timezone.utc)
 
         occ = ClassOccurrence(
             class_template=class_template,

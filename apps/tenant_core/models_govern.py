@@ -263,6 +263,8 @@ class InAppNotification(models.Model):
         app_label = 'tenant_core'
         db_table = 'in_app_notifications'
         ordering = ['-created_at']
+        verbose_name = 'In-App Notification'
+        verbose_name_plural = 'In-App Notifications'
         indexes = [
             models.Index(fields=['user', 'is_read', '-created_at'], name='idx_notif_user_read'),
             models.Index(fields=['organization', '-created_at'], name='idx_notif_org_created'),

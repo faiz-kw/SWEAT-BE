@@ -488,6 +488,16 @@ class LeadAssignmentExecutionService:
                 lead.assigned_sales_user = None
                 lead.save(using=alias, update_fields=['assigned_sales_user', 'updated_at'])
 
+                from .models_crm import LeadActivity
+                LeadActivity.objects.using(alias).create(
+                    lead=lead,
+                    activity_type='OTHER',
+                    outcome='UNASSIGNED',
+                    notes=f"Lead recorded as unassigned ({reason or 'No available agent'}).",
+                    performed_by_user=actor_user,
+                    activity_at=timezone.now(),
+                )
+
                 # Notify managers if unassigned alert is enabled
                 config = CRMAgentAssignmentConfig.objects.using(alias).filter(organization=lead.organization).first()
                 if config and config.notify_manager_on_unassigned:
@@ -542,6 +552,26 @@ class LeadAssignmentExecutionService:
             lead.assigned_sales_user = assigned_to_user
             lead.save(using=alias, update_fields=['assigned_sales_user', 'updated_at'])
 
+            # Record timeline activity
+            from .models_crm import LeadActivity
+            act_outcome = 'REASSIGNED' if prev_user else 'ASSIGNED'
+            assigned_user_name = f"{assigned_to_user.first_name} {assigned_to_user.last_name}".strip() or assigned_to_user.email
+            prev_user_name = f"{prev_user.first_name} {prev_user.last_name}".strip() or prev_user.email if prev_user else None
+            act_notes = (
+                f"Assigned to {assigned_user_name} ({assigned_to_user.email}) [{assignment_source}]."
+                + (f" Previously assigned to {prev_user_name}." if prev_user else "")
+                + (f" Reason: {reason}" if reason else "")
+            ).strip()
+
+            LeadActivity.objects.using(alias).create(
+                lead=lead,
+                activity_type='OTHER',
+                outcome=act_outcome,
+                notes=act_notes,
+                performed_by_user=actor_user,
+                activity_at=timezone.now(),
+            )
+
             # Audit & Outbox
             action_code = 'CRM_LEAD_REASSIGNED' if prev_user else 'CRM_LEAD_ASSIGNED'
             record_business_audit(
@@ -566,40 +596,70 @@ class LeadAssignmentExecutionService:
                 db_alias=alias,
             )
 
+            outbox_payload = {
+                'lead_id': str(lead.id),
+                'lead_name': f"{lead.first_name} {lead.last_name}".strip(),
+                'branch': lead.branch.name if lead.branch else 'General',
+                'branch_id': str(lead.branch_id) if lead.branch else None,
+                'assigned_user_id': str(assigned_to_user.id),
+                'assigned_user_name': assigned_user_name,
+                'previous_user_id': str(prev_user.id) if prev_user else None,
+                'previous_user_name': prev_user_name,
+                'assigned_by': str(actor_user.id) if actor_user else None,
+                'assignment_source': assignment_source,
+                'assignment_strategy': assignment_strategy,
+                'status': lead.current_status,
+                'priority': getattr(lead, 'priority', 'MEDIUM'),
+                'assigned_timestamp': timezone.now().isoformat(),
+                'created_at': timezone.now().isoformat(),
+            }
+
+            # Enqueue canonical LEAD_ASSIGNED outbox event
+            enqueue_outbox_event(
+                organization=lead.organization,
+                event_type='LEAD_ASSIGNED',
+                aggregate_type='Lead',
+                aggregate_id=lead.id,
+                payload=outbox_payload,
+                db_alias=alias,
+            )
+
+            # Enqueue legacy compatibility event
             enqueue_outbox_event(
                 organization=lead.organization,
                 event_type='crm.lead.assigned',
                 aggregate_type='Lead',
                 aggregate_id=lead.id,
-                payload={
-                    'lead_id': str(lead.id),
-                    'assigned_user_id': str(assigned_to_user.id),
-                    'previous_user_id': str(prev_user.id) if prev_user else None,
-                    'branch_id': str(lead.branch_id) if lead.branch else None,
-                    'assigned_by': str(actor_user.id) if actor_user else None,
-                    'assignment_source': assignment_source,
-                    'assignment_strategy': assignment_strategy,
-                    'created_at': timezone.now().isoformat(),
-                },
+                payload=outbox_payload,
                 db_alias=alias,
             )
 
             # In-App Notification to assigned representative
             from .services_crm import send_in_app_notification
+            is_reassigned = bool(prev_user)
+            notif_title = 'Lead Reassigned to You' if is_reassigned else 'New Lead Assigned'
+            notif_msg = (
+                f"Lead {lead.first_name} {lead.last_name} has been reassigned to you by {actor_user.first_name if actor_user else 'System'}."
+                if is_reassigned
+                else f"A new lead has been assigned to you: {lead.first_name} {lead.last_name} — {lead.branch.name if lead.branch else 'General'}"
+            )
+
             send_in_app_notification(
                 organization=lead.organization,
                 user=assigned_to_user,
                 notification_type='LEAD_ASSIGNED',
-                title='New Lead Assigned',
-                message=f"A new lead has been assigned to you: {lead.first_name} {lead.last_name} — {lead.branch.name if lead.branch else 'General'}",
+                title=notif_title,
+                message=notif_msg,
                 data={
                     'lead_id': str(lead.id),
                     'lead_name': f"{lead.first_name} {lead.last_name}",
                     'branch_name': lead.branch.name if lead.branch else 'General',
                     'branch_id': str(lead.branch_id) if lead.branch else None,
                     'previous_user_id': str(prev_user.id) if prev_user else None,
+                    'previous_user_name': prev_user_name,
                     'assignment_source': assignment_source,
                     'assigned_by': actor_user.email if actor_user else 'System',
+                    'assigned_timestamp': timezone.now().isoformat(),
                 },
                 deep_link=f"/crm/leads?lead_id={lead.id}",
                 idempotency_key=f"lead_assigned:{lead.id}:{assigned_to_user.id}:{new_assign.id}",

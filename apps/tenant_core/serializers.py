@@ -193,7 +193,8 @@ class TenantUserSerializer(serializers.ModelSerializer):
     department = serializers.SerializerMethodField()
     departments = serializers.SerializerMethodField()
     home_branch_name = serializers.CharField(source='home_branch.name', read_only=True, default=None)
-    active_location_name = serializers.CharField(source='home_branch.name', read_only=True, default=None)
+    active_location_name = serializers.SerializerMethodField()
+    active_location_address = serializers.SerializerMethodField()
     active_location_id = serializers.CharField(source='home_branch_id', read_only=True, default=None)
     tenant_id = serializers.SerializerMethodField()
     tenant_name = serializers.SerializerMethodField()
@@ -209,7 +210,7 @@ class TenantUserSerializer(serializers.ModelSerializer):
             'deactivated_by', 'deactivation_reason', 'suspended_until',
             'last_login_at', 'created_at',
             'full_name', 'role', 'role_name', 'roles', 'branch_access', 'department', 'departments',
-            'home_branch_name', 'active_location_name', 'active_location_id', 'tenant_id', 'tenant_name', 'is_active',
+            'home_branch_name', 'active_location_name', 'active_location_address', 'active_location_id', 'tenant_id', 'tenant_name', 'is_active',
             'reports_to_id', 'reports_to_name',
         ]
         read_only_fields = ['id', 'last_login_at', 'created_at', 'deactivated_at', 'deactivated_by']
@@ -271,6 +272,22 @@ class TenantUserSerializer(serializers.ModelSerializer):
             return obj.organization.name if obj.organization else ''
         except Exception:
             return ''
+
+    def get_active_location_name(self, obj):
+        hb = getattr(obj, 'home_branch', None)
+        if not hb:
+            return None
+        loc = getattr(hb, 'location', None)
+        city = (loc and (loc.city or loc.name)) or getattr(hb, 'city', '')
+        if city and hb.name and str(city).lower() not in str(hb.name).lower():
+            return f"{city} · {hb.name}"
+        return hb.name
+
+    def get_active_location_address(self, obj):
+        hb = getattr(obj, 'home_branch', None)
+        if not hb:
+            return None
+        return (getattr(hb, 'address', '') or '').strip()
 
     def get_role(self, obj):
         db = obj._state.db or 'default'

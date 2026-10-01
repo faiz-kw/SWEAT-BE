@@ -746,7 +746,9 @@ class CRMPhase8ConversionTestCase(APITestCase):
         membership = Membership.objects.using(DB).get(id=res['membership_id'])
         self.assertEqual(membership.package_version_id, self.pkg_version.id)
 
-        # Create & publish V2
+        # Retire V1 then create & publish V2
+        self.pkg_version.status = 'RETIRED'
+        self.pkg_version.save(using=DB, update_fields=['status'])
         pkg_v2 = PackageVersion.objects.using(DB).create(
             package=self.package,
             version_number=2,
@@ -1253,8 +1255,12 @@ class CRMPhase8ConversionTestCase(APITestCase):
             first_name='Mismatch', last_name='Pkg', phone_normalized='+919876540004',
             email_normalized='mismatch.pkg@phase8.test', current_status='NEW_LEAD',
         )
+        package2 = Package.objects.using(DB).create(
+            organization=self.org, program=self.program, name='Phase8 Silver',
+            code='P8-SILVER', status='ACTIVE',
+        )
         pkg_v2 = PackageVersion.objects.using(DB).create(
-            package=self.package, version_number=2, name_snapshot='Phase8 Gold v2',
+            package=package2, version_number=1, name_snapshot='Phase8 Silver v1',
             duration_value=30, duration_unit='DAY', total_days=30, status='ACTIVE',
             effective_from=timezone.now() - timezone.timedelta(days=1),
             created_by_user=self.admin,

@@ -1068,12 +1068,41 @@ class CRMProgramEligibilityService:
             return trial_qs.order_by('display_order', 'name')
 
         elif context == 'conversion':
-            from .models_catalog import PackageBranchAvailability
+            from .models_catalog import PackageBranchAvailability, PackageVersion
+            from django.utils import timezone
+            from django.db.models import Q
+            now = timezone.now()
             pba_progs_list = list(pba_progs)
-            pba_package_progs = PackageBranchAvailability.objects.using(alias).filter(
-                branch_id=branch_id, status='ENABLED'
-            ).values_list('package__program_id', flat=True)
-            return qs.filter(id__in=pba_progs_list).filter(id__in=pba_package_progs).order_by('display_order', 'name')
+
+            # Find active packages enabled for this branch (or unrestricted) that have at least one active sellable version
+            enabled_pkg_ids = set(
+                PackageBranchAvailability.objects.using(alias).filter(
+                    branch_id=branch_id, status='ENABLED'
+                ).filter(
+                    Q(available_from__isnull=True) | Q(available_from__lte=now)
+                ).filter(
+                    Q(available_until__isnull=True) | Q(available_until__gte=now)
+                ).values_list('package_id', flat=True)
+            )
+            restricted_pkg_ids = set(
+                PackageBranchAvailability.objects.using(alias).values_list('package_id', flat=True).distinct()
+            )
+
+            sellable_progs = set(
+                PackageVersion.objects.using(alias).filter(
+                    status='ACTIVE',
+                    package__status='ACTIVE',
+                    only_for_trial=False,
+                ).filter(
+                    Q(package_id__in=enabled_pkg_ids) | ~Q(package_id__in=restricted_pkg_ids)
+                ).filter(
+                    Q(effective_from__isnull=True) | Q(effective_from__lte=now)
+                ).filter(
+                    Q(effective_until__isnull=True) | Q(effective_until__gte=now)
+                ).values_list('package__program_id', flat=True)
+            )
+
+            return qs.filter(id__in=pba_progs_list).filter(id__in=sellable_progs).order_by('display_order', 'name')
 
         return qs.order_by('display_order', 'name')
 

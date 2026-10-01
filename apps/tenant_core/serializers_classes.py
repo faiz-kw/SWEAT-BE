@@ -325,10 +325,19 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
+        tz_name = getattr(instance.branch, 'timezone', None) or 'Asia/Kolkata'
+        try:
+            from zoneinfo import ZoneInfo
+            branch_tz = ZoneInfo(tz_name)
+        except Exception:
+            branch_tz = None
+
         if instance.start_at:
-            ret['start_time'] = instance.start_at.strftime('%H:%M:%S')
+            dt = instance.start_at.astimezone(branch_tz) if branch_tz else instance.start_at
+            ret['start_time'] = dt.strftime('%H:%M:%S')
         if instance.end_at:
-            ret['end_time'] = instance.end_at.strftime('%H:%M:%S')
+            dt = instance.end_at.astimezone(branch_tz) if branch_tz else instance.end_at
+            ret['end_time'] = dt.strftime('%H:%M:%S')
         return ret
 
     def get_trainer_checked_in(self, obj):

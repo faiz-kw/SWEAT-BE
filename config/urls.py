@@ -38,6 +38,9 @@ urlpatterns = [
     path('api/v1/tenant/', include(('apps.tenant_core.urls', 'tenant_core'), namespace='tenant_scoped')),
     path('api/v1/admin-config/security-policy/current/', SecurityPolicyView.as_view(), name='admin-config-security-policy'),
 
+    # Mobile App API — Consumer / Member facing endpoints
+    path('api/v1/mobile/', include('apps.tenant_core.urls_mobile')),
+
     # OpenAPI 3.1 Schema & Interactive Docs
     path('api/schema/', SpectacularAPIView.as_view(), name='schema'),
     path('api/docs/', SpectacularSwaggerView.as_view(url_name='schema'), name='swagger-ui'),

@@ -388,3 +388,55 @@ def process_due_waiting_automations_periodic_task(self, tenant_id: str = None, *
         }
 
 
+@shared_task(
+    bind=True,
+    name='apps.tenant_core.tasks.generate_rolling_occurrences_task',
+    max_retries=2,
+    acks_late=True,
+)
+def generate_rolling_occurrences_task(self, tenant_id: str = None, days_ahead: int = 30, **kwargs) -> dict:
+    """
+    Automated rolling occurrence generation task:
+    Iterates through all ACTIVE ClassScheduleRule records for the tenant,
+    generating occurrences from today to (today + days_ahead).
+    Idempotent: uses get_or_create/existence checks on unique slots.
+    """
+    if not tenant_id:
+        return {'status': 'FAILED', 'error': 'tenant_id is mandatory'}
+
+    from datetime import timedelta
+    from django.utils import timezone
+    from .context import tenant_database_context
+    from .models_classes import ClassScheduleRule
+    from .services_classes import ClassSchedulingService
+
+    today = timezone.now().date()
+    end_date = today + timedelta(days=days_ahead)
+
+    with tenant_database_context(tenant_id) as db_alias:
+        rules = ClassScheduleRule.objects.using(db_alias).filter(status='ACTIVE')
+        total_created = 0
+        rules_count = rules.count()
+        for rule in rules:
+            created = ClassSchedulingService.generate_occurrences_from_rule(
+                rule=rule,
+                from_date=today,
+                to_date=end_date,
+                db_alias=db_alias,
+            )
+            total_created += len(created)
+
+        logger.info(
+            "generate_rolling_occurrences_task: tenant=%s rules=%d created=%d horizon=%dd",
+            tenant_id, rules_count, total_created, days_ahead
+        )
+        return {
+            'status': 'COMPLETED',
+            'tenant_id': str(tenant_id),
+            'rules_processed': rules_count,
+            'occurrences_created': total_created,
+            'days_ahead': days_ahead,
+        }
+
+
+

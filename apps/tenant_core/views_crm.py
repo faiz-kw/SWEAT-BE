@@ -62,6 +62,7 @@ from .models_crm import (
     CRMTrialReminderPolicy,
     CRMAgentAssignmentConfig,
     LeadAttribution,
+    CRMStageAutomationRule,
 )
 from .serializers_crm import (
     LeadSourceSerializer,
@@ -85,6 +86,7 @@ from .serializers_crm import (
     CRMAttentionPolicySerializer,
     CRMAgentAssignmentConfigSerializer,
     InAppNotificationSerializer,
+    CRMStageAutomationRuleSerializer,
 )
 from .models_attention import CRMAttentionPolicy
 from .models_communication import CommunicationMessage, CommunicationStatusEvent
@@ -155,8 +157,13 @@ def get_user_effective_branch_ids(user, db_alias: str = 'default') -> Optional[S
 
     # If any active assignment has ORG scope, user has org-wide scope
     for ra in assignments:
-        if ra.role and ra.role.is_active and ra.role.scope == 'ORG':
-            return None
+        if ra.role and ra.role.is_active:
+            if (
+                getattr(ra, 'scope_type', '') in ('ORGANIZATION', 'ALL')
+                or getattr(ra.role, 'scope', '') == 'ORG'
+                or (ra.branch_id is None and getattr(ra, 'scope_type', 'ORGANIZATION') != 'BRANCH')
+            ):
+                return None
 
     permitted = set()
     for ra in assignments:
@@ -350,6 +357,11 @@ class LeadViewSet(viewsets.ModelViewSet):
         'conversion_quote': 'crm.leads.convert',
         'convert': 'crm.leads.convert',
     }
+    action_alternative_permissions = {
+        'conversion_eligibility': ['crm.leads.edit'],
+        'conversion_quote': ['crm.leads.edit'],
+        'convert': ['crm.leads.edit'],
+    }
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['first_name', 'last_name', 'phone_normalized', 'email_normalized', 'company_name']
     ordering_fields = ['created_at', 'first_name', 'current_status']
@@ -360,7 +372,7 @@ class LeadViewSet(viewsets.ModelViewSet):
         org = _get_org(self.request)
         qs = Lead.objects.using(alias).select_related(
             'organization', 'branch', 'lead_source', 'assigned_sales_user', 'assigned_trainer_user',
-            'interested_program', 'referred_by_user', 'commercial_profile'
+            'interested_program', 'referred_by_user', 'commercial_profile', 'converted_user_profile'
         ).prefetch_related('attributions')
         if org:
             qs = qs.filter(organization=org)
@@ -368,7 +380,8 @@ class LeadViewSet(viewsets.ModelViewSet):
         # Enforce server-side branch scope
         permitted_branches = get_user_effective_branch_ids(self.request.user, alias)
         if permitted_branches is not None:
-            qs = qs.filter(branch_id__in=permitted_branches)
+            # Users can see leads in their permitted branches OR any lead specifically assigned to them within the organization
+            qs = qs.filter(Q(branch_id__in=permitted_branches) | Q(assigned_sales_user=self.request.user))
 
         status_val = self.request.query_params.get('current_status')
         if status_val:
@@ -438,12 +451,13 @@ class LeadViewSet(viewsets.ModelViewSet):
             else:
                 raise PermissionDenied("A branch selection is required for branch-scoped staff.")
 
-        assignment_mode = str(self.request.data.get('assignment_mode') or 'MANUAL').upper()
+        req_mode = self.request.data.get('assignment_mode')
+        assignment_mode = str(req_mode).upper() if req_mode else None
         if assignment_mode not in ('MANUAL', 'AUTO'):
-            assignment_mode = 'MANUAL'
+            assignment_mode = None
 
         assigned_sales_user = serializer.validated_data.get('assigned_sales_user')
-        if assigned_sales_user and assignment_mode == 'MANUAL':
+        if assigned_sales_user and assignment_mode != 'AUTO':
             from .services_lead_assignment import LeadAssignmentEligibilityService
             is_valid, validation_err = LeadAssignmentEligibilityService.validate_assignee_eligibility(
                 organization=org,
@@ -459,7 +473,8 @@ class LeadViewSet(viewsets.ModelViewSet):
             k: v for k, v in serializer.validated_data.items()
             if k not in ('first_name', 'last_name', 'phone_normalized', 'email_normalized', 'branch', 'lead_source', 'assigned_sales_user', 'attribution')
         }
-        extra_fields['assignment_mode'] = assignment_mode
+        if assignment_mode:
+            extra_fields['assignment_mode'] = assignment_mode
 
         lead = CRMLeadService.create_lead(
             organization=org,
@@ -469,7 +484,7 @@ class LeadViewSet(viewsets.ModelViewSet):
             email=serializer.validated_data.get('email_normalized'),
             branch=branch,
             lead_source=serializer.validated_data.get('lead_source'),
-            assigned_sales_user=assigned_sales_user if assignment_mode == 'MANUAL' else None,
+            assigned_sales_user=assigned_sales_user if assignment_mode != 'AUTO' else None,
             actor_user=getattr(self.request, 'user', None),
             extra_fields=extra_fields,
             attribution_data=serializer.validated_data.get('attribution'),
@@ -632,6 +647,13 @@ class LeadViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='transition-status')
     def transition_status(self, request, pk=None):
         lead = self.get_object()
+        alias = _get_db(request)
+        if lead.current_status == 'CONVERTED' or getattr(lead, 'converted_user_profile_id', None) or LeadConversion.objects.using(alias).filter(lead=lead).exists():
+            return Response(
+                {'error': 'This lead has already been converted to a member. The CRM sales journey is terminal.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         new_status = request.data.get('new_status')
         reason_code = request.data.get('reason_code')
         reason_text = request.data.get('reason_text')
@@ -658,12 +680,24 @@ class LeadViewSet(viewsets.ModelViewSet):
         alias = _get_db(request)
         org = _get_org(request)
         lead = self.get_object()
+
+        if lead.current_status == 'CONVERTED' or getattr(lead, 'converted_user_profile_id', None) or LeadConversion.objects.using(alias).filter(lead=lead).exists():
+            return Response(
+                {'error': 'This lead has already been converted to a member. Lead ownership reassignment is no longer operationally relevant.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         user_id = request.data.get('assigned_to_user_id')
         assignment_type = request.data.get('assignment_type', 'SALES')
         notes = request.data.get('notes', '')
+        is_claim = bool(
+            request.data.get('claim')
+            or request.data.get('takeover')
+            or str(user_id or '').lower() in ('me', 'self', str(request.user.id).lower())
+        )
 
         # Explicit unassign
-        if not user_id or str(user_id).lower() in ('unassign', 'none', 'null', ''):
+        if not is_claim and (not user_id or str(user_id).lower() in ('unassign', 'none', 'null', '')):
             updated_lead = CRMLeadService.unassign_lead(
                 lead=lead,
                 assignment_type=assignment_type,
@@ -673,22 +707,27 @@ class LeadViewSet(viewsets.ModelViewSet):
             )
             return Response(LeadSerializer(updated_lead).data)
 
-        try:
-            target_user = TenantUser.objects.using(alias).get(id=user_id, organization=org)
-        except TenantUser.DoesNotExist:
-            return Response({'error': 'Target user not found or not in organization'}, status=status.HTTP_404_NOT_FOUND)
+        if is_claim:
+            target_user = request.user
+        else:
+            try:
+                target_user = TenantUser.objects.using(alias).get(id=user_id, organization=org)
+            except TenantUser.DoesNotExist:
+                return Response({'error': 'Target user not found or not in organization'}, status=status.HTTP_404_NOT_FOUND)
 
         if target_user.status != 'ACTIVE' or not target_user.is_login_allowed:
             return Response({'error': 'Assigned agent is inactive or not allowed to log in'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Branch eligibility
-        if lead.branch_id:
-            agent_permitted = get_user_effective_branch_ids(target_user, alias)
-            if agent_permitted is not None and str(lead.branch_id) not in agent_permitted:
-                return Response(
-                    {'error': f"Agent is not authorized for branch '{lead.branch.name if lead.branch else lead.branch_id}'"},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
+        # Authoritative eligibility check
+        from .services_lead_assignment import LeadAssignmentEligibilityService
+        is_valid, validation_err = LeadAssignmentEligibilityService.validate_assignee_eligibility(
+            organization=org,
+            user=target_user,
+            branch=lead.branch,
+            db_alias=alias,
+        )
+        if not is_valid:
+            return Response({'error': f"Target user is not eligible: {validation_err}"}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             assignment = CRMLeadService.assign_lead(
@@ -697,6 +736,9 @@ class LeadViewSet(viewsets.ModelViewSet):
                 assignment_type=assignment_type,
                 notes=notes,
                 actor_user=request.user,
+                assignment_source='MANUAL',
+                assignment_strategy='TAKEOVER' if is_claim else '',
+                reason=notes or ('Lead claimed/taken over by representative' if is_claim else 'Reassigned via CRM'),
                 db_alias=alias,
             )
             return Response(LeadAssignmentSerializer(assignment).data)
@@ -707,6 +749,12 @@ class LeadViewSet(viewsets.ModelViewSet):
     def book_trial(self, request, pk=None):
         alias = _get_db(request)
         lead = self.get_object()
+
+        if lead.current_status == 'CONVERTED' or getattr(lead, 'converted_user_profile_id', None) or LeadConversion.objects.using(alias).filter(lead=lead).exists():
+            return Response(
+                {'error': 'This lead has already been converted to a member. The CRM sales journey is terminal. Bookings must be made via the Member schedule.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         branch_id = request.data.get('branch_id') or getattr(lead, 'branch_id', None)
         if not branch_id:
@@ -882,10 +930,16 @@ class LeadViewSet(viewsets.ModelViewSet):
     def trials(self, request, pk=None):
         lead = self.get_object()
         alias = _get_db(request)
-        qs = TrialBooking.objects.using(alias).filter(lead=lead).select_related(
+        all_trials = list(TrialBooking.objects.using(alias).filter(lead=lead).select_related(
             'branch', 'assigned_trainer_profile'
-        ).order_by('-scheduled_start')
-        return Response(TrialBookingSerializer(qs, many=True).data)
+        ).order_by('-created_at'))
+
+        active_trial = CRMLeadService.get_canonical_active_trial(lead, db_alias=alias)
+        if active_trial:
+            trials_sorted = [active_trial] + [t for t in all_trials if t.id != active_trial.id]
+        else:
+            trials_sorted = all_trials
+        return Response(TrialBookingSerializer(trials_sorted, many=True).data)
 
     @action(detail=True, methods=['get'], url_path='offers')
     def offers(self, request, pk=None):
@@ -1503,7 +1557,14 @@ class IntakeFormViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         org = _get_org(self.request)
-        serializer.save(organization=org)
+        alias = _get_db(self.request)
+        form_type = serializer.validated_data.get('form_type')
+        version = serializer.validated_data.get('version_number', 1)
+        if IntakeForm.objects.using(alias).filter(organization=org, form_type=form_type, version_number=version).exists():
+            max_v = IntakeForm.objects.using(alias).filter(organization=org, form_type=form_type).order_by('-version_number').values_list('version_number', flat=True).first() or 0
+            serializer.save(organization=org, version_number=max_v + 1)
+        else:
+            serializer.save(organization=org, version_number=version)
 
     @action(detail=True, methods=['post'], url_path='submit')
     def submit(self, request, pk=None):
@@ -1517,10 +1578,17 @@ class IntakeFormViewSet(viewsets.ModelViewSet):
         if lead_id:
             lead = Lead.objects.using(alias).filter(id=lead_id).first()
 
+        user_profile = None
+        if user_profile_id:
+            user_profile = UserProfile.objects.using(alias).filter(id=user_profile_id).first()
+        elif lead and getattr(lead, 'converted_member_profile', None):
+            user_profile = lead.converted_member_profile
+
         submission = CRMLeadService.submit_intake_form(
             intake_form=form,
             answers=answers,
             lead=lead,
+            user_profile=user_profile,
             submitted_by_user=request.user,
             db_alias=alias,
         )
@@ -1616,7 +1684,14 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         alias = _get_db(self.request)
         org = _get_org(self.request)
-        qs = TrialBooking.objects.using(alias).select_related('lead', 'branch', 'assigned_trainer_profile')
+        qs = TrialBooking.objects.using(alias).select_related(
+            'lead',
+            'branch',
+            'assigned_trainer_profile',
+            'assigned_trainer_profile__employee_profile',
+            'assigned_trainer_profile__employee_profile__user_profile',
+            'assigned_trainer_profile__employee_profile__user_profile__user',
+        )
         if org:
             qs = qs.filter(lead__organization=org)
 
@@ -1786,14 +1861,20 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='request-reschedule')
     def request_reschedule(self, request, pk=None):
         trial = self.get_object()
+        if trial.status == 'ATTENDED':
+            return Response({'error': 'Cannot request reschedule for an already attended trial.'}, status=status.HTTP_400_BAD_REQUEST)
         reason = request.data.get('cancellation_reason') or request.data.get('reason') or request.data.get('notes')
-        updated_trial = CRMLeadService.request_reschedule_trial(
-            trial=trial,
-            reason=reason,
-            actor_user=request.user,
-            db_alias=_get_db(request),
-        )
-        return Response(TrialBookingSerializer(updated_trial).data)
+        try:
+            updated_trial = CRMLeadService.request_reschedule_trial(
+                trial=trial,
+                reason=reason,
+                actor_user=request.user,
+                db_alias=_get_db(request),
+            )
+            return Response(TrialBookingSerializer(updated_trial).data)
+        except (ValueError, ValidationError) as exc:
+            msg = exc.message if hasattr(exc, 'message') else str(exc)
+            return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=True, methods=['post'], url_path='request_reschedule')
     def request_reschedule_underscore(self, request, pk=None):
@@ -1802,6 +1883,8 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='reschedule')
     def reschedule(self, request, pk=None):
         trial = self.get_object()
+        if trial.status == 'ATTENDED':
+            return Response({'error': 'Cannot reschedule an already attended trial.'}, status=status.HTTP_400_BAD_REQUEST)
         start_str = request.data.get('new_scheduled_start') or request.data.get('scheduled_start')
         end_str = request.data.get('new_scheduled_end') or request.data.get('scheduled_end')
         new_start = parse_datetime(start_str) if start_str else None
@@ -1827,6 +1910,8 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='cancel')
     def cancel(self, request, pk=None):
         trial = self.get_object()
+        if trial.status == 'ATTENDED':
+            return Response({'error': 'Cannot cancel an already attended trial.'}, status=status.HTTP_400_BAD_REQUEST)
         reason = request.data.get('cancellation_reason') or request.data.get('reason') or request.data.get('notes')
         try:
             cancelled_trial = CRMLeadService.cancel_trial(
@@ -1844,11 +1929,13 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
     def mark_attended(self, request, pk=None):
         trial = self.get_object()
         notes = request.data.get('notes')
+        allow_override = bool(request.data.get('override'))
         try:
             attended_trial = CRMLeadService.mark_trial_attended(
                 trial=trial,
                 notes=notes,
                 actor_user=request.user,
+                allow_override=allow_override,
                 db_alias=_get_db(request),
             )
             return Response(TrialBookingSerializer(attended_trial).data)
@@ -1863,6 +1950,8 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='mark-no-show')
     def mark_no_show(self, request, pk=None):
         trial = self.get_object()
+        if trial.status == 'ATTENDED':
+            return Response({'error': 'Cannot mark an already attended trial as no-show.'}, status=status.HTTP_400_BAD_REQUEST)
         notes = request.data.get('notes')
         try:
             noshow_trial = CRMLeadService.mark_trial_no_show(
@@ -2249,6 +2338,77 @@ class CRMStageSlaPolicyViewSet(viewsets.ModelViewSet):
             metadata={'stage': instance.canonical_stage, 'target': f"{instance.response_target_value} {instance.response_target_unit}"},
             db_alias=alias,
         )
+
+
+class CRMStageAutomationRuleViewSet(viewsets.ModelViewSet):
+    serializer_class = CRMStageAutomationRuleSerializer
+    permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
+    required_module = 'crm'
+    required_submodule = 'leads'
+    required_permission = 'crm.settings.view'
+    permission_action_map = {
+        'create': 'crm.settings.edit',
+        'update': 'crm.settings.edit',
+        'partial_update': 'crm.settings.edit',
+        'destroy': 'crm.settings.edit',
+    }
+    ordering = ['priority', 'created_at']
+
+    def get_queryset(self):
+        alias = _get_db(self.request)
+        org = _get_org(self.request)
+        if not org:
+            return CRMStageAutomationRule.objects.none()
+        from .services_stage_automation import CRMStageAutomationService
+        # Ensure default automation rules are seeded
+        CRMStageAutomationService.get_rules_for_event(org, trigger_event='FOLLOWUP_COMPLETED', db_alias=alias)
+        return CRMStageAutomationRule.objects.using(alias).filter(organization=org).order_by('priority', 'created_at')
+
+    def perform_create(self, serializer):
+        org = _get_org(self.request)
+        alias = _get_db(self.request)
+        instance = serializer.save(organization=org)
+        record_business_audit(
+            organization=org,
+            module='crm',
+            action_code='CRM_STAGE_AUTOMATION_RULE_CREATED',
+            entity_type='CRMStageAutomationRule',
+            entity_id=instance.id,
+            actor_user=getattr(self.request, 'user', None),
+            metadata={'event': instance.trigger_event, 'to_stage': instance.to_stage},
+            db_alias=alias,
+        )
+
+    def perform_update(self, serializer):
+        org = _get_org(self.request)
+        alias = _get_db(self.request)
+        instance = serializer.save()
+        record_business_audit(
+            organization=org,
+            module='crm',
+            action_code='CRM_STAGE_AUTOMATION_RULE_UPDATED',
+            entity_type='CRMStageAutomationRule',
+            entity_id=instance.id,
+            actor_user=getattr(self.request, 'user', None),
+            metadata={'event': instance.trigger_event, 'to_stage': instance.to_stage, 'is_enabled': instance.is_enabled},
+            db_alias=alias,
+        )
+
+    def perform_destroy(self, instance):
+        org = _get_org(self.request)
+        alias = _get_db(self.request)
+        record_business_audit(
+            organization=org,
+            module='crm',
+            action_code='CRM_STAGE_AUTOMATION_RULE_DELETED',
+            entity_type='CRMStageAutomationRule',
+            entity_id=instance.id,
+            actor_user=getattr(self.request, 'user', None),
+            metadata={'event': instance.trigger_event, 'to_stage': instance.to_stage},
+            db_alias=alias,
+        )
+        instance.delete(using=alias)
+
 
 
 class CRMTrialReminderPolicyViewSet(viewsets.ViewSet):

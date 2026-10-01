@@ -1,4 +1,4 @@
-﻿'''
+'''
 Production & Staging Deployment Seeder Management Command.
 Executes an end-to-end, fully idempotent seed workflow across:
   1. Master DB SaaS Catalog (Metrics, Modules, Submodules, Permissions, Plans, Marketplace)
@@ -422,7 +422,7 @@ class Command(BaseCommand):
                 self.stdout.write("\n[7/7] Seeding Starter Programs, Membership Packages & CRM Defaults...")
                 from apps.tenant_core.models_catalog import (
                     ProgramCategory, Program, Package, PackageVersion,
-                    PackagePrice, PackageBranchAvailability
+                    PackagePrice, PackageBranchAvailability, ProgramBranchAvailability
                 )
                 from apps.tenant_core.models_crm import LeadSource
 
@@ -474,6 +474,18 @@ class Command(BaseCommand):
                         'trial_allowed': True,
                         'status': 'ACTIVE',
                     }
+                )
+
+                # Program Branch Availability
+                ProgramBranchAvailability.objects.using(db_alias).get_or_create(
+                    program=prog_gym,
+                    branch=branch,
+                    defaults={'is_active': True}
+                )
+                ProgramBranchAvailability.objects.using(db_alias).get_or_create(
+                    program=prog_group,
+                    branch=branch,
+                    defaults={'is_active': True}
                 )
 
                 # Packages Matrix

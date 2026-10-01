@@ -53,29 +53,78 @@ class PublicLeadCaptureView(APIView):
             if not org:
                 return Response({'error': 'Tenant organization not found'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-            # Extract lead details
+            # Extract lead details — all fields from the website form
             first_name = payload.get('first_name') or payload.get('firstName', '')
             last_name = payload.get('last_name') or payload.get('lastName', '')
             email = payload.get('email') or payload.get('emailAddress', '')
             phone = payload.get('phone') or payload.get('contactNumber', '')
             source_code = payload.get('lead_source', 'WEBSITE')
-            
+
+            # Optional enrichment fields
+            gender = payload.get('gender') or None
+            date_of_birth = payload.get('date_of_birth') or payload.get('birthday') or None
+            fitness_goal = payload.get('fitness_goal') or payload.get('goal') or None
+            area = payload.get('area') or payload.get('location_area') or None
+            country = payload.get('country') or 'India'
+            branch_name = payload.get('branch_name') or None
+            program_name = payload.get('interested_in') or payload.get('program_name') or None
+            pincode = payload.get('pincode') or None
+            state = payload.get('state') or None
+
+            # Build area string combining area + state + pincode if available
+            area_parts = [p for p in [area, state, pincode] if p]
+            full_area = ', '.join(area_parts) if area_parts else None
+
             if not first_name and not last_name:
                 return Response({'error': 'Name is required'}, status=status.HTTP_400_BAD_REQUEST)
 
-            # Create lead using CRMLeadService
             try:
-                # Assuming first active branch if branch isn't specified
                 from apps.tenant_core.models_org import Branch
-                branch = Branch.objects.using(db_alias).filter(organization=org, status='ACTIVE').first()
-
-                # Get or create the LeadSource
                 from apps.tenant_core.models_crm import LeadSource
+                from apps.tenant_core.models_catalog import Program
+
+                # Resolve branch: by name from form, fallback to first active branch
+                branch = None
+                if branch_name:
+                    branch = Branch.objects.using(db_alias).filter(
+                        organization=org,
+                        name__iexact=branch_name,
+                        status='ACTIVE'
+                    ).first()
+                if not branch:
+                    branch = Branch.objects.using(db_alias).filter(
+                        organization=org, status='ACTIVE'
+                    ).first()
+
+                # Resolve program: by name from form, fallback to None (optional field)
+                program = None
+                if program_name and branch:
+                    program = Program.objects.using(db_alias).filter(
+                        name__iexact=program_name,
+                        status='ACTIVE'
+                    ).first()
+
+                # Get or create the LeadSource by code
                 lead_source, _ = LeadSource.objects.using(db_alias).get_or_create(
                     organization=org,
                     code=source_code,
                     defaults={'name': 'Website', 'source_type': 'WEBSITE', 'status': 'ACTIVE'}
                 )
+
+                # Build extra_fields — only include non-None values
+                extra_fields = {}
+                if gender:
+                    extra_fields['gender'] = gender
+                if date_of_birth:
+                    extra_fields['date_of_birth'] = date_of_birth
+                if fitness_goal:
+                    extra_fields['fitness_goal'] = fitness_goal
+                if full_area:
+                    extra_fields['area'] = full_area
+                if country:
+                    extra_fields['country'] = country
+                if program:
+                    extra_fields['interested_program'] = program
 
                 lead = CRMLeadService.create_lead(
                     organization=org,
@@ -85,14 +134,15 @@ class PublicLeadCaptureView(APIView):
                     email=email,
                     branch=branch,
                     lead_source=lead_source,
-                    assigned_sales_user=None, # Starts unassigned
-                    actor_user=None, # System created
+                    assigned_sales_user=None,  # Auto-assigned by CRM policy
+                    actor_user=None,            # System-created via website
+                    extra_fields=extra_fields,
                     db_alias=db_alias,
                 )
 
                 return Response({
                     'status': 'success',
-                    'lead_id': str(lead.id)
+                    'lead_id': str(lead.id),
                 }, status=status.HTTP_201_CREATED)
 
             except Exception as e:

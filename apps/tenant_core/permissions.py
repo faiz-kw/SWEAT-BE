@@ -150,8 +150,14 @@ class TenantRBACPermission(permissions.BasePermission):
             request=request,
         )
 
-        if not allowed and hasattr(view, 'alternative_permissions'):
-            for alt_perm in view.alternative_permissions:
+        if not allowed:
+            act = getattr(view, 'action', None)
+            alt_map = getattr(view, 'action_alternative_permissions', {}) or getattr(view, 'permission_action_alternatives', {})
+            alts = list(alt_map.get(act, [])) if act and isinstance(alt_map, dict) else []
+            if not alts and hasattr(view, 'alternative_permissions'):
+                alts = list(getattr(view, 'alternative_permissions', []) or [])
+
+            for alt_perm in alts:
                 alt_allowed, _, _ = RBACAuthorizationEngine.evaluate(
                     user=user,
                     required_module=required_module,
@@ -194,6 +200,24 @@ class TenantRBACPermission(permissions.BasePermission):
             request=request,
         )
         if not allowed:
+            # Assignee Guarantee: If user is the assigned sales user for this lead in the same org,
+            # allow access if they hold the action permission across any of their active roles in the org.
+            if (
+                hasattr(obj, 'assigned_sales_user_id')
+                and obj.assigned_sales_user_id == request.user.id
+                and getattr(obj, 'organization_id', None) == getattr(request.user, 'organization_id', None)
+            ):
+                allowed_as_assignee, _, _ = RBACAuthorizationEngine.evaluate(
+                    user=request.user,
+                    required_module=required_module,
+                    required_submodule=required_submodule,
+                    required_permission=required_permission,
+                    branch_id=None,
+                    request=request,
+                )
+                if allowed_as_assignee:
+                    return True
+
             raise PermissionDenied(reason)
 
         return True

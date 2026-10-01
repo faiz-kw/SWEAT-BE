@@ -4,10 +4,12 @@ apps/tenant_core/views_memberships.py — ViewSets for Layer 2 Module I: Members
 
 import uuid
 from decimal import Decimal
-from rest_framework import viewsets, status
+from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.pagination import PageNumberPagination
 from django.core.exceptions import ValidationError
+from django.db.models import Q
 
 from apps.tenant_core.permissions import RequireActiveTenantAndOrg, TenantRBACPermission
 from apps.tenant_core.context import get_tenant_db_alias
@@ -51,6 +53,23 @@ def _get_db(request):
     return get_tenant_db_alias() or 'default'
 
 
+class MembershipPagination(PageNumberPagination):
+    """Standard cursor-based page pagination for the Membership list endpoint."""
+    page_size = 25
+    page_size_query_param = 'page_size'
+    max_page_size = 200
+    page_query_param = 'page'
+
+    def get_paginated_response(self, data):
+        return Response({
+            'count': self.page.paginator.count,
+            'total_pages': self.page.paginator.num_pages,
+            'next': self.get_next_link(),
+            'previous': self.get_previous_link(),
+            'results': data,
+        })
+
+
 class MembershipViewSet(viewsets.ModelViewSet):
     serializer_class = MembershipSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
@@ -66,12 +85,15 @@ class MembershipViewSet(viewsets.ModelViewSet):
         'reverse_entitlement': 'core.settings.edit',
         'freeze': 'core.settings.edit',
     }
+    pagination_class = MembershipPagination
+    filter_backends = [filters.OrderingFilter]
+    ordering = ['-created_at']
 
     def get_queryset(self):
         db = _get_db(self.request)
         org = getattr(self.request.user, 'organization', None)
         qs = Membership.objects.using(db).select_related(
-            'user_profile', 'package', 'package_version', 'home_branch', 'purchase_branch'
+            'user_profile', 'user_profile__user', 'package', 'package_version', 'home_branch', 'purchase_branch'
         ).prefetch_related('entitlements')
         if org:
             qs = qs.filter(home_branch__organization=org)
@@ -84,6 +106,20 @@ class MembershipViewSet(viewsets.ModelViewSet):
         status_param = self.request.query_params.get('status')
         if status_param:
             qs = qs.filter(status=status_param)
+
+        # Server-side search across member identity, contact, and package fields
+        search = self.request.query_params.get('search', '').strip()
+        if search:
+            qs = qs.filter(
+                Q(membership_number__icontains=search)
+                | Q(user_profile__member_number__icontains=search)
+                | Q(user_profile__first_name_snapshot__icontains=search)
+                | Q(user_profile__last_name_snapshot__icontains=search)
+                | Q(user_profile__user__email__icontains=search)
+                | Q(user_profile__user__phone__icontains=search)
+                | Q(package__name__icontains=search)
+            )
+
         return qs.order_by('-created_at')
 
     def perform_create(self, serializer):
@@ -184,7 +220,37 @@ class MembershipViewSet(viewsets.ModelViewSet):
         membership = self.get_object()
         contract = getattr(membership, 'contract_snapshot', None)
         if not contract:
-            return Response({'error': 'No contract snapshot on file for this membership.'}, status=status.HTTP_404_NOT_FOUND)
+            db = _get_db(request)
+            try:
+                pv = membership.package_version
+                ents = [
+                    {
+                        'entitlement_type': e.entitlement_type,
+                        'allocated_units': str(e.allocated_units) if e.allocated_units else None,
+                        'is_unlimited': e.is_unlimited,
+                    }
+                    for e in membership.entitlements.all()
+                ]
+                contract = MembershipContractSnapshot.objects.using(db).create(
+                    membership=membership,
+                    package=membership.package,
+                    package_version=pv,
+                    package_price=membership.package_price,
+                    package_name_snapshot=membership.package.name if membership.package else 'Standard Plan',
+                    purchase_price=Decimal('0.00'),
+                    discount_amount=Decimal('0.00'),
+                    tax_amount=Decimal('0.00'),
+                    final_amount=Decimal('0.00'),
+                    currency='INR',
+                    duration_value=pv.duration_value if pv else 1,
+                    duration_unit=pv.duration_unit if pv else 'MONTH',
+                    start_date=membership.start_date,
+                    end_date=membership.end_date,
+                    entitlements_snapshot=ents,
+                    purchase_branch=membership.purchase_branch or membership.home_branch,
+                )
+            except Exception:
+                return Response({'error': 'No contract snapshot on file for this membership.'}, status=status.HTTP_404_NOT_FOUND)
         return Response(MembershipContractSnapshotSerializer(contract).data, status=status.HTTP_200_OK)
 
 

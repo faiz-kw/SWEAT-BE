@@ -237,6 +237,34 @@ class Command(BaseCommand):
                             }
                         )
 
+            # Special action permissions
+            crm_mod = modules_map.get('crm')
+            if crm_mod:
+                leads_sub = ProductSubmodule.objects.using('default').filter(module=crm_mod, code='leads').first()
+                if leads_sub:
+                    TenantPermissionCatalog.objects.using('default').update_or_create(
+                        code='crm.leads.convert',
+                        defaults={
+                            'module': crm_mod,
+                            'submodule': leads_sub,
+                            'action': 'convert',
+                            'label': 'Convert Leads to Active Members',
+                            'is_active': True,
+                        }
+                    )
+                comm_sub = ProductSubmodule.objects.using('default').filter(module=crm_mod, code='communications').first()
+                if comm_sub:
+                    TenantPermissionCatalog.objects.using('default').update_or_create(
+                        code='crm.communications.send',
+                        defaults={
+                            'module': crm_mod,
+                            'submodule': comm_sub,
+                            'action': 'send',
+                            'label': 'Send Direct Messages to Leads',
+                            'is_active': True,
+                        }
+                    )
+
             # 3. SaaS Subscription Plans
             plans_data = [
                 {

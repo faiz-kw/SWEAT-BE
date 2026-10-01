@@ -56,6 +56,7 @@ from .views_crm import (
     LeadConversionViewSet,
     SalesFollowupTaskViewSet,
     CRMStageSlaPolicyViewSet,
+    CRMStageAutomationRuleViewSet,
     CRMTrialReminderPolicyViewSet,
     CRMAttentionPolicyViewSet,
     CRMAgentAssignmentConfigViewSet,
@@ -270,6 +271,7 @@ router.register(r'trial-status-history', TrialStatusHistoryViewSet, basename='tr
 router.register(r'lead-conversions', LeadConversionViewSet, basename='lead-conversion')
 router.register(r'sales-followup-tasks', SalesFollowupTaskViewSet, basename='sales-followup-task')
 router.register(r'crm/sla-policies', CRMStageSlaPolicyViewSet, basename='crm-sla-policy')
+router.register(r'crm/stage-automation-rules', CRMStageAutomationRuleViewSet, basename='crm-stage-automation-rule')
 router.register(r'crm/trial-reminder-policy', CRMTrialReminderPolicyViewSet, basename='crm-trial-reminder-policy')
 router.register(r'crm/attention-policy', CRMAttentionPolicyViewSet, basename='crm-attention-policy')
 router.register(r'crm/agent-assignment-config', CRMAgentAssignmentConfigViewSet, basename='crm-agent-assignment-config')
