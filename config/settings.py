@@ -493,4 +493,11 @@ ZATA_S3_UPLOAD_EXPIRES = int(os.getenv('ZATA_S3_UPLOAD_EXPIRES', '900'))    # 15
 ZATA_S3_DOWNLOAD_EXPIRES = int(os.getenv('ZATA_S3_DOWNLOAD_EXPIRES', '3600'))  # 60 minutes TTL for presigned GET
 ZATA_S3_MAX_FILE_SIZE = int(os.getenv('ZATA_S3_MAX_FILE_SIZE', str(50 * 1024 * 1024)))  # 50 MB max
 
+# ---------------------------------------------------------------------------
+# Meta Lead Ads Integration & Outbound Safety (Development Simulator)
+# ---------------------------------------------------------------------------
+DEPLOYMENT_ENVIRONMENT = os.getenv('DEPLOYMENT_ENVIRONMENT', 'development' if DEBUG else 'production').lower()
+META_LEAD_SIMULATOR_ENABLED = os.getenv('META_LEAD_SIMULATOR_ENABLED', 'true' if DEBUG else 'false').lower() in ('true', '1', 't')
+COMMUNICATIONS_OUTBOUND_ENABLED = os.getenv('COMMUNICATIONS_OUTBOUND_ENABLED', 'false' if DEBUG else 'true').lower() in ('true', '1', 't')
+
 

@@ -310,6 +310,10 @@ router.register(r'integrations', TenantIntegrationViewSet, basename='integration
 router.register(r'in-app-notifications', InAppNotificationViewSet, basename='in-app-notification')
 router.register(r'notifications', InAppNotificationViewSet, basename='notification')
 
+from .views_meta_leads import MetaLeadMappingViewSet, MetaLeadImportViewSet
+router.register(r'meta-lead-mappings', MetaLeadMappingViewSet, basename='meta-lead-mapping')
+router.register(r'meta-lead-imports', MetaLeadImportViewSet, basename='meta-lead-import')
+
 app_name = 'tenant_core'
 
 urlpatterns = [
