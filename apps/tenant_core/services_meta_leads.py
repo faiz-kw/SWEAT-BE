@@ -1,4 +1,4 @@
-﻿"""Tenant-owned Meta lead services: Simulator & Production Live Adapter.
+"""Tenant-owned Meta lead services: Simulator & Production Live Adapter.
 
 Supports:
 - Safe, isolated simulator execution for local development & testing.
@@ -6,6 +6,7 @@ Supports:
 - Durable idempotency and background retry protection.
 """
 import logging
+from typing import Tuple
 from django.conf import settings
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
