@@ -287,4 +287,14 @@ __all__ += [
     'CRMAttentionPolicy',
 ]
 
+from .models_meta_leads import (
+    MetaLeadMapping,
+    MetaLeadImport,
+)
+
+__all__ += [
+    'MetaLeadMapping',
+    'MetaLeadImport',
+]
+
 

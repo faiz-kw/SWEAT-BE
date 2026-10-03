@@ -1,9 +1,63 @@
-"""Tenant-owned Meta lead mappings and durable import history.
+﻿"""Tenant-owned Meta lead connections, mappings, and durable import history.
 
-Phase one exposes SIMULATOR only. No Meta credentials belong in these tables.
+Zero Meta credentials belong in plaintext. OAuth tokens are Fernet-encrypted.
 """
 import uuid
 from django.db import models
+
+
+class MetaConnection(models.Model):
+    STATUSES = [
+        ('NOT_CONNECTED', 'Not Connected'),
+        ('CONNECTED', 'Connected'),
+        ('TOKEN_EXPIRED', 'Token Expired'),
+        ('REVOKED', 'Revoked'),
+        ('DISCONNECTED', 'Disconnected'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey('tenant_core.Organization', on_delete=models.PROTECT)
+    status = models.CharField(max_length=30, choices=STATUSES, default='NOT_CONNECTED')
+    meta_user_id = models.CharField(max_length=100, blank=True, default='')
+    meta_user_name = models.CharField(max_length=200, blank=True, default='')
+    encrypted_user_access_token = models.TextField(blank=True, default='')
+    token_expires_at = models.DateTimeField(null=True, blank=True)
+    scopes = models.JSONField(default=list, blank=True)
+    last_connected_at = models.DateTimeField(null=True, blank=True)
+    last_error = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        app_label = 'tenant_core'
+        db_table = 'crm_meta_connections'
+        constraints = [models.UniqueConstraint(fields=['organization'], name='uq_meta_connection_org')]
+
+    def __str__(self):
+        return f"MetaConnection ({self.status}) for Org {self.organization_id}"
+
+
+class MetaPageConnection(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey('tenant_core.Organization', on_delete=models.PROTECT)
+    connection = models.ForeignKey(MetaConnection, on_delete=models.CASCADE, related_name='pages')
+    page_id = models.CharField(max_length=100)
+    page_name = models.CharField(max_length=255)
+    encrypted_page_access_token = models.TextField(blank=True, default='')
+    is_subscribed_to_webhooks = models.BooleanField(default=False)
+    subscribed_at = models.DateTimeField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        app_label = 'tenant_core'
+        db_table = 'crm_meta_page_connections'
+        constraints = [models.UniqueConstraint(fields=['organization', 'page_id'], name='uq_meta_page_connection_org_page')]
+        ordering = ['page_name', 'page_id']
+
+    def __str__(self):
+        return f"{self.page_name} ({self.page_id})"
 
 
 class MetaLeadMapping(models.Model):
@@ -50,10 +104,22 @@ class MetaLeadMapping(models.Model):
 
 
 class MetaLeadImport(models.Model):
-    STATUSES = [('PENDING', 'Pending'), ('IMPORTED', 'Imported'), ('NEEDS_MAPPING', 'Needs mapping'), ('NEEDS_ASSIGNMENT', 'Needs branch assignment'), ('NEEDS_REVIEW', 'Repeat enquiry review'), ('FAILED', 'Failed')]
+    STATUSES = [
+        ('PENDING', 'Pending'),
+        ('IMPORTED', 'Imported'),
+        ('NEEDS_MAPPING', 'Needs mapping'),
+        ('NEEDS_ASSIGNMENT', 'Needs branch assignment'),
+        ('NEEDS_REVIEW', 'Repeat enquiry review'),
+        ('FAILED', 'Failed'),
+    ]
+    MODES = [
+        ('SIMULATOR', 'Simulator'),
+        ('LIVE', 'Live Webhook'),
+    ]
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     organization = models.ForeignKey('tenant_core.Organization', on_delete=models.PROTECT)
-    mode = models.CharField(max_length=20, default='SIMULATOR', editable=False)
+    mode = models.CharField(max_length=20, choices=MODES, default='SIMULATOR')
     page_id = models.CharField(max_length=100)
     form_id = models.CharField(max_length=100)
     external_lead_id = models.CharField(max_length=100)
@@ -66,6 +132,16 @@ class MetaLeadImport(models.Model):
     attempt_count = models.PositiveIntegerField(default=0)
     error_code = models.CharField(max_length=50, blank=True, default='')
     error_message = models.CharField(max_length=500, blank=True, default='')
+
+    # Campaign attribution captured from Meta Graph API
+    campaign_id = models.CharField(max_length=100, blank=True, default='')
+    campaign_name = models.CharField(max_length=255, blank=True, default='')
+    adset_id = models.CharField(max_length=100, blank=True, default='')
+    adset_name = models.CharField(max_length=255, blank=True, default='')
+    ad_id = models.CharField(max_length=100, blank=True, default='')
+    ad_name = models.CharField(max_length=255, blank=True, default='')
+    is_organic = models.BooleanField(default=False)
+
     received_at = models.DateTimeField(auto_now_add=True)
     processed_at = models.DateTimeField(null=True, blank=True)
     updated_at = models.DateTimeField(auto_now=True)

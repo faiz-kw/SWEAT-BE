@@ -35,18 +35,39 @@ DEFAULT_LOCKOUT_DURATION = 900  # 15 minutes
 MFA_CHALLENGE_TTL = 300         # 5 minutes
 
 
+import sys
+import time
+
+_REDIS_LAST_FAIL_TIME = 0.0
+_REDIS_FAIL_COOLDOWN = 30.0  # seconds cooldown before retrying dead Redis
+
 def _get_redis_client():
-    """Get Redis client using django_redis or redis library."""
+    """Get Redis client with fast circuit-breaker when Redis is offline or running unit tests."""
+    global _REDIS_LAST_FAIL_TIME
+
+    # If running Django test suite without explicit Redis testing flag, skip socket timeout
+    if 'test' in sys.argv and not getattr(settings, 'TEST_USE_REDIS', False):
+        return None
+
+    now = time.time()
+    if now - _REDIS_LAST_FAIL_TIME < _REDIS_FAIL_COOLDOWN:
+        return None
+
     try:
         from django_redis import get_redis_connection
-        return get_redis_connection("default")
+        conn = get_redis_connection("default")
+        conn.ping()
+        return conn
     except Exception:
         try:
             import redis
             redis_url = getattr(settings, 'REDIS_URL', 'redis://localhost:6379/0')
-            return redis.from_url(redis_url, socket_connect_timeout=0.2, socket_timeout=0.2)
+            client = redis.from_url(redis_url, socket_connect_timeout=0.2, socket_timeout=0.2)
+            client.ping()
+            return client
         except Exception as e:
-            logger.error("Failed to acquire Redis connection: %s", e)
+            _REDIS_LAST_FAIL_TIME = time.time()
+            logger.debug("Redis unavailable, failing over gracefully: %s", e)
             return None
 
 
@@ -193,7 +214,8 @@ def is_token_revoked(user_id: str, token_iat: Optional[int]) -> bool:
             if int(token_iat) <= revoked_at:
                 return True
     except Exception as e:
-        logger.error("Error checking token revocation in Redis: %s", e)
+        _REDIS_LAST_FAIL_TIME = time.time()
+        logger.warning("Error checking token revocation in Redis: %s", e)
 
     return False
 

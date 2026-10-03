@@ -14,6 +14,7 @@ from apps.master.views import BillingWebhookView
 from apps.tenant_core.views_security_policy import SecurityPolicyView
 from apps.tenant_core.views_communication_webhook import CommunicationWebhookView
 from apps.tenant_core.views_lead_webhook import PublicLeadCaptureView
+from apps.tenant_core.views_meta_webhook import MetaLeadWebhookView
 
 # Django admin branding
 admin.site.site_header = "PerformanceOS • Platform Control Panel"
@@ -32,6 +33,8 @@ urlpatterns = [
     path('api/v1/billing/webhook/', BillingWebhookView.as_view({'post': 'create'}), name='global-billing-webhook'),
     path('api/v1/webhooks/communications/<str:provider>/<str:public_integration_id>/', CommunicationWebhookView.as_view(), name='communication-provider-webhook'),
     path('api/v1/webhooks/leads/<str:tenant_public_id>/', PublicLeadCaptureView.as_view(), name='public-lead-capture-webhook'),
+    path('api/v1/webhooks/meta/leads/', MetaLeadWebhookView.as_view(), name='meta-lead-webhook-global'),
+    path('api/v1/webhooks/meta/leads/<str:tenant_public_id>/', MetaLeadWebhookView.as_view(), name='meta-lead-webhook-tenant'),
 
     # Tenant Admin — Org/Branch/User/RBAC management (scoped to tenant DB)
     path('api/v1/admin/', include('apps.tenant_core.urls')),

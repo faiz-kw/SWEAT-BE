@@ -616,6 +616,9 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
         'reactivate': 'core.users.edit',
         'deactivate': 'core.users.delete',
         'toggle_active': 'core.users.edit',
+        'reset_password': 'core.users.edit',
+        'resend_invite': 'core.users.edit',
+        'resend_invite_dash': 'core.users.edit',
     }
     queryset = TenantUser.objects.all()
 
@@ -949,6 +952,92 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
             return self.deactivate(request, pk)
         else:
             return self.reactivate(request, pk)
+
+    @action(detail=True, methods=['post'], url_path='reset-password')
+    def reset_password(self, request, pk=None):
+        """Administrative password reset for a tenant user."""
+        user = self.get_object()
+        db = self.get_db()
+        new_password = request.data.get('password') or request.data.get('new_password')
+        if not new_password:
+            return Response({'error': 'Password is required.', 'detail': 'Password is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if len(new_password) < 8:
+            return Response({'error': 'Password must be at least 8 characters long.', 'detail': 'Password must be at least 8 characters long.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic(using=db):
+            user.set_password(new_password)
+            user.save(using=db, update_fields=['password_hash', 'updated_at'])
+
+            from apps.master.services_auth_directory import sync_tenant_user_identity
+            tenant_id = self.get_tenant_id()
+            sync_tenant_user_identity(user, tenant_id=tenant_id, db=db)
+
+            from apps.authentication.security import reset_login_lockout
+            reset_login_lockout(request, user.email, tenant_id=str(tenant_id) if tenant_id else None)
+
+            from .audit import emit_audit_event
+            emit_audit_event(
+                action='UPDATE',
+                resource_type='TenantUser',
+                resource_id=str(user.pk),
+                request=request,
+                instance=user,
+                db_alias=db,
+                description=f"Administrative password reset for {user.email}."
+            )
+
+        return Response({'message': f'Password for {user.email} has been successfully reset.'}, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='resend-invite')
+    def resend_invite_dash(self, request, pk=None):
+        return self.resend_invite(request, pk)
+
+    @action(detail=True, methods=['post'], url_path='resend_invite')
+    def resend_invite(self, request, pk=None):
+        """Generate and dispatch an activation invite link for a tenant user."""
+        user = self.get_object()
+        db = self.get_db()
+
+        origin = (request.META.get('HTTP_ORIGIN') or request.META.get('HTTP_REFERER') or 'http://localhost:5173').rstrip('/')
+        from urllib.parse import urlparse
+        parsed_origin = urlparse(origin)
+        clean_origin = f"{parsed_origin.scheme}://{parsed_origin.netloc}" if parsed_origin.netloc else "http://localhost:5173"
+
+        tenant_slug = getattr(request, 'tenant_slug', None) or 'sweat'
+
+        # Resolve the Tenant object to embed its ID in the signed token
+        from apps.master.models_tenant import Tenant
+        from django.core.signing import TimestampSigner
+        tenant_obj = Tenant.objects.using('default').filter(slug=tenant_slug).first()
+        if not tenant_obj:
+            return Response({'error': 'Tenant not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Build a signed token: TENANT:<tenant_id>:<user_id>, expires in 72 hours
+        signer = TimestampSigner(salt='staff-invite-salt')
+        token = signer.sign(f"TENANT:{tenant_obj.id}:{user.pk}")
+
+        # Point to /activate — NOT /login
+        import urllib.parse
+        invite_link = f"{clean_origin}/activate?token={urllib.parse.quote(token, safe='')}&tenant={tenant_slug}"
+
+        from .audit import emit_audit_event
+        emit_audit_event(
+            action='UPDATE',
+            resource_type='TenantUser',
+            resource_id=str(user.pk),
+            request=request,
+            instance=user,
+            db_alias=db,
+            description=f"Invitation and activation link dispatched for {user.email}."
+        )
+
+        return Response({
+            'message': f"Invitation link successfully generated for {user.email}",
+            'invite_link': invite_link,
+            'email': user.email,
+            'status': user.status
+        }, status=status.HTTP_200_OK)
+
 
 
 class RoleViewSet(TenantDBMixin, viewsets.ModelViewSet):

@@ -1,21 +1,46 @@
-"""Organisation-wide CRM configuration and development import APIs."""
+from django.http import HttpResponseRedirect
+import urllib.parse
+"""Organisation-wide CRM configuration, Meta OAuth lifecycle, and import APIs."""
 import uuid
+import logging
+from datetime import timedelta
+from django.utils import timezone
+from django.conf import settings
 from django.db import transaction
 from django.shortcuts import get_object_or_404
-from rest_framework import serializers, viewsets, mixins
+from rest_framework import serializers, viewsets, mixins, status
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
 from .meta_lead_rules import DESTINATION_FIELDS, normalize_field_data
-from .models_meta_leads import MetaLeadMapping, MetaLeadImport
+from .models_meta_leads import MetaLeadMapping, MetaLeadImport, MetaConnection, MetaPageConnection
 from .models_org import Branch
 from .models_crm import LeadSource, Lead, SalesFollowupTask, CRMAgentAssignmentConfig
 from .models_users import TenantUser
 from .permissions import RequireActiveTenantAndOrg, TenantRBACPermission
-from .services_meta_leads import require_tenant_alias, receive_simulation, process_simulation, simulator_enabled
+from .services_meta_leads import (
+    require_tenant_alias,
+    receive_simulation,
+    process_simulation,
+    process_live_import,
+    simulator_enabled,
+)
 from .services_reliability import record_business_audit
 from .views_crm import get_user_effective_branch_ids
+from .meta_crypto import encrypt_token, decrypt_token, mask_token
+from .services_meta_graph import (
+    MetaGraphClient,
+    generate_oauth_state,
+    verify_oauth_state,
+    get_meta_app_credentials,
+    MetaTokenExpiredError,
+    MetaPermissionError,
+    MetaGraphAPIError,
+)
+from apps.master.models_tenant import MetaPageRegistry
+
+logger = logging.getLogger(__name__)
 
 
 class MappingSerializer(serializers.ModelSerializer):
@@ -33,10 +58,9 @@ class MappingSerializer(serializers.ModelSerializer):
                   'assignment_mode', 'assigned_sales_user', 'create_followup_task', 'followup_task_type',
                   'followup_due_hours', 'updated_at']
         read_only_fields = ['id', 'version', 'updated_at']
-        validators = []  # Organisation is trusted server context, never a client field.
+        validators = []
 
     def to_representation(self, instance):
-        # UUIDField must receive IDs, not model instances.
         result = super().to_representation({
             key: getattr(instance, key + '_id' if key in ('branch', 'fallback_branch', 'lead_source', 'assigned_sales_user') else key)
             for key in self.Meta.fields if key != 'expected_version'
@@ -122,7 +146,6 @@ class MappingSerializer(serializers.ModelSerializer):
                 attrs['fallback_branch'] = None
             attrs.update(branch=None, branch_answers=normalized)
 
-        # Sales assignment validation
         assignment_mode = value('assignment_mode', 'TENANT_POLICY')
         if assignment_mode == 'SPECIFIC_USER':
             user_id = value('assigned_sales_user')
@@ -135,13 +158,11 @@ class MappingSerializer(serializers.ModelSerializer):
         else:
             attrs['assigned_sales_user'] = None
 
-        # Initial stage validation
         initial_stage = value('initial_stage', 'NEW_LEAD')
         valid_stages = {s[0] for s in Lead.STATUSES}
         if initial_stage not in valid_stages:
             raise serializers.ValidationError({'initial_stage': 'Choose a supported CRM pipeline stage.'})
 
-        # Follow-up task validation
         if value('create_followup_task', False):
             task_type = value('followup_task_type', 'CALL')
             valid_types = {t[0] for t in SalesFollowupTask.TASK_TYPES}
@@ -169,8 +190,12 @@ class MappingSerializer(serializers.ModelSerializer):
 class ImportSerializer(serializers.ModelSerializer):
     class Meta:
         model = MetaLeadImport
-        fields = ['id', 'mode', 'page_id', 'form_id', 'external_lead_id', 'status', 'lead',
-                  'mapping_version', 'attempt_count', 'error_code', 'error_message', 'received_at', 'processed_at']
+        fields = [
+            'id', 'mode', 'page_id', 'form_id', 'external_lead_id', 'status', 'lead',
+            'mapping_version', 'attempt_count', 'error_code', 'error_message',
+            'campaign_id', 'campaign_name', 'adset_id', 'adset_name', 'ad_id', 'ad_name', 'is_organic',
+            'received_at', 'processed_at'
+        ]
         read_only_fields = fields
 
 
@@ -196,16 +221,29 @@ class MetaAccessMixin:
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
     required_module = 'crm'
     required_submodule = 'settings'
-    action_permission_map = {'list': 'crm.settings.view', 'retrieve': 'crm.settings.view', 'metadata': 'crm.settings.view',
-                             'audit_history': 'crm.settings.view',
-                             'create': 'crm.settings.edit', 'partial_update': 'crm.settings.edit',
-                             'simulate': 'crm.settings.edit', 'retry': 'crm.settings.edit'}
+    action_permission_map = {
+        'list': 'crm.settings.view',
+        'retrieve': 'crm.settings.view',
+        'metadata': 'crm.settings.view',
+        'audit_history': 'crm.settings.view',
+        'connection': 'crm.settings.view',
+        'pages': 'crm.settings.view',
+        'forms': 'crm.settings.view',
+        'form_fields': 'crm.settings.view',
+        'create': 'crm.settings.edit',
+        'partial_update': 'crm.settings.edit',
+        'simulate': 'crm.settings.edit',
+        'retry': 'crm.settings.edit',
+        'oauth_init': 'crm.settings.edit',
+        'oauth_callback': 'crm.settings.edit',
+        'disconnect': 'crm.settings.edit',
+        'reconnect': 'crm.settings.edit',
+    }
     pagination_class = MetaPagination
 
     def initial(self, request, *args, **kwargs):
         super().initial(request, *args, **kwargs)
         self.alias = require_tenant_alias()
-        # Integration routing is organisation-wide; branch staff must not see other branches' intake data.
         if getattr(request.user, '_auth_type', None) != 'tenant':
             raise PermissionDenied('Sign in as a tenant administrator.')
         self.organization = getattr(request.user, 'organization', None)
@@ -287,6 +325,309 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
             })
         return Response({'results': results})
 
+    @action(detail=False, methods=['post'], url_path='oauth-init')
+    def oauth_init(self, request):
+        redirect_uri = request.data.get('redirect_uri')
+        if not redirect_uri:
+            raise ValidationError({'redirect_uri': 'A valid callback redirect URI is required.'})
+
+        client = MetaGraphClient()
+        if not client.app_id:
+            return Response({
+                'live_available': False,
+                'error': 'Meta Lead Ads integration is pending platform setup. META_APP_ID is not configured in backend environment.',
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        tenant_id = request.tenant_id if hasattr(request, 'tenant_id') else str(self.organization.id)
+        state_token = generate_oauth_state(
+            tenant_id=tenant_id,
+            organization_id=str(self.organization.id),
+            user_id=str(request.user.id),
+            redirect_uri=redirect_uri,
+        )
+        auth_url = client.build_authorize_url(state=state_token, redirect_uri=redirect_uri)
+
+        record_business_audit(
+            organization=self.organization, module='crm', action_code='META_OAUTH_INITIATED',
+            entity_type='MetaConnection', entity_id=None, actor_user=request.user,
+            metadata={'redirect_uri': redirect_uri}, db_alias=self.alias
+        )
+        return Response({'authorize_url': auth_url, 'state': state_token, 'live_available': True})
+
+    @action(detail=False, methods=['get', 'post'], url_path='oauth_callback')
+    def oauth_callback_alias(self, request):
+        """Snake-case alias for oauth-callback endpoint."""
+        return self.oauth_callback(request)
+
+    @action(detail=False, methods=['get', 'post'], url_path='oauth-callback')
+    def oauth_callback(self, request):
+        is_browser_redirect = (request.method == 'GET')
+        if is_browser_redirect:
+            # Check for Meta authorization errors / cancellation
+            error_code = request.query_params.get('error') or request.query_params.get('error_reason')
+            error_desc = request.query_params.get('error_description') or ''
+            if error_code:
+                logger.warning("Meta OAuth browser redirect returned error: %s - %s", error_code, error_desc)
+                return HttpResponseRedirect(f"/crm/settings?meta_error={urllib.parse.quote(str(error_code))}&meta_desc={urllib.parse.quote(str(error_desc))}")
+
+            code = request.query_params.get('code')
+            state_token = request.query_params.get('state')
+            redirect_uri = request.query_params.get('redirect_uri')
+        else:
+            code = request.data.get('code')
+            state_token = request.data.get('state')
+            redirect_uri = request.data.get('redirect_uri')
+
+        if not code or not state_token:
+            if is_browser_redirect:
+                return HttpResponseRedirect("/crm/settings?meta_error=missing_code_or_state")
+            raise ValidationError('code and state are required.')
+
+        try:
+            # Verify signature, 15-min expiration, and single-use nonce (replay prevention)
+            state_data = verify_oauth_state(state_token, consume=True)
+        except ValueError as exc:
+            logger.warning("OAuth callback rejected: %s", exc)
+            if is_browser_redirect:
+                return HttpResponseRedirect(f"/crm/settings?meta_error=invalid_state&meta_desc={urllib.parse.quote(str(exc))}")
+            raise ValidationError({'state': str(exc)})
+
+        # Organization and User binding verification
+        expected_org_id = state_data.get('organization_id')
+        initiating_user_id = state_data.get('user_id')
+
+        if hasattr(self, 'organization') and self.organization:
+            if expected_org_id != str(self.organization.id):
+                raise PermissionDenied('OAuth state is bound to a different tenant organisation.')
+            if hasattr(request, 'user') and request.user.is_authenticated:
+                if initiating_user_id and str(request.user.id) != str(initiating_user_id):
+                    raise PermissionDenied('OAuth state is bound to a different initiating user.')
+
+        if not redirect_uri:
+            redirect_uri = state_data.get('redirect_uri') or request.build_absolute_uri('/api/v1/tenant/meta-lead-mappings/oauth-callback/')
+
+        client = MetaGraphClient()
+        try:
+            tokens_data = client.exchange_code_for_tokens(code=code, redirect_uri=redirect_uri)
+        except Exception as exc:
+            logger.error("Meta token exchange failed: %s", exc)
+            return Response({'error': f'Failed to exchange authorization code with Meta: {exc}'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user_token = tokens_data['user_access_token']
+        meta_user_id = tokens_data['meta_user_id']
+        meta_user_name = tokens_data['meta_user_name']
+        from datetime import timedelta
+        expires_at = timezone.now() + timedelta(seconds=tokens_data.get('expires_in', 5184000))
+
+        with transaction.atomic(using=self.alias):
+            conn, _ = MetaConnection.objects.using(self.alias).update_or_create(
+                organization=self.organization,
+                defaults={
+                    'status': 'CONNECTED',
+                    'meta_user_id': meta_user_id,
+                    'meta_user_name': meta_user_name,
+                    'encrypted_user_access_token': encrypt_token(user_token),
+                    'token_expires_at': expires_at,
+                    'scopes': ['leads_retrieval', 'pages_show_list', 'pages_read_engagement', 'pages_manage_ads'],
+                    'last_connected_at': timezone.now(),
+                    'last_error': '',
+                }
+            )
+
+            discovered_pages = []
+            try:
+                pages_data = client.fetch_user_pages(user_token)
+                for p in pages_data:
+                    p_id = str(p['id'])
+                    p_name = p.get('name', f"Page {p_id}")
+                    p_token = p.get('access_token', '')
+
+                    subscribed = False
+                    if p_token:
+                        try:
+                            subscribed = client.subscribe_page_to_webhooks(p_id, p_token)
+                        except Exception as sub_err:
+                            logger.warning("Could not subscribe page %s to webhooks: %s", p_id, sub_err)
+
+                    MetaPageConnection.objects.using(self.alias).update_or_create(
+                        organization=self.organization,
+                        page_id=p_id,
+                        defaults={
+                            'connection': conn,
+                            'page_name': p_name,
+                            'encrypted_page_access_token': encrypt_token(p_token),
+                            'is_subscribed_to_webhooks': subscribed,
+                            'subscribed_at': timezone.now() if subscribed else None,
+                            'is_active': True,
+                        }
+                    )
+
+                    tenant_id = getattr(request, 'tenant_id', None)
+                    if tenant_id:
+                        from apps.master.models_tenant import Tenant
+                        tenant_obj = Tenant.objects.using('default').filter(id=tenant_id).first()
+                        if tenant_obj:
+                            MetaPageRegistry.objects.using('default').update_or_create(
+                                page_id=p_id,
+                                defaults={'tenant': tenant_obj, 'page_name': p_name, 'is_active': True}
+                            )
+
+                    discovered_pages.append({
+                        'page_id': p_id,
+                        'page_name': p_name,
+                        'is_subscribed': subscribed,
+                    })
+
+            except Exception as page_exc:
+                logger.error("Failed to discover pages for user %s: %s", meta_user_id, page_exc)
+
+            record_business_audit(
+                organization=self.organization, module='crm', action_code='META_ACCOUNT_CONNECTED',
+                entity_type='MetaConnection', entity_id=conn.id, actor_user=request.user,
+                metadata={'meta_user_name': meta_user_name, 'pages_count': len(discovered_pages)}, db_alias=self.alias
+            )
+
+        if is_browser_redirect:
+            return HttpResponseRedirect(f"/crm/settings?meta_connected=true&pages={len(discovered_pages)}")
+
+        return Response({
+            'status': 'CONNECTED',
+            'meta_user_name': meta_user_name,
+            'pages': discovered_pages,
+            'expires_at': expires_at.isoformat(),
+        })
+
+    @action(detail=False, methods=['get'], url_path='connection')
+    def connection(self, request):
+        conn = MetaConnection.objects.using(self.alias).filter(organization=self.organization).first()
+        if not conn:
+            return Response({'status': 'NOT_CONNECTED', 'pages': []})
+
+        pages = list(MetaPageConnection.objects.using(self.alias).filter(
+            organization=self.organization, is_active=True
+        ).values('id', 'page_id', 'page_name', 'is_subscribed_to_webhooks', 'subscribed_at'))
+
+        return Response({
+            'status': conn.status,
+            'meta_user_id': conn.meta_user_id,
+            'meta_user_name': conn.meta_user_name,
+            'token_expires_at': conn.token_expires_at.isoformat() if conn.token_expires_at else None,
+            'scopes': conn.scopes,
+            'last_connected_at': conn.last_connected_at.isoformat() if conn.last_connected_at else None,
+            'last_error': conn.last_error,
+            'pages': pages,
+        })
+
+    @action(detail=False, methods=['post'], url_path='disconnect')
+    def disconnect(self, request):
+        conn = MetaConnection.objects.using(self.alias).filter(organization=self.organization).first()
+        if not conn:
+            return Response({'status': 'NOT_CONNECTED'})
+
+        with transaction.atomic(using=self.alias):
+            client = MetaGraphClient()
+            for p_conn in MetaPageConnection.objects.using(self.alias).filter(organization=self.organization):
+                token = decrypt_token(p_conn.encrypted_page_access_token)
+                if token:
+                    try:
+                        client.unsubscribe_page_from_webhooks(p_conn.page_id, token)
+                    except Exception:
+                        pass
+                p_conn.encrypted_page_access_token = ''
+                p_conn.is_subscribed_to_webhooks = False
+                p_conn.is_active = False
+                p_conn.save(using=self.alias)
+
+            conn.status = 'DISCONNECTED'
+            conn.encrypted_user_access_token = ''
+            conn.last_error = ''
+            conn.save(using=self.alias)
+
+            record_business_audit(
+                organization=self.organization, module='crm', action_code='META_ACCOUNT_DISCONNECTED',
+                entity_type='MetaConnection', entity_id=conn.id, actor_user=request.user,
+                metadata={'status': 'DISCONNECTED'}, db_alias=self.alias
+            )
+
+        return Response({'status': 'DISCONNECTED'})
+
+    @action(detail=False, methods=['get'], url_path='pages')
+    def pages(self, request):
+        pages = list(MetaPageConnection.objects.using(self.alias).filter(
+            organization=self.organization, is_active=True
+        ).values('id', 'page_id', 'page_name', 'is_subscribed_to_webhooks'))
+        return Response({'results': pages})
+
+    @action(detail=False, methods=['get'], url_path='forms')
+    def forms(self, request):
+        page_id = request.query_params.get('page_id')
+        if not page_id:
+            raise ValidationError({'page_id': 'Query parameter page_id is required.'})
+
+        page_conn = MetaPageConnection.objects.using(self.alias).filter(
+            organization=self.organization, page_id=page_id, is_active=True
+        ).first()
+
+        if not page_conn:
+            return Response({'results': [], 'notice': 'Page is not connected. Enter form ID manually.'})
+
+        token = decrypt_token(page_conn.encrypted_page_access_token)
+        if not token:
+            return Response({'results': [], 'notice': 'Page token not available. Re-authorize connection.'})
+
+        client = MetaGraphClient()
+        try:
+            forms_data = client.fetch_page_forms(page_id, token)
+            results = []
+            for f in forms_data:
+                results.append({
+                    'id': f['id'],
+                    'name': f.get('name', f"Form {f['id']}"),
+                    'status': f.get('status', 'ACTIVE'),
+                    'questions_count': len(f.get('questions', [])),
+                })
+            return Response({'results': results})
+        except MetaTokenExpiredError:
+            return Response({'results': [], 'error': 'TOKEN_EXPIRED', 'message': 'Page token expired. Please reconnect.'}, status=401)
+        except Exception as exc:
+            logger.warning("Could not fetch forms for page %s: %s", page_id, exc)
+            return Response({'results': [], 'error': str(exc)})
+
+    @action(detail=False, methods=['get'], url_path='form-fields')
+    def form_fields(self, request):
+        page_id = request.query_params.get('page_id')
+        form_id = request.query_params.get('form_id')
+        if not page_id or not form_id:
+            raise ValidationError('Both page_id and form_id are required.')
+
+        page_conn = MetaPageConnection.objects.using(self.alias).filter(
+            organization=self.organization, page_id=page_id, is_active=True
+        ).first()
+
+        if not page_conn:
+            return Response({'questions': []})
+
+        token = decrypt_token(page_conn.encrypted_page_access_token)
+        if not token:
+            return Response({'questions': []})
+
+        client = MetaGraphClient()
+        try:
+            form_data = client.fetch_form_details(form_id, token)
+            questions = form_data.get('questions', [])
+            mapped_questions = []
+            for q in questions:
+                mapped_questions.append({
+                    'key': q.get('key') or q.get('field_key') or q.get('name', ''),
+                    'label': q.get('label') or q.get('name', ''),
+                    'type': q.get('type', 'CUSTOM'),
+                    'options': [opt.get('value') or opt.get('key') for opt in q.get('options', [])] if q.get('options') else [],
+                })
+            return Response({'questions': mapped_questions, 'form_name': form_data.get('name', '')})
+        except Exception as exc:
+            logger.warning("Could not fetch form fields for %s: %s", form_id, exc)
+            return Response({'questions': [], 'error': str(exc)})
+
     @action(detail=False, methods=['get'])
     def metadata(self, request):
         config = CRMAgentAssignmentConfig.objects.using(self.alias).filter(organization=self.organization).first()
@@ -302,8 +643,17 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
         for u in eligible_users:
             u['name'] = f"{u['first_name']} {u['last_name']}".strip() or u['email']
 
+        conn = MetaConnection.objects.using(self.alias).filter(organization=self.organization).first()
+        app_id, _, _ = get_meta_app_credentials()
+
         return Response({
-            'connection_status': 'NOT_CONNECTED', 'live_available': False,
+            'connection_status': conn.status if conn else 'NOT_CONNECTED',
+            'connected_user_name': conn.meta_user_name if conn else '',
+            'connected_user_id': conn.meta_user_id if conn else '',
+            'token_expires_at': conn.token_expires_at.isoformat() if conn and conn.token_expires_at else None,
+            'live_available': bool(app_id),
+            'app_id_configured': bool(app_id),
+            'webhook_endpoint': '/api/v1/webhooks/meta/leads/',
             'simulator_enabled': simulator_enabled(),
             'simulator_requirement': 'Development/test deployment, DEBUG enabled, META_LEAD_SIMULATOR_ENABLED enabled and COMMUNICATIONS_OUTBOUND_ENABLED disabled.',
             'destination_fields': [{'value': k, 'label': v} for k, v in DESTINATION_FIELDS.items()],
@@ -339,13 +689,22 @@ class MetaLeadImportViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retri
     serializer_class = ImportSerializer
 
     def get_queryset(self):
-        qs = MetaLeadImport.objects.using(self.alias).filter(organization=self.organization, mode='SIMULATOR')
+        qs = MetaLeadImport.objects.using(self.alias).filter(organization=self.organization)
+        mode = self.request.query_params.get('mode')
+        if mode:
+            qs = qs.filter(mode=mode)
         status = self.request.query_params.get('status')
-        return qs.filter(status=status) if status else qs
+        if status:
+            qs = qs.filter(status=status)
+        return qs
 
     def retrieve(self, request, *args, **kwargs):
         event = self.get_object()
-        return Response({**self.get_serializer(event).data, 'field_data': event.field_data, 'mapping_snapshot': event.mapping_snapshot})
+        return Response({
+            **self.get_serializer(event).data,
+            'field_data': event.field_data,
+            'mapping_snapshot': event.mapping_snapshot,
+        })
 
     @action(detail=False, methods=['post'])
     def simulate(self, request):
@@ -357,5 +716,8 @@ class MetaLeadImportViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retri
     @action(detail=True, methods=['post'])
     def retry(self, request, pk=None):
         event = self.get_object()
-        event = process_simulation(self.organization, event.id, request.user)
+        if event.mode == 'LIVE':
+            event = process_live_import(self.organization, event.id, request.user, alias=self.alias)
+        else:
+            event = process_simulation(self.organization, event.id, request.user)
         return Response(self.get_serializer(event).data)

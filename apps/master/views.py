@@ -947,6 +947,24 @@ class PlatformUserViewSet(viewsets.ModelViewSet):
     serializer_class = PlatformUserSerializer
     queryset = PlatformUser.objects.using('default').all()
 
+    @action(detail=True, methods=['post'], url_path='reset-password')
+    def reset_password(self, request, pk=None):
+        """Administrative password reset for a platform user."""
+        user = self.get_object()
+        new_password = request.data.get('password') or request.data.get('new_password')
+        if not new_password:
+            return Response({'error': 'Password is required.', 'detail': 'Password is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if len(new_password) < 8:
+            return Response({'error': 'Password must be at least 8 characters long.', 'detail': 'Password must be at least 8 characters long.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user.set_password(new_password)
+        user.save(using='default')
+
+        from apps.master.services_auth_directory import sync_platform_user_identity
+        sync_platform_user_identity(user)
+
+        return Response({'message': f'Password for {user.email} has been successfully reset.'}, status=status.HTTP_200_OK)
+
 
 class MarketplaceIntegrationViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [PlatformRBACPermission]

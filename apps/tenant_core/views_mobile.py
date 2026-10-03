@@ -56,7 +56,7 @@ from .models_org import Organization, Branch
 from .models_users import TenantUser
 from .models_rbac import Role, RoleAssignment
 from .models_workforce import UserProfile, TrainerProfile
-from .models_classes import ClassTemplate, ClassOccurrence, ClassPrice
+from .models_classes import ClassTemplate, ClassOccurrence, ClassPrice, PackageClassAccessRule
 from .models_bookings import Booking, BookingCancellation
 from .models_catalog import Package, PackageVersion, PackagePrice, PackageEntitlementDefinition
 from .models_memberships import Membership, MembershipEntitlement
@@ -75,19 +75,9 @@ def _resolve_mobile_tenant_and_db(request):
     Resolves the tenant and registers/returns the active tenant DB alias.
     Defaults to 'sweat' if not explicitly provided via X-Tenant-Slug header or params.
     """
-    active_alias = get_tenant_db_alias()
-    if active_alias:
-        return active_alias, None
-
-    # Check authenticated user's state db
-    if getattr(request, 'user', None) and request.user.is_authenticated:
-        user_db = getattr(getattr(request.user, '_state', None), 'db', None)
-        if user_db:
-            set_tenant_db_alias(user_db)
-            return user_db, None
-
     tenant_slug = (
-        request.headers.get('X-Tenant-Slug')
+        (request.headers.get('X-Tenant-Slug') if hasattr(request, 'headers') else None)
+        or request.META.get('HTTP_X_TENANT_SLUG')
         or request.query_params.get('tenant')
         or (request.data.get('tenant_slug') if hasattr(request, 'data') and isinstance(request.data, dict) else None)
         or 'sweat'
@@ -97,6 +87,17 @@ def _resolve_mobile_tenant_and_db(request):
     if not tenant:
         # Fallback to the first active tenant in platform
         tenant = Tenant.objects.using('default').filter(status='ACTIVE').first()
+
+    active_alias = get_tenant_db_alias()
+    if active_alias and tenant:
+        return active_alias, tenant
+
+    # Check authenticated user's state db
+    if getattr(request, 'user', None) and request.user.is_authenticated:
+        user_db = getattr(getattr(request.user, '_state', None), 'db', None)
+        if user_db:
+            set_tenant_db_alias(user_db)
+            return user_db, tenant
 
     if not tenant:
         return None, None
@@ -568,12 +569,15 @@ class MobileTrainersView(APIView):
             ]
             results.append({
                 'id': str(t.id),
+                'name': f"{user.first_name} {user.last_name}".strip() if user else 'SWEAT Coach',
                 'full_name': f"{user.first_name} {user.last_name}".strip() if user else 'SWEAT Coach',
                 'title': emp.designation if emp and emp.designation else 'Master Reformer Instructor',
+                'designation': emp.designation if emp and emp.designation else 'Master Reformer Instructor',
                 'bio': t.bio or 'Certified Pilates Reformer & Athletic Conditioning specialist.',
                 'avatar_url': user.avatar_url if user and user.avatar_url else '',
                 'specialties': specialties or ['Reformer Pilates', 'Core Stability', 'Postural Alignment'],
                 'years_of_experience': float(t.experience_years) if t.experience_years else 5.0,
+                'experience_years': float(t.experience_years) if t.experience_years else 5.0,
             })
         return Response(results)
 
@@ -612,10 +616,13 @@ class MobileScheduleView(APIView):
             .filter(
                 models.Q(occurrence_date=target_date)
                 | (models.Q(occurrence_date__isnull=True) & models.Q(start_at__date=target_date)),
-                status__in=['SCHEDULED', 'IN_PROGRESS', 'CONFIRMED']
+                status__in=['OPEN', 'SCHEDULED', 'IN_PROGRESS', 'CONFIRMED', 'PUBLISHED', 'ACTIVE']
             )
             .select_related('class_template__category', 'branch')
-            .prefetch_related('trainer_assignments__trainer_profile__employee_profile__user_profile__user')
+            .prefetch_related(
+                'trainer_assignments__trainer_profile__employee_profile__user_profile__user',
+                'trainer_assignments__trainer_profile__specialty_assignments__specialty',
+            )
             .order_by('start_at')
         )
 
@@ -626,9 +633,25 @@ class MobileScheduleView(APIView):
 
         # Authenticated user bookings for this day to show 'CONFIRMED' / 'WAITLISTED' badges
         user_booking_map = {}
+        included_class_ids = None
         if request.user and request.user.is_authenticated:
             user_profile = UserProfile.objects.using(alias).filter(user=request.user).first()
             if user_profile:
+                # Resolve active membership and its package class access rules
+                active_mem = (
+                    Membership.objects.using(alias)
+                    .filter(user_profile=user_profile, status='ACTIVE', end_date__gte=timezone.now().date())
+                    .order_by('-created_at')
+                    .first()
+                )
+                if active_mem and active_mem.package_version_id:
+                    rules = PackageClassAccessRule.objects.using(alias).filter(
+                        package_version_id=active_mem.package_version_id, access_type='INCLUDED'
+                    )
+                    rule_ids = {str(r.class_template_id) for r in rules if r.class_template_id}
+                    if rule_ids:
+                        included_class_ids = rule_ids
+
                 user_bookings = Booking.objects.using(alias).filter(
                     user_profile=user_profile,
                     occurrence__in=qs,
@@ -669,9 +692,19 @@ class MobileScheduleView(APIView):
             trainer_name = 'SWEAT Trainer'
             trainer_photo = ''
             trainer_title = 'Master Coach'
+            trainer_bio = 'Certified Reformer Pilates & Conditioning Specialist.'
+            trainer_specialties = ['Reformer Pilates', 'Strength & Core', 'Postural Alignment']
+            trainer_experience = 5.0
+
             trainer_assignment = occ.trainer_assignments.filter(trainer_role='LEAD').first() or occ.trainer_assignments.first()
             if trainer_assignment and trainer_assignment.trainer_profile:
                 t_prof = trainer_assignment.trainer_profile
+                trainer_bio = t_prof.bio or trainer_bio
+                trainer_experience = float(t_prof.experience_years) if t_prof.experience_years else 5.0
+                specs = [sa.specialty.name for sa in t_prof.specialty_assignments.all() if sa.specialty and sa.is_active]
+                if specs:
+                    trainer_specialties = specs
+
                 emp = getattr(t_prof, 'employee_profile', None)
                 if emp:
                     trainer_title = emp.designation or trainer_title
@@ -681,6 +714,7 @@ class MobileScheduleView(APIView):
                         trainer_photo = t_user.avatar_url or ''
 
             user_booking = user_booking_map.get(str(occ.id))
+            is_included = (str(template.id) in included_class_ids) if (included_class_ids is not None and template) else True
 
             results.append({
                 'id': str(occ.id),
@@ -700,6 +734,9 @@ class MobileScheduleView(APIView):
                     'name': trainer_name,
                     'title': trainer_title,
                     'avatar_url': trainer_photo,
+                    'bio': trainer_bio,
+                    'specialties': trainer_specialties,
+                    'experience_years': trainer_experience,
                 },
                 'capacity': {
                     'total_capacity': total_capacity,
@@ -710,6 +747,7 @@ class MobileScheduleView(APIView):
                     'is_waitlist_open': is_waitlist_open,
                 },
                 'user_booking': user_booking,
+                'is_included_in_plan': is_included,
             })
 
         return Response({
@@ -811,13 +849,15 @@ class MobileBookClassView(APIView):
     """
     permission_classes = [IsAuthenticated]
 
-    def post(self, request):
+    def post(self, request, occurrence_id=None):
         user = request.user
-        alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
         profile = _get_or_create_user_profile(user, alias)
 
-        occurrence_id = request.data.get('occurrence_id')
-        if not occurrence_id:
+        occ_id = occurrence_id or request.data.get('occurrence_id')
+        if not occ_id:
             return Response({'detail': 'occurrence_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
         # 1. Resolve occurrence
@@ -825,7 +865,7 @@ class MobileBookClassView(APIView):
             occurrence = (
                 ClassOccurrence.objects.using(alias)
                 .select_related('class_template__category__organization', 'branch')
-                .get(id=occurrence_id)
+                .get(id=occ_id)
             )
         except ClassOccurrence.DoesNotExist:
             return Response({'detail': 'Class slot not found.'}, status=status.HTTP_404_NOT_FOUND)
@@ -954,10 +994,12 @@ class MobileMyBookingsView(APIView):
             item = {
                 'id': str(b.id),
                 'booking_number': b.booking_number,
+                'occurrence_id': str(occ.id) if occ else None,
                 'status': b.status,
                 'booking_type': b.booking_type,
                 'waitlist_position': b.waitlist_position,
                 'class_name': template.name if template else 'Reformer Pilates',
+                'category': template.category.name if template and template.category else 'Bootcamp',
                 'branch_name': branch.name if branch else 'SWEAT Studio',
                 'date': occ.occurrence_date.isoformat() if occ and occ.occurrence_date else None,
                 'start_at': occ.start_at.isoformat() if occ and occ.start_at else None,
@@ -965,6 +1007,8 @@ class MobileMyBookingsView(APIView):
                 'duration_minutes': template.default_duration_minutes if template else 50,
                 'trainer_name': trainer_name,
                 'booked_at': b.booked_at.isoformat() if b.booked_at else None,
+                'can_reschedule': (b.status in ['CONFIRMED', 'RESERVED']),
+                'can_cancel': (b.status in ['CONFIRMED', 'RESERVED']),
             }
 
             if b.status == 'WAITLISTED' and occ and occ.start_at >= now:
@@ -994,7 +1038,9 @@ class MobileCancelBookingView(APIView):
 
     def post(self, request, booking_id):
         user = request.user
-        alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
         profile = _get_or_create_user_profile(user, alias)
 
         try:
@@ -1038,6 +1084,74 @@ class MobileCancelBookingView(APIView):
         })
 
 
+class MobileRescheduleBookingView(APIView):
+    """
+    POST /api/v1/mobile/bookings/<uuid:booking_id>/reschedule/
+    Reschedules a member's own booking to another eligible class occurrence.
+    Validates cutoff, verifies capacity/waitlist, transfers session credit entitlement.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, booking_id):
+        user = request.user
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
+        profile = _get_or_create_user_profile(user, alias)
+
+        try:
+            booking = (
+                Booking.objects.using(alias)
+                .select_related('occurrence__class_template__category__organization', 'branch', 'user_profile')
+                .get(id=booking_id)
+            )
+        except Booking.DoesNotExist:
+            return Response({'detail': 'Booking not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if booking.user_profile_id != profile.id:
+            return Response({'detail': 'You can only reschedule your own bookings.'}, status=status.HTTP_403_FORBIDDEN)
+
+        if booking.status in ['CANCELLED', 'COMPLETED', 'NO_SHOW']:
+            return Response({'detail': f'Booking is already {booking.status.lower()} and cannot be rescheduled.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        to_occurrence_id = request.data.get('to_occurrence_id') or request.data.get('new_occurrence_id')
+        if not to_occurrence_id:
+            return Response({'detail': 'to_occurrence_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            to_occurrence = (
+                ClassOccurrence.objects.using(alias)
+                .select_related('class_template__category__organization', 'branch')
+                .get(id=to_occurrence_id)
+            )
+        except ClassOccurrence.DoesNotExist:
+            return Response({'detail': 'Target class slot not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            new_booking = BookingWaitlistAttendanceService.reschedule_booking(
+                booking=booking,
+                to_occurrence=to_occurrence,
+                rescheduled_by_user=user,
+                reason_code='MEMBER_PORTAL_RESCHEDULE',
+                reason_text=request.data.get('reason', 'Rescheduled by member via Member Portal'),
+                db_alias=alias,
+            )
+            return Response({
+                'detail': 'Workout rescheduled successfully!',
+                'booking_id': str(new_booking.id),
+                'booking_number': new_booking.booking_number,
+                'status': new_booking.status,
+                'class_name': to_occurrence.class_template.name,
+                'start_at': to_occurrence.start_at.isoformat() if to_occurrence.start_at else None,
+                'branch_name': to_occurrence.branch.name if to_occurrence.branch else 'SWEAT Studio',
+            }, status=status.HTTP_200_OK)
+        except ValidationError as e:
+            detail = e.messages[0] if hasattr(e, 'messages') and e.messages else str(e)
+            return Response({'detail': detail}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
 class MobileQRPassView(APIView):
     """
     GET /api/v1/mobile/bookings/<uuid:booking_id>/qr-pass/
@@ -1045,10 +1159,36 @@ class MobileQRPassView(APIView):
     """
     permission_classes = [IsAuthenticated]
 
-    def get(self, request, booking_id):
+    def get(self, request, booking_id=None):
         user = request.user
-        alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
         profile = _get_or_create_user_profile(user, alias)
+
+        if not booking_id:
+            # General Member Digital Turnstile Access Pass
+            valid_until_ts = int(timezone.now().timestamp()) + 86400
+            pass_data = {
+                'uid': str(user.id),
+                'mno': profile.member_number or 'MEM-1CCA18',
+                'name': f"{user.first_name} {user.last_name}".strip(),
+                'branch': user.home_branch.name if getattr(user, 'home_branch', None) else 'All SWEAT Studios',
+                'type': 'STUDIO_TURNSTILE_ACCESS',
+                'exp': valid_until_ts,
+            }
+            raw_str = json.dumps(pass_data, separators=(',', ':'))
+            sig = hmac.new(settings.SECRET_KEY.encode('utf-8'), raw_str.encode('utf-8'), hashlib.sha256).hexdigest()[:16]
+            token = f"{base64.urlsafe_b64encode(raw_str.encode()).decode().rstrip('=')}.{sig}"
+            return Response({
+                'pass_id': str(uuid.uuid4()),
+                'qr_token': token,
+                'qr_payload': token,
+                'member_name': pass_data['name'],
+                'membership_number': pass_data['mno'],
+                'branch_name': pass_data['branch'],
+                'valid_until': datetime.fromtimestamp(valid_until_ts).isoformat(),
+            })
 
         try:
             booking = (
@@ -1526,7 +1666,22 @@ class MobileOnboardingSurveyView(APIView):
             },
         ]
 
-        return Response({'sections': survey_sections})
+        saved_onboarding = None
+        if request.user and request.user.is_authenticated:
+            user_profile = UserProfile.objects.using(alias).filter(user=request.user).first()
+            if user_profile and user_profile.address_json:
+                saved_onboarding = user_profile.address_json.get('onboarding')
+
+        is_cleared = False
+        if saved_onboarding:
+            is_cleared = not saved_onboarding.get('requires_doctor_clearance', False)
+
+        return Response({
+            'sections': survey_sections,
+            'saved_responses': saved_onboarding,
+            'is_cleared': is_cleared,
+            'is_completed': saved_onboarding is not None,
+        })
 
 
 class MobileOnboardingSubmitView(APIView):
@@ -1565,11 +1720,169 @@ class MobileOnboardingSubmitView(APIView):
         profile.save(using=alias)
 
         return Response({
-            'detail': 'Onboarding and health assessment saved successfully.',
+            'detail': 'PAR-Q health assessment saved successfully.',
             'requires_doctor_clearance': requires_doctor_clearance,
+            'is_cleared': not requires_doctor_clearance,
             'message': (
-                'Please note: Your answers indicate you may require a doctor clearance before intense sessions.'
+                'Notice: Based on your health responses, a medical clearance is recommended prior to high intensity sessions.'
                 if requires_doctor_clearance
-                else 'Assessment complete! You are ready to book your first class.'
+                else 'PAR-Q Cleared! You are medically cleared to participate in all studio workouts.'
             ),
         })
+
+
+class MobilePTAppointmentsView(APIView):
+    """
+    GET, POST /api/v1/mobile/pt/appointments/
+    Lists and books 1-on-1 Personal Training appointments for authenticated members.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
+        profile = _get_or_create_user_profile(user, alias)
+
+        from .models_appointments import Appointment
+        appts = (
+            Appointment.objects.using(alias)
+            .filter(user_profile=profile)
+            .select_related('appointment_type', 'branch')
+            .prefetch_related('assigned_trainers__trainer_profile__employee_profile__user_profile__user')
+            .order_by('-start_at')
+        )
+
+        results = []
+        for a in appts:
+            assigned = a.assigned_trainers.first()
+            trainer_name = 'SWEAT Master Coach'
+            trainer_photo = ''
+            trainer_designation = 'Personal Trainer'
+            if assigned and assigned.trainer_profile:
+                t_prof = assigned.trainer_profile
+                emp = getattr(t_prof, 'employee_profile', None)
+                if emp:
+                    trainer_designation = emp.designation or trainer_designation
+                    if emp.user_profile and emp.user_profile.user:
+                        u = emp.user_profile.user
+                        trainer_name = f"{u.first_name} {u.last_name}".strip()
+                        trainer_photo = u.avatar_url or ''
+
+            results.append({
+                'id': str(a.id),
+                'appointment_number': f"PT-{str(a.id)[:8].upper()}",
+                'type_name': a.appointment_type.name if a.appointment_type else '1-on-1 Personal Training',
+                'status': a.status,
+                'start_at': a.start_at.isoformat() if a.start_at else None,
+                'end_at': a.end_at.isoformat() if a.end_at else None,
+                'trainer_name': trainer_name,
+                'trainer_avatar': trainer_photo,
+                'trainer_designation': trainer_designation,
+                'branch_name': a.branch.name if a.branch else 'SWEAT Studio',
+                'notes': a.notes or '',
+            })
+        return Response(results)
+
+    def post(self, request):
+        user = request.user
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
+        profile = _get_or_create_user_profile(user, alias)
+
+        from .models_appointments import Appointment, AppointmentType, AppointmentTrainer
+
+        data = request.data
+        trainer_id = data.get('trainer_id')
+        start_at_str = data.get('start_at')
+        duration_minutes = int(data.get('duration_minutes', 60))
+        focus = data.get('focus', 'Pilates Core & Athletic Conditioning')
+        notes = data.get('notes', f"Focus: {focus}")
+
+        if not start_at_str:
+            return Response({'detail': 'start_at date and time is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            start_at = datetime.fromisoformat(start_at_str)
+            if timezone.is_naive(start_at):
+                start_at = timezone.make_aware(start_at)
+        except Exception:
+            return Response({'detail': 'Invalid datetime format for start_at.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        end_at = start_at + timedelta(minutes=duration_minutes)
+
+        org = Organization.objects.using(alias).first()
+        branch = getattr(user, 'home_branch', None) or Branch.objects.using(alias).filter(status='ACTIVE').first()
+
+        appt_type = AppointmentType.objects.using(alias).filter(status='ACTIVE').first()
+        if not appt_type:
+            appt_type = AppointmentType.objects.using(alias).create(
+                organization=org,
+                code='PT-1ON1',
+                name='1-on-1 Personal Training',
+                default_duration_minutes=60,
+                default_delivery_mode='OFFLINE',
+                requires_trainer=True,
+                status='ACTIVE',
+            )
+
+        with transaction.atomic(using=alias):
+            appt = Appointment.objects.using(alias).create(
+                branch=branch,
+                appointment_type=appt_type,
+                user_profile=profile,
+                start_at=start_at,
+                end_at=end_at,
+                status='CONFIRMED',
+                booking_source='WEB',
+                notes=notes,
+            )
+
+            if trainer_id:
+                trainer_prof = TrainerProfile.objects.using(alias).filter(id=trainer_id).first()
+                if trainer_prof:
+                    AppointmentTrainer.objects.using(alias).create(
+                        appointment=appt,
+                        trainer_profile=trainer_prof,
+                        role='LEAD',
+                    )
+
+        return Response({
+            'detail': '1-on-1 Personal Training session scheduled successfully!',
+            'appointment_id': str(appt.id),
+            'appointment_number': f"PT-{str(appt.id)[:8].upper()}",
+            'status': appt.status,
+            'start_at': appt.start_at.isoformat(),
+        }, status=status.HTTP_201_CREATED)
+
+
+class MobileCancelPTAppointmentView(APIView):
+    """
+    POST /api/v1/mobile/pt/appointments/<uuid:appointment_id>/cancel/
+    Cancels a member's 1-on-1 Personal Training appointment.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, appointment_id):
+        user = request.user
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
+        profile = _get_or_create_user_profile(user, alias)
+
+        from .models_appointments import Appointment
+        try:
+            appt = Appointment.objects.using(alias).get(id=appointment_id, user_profile=profile)
+        except Appointment.DoesNotExist:
+            return Response({'detail': 'Appointment not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        appt.status = 'CANCELLED'
+        appt.save(using=alias)
+
+        return Response({
+            'detail': 'Personal Training appointment cancelled successfully.',
+            'appointment_id': str(appt.id),
+            'status': 'CANCELLED',
+        }, status=status.HTTP_200_OK)

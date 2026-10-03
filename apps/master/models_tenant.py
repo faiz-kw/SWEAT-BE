@@ -262,3 +262,25 @@ class TenantBranding(models.Model):
         self._orig_secondary_color = self.secondary_color
         self._orig_accent_color = self.accent_color
 
+
+
+class MetaPageRegistry(models.Model):
+    """
+    Platform-level registry mapping Meta Facebook Page IDs to Tenant records.
+    Used by public webhook receiver to safely resolve tenant DB context in O(1)
+    without trusting client parameters or scanning tenant databases.
+    """
+    page_id = models.CharField(max_length=100, primary_key=True)
+    tenant = models.ForeignKey(Tenant, on_delete=models.CASCADE, related_name='meta_page_registrations')
+    page_name = models.CharField(max_length=255, blank=True, default='')
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        app_label = 'master'
+        db_table = 'master_meta_page_registry'
+        indexes = [models.Index(fields=['tenant', 'is_active'], name='master_meta_tenant__e7f41a_idx')]
+
+    def __str__(self):
+        return f"{self.page_name or self.page_id} -> Tenant {self.tenant.slug}"

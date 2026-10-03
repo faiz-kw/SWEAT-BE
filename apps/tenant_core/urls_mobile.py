@@ -11,6 +11,7 @@ from .views_mobile import (
     MobileBookClassView,
     MobileMyBookingsView,
     MobileCancelBookingView,
+    MobileRescheduleBookingView,
     MobileQRPassView,
     MobilePackagesView,
     MobileMyCreditsView,
@@ -19,6 +20,8 @@ from .views_mobile import (
     MobileCheckoutVerifyView,
     MobileOnboardingSurveyView,
     MobileOnboardingSubmitView,
+    MobilePTAppointmentsView,
+    MobileCancelPTAppointmentView,
 )
 
 app_name = 'mobile_api'
@@ -28,28 +31,39 @@ urlpatterns = [
     path('auth/register/', MobileRegisterView.as_view(), name='mobile-register'),
     path('auth/login/', MobileLoginView.as_view(), name='mobile-login'),
     path('auth/me/', MobileMeView.as_view(), name='mobile-me'),
+    path('me/', MobileMeView.as_view(), name='mobile-me-direct'),
 
     # 2. Studio Catalog & Schedule
     path('branches/', MobileBranchesView.as_view(), name='mobile-branches'),
     path('classes/', MobileClassesView.as_view(), name='mobile-classes'),
     path('trainers/', MobileTrainersView.as_view(), name='mobile-trainers'),
     path('schedule/', MobileScheduleView.as_view(), name='mobile-schedule'),
+    path('schedule/<uuid:occurrence_id>/book/', MobileBookClassView.as_view(), name='mobile-schedule-book-direct'),
 
-    # 3. Bookings, Free Trial, Cancellations & QR Pass
+    # 3. Bookings, Reschedule, Free Trial, Cancellations & QR Pass
     path('bookings/claim-free-trial/', MobileClaimFreeTrialView.as_view(), name='mobile-claim-free-trial'),
     path('bookings/book/', MobileBookClassView.as_view(), name='mobile-book-class'),
     path('bookings/my-bookings/', MobileMyBookingsView.as_view(), name='mobile-my-bookings'),
+    path('bookings/', MobileMyBookingsView.as_view(), name='mobile-bookings-direct'),
     path('bookings/<uuid:booking_id>/cancel/', MobileCancelBookingView.as_view(), name='mobile-cancel-booking'),
+    path('bookings/<uuid:booking_id>/reschedule/', MobileRescheduleBookingView.as_view(), name='mobile-reschedule-booking'),
     path('bookings/<uuid:booking_id>/qr-pass/', MobileQRPassView.as_view(), name='mobile-qr-pass'),
+    path('qr-pass/', MobileQRPassView.as_view(), name='mobile-qr-pass-direct'),
 
-    # 4. Memberships, Packs, Credits & Checkout
+    # 4. Personal Training (PT)
+    path('pt/appointments/', MobilePTAppointmentsView.as_view(), name='mobile-pt-appointments'),
+    path('pt/appointments/<uuid:appointment_id>/cancel/', MobileCancelPTAppointmentView.as_view(), name='mobile-pt-cancel'),
+
+    # 5. Memberships, Packs, Credits & Checkout
     path('packages/', MobilePackagesView.as_view(), name='mobile-packages'),
     path('my-credits/', MobileMyCreditsView.as_view(), name='mobile-my-credits'),
+    path('credits/', MobileMyCreditsView.as_view(), name='mobile-credits-direct'),
     path('coupons/validate/', MobileValidateCouponView.as_view(), name='mobile-validate-coupon'),
     path('checkout/create-order/', MobileCheckoutOrderView.as_view(), name='mobile-checkout-create-order'),
     path('checkout/verify/', MobileCheckoutVerifyView.as_view(), name='mobile-checkout-verify'),
 
-    # 5. Onboarding & Health Assessments
+    # 6. Onboarding & Health Assessments / PAR-Q
     path('onboarding/survey/', MobileOnboardingSurveyView.as_view(), name='mobile-onboarding-survey'),
+    path('onboarding-survey/', MobileOnboardingSurveyView.as_view(), name='mobile-onboarding-survey-direct'),
     path('onboarding/submit/', MobileOnboardingSubmitView.as_view(), name='mobile-onboarding-submit'),
 ]

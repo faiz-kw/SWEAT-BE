@@ -539,6 +539,31 @@ class CRMDashboardService:
         results.sort(key=lambda x: (-x['leads'], -Decimal(x['paid_revenue'])))
         return results
 
+    @classmethod
+    def _get_net_paid_orders_map(cls, order_ids: Set[Any], db_alias: str) -> Dict[Any, Decimal]:
+        """
+        Calculate net paid revenue per order: PAID / PARTIALLY_REFUNDED orders minus successful refunds.
+        """
+        if not order_ids:
+            return {}
+        orders = Order.objects.using(db_alias).filter(
+            id__in=order_ids, status__in=['PAID', 'PARTIALLY_REFUNDED']
+        ).values('id', 'total_amount')
+        order_amounts = {o['id']: o['total_amount'] for o in orders}
+
+        refund_sums: Dict[Any, Decimal] = {}
+        for ref in Refund.objects.using(db_alias).filter(
+            order_id__in=order_ids, status='SUCCESS'
+        ).values('order_id', 'amount'):
+            oid = ref['order_id']
+            refund_sums[oid] = refund_sums.get(oid, Decimal('0.00')) + ref['amount']
+
+        paid_orders_map = {}
+        for oid, amt in order_amounts.items():
+            net_amt = max(Decimal('0.00'), amt - refund_sums.get(oid, Decimal('0.00')))
+            paid_orders_map[oid] = net_amt
+        return paid_orders_map
+
     # -------------------------------------------------------------------------
     # PART G: Campaign Performance (Reusing Phase 9 Semantics)
     # -------------------------------------------------------------------------
@@ -556,7 +581,7 @@ class CRMDashboardService:
             organization=organization,
             captured_at__gte=start_dt,
             captured_at__lte=end_dt,
-        ).select_related('lead')
+        ).exclude(raw_metadata__is_test=True).select_related('lead')
 
         if effective_branch_ids is not None:
             qs = qs.filter(lead__branch_id__in=effective_branch_ids)
@@ -598,10 +623,7 @@ class CRMDashboardService:
             if conv['order_id']:
                 order_ids.add(conv['order_id'])
 
-        paid_orders_map = {}
-        if order_ids:
-            for ord_obj in Order.objects.using(db_alias).filter(id__in=order_ids, status='PAID').values('id', 'total_amount'):
-                paid_orders_map[ord_obj['id']] = ord_obj['total_amount']
+        paid_orders_map = cls._get_net_paid_orders_map(order_ids, db_alias)
 
         results = []
         for (camp_name, plat), data in campaign_map.items():
@@ -816,10 +838,7 @@ class CRMDashboardService:
         for oids in order_ids_by_agent.values():
             all_oids.update(oids)
 
-        paid_orders_map = {}
-        if all_oids:
-            for ord_row in Order.objects.using(db_alias).filter(id__in=all_oids, status='PAID').values('id', 'total_amount'):
-                paid_orders_map[ord_row['id']] = ord_row['total_amount']
+        paid_orders_map = cls._get_net_paid_orders_map(all_oids, db_alias)
 
         results = []
         for uid in agent_ids:
@@ -888,10 +907,7 @@ class CRMDashboardService:
         for oids in order_ids_by_branch.values():
             all_oids.update(oids)
 
-        paid_orders_map = {}
-        if all_oids:
-            for ord_row in Order.objects.using(db_alias).filter(id__in=all_oids, status='PAID').values('id', 'total_amount'):
-                paid_orders_map[ord_row['id']] = ord_row['total_amount']
+        paid_orders_map = cls._get_net_paid_orders_map(all_oids, db_alias)
 
         results = []
         for b in permitted_branches:
@@ -961,10 +977,7 @@ class CRMDashboardService:
         for oids in order_ids_by_date.values():
             all_oids.update(oids)
 
-        paid_orders_map = {}
-        if all_oids:
-            for ord_row in Order.objects.using(db_alias).filter(id__in=all_oids, status='PAID').values('id', 'total_amount'):
-                paid_orders_map[ord_row['id']] = ord_row['total_amount']
+        paid_orders_map = cls._get_net_paid_orders_map(all_oids, db_alias)
 
         # Generate complete continuous daily array
         trends = []

@@ -8,6 +8,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.core.exceptions import ValidationError
+from django.db import transaction
 
 from apps.tenant_core.permissions import RequireActiveTenantAndOrg, TenantRBACPermission
 from apps.tenant_core.context import get_tenant_db_alias
@@ -57,6 +58,7 @@ class DiscountCampaignViewSet(viewsets.ModelViewSet):
         'generate_code': 'core.settings.edit',
         'validate_coupon': 'core.settings.view',
         'evaluate_offers': 'core.settings.view',
+        'get_member_context': 'core.settings.view',
     }
 
     def get_queryset(self):
@@ -136,6 +138,21 @@ class DiscountCampaignViewSet(viewsets.ModelViewSet):
         )
         return Response(DiscountCodeSerializer(code).data, status=status.HTTP_201_CREATED)
 
+    @action(detail=False, methods=['get'], url_path='member-context')
+    def get_member_context(self, request):
+        user_profile_id = request.query_params.get('user_profile_id')
+        membership_id = request.query_params.get('membership_id')
+        if not user_profile_id:
+            return Response({'error': 'user_profile_id query parameter is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        db = _get_db(request)
+        try:
+            user_profile = UserProfile.objects.using(db).get(id=user_profile_id)
+        except (UserProfile.DoesNotExist, ValueError):
+            return Response({'error': 'UserProfile not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        context = DiscountCouponEngineService.resolve_member_context(user_profile, db_alias=db, membership_id=membership_id)
+        return Response(context, status=status.HTTP_200_OK)
+
     @action(detail=False, methods=['post'], url_path='validate-coupon')
     def validate_coupon(self, request):
         serializer = CouponValidationRequestSerializer(data=request.data)
@@ -162,6 +179,7 @@ class DiscountCampaignViewSet(viewsets.ModelViewSet):
             order_subtotal=data['order_subtotal'],
             branch=branch,
             package=package,
+            db_alias=db,
         )
         return Response(result, status=status.HTTP_200_OK if result['is_valid'] else status.HTTP_400_BAD_REQUEST)
 
@@ -198,6 +216,7 @@ class DiscountCampaignViewSet(viewsets.ModelViewSet):
             context=context,
             branch=branch,
             target_package=target_package,
+            db_alias=db,
         )
         return Response({'offers': offers, 'count': len(offers)}, status=status.HTTP_200_OK)
 
@@ -332,6 +351,9 @@ class DiscountEligibilityRuleViewSet(viewsets.ModelViewSet):
         'destroy': 'core.settings.edit',
         'add_condition': 'core.settings.edit',
         'add_action': 'core.settings.edit',
+        'sync_conditions_actions': 'core.settings.edit',
+        'toggle_status': 'core.settings.edit',
+        'metadata': 'core.settings.view',
     }
 
     def get_queryset(self):
@@ -361,6 +383,75 @@ class DiscountEligibilityRuleViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         act = serializer.save(discount_eligibility_rule=rule)
         return Response(DiscountRuleActionSerializer(act).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'], url_path='sync-conditions-actions')
+    def sync_conditions_actions(self, request, pk=None):
+        rule = self.get_object()
+        db = _get_db(request)
+        conditions_data = request.data.get('conditions', [])
+        actions_data = request.data.get('actions', [])
+
+        with transaction.atomic(using=db):
+            DiscountRuleCondition.objects.using(db).filter(discount_eligibility_rule=rule).delete()
+            DiscountRuleAction.objects.using(db).filter(discount_eligibility_rule=rule).delete()
+
+            for i, cond in enumerate(conditions_data):
+                cleaned_cond = dict(cond)
+                cleaned_cond.pop('id', None)
+                cleaned_cond.pop('discount_eligibility_rule', None)
+                if not cleaned_cond.get('numeric_value') and cleaned_cond.get('numeric_value') != 0:
+                    cleaned_cond['numeric_value'] = None
+                cleaned_cond['sequence'] = i + 1
+                c_ser = DiscountRuleConditionSerializer(data=cleaned_cond)
+                c_ser.is_valid(raise_exception=True)
+                c_ser.save(discount_eligibility_rule=rule)
+
+            for act in actions_data:
+                cleaned_act = dict(act)
+                cleaned_act.pop('id', None)
+                cleaned_act.pop('discount_eligibility_rule', None)
+                for fk_field in ['discount_campaign', 'discount_code', 'discount_percentage', 'discount_amount', 'maximum_discount']:
+                    if not cleaned_act.get(fk_field):
+                        cleaned_act[fk_field] = None
+                a_ser = DiscountRuleActionSerializer(data=cleaned_act)
+                a_ser.is_valid(raise_exception=True)
+                a_ser.save(discount_eligibility_rule=rule)
+
+        rule.refresh_from_db()
+        return Response(DiscountEligibilityRuleSerializer(rule).data, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get'], url_path='metadata')
+    def metadata(self, request):
+        return Response({
+            'rule_types': [{'value': k, 'label': v} for k, v in DiscountEligibilityRule.RULE_TYPE_CHOICES],
+            'evaluation_modes': [{'value': k, 'label': v} for k, v in DiscountEligibilityRule.EVALUATION_MODE_CHOICES],
+            'status_choices': [{'value': k, 'label': v} for k, v in DiscountEligibilityRule.STATUS_CHOICES],
+            'operators': [{'value': k, 'label': v} for k, v in DiscountRuleCondition.OPERATOR_CHOICES],
+            'action_types': [{'value': k, 'label': v} for k, v in DiscountRuleAction.ACTION_TYPE_CHOICES],
+            'condition_types': [
+                {'value': 'USAGE_PERCENTAGE', 'label': 'Session Usage Percentage (%)'},
+                {'value': 'SESSIONS_CONSUMED', 'label': 'Sessions Consumed (Count)'},
+                {'value': 'SESSIONS_REMAINING', 'label': 'Sessions Remaining (Count)'},
+                {'value': 'PACKAGE_AGE_DAYS', 'label': 'Package Age (Days Active)'},
+                {'value': 'MEMBERSHIP_AGE_DAYS', 'label': 'Membership Age (Days)'},
+                {'value': 'REMAINING_DAYS', 'label': 'Remaining Days in Term'},
+            ],
+        })
+
+    @action(detail=True, methods=['post'], url_path='toggle-status')
+    def toggle_status(self, request, pk=None):
+        rule = self.get_object()
+        db = _get_db(request)
+        target_status = request.data.get('status')
+        if target_status:
+            target_status = target_status.upper()
+            if target_status not in ['ACTIVE', 'INACTIVE', 'DRAFT', 'EXPIRED']:
+                return Response({'error': f"Invalid status '{target_status}'"}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            target_status = 'INACTIVE' if rule.status == 'ACTIVE' else 'ACTIVE'
+        rule.status = target_status
+        rule.save(using=db)
+        return Response(DiscountEligibilityRuleSerializer(rule).data, status=status.HTTP_200_OK)
 
 
 class DiscountRedemptionViewSet(viewsets.ReadOnlyModelViewSet):
@@ -406,12 +497,20 @@ class DiscountRedemptionViewSet(viewsets.ReadOnlyModelViewSet):
         except (Order.DoesNotExist, UserProfile.DoesNotExist) as exc:
             return Response({'error': str(exc)}, status=status.HTTP_404_NOT_FOUND)
 
+        user_org = getattr(request.user, 'organization_id', None)
+        if user_org:
+            if order.branch.organization_id != user_org:
+                return Response({'error': 'Order belongs to a different organization.'}, status=status.HTTP_403_FORBIDDEN)
+            if user_profile.user.organization_id != user_org:
+                return Response({'error': 'User profile belongs to a different organization.'}, status=status.HTTP_403_FORBIDDEN)
+
         try:
             redemption = DiscountCouponEngineService.redeem_coupon(
                 order=order,
                 code_str=code_str,
                 user_profile=user_profile,
                 created_by_user=request.user,
+                db_alias=db,
             )
             return Response(DiscountRedemptionSerializer(redemption).data, status=status.HTTP_201_CREATED)
         except ValidationError as exc:

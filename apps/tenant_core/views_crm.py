@@ -2802,9 +2802,7 @@ class CRMAgentAssignmentConfigViewSet(viewsets.ViewSet):
                 'allow_all_staff_fallback': True,
             }
         )
-        if not config.allowed_role_codes:
-            config.allowed_role_codes = ['SALES_REP', 'BRANCH_MANAGER', 'FRONT_DESK', 'ORG_ADMIN']
-            config.save(using=alias)
+        # Preserve an intentionally empty saved selection; seed defaults only on creation.
 
         from .models_rbac import Role, RoleAssignment
         roles_qs = Role.objects.using(alias).filter(organization=org, is_active=True).order_by('name')

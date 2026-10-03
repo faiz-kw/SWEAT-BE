@@ -286,6 +286,19 @@ class CRMPhase4TrialManagementTests(TestCase):
             status='OPEN',
         )
 
+        # Today active occurrence (within check-in window)
+        now_dt = timezone.now()
+        self.occurrence_now = ClassOccurrence.objects.using('tenant_test').create(
+            class_template=self.class_template,
+            branch=self.branch_a1,
+            occurrence_date=now_dt.date(),
+            start_at=now_dt - timedelta(minutes=10),
+            end_at=now_dt + timedelta(minutes=50),
+            capacity=10,
+            trial_capacity=3,
+            status='OPEN',
+        )
+
         # Branch A2 Occurrence
         self.occurrence_a2 = ClassOccurrence.objects.using('tenant_test').create(
             class_template=self.class_template,
@@ -976,7 +989,7 @@ class CRMPhase4TrialManagementTests(TestCase):
 
     def test_33_mark_attended_updates_status_and_lead_stage(self):
         """33. Mark attended updates status=ATTENDED and syncs Lead status to TRIAL_ATTENDED."""
-        trial = self._create_trial(branch=self.branch_a1, lead=self.lead_a1, occurrence=self.occurrence_a1, status='BOOKED')
+        trial = self._create_trial(branch=self.branch_a1, lead=self.lead_a1, occurrence=self.occurrence_now, status='BOOKED')
         resp = self.client.post(
             f'/api/v1/tenant/trial-bookings/{trial.id}/mark_attended/',
             {'notes': 'Great enthusiasm in reformer intro'},
@@ -990,7 +1003,7 @@ class CRMPhase4TrialManagementTests(TestCase):
 
     def test_34_mark_attended_generates_idempotent_followup_task(self):
         """34. Mark attended generates idempotent SalesFollowupTask when tenant policy is enabled."""
-        trial = self._create_trial(branch=self.branch_a1, lead=self.lead_a1, occurrence=self.occurrence_a1, status='BOOKED')
+        trial = self._create_trial(branch=self.branch_a1, lead=self.lead_a1, occurrence=self.occurrence_now, status='BOOKED')
         # First call
         self.client.post(f'/api/v1/tenant/trial-bookings/{trial.id}/mark_attended/', {}, **self.auth_headers(self.token_admin, self.branch_a1))
         # Retry/second call

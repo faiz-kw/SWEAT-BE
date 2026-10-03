@@ -143,7 +143,7 @@ class DiscountRuleConditionSerializer(serializers.ModelSerializer):
             'created_at',
             'updated_at',
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'discount_eligibility_rule', 'created_at', 'updated_at']
 
 
 class DiscountRuleActionSerializer(serializers.ModelSerializer):
@@ -163,7 +163,7 @@ class DiscountRuleActionSerializer(serializers.ModelSerializer):
             'created_at',
             'updated_at',
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'discount_eligibility_rule', 'created_at', 'updated_at']
 
 
 class DiscountEligibilityRuleSerializer(serializers.ModelSerializer):
