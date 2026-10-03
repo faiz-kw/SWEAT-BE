@@ -474,6 +474,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'apps.master.tasks.generate_all_tenants_rolling_occurrences_async',
         'schedule': float(os.getenv('CELERY_SCHEDULE_OCCURRENCES_SECONDS', '86400.0')),  # daily rolling 30-day horizon
     },
+    'tenant-recover-unprocessed-meta-imports': {
+        'task': 'apps.tenant_core.tasks_meta_leads.recover_meta_imports_periodic_task',
+        'schedule': float(os.getenv('CELERY_SCHEDULE_META_RECOVERY_SECONDS', '120.0')),  # every 2 min
+    },
 }
 
 

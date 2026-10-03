@@ -368,7 +368,10 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
             error_desc = request.query_params.get('error_description') or ''
             if error_code:
                 logger.warning("Meta OAuth browser redirect returned error: %s - %s", error_code, error_desc)
-                return HttpResponseRedirect(f"/crm/settings?meta_error={urllib.parse.quote(str(error_code))}&meta_desc={urllib.parse.quote(str(error_desc))}")
+                frontend_origin = (getattr(settings, 'FRONTEND_URL', None) or os.getenv('FRONTEND_URL', '')).rstrip('/')
+                target_path = '/crm/setup?tab=meta'
+                return HttpResponseRedirect(f"{frontend_origin}{target_path}&meta_error={urllib.parse.quote(str(error_code))}&meta_desc={urllib.parse.quote(str(error_desc))}")
+
 
             code = request.query_params.get('code')
             state_token = request.query_params.get('state')
@@ -380,7 +383,9 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
 
         if not code or not state_token:
             if is_browser_redirect:
-                return HttpResponseRedirect("/crm/settings?meta_error=missing_code_or_state")
+                frontend_origin = (getattr(settings, 'FRONTEND_URL', None) or os.getenv('FRONTEND_URL', '')).rstrip('/')
+                target_path = '/crm/setup?tab=meta'
+                return HttpResponseRedirect(f"{frontend_origin}{target_path}&meta_error=missing_code_or_state")
             raise ValidationError('code and state are required.')
 
         try:
@@ -389,7 +394,9 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
         except ValueError as exc:
             logger.warning("OAuth callback rejected: %s", exc)
             if is_browser_redirect:
-                return HttpResponseRedirect(f"/crm/settings?meta_error=invalid_state&meta_desc={urllib.parse.quote(str(exc))}")
+                frontend_origin = (getattr(settings, 'FRONTEND_URL', None) or os.getenv('FRONTEND_URL', '')).rstrip('/')
+                target_path = '/crm/setup?tab=meta'
+                return HttpResponseRedirect(f"{frontend_origin}{target_path}&meta_error=invalid_state&meta_desc={urllib.parse.quote(str(exc))}")
             raise ValidationError({'state': str(exc)})
 
         # Organization and User binding verification
@@ -488,7 +495,9 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
             )
 
         if is_browser_redirect:
-            return HttpResponseRedirect(f"/crm/settings?meta_connected=true&pages={len(discovered_pages)}")
+            frontend_origin = (getattr(settings, 'FRONTEND_URL', None) or os.getenv('FRONTEND_URL', '')).rstrip('/')
+            target_path = '/crm/setup?tab=meta'
+            return HttpResponseRedirect(f"{frontend_origin}{target_path}&meta_connected=true&pages={len(discovered_pages)}")
 
         return Response({
             'status': 'CONNECTED',

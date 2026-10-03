@@ -1,4 +1,4 @@
-﻿"""
+"""
 apps/tenant_core/tasks_meta_leads.py — Asynchronous Celery Tasks for Meta Lead Ads Ingestion.
 
 Ensures:
@@ -40,12 +40,13 @@ def process_meta_lead_import_task(self, tenant_id: str, import_id: str):
 
     try:
         with tenant_database_context(tenant_id) as db_alias:
-            org = Organization.objects.using(db_alias).filter(status='ACTIVE').order_by('-created_at').first()
-            if not org:
-                logger.error("No active organization found in tenant database '%s'", db_alias)
-                return {'status': 'FAILED', 'error': 'Active organization not found'}
+            from apps.tenant_core.models_meta_leads import MetaLeadImport
+            imp = MetaLeadImport.objects.using(db_alias).select_related('organization').filter(id=import_id).first()
+            if not imp:
+                logger.warning("MetaLeadImport %s not found in tenant DB %s", import_id, db_alias)
+                return {'status': 'FAILED', 'error': 'Import record not found'}
 
-            event = process_live_import(organization=org, event_id=import_id, actor_user=None, alias=db_alias)
+            event = process_live_import(organization=imp.organization, event_id=import_id, actor_user=None, alias=db_alias)
             logger.info("Meta lead import processed: import_id=%s status=%s lead_id=%s", import_id, event.status, event.lead_id)
             return {'status': event.status, 'lead_id': str(event.lead_id) if event.lead_id else None}
 
@@ -70,4 +71,55 @@ def process_meta_lead_import_task(self, tenant_id: str, import_id: str):
             raise self.retry(exc=exc, countdown=countdown)
         else:
             logger.exception("Max retries exceeded for Meta lead import %s: %s", import_id, exc)
-            return {'status': 'FAILED', 'error': str(exc)}
+            err_msg = f"Exhausted max retries (5/5): {exc}"
+            try:
+                with tenant_database_context(tenant_id) as db_alias:
+                    from apps.tenant_core.models_meta_leads import MetaLeadImport
+                    from apps.tenant_core.services_reliability import record_business_audit
+                    imp = MetaLeadImport.objects.using(db_alias).filter(id=import_id).first()
+                    if imp:
+                        imp.status = 'FAILED'
+                        imp.error_code = 'MAX_RETRIES_EXCEEDED'
+                        imp.error_message = err_msg
+                        imp.save(using=db_alias, update_fields=['status', 'error_code', 'error_message', 'updated_at'])
+                        record_business_audit(
+                            organization=imp.organization,
+                            module='crm',
+                            action_code='META_IMPORT_EXHAUSTED',
+                            entity_type='MetaLeadImport',
+                            entity_id=imp.id,
+                            actor_user=None,
+                            metadata={'error': str(exc), 'retries': 5},
+                            db_alias=db_alias,
+                        )
+            except Exception as db_err:
+                logger.error("Could not persist exhausted state for %s: %s", import_id, db_err)
+            return {'status': 'FAILED', 'error': err_msg}
+
+
+@shared_task(
+    name='apps.tenant_core.tasks_meta_leads.recover_meta_imports_periodic_task'
+)
+def recover_meta_imports_periodic_task():
+    """
+    Periodic Celery Beat task scanning all active tenants for stranded PENDING imports
+    (e.g. broker disconnection or worker crash during fast-ingest commit) and re-dispatching them.
+    """
+    from apps.master.models_tenant import Tenant
+    from apps.tenant_core.services_meta_recovery import recover_unprocessed_meta_imports
+
+    results = {}
+    active_tenants = Tenant.objects.using('default').filter(status='ACTIVE')
+    for tenant in active_tenants:
+        try:
+            res = recover_unprocessed_meta_imports(
+                tenant_id=str(tenant.id),
+                min_age_seconds=60,
+                max_batch_size=50,
+                dispatch_async=True,
+            )
+            if res.get('recovered_count', 0) > 0:
+                results[str(tenant.id)] = res
+        except Exception as exc:
+            logger.warning("Periodic recovery error for tenant %s: %s", tenant.slug, exc)
+    return results
