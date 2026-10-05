@@ -995,22 +995,39 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='resend_invite')
     def resend_invite(self, request, pk=None):
         """Generate and dispatch an activation invite link for a tenant user."""
+        from django.conf import settings
+        import os
+        from urllib.parse import urlparse
+        from apps.master.models_tenant import Tenant
+        from django.core.signing import TimestampSigner
+
         user = self.get_object()
         db = self.get_db()
 
-        origin = (request.META.get('HTTP_ORIGIN') or request.META.get('HTTP_REFERER') or 'http://localhost:5173').rstrip('/')
-        from urllib.parse import urlparse
+        default_frontend = (getattr(settings, 'FRONTEND_URL', None) or os.getenv('FRONTEND_URL', '') or 'http://localhost:5173').rstrip('/')
+        origin = (request.META.get('HTTP_ORIGIN') or request.META.get('HTTP_REFERER') or default_frontend).rstrip('/')
         parsed_origin = urlparse(origin)
-        clean_origin = f"{parsed_origin.scheme}://{parsed_origin.netloc}" if parsed_origin.netloc else "http://localhost:5173"
+        clean_origin = f"{parsed_origin.scheme}://{parsed_origin.netloc}" if parsed_origin.netloc else default_frontend
 
-        tenant_slug = getattr(request, 'tenant_slug', None) or 'sweat'
+        # Authoritatively resolve tenant object: first by user._tenant_id, then request.auth tid, then slug
+        tenant_obj = None
+        tenant_id = getattr(request.user, '_tenant_id', None)
+        if not tenant_id and hasattr(request, 'auth') and hasattr(request.auth, 'get'):
+            tenant_id = request.auth.get('tid')
+        if tenant_id:
+            tenant_obj = Tenant.objects.using('default').filter(id=tenant_id).first()
 
-        # Resolve the Tenant object to embed its ID in the signed token
-        from apps.master.models_tenant import Tenant
-        from django.core.signing import TimestampSigner
-        tenant_obj = Tenant.objects.using('default').filter(slug=tenant_slug).first()
+        tenant_slug = getattr(request, 'tenant_slug', None)
+        if not tenant_obj and tenant_slug:
+            tenant_obj = Tenant.objects.using('default').filter(slug=tenant_slug).first()
+
+        if not tenant_obj:
+            tenant_obj = Tenant.objects.using('default').filter(slug='sweat').first() or Tenant.objects.using('default').first()
+
         if not tenant_obj:
             return Response({'error': 'Tenant not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        tenant_slug = tenant_obj.slug
 
         # Build a signed token: TENANT:<tenant_id>:<user_id>, expires in 72 hours
         signer = TimestampSigner(salt='staff-invite-salt')

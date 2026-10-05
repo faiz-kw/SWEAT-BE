@@ -32,6 +32,7 @@ from django.utils import timezone
 from django.core.validators import validate_email, URLValidator
 from django.core.exceptions import ValidationError as DjangoValidationError
 from .models_users import TenantUser
+from .models_org import Branch, Organization
 
 
 class LeadSourceSerializer(serializers.ModelSerializer):

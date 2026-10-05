@@ -1,3 +1,4 @@
+import os
 from django.http import HttpResponseRedirect
 import urllib.parse
 """Organisation-wide CRM configuration, Meta OAuth lifecycle, and import APIs."""
@@ -660,8 +661,10 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
             'connected_user_name': conn.meta_user_name if conn else '',
             'connected_user_id': conn.meta_user_id if conn else '',
             'token_expires_at': conn.token_expires_at.isoformat() if conn and conn.token_expires_at else None,
+            'is_connected': conn.status in ('CONNECTED', 'LIVE_CONNECTED') if conn else False,
             'live_available': bool(app_id),
             'app_id_configured': bool(app_id),
+            'meta_app_configured': bool(app_id),
             'webhook_endpoint': '/api/v1/webhooks/meta/leads/',
             'simulator_enabled': simulator_enabled(),
             'simulator_requirement': 'Development/test deployment, DEBUG enabled, META_LEAD_SIMULATOR_ENABLED enabled and COMMUNICATIONS_OUTBOUND_ENABLED disabled.',

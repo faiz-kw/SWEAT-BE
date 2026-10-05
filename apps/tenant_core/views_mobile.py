@@ -62,10 +62,11 @@ from .models_catalog import Package, PackageVersion, PackagePrice, PackageEntitl
 from .models_memberships import Membership, MembershipEntitlement
 from .models_commerce import Order, OrderItem, PaymentTransaction
 from .models_discounts import DiscountCode
-from .models_crm import IntakeForm, IntakeQuestion, IntakeSubmission, TrialBooking
+from .models_crm import IntakeForm, IntakeQuestion, IntakeSubmission, TrialBooking, Lead, LeadSource, LeadConversion
 from .services_bookings import BookingWaitlistAttendanceService
 from .services_memberships import MembershipLifecycleService
 from .services_discounts import DiscountCouponEngineService
+from .services_crm import CRMLeadService
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +233,40 @@ class MobileRegisterView(APIView):
                 sync_tenant_user_identity(user, tenant_id=tenant.id, db=alias)
             except Exception as e:
                 logger.warning("Could not sync directory identity for %s: %s", email, e)
+
+            # 6b. Automatically create or link CRM Lead record with source 'MOBILE_APP'
+            try:
+                lead_source, _ = LeadSource.objects.using(alias).get_or_create(
+                    organization=org,
+                    code='MOBILE_APP',
+                    defaults={'name': 'Mobile App', 'source_type': 'MOBILE_APP', 'status': 'ACTIVE'}
+                )
+
+                lead = Lead.objects.using(alias).filter(
+                    models.Q(email_normalized__iexact=email) |
+                    (models.Q(phone_normalized=phone) if phone else models.Q(pk=None))
+                ).first()
+
+                if not lead:
+                    CRMLeadService.create_lead(
+                        organization=org,
+                        first_name=first_name,
+                        last_name=last_name or '',
+                        phone=phone or '',
+                        email=email,
+                        branch=branch,
+                        lead_source=lead_source,
+                        assigned_sales_user=None,
+                        actor_user=None,
+                        extra_fields={'converted_user_profile': profile},
+                        db_alias=alias,
+                    )
+                else:
+                    lead.converted_user_profile = profile
+                    lead.latest_touch_source = 'MOBILE_APP'
+                    lead.save(using=alias, update_fields=['converted_user_profile', 'latest_touch_source'])
+            except Exception as crm_err:
+                logger.warning("Could not auto-create CRM lead for mobile user %s: %s", email, crm_err)
 
             # 7. Generate JWT access & refresh tokens
             tokens = _build_tenant_token(user, tenant, alias)
@@ -822,6 +857,32 @@ class MobileClaimFreeTrialView(APIView):
             return Response({'detail': detail}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
             return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Advance CRM Lead status to TRIAL_BOOKED and log TrialBooking record
+        try:
+            lead = Lead.objects.using(alias).filter(
+                models.Q(email_normalized__iexact=user.email) |
+                (models.Q(phone_normalized=user.phone) if user.phone else models.Q(pk=None))
+            ).first()
+            if lead:
+                if lead.current_status == 'NEW_LEAD':
+                    lead.current_status = 'TRIAL_BOOKED'
+                    lead.save(using=alias, update_fields=['current_status'])
+                TrialBooking.objects.using(alias).get_or_create(
+                    lead=lead,
+                    class_occurrence_id=occurrence.id,
+                    defaults={
+                        'user_profile': profile,
+                        'branch': occurrence.branch,
+                        'scheduled_start': occurrence.start_at,
+                        'scheduled_end': occurrence.end_at,
+                        'status': 'BOOKED',
+                        'confirmation_status': 'CONFIRMED' if booking.status == 'CONFIRMED' else 'PENDING',
+                        'booking_source': 'MOBILE_APP',
+                    }
+                )
+        except Exception as trial_crm_err:
+            logger.warning("Could not sync CRM trial booking for %s: %s", user.email, trial_crm_err)
 
         return Response({
             'booking_id': str(booking.id),
@@ -1568,6 +1629,30 @@ class MobileCheckoutVerifyView(APIView):
                 created_by_user=user,
                 db_alias=alias,
             )
+
+            # 4. Advance CRM Lead status to CONVERTED
+            try:
+                lead = Lead.objects.using(alias).filter(
+                    models.Q(email_normalized__iexact=user.email) |
+                    (models.Q(phone_normalized=user.phone) if user.phone else models.Q(pk=None))
+                ).first()
+                if lead:
+                    if lead.current_status != 'CONVERTED':
+                        lead.current_status = 'CONVERTED'
+                        lead.save(using=alias, update_fields=['current_status'])
+                    LeadConversion.objects.using(alias).get_or_create(
+                        lead=lead,
+                        user_profile=profile,
+                        defaults={
+                            'order_id': order.id,
+                            'membership_id': membership.id,
+                            'package_id': getattr(order_item, 'package_id', None),
+                            'package_version_id': getattr(order_item, 'package_version_id', None),
+                            'conversion_source': 'MOBILE_APP',
+                        }
+                    )
+            except Exception as conv_crm_err:
+                logger.warning("Could not sync CRM lead conversion for %s: %s", user.email, conv_crm_err)
 
         return Response({
             'detail': 'Payment successful! Your session pack is now active.',

@@ -271,7 +271,7 @@ class MetaLeadProductionVerificationTests(TestCase):
             # Browser GET request to callback
             response = self.client.get(f'/meta-lead-mappings/oauth-callback/?code=fb_auth_code_999&state={state}')
             self.assertEqual(response.status_code, 302)
-            self.assertIn('/crm/settings?meta_connected=true', response.url)
+            self.assertIn('/crm/setup?tab=meta&meta_connected=true', response.url)
 
             # Replaying the exact same URL must redirect with error
             replay_res = self.client.get(f'/meta-lead-mappings/oauth-callback/?code=fb_auth_code_999&state={state}')
