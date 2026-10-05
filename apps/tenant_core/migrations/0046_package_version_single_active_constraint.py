@@ -3,6 +3,35 @@
 from django.db import migrations, models
 
 
+def deduplicate_active_package_versions(apps, schema_editor):
+    """
+    Ensure each package has at most ONE 'ACTIVE' version before adding the
+    partial unique constraint. Older duplicate active versions are marked 'RETIRED'.
+    """
+    PackageVersion = apps.get_model('tenant_core', 'PackageVersion')
+    db_alias = schema_editor.connection.alias
+
+    duplicate_packages = (
+        PackageVersion.objects.using(db_alias)
+        .filter(status='ACTIVE')
+        .values('package_id')
+        .annotate(active_count=models.Count('id'))
+        .filter(active_count__gt=1)
+    )
+
+    for entry in duplicate_packages:
+        pkg_id = entry['package_id']
+        active_versions = list(
+            PackageVersion.objects.using(db_alias)
+            .filter(package_id=pkg_id, status='ACTIVE')
+            .order_by('-version_number', '-created_at')
+        )
+        # Keep the newest version ACTIVE; retire all older active versions
+        for old_version in active_versions[1:]:
+            old_version.status = 'RETIRED'
+            old_version.save(update_fields=['status'])
+
+
 class Migration(migrations.Migration):
 
     dependencies = [
@@ -10,6 +39,7 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
+        migrations.RunPython(deduplicate_active_package_versions, migrations.RunPython.noop),
         migrations.AddConstraint(
             model_name='packageversion',
             constraint=models.UniqueConstraint(condition=models.Q(('status', 'ACTIVE')), fields=('package',), name='chk_single_active_package_version_per_package'),
