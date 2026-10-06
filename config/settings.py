@@ -173,6 +173,17 @@ if 'test' in sys.argv:
             'NAME': 'test_fitness_tenant',
         },
     }
+    DATABASES['tenant_other'] = {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': 'fitness_tenant_other',
+        'USER': _parsed.username or 'postgres',
+        'PASSWORD': _parsed.password or '',
+        'HOST': _parsed.hostname or 'localhost',
+        'PORT': _parsed.port or 5432,
+        'TEST': {
+            'NAME': 'test_fitness_tenant_other',
+        },
+    }
 
 # Database routing — master models → default, tenant models → dynamic alias
 DATABASE_ROUTERS = ['config.routers.MasterRouter', 'config.routers.TenantRouter']
@@ -506,3 +517,9 @@ META_LEAD_SIMULATOR_ENABLED = os.getenv('META_LEAD_SIMULATOR_ENABLED', 'true' if
 COMMUNICATIONS_OUTBOUND_ENABLED = os.getenv('COMMUNICATIONS_OUTBOUND_ENABLED', 'false' if DEBUG else 'true').lower() in ('true', '1', 't')
 
 
+
+# ---------------------------------------------------------------------------
+# Razorpay Payment Gateway (Test Mode / Production)
+# ---------------------------------------------------------------------------
+RAZORPAY_KEY_ID = os.getenv('RAZORPAY_KEY_ID', '').strip()
+RAZORPAY_KEY_SECRET = os.getenv('RAZORPAY_KEY_SECRET', '').strip()

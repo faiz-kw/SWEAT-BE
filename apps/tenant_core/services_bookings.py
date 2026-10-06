@@ -324,6 +324,12 @@ class BookingWaitlistAttendanceService:
 
         # 4. Membership Specific Validations (if membership provided)
         if membership:
+            if membership.legacy_reference and 'PROVISIONAL_CASH_LIMIT_REACHED' in membership.legacy_reference:
+                return {
+                    'eligible': False,
+                    'reason_code': 'PAYMENT_APPROVAL_PENDING_LIMIT_REACHED',
+                    'reason_message': 'Cash payment approval is still pending and provisional session limit has been reached.',
+                }
             if membership.status != 'ACTIVE':
                 return {
                     'eligible': False,

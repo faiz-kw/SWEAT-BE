@@ -8,6 +8,7 @@ from datetime import timedelta
 from django.utils import timezone
 from django.conf import settings
 from django.db import transaction
+from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from rest_framework import serializers, viewsets, mixins, status
 from rest_framework.decorators import action
@@ -26,7 +27,9 @@ from .services_meta_leads import (
     process_simulation,
     process_live_import,
     simulator_enabled,
+    require_simulator,
 )
+from .services_crm import validate_lead_email, validate_lead_phone
 from .services_reliability import record_business_audit
 from .views_crm import get_user_effective_branch_ids
 from .meta_crypto import encrypt_token, decrypt_token, mask_token
@@ -189,15 +192,62 @@ class MappingSerializer(serializers.ModelSerializer):
 
 
 class ImportSerializer(serializers.ModelSerializer):
+    matched_lead = serializers.SerializerMethodField()
+    resolution = serializers.SerializerMethodField()
+
     class Meta:
         model = MetaLeadImport
         fields = [
             'id', 'mode', 'page_id', 'form_id', 'external_lead_id', 'status', 'lead',
             'mapping_version', 'attempt_count', 'error_code', 'error_message',
             'campaign_id', 'campaign_name', 'adset_id', 'adset_name', 'ad_id', 'ad_name', 'is_organic',
-            'received_at', 'processed_at'
+            'received_at', 'processed_at', 'matched_lead', 'resolution', 'field_data', 'mapping_snapshot'
         ]
         read_only_fields = fields
+
+    def get_resolution(self, obj):
+        if isinstance(obj.mapping_snapshot, dict):
+            return obj.mapping_snapshot.get('resolution')
+        return None
+
+    def get_matched_lead(self, obj):
+        alias = getattr(self.context.get('view'), 'alias', None) or require_tenant_alias()
+        lead = obj.lead
+        if not lead:
+            email = None
+            phone = None
+            if obj.field_data and isinstance(obj.field_data, list):
+                for f in obj.field_data:
+                    name = (f.get('name') or '').lower()
+                    vals = f.get('values') or []
+                    val = vals[0] if vals else None
+                    if val:
+                        if 'email' in name and not email:
+                            email = validate_lead_email(val, required=False)
+                        elif any(p in name for p in ('phone', 'mobile', 'contact')) and not phone:
+                            phone = validate_lead_phone(val, required=False)
+
+            contact = Q()
+            if email:
+                contact |= Q(email_normalized=email)
+            if phone:
+                contact |= Q(phone_normalized=phone)
+            if contact:
+                lead = Lead.objects.using(alias).filter(organization_id=obj.organization_id).filter(contact).first()
+
+        if lead:
+            name = f"{lead.first_name} {lead.last_name}".strip()
+            return {
+                'id': str(lead.id),
+                'name': name or lead.phone_normalized or lead.email_normalized or 'Existing Lead',
+                'first_name': lead.first_name,
+                'last_name': lead.last_name,
+                'email': lead.email_normalized,
+                'phone': lead.phone_normalized,
+                'status': lead.current_status,
+                'created_at': lead.created_at.isoformat() if lead.created_at else None,
+            }
+        return None
 
 
 class SimulationSerializer(serializers.Serializer):
@@ -235,6 +285,7 @@ class MetaAccessMixin:
         'partial_update': 'crm.settings.edit',
         'simulate': 'crm.settings.edit',
         'retry': 'crm.settings.edit',
+        'resolve': 'crm.settings.edit',
         'oauth_init': 'crm.settings.edit',
         'oauth_callback': 'crm.settings.edit',
         'disconnect': 'crm.settings.edit',
@@ -702,10 +753,11 @@ class MetaLeadImportViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retri
 
     def get_queryset(self):
         qs = MetaLeadImport.objects.using(self.alias).filter(organization=self.organization)
-        mode = self.request.query_params.get('mode')
+        params = getattr(self.request, 'query_params', getattr(self.request, 'GET', {}))
+        mode = params.get('mode')
         if mode:
             qs = qs.filter(mode=mode)
-        status = self.request.query_params.get('status')
+        status = params.get('status')
         if status:
             qs = qs.filter(status=status)
         return qs
@@ -720,14 +772,95 @@ class MetaLeadImportViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retri
 
     @action(detail=False, methods=['post'])
     def simulate(self, request):
+        require_simulator()
         serializer = SimulationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         event, created = receive_simulation(self.organization, serializer.validated_data, request.user)
         return Response({**self.get_serializer(event).data, 'duplicate_delivery': not created}, status=201 if created else 200)
 
     @action(detail=True, methods=['post'])
+    def resolve(self, request, pk=None):
+        event = self.get_object()
+
+        # Idempotent response if already resolved
+        if event.status == 'RESOLVED':
+            return Response(self.get_serializer(event).data, status=status.HTTP_200_OK)
+
+        if event.status == 'IMPORTED':
+            raise ValidationError({'detail': 'Imported submissions cannot be dismissed as repeat enquiries.'})
+
+        reason = (request.data.get('reason') or '').strip()
+        if not reason:
+            raise ValidationError({'reason': 'A resolution reason is required.'})
+
+        action_type = request.data.get('action') or 'DISMISSED'
+
+        serializer = self.get_serializer(event)
+        matched_lead_data = serializer.get_matched_lead(event)
+        matched_lead = None
+        if matched_lead_data:
+            matched_lead = Lead.objects.using(self.alias).filter(
+                id=matched_lead_data['id'], organization_id=self.organization.id
+            ).first()
+
+        actor_name = 'User'
+        if request.user:
+            name_parts = f"{getattr(request.user, 'first_name', '')} {getattr(request.user, 'last_name', '')}".strip()
+            actor_name = name_parts or getattr(request.user, 'email', str(request.user.id))
+
+        now_iso = timezone.now().isoformat()
+        resolution_data = {
+            'resolved_by_id': str(request.user.id),
+            'resolved_by_name': actor_name,
+            'resolved_at': now_iso,
+            'reason': reason,
+            'action': action_type,
+            'previous_status': event.status,
+            'previous_error_code': event.error_code,
+            'matched_lead_id': str(matched_lead.id) if matched_lead else (str(event.lead_id) if event.lead_id else None),
+        }
+
+        if not isinstance(event.mapping_snapshot, dict):
+            event.mapping_snapshot = {}
+        event.mapping_snapshot['resolution'] = resolution_data
+
+        if not event.lead and matched_lead:
+            event.lead = matched_lead
+
+        before_status = event.status
+        event.status = 'RESOLVED'
+        event.error_message = f"Resolved by {actor_name}: {reason}"[:500]
+        event.processed_at = timezone.now()
+        event.save(using=self.alias)
+
+        record_business_audit(
+            organization=self.organization,
+            module='crm',
+            action_code='META_IMPORT_RESOLVED',
+            entity_type='MetaLeadImport',
+            entity_id=event.id,
+            actor_user=request.user,
+            before_data={'status': before_status, 'error_code': event.error_code},
+            after_data={'status': 'RESOLVED', 'reason': reason, 'action': action_type},
+            metadata={
+                'resolved_by': actor_name,
+                'resolved_by_id': str(request.user.id),
+                'resolved_at': now_iso,
+                'reason': reason,
+                'action': action_type,
+                'matched_lead_id': str(event.lead_id) if event.lead_id else None,
+                'external_lead_id': event.external_lead_id,
+            },
+            db_alias=self.alias,
+        )
+
+        return Response(self.get_serializer(event).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'])
     def retry(self, request, pk=None):
         event = self.get_object()
+        if event.status in ('IMPORTED', 'RESOLVED'):
+            return Response(self.get_serializer(event).data)
         if event.mode == 'LIVE':
             event = process_live_import(self.organization, event.id, request.user, alias=self.alias)
         else:

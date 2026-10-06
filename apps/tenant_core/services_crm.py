@@ -3084,6 +3084,7 @@ class LeadConversionService:
         package_version_id: str,
         branch_id: str,
         coupon_code: Optional[str] = None,
+        channel: str = 'STAFF',
         db_alias: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -3171,24 +3172,52 @@ class LeadConversionService:
 
         from .models_commerce import PaymentTransaction
         from .models_infra import Integration
+        from .services_payment_policy import PaymentPolicyService
 
-        all_provider_choices = [c[0] for c in PaymentTransaction.PROVIDER_CHOICES]
-        offline_providers = ['CASH', 'BANK_TRANSFER', 'OTHER']
-        gateway_providers = [c for c in all_provider_choices if c not in offline_providers]
+        policy = PaymentPolicyService.get_effective_policy(
+            organization=lead.organization,
+            branch=branch,
+            package=pv.package,
+            package_version=pv,
+            db_alias=alias,
+        )
 
-        available_providers = [p for p in offline_providers if p in all_provider_choices]
-        try:
-            active_gateways = set(
-                Integration.objects.using(alias)
-                .filter(integration_type='PAYMENT', status='ACTIVE')
-                .values_list('provider', flat=True)
-            )
-            active_gateways_upper = {g.strip().upper() for g in active_gateways if g}
-            for gw in gateway_providers:
-                if gw in active_gateways_upper:
-                    available_providers.append(gw)
-        except Exception:
-            pass
+        available_providers = []
+        is_member = any(term in str(channel).strip().upper() for term in ['MEMBER', 'MOBILE', 'CLIENT', 'APP', 'PORTAL'])
+
+        # 1. Staff Cash (strictly blocked for member self-service)
+        if not is_member and policy['payment_methods'].get('staff_cash_enabled', True):
+            available_providers.append('CASH')
+
+        # 2. Razorpay Online
+        rzp_enabled = policy['payment_methods'].get('member_razorpay_enabled', True) if is_member else policy['payment_methods'].get('staff_razorpay_enabled', True)
+        if rzp_enabled:
+            from .services_razorpay import RazorpayService
+            has_int = Integration.objects.using(alias).filter(integration_type='PAYMENT', provider__iexact='Razorpay', status='ACTIVE').exists()
+            if has_int or RazorpayService.is_configured(db_alias=alias):
+                if RazorpayService.is_configured(db_alias=alias):
+                    available_providers.append('RAZORPAY')
+
+        # Partial payment policy preview
+        partial_cfg = policy.get('partial_payment_policy', {})
+        min_type = partial_cfg.get('min_first_payment_type', 'PERCENTAGE')
+        if min_type == 'PERCENTAGE':
+            min_pct = Decimal(str(partial_cfg.get('min_first_payment_percentage', '30.00')))
+            min_first_amt = (total_payable * min_pct / Decimal('100.00')).quantize(Decimal('0.01'))
+        else:
+            min_first_amt = Decimal(str(partial_cfg.get('min_first_payment_amount', '1000.00')))
+        min_first_amt = min(min_first_amt, total_payable)
+
+        partial_info = {
+            'enabled': bool(partial_cfg.get('enabled', False)),
+            'min_first_payment_type': min_type,
+            'min_first_payment_percentage': str(partial_cfg.get('min_first_payment_percentage', '30.00')),
+            'min_first_payment_amount': str(min_first_amt),
+            'max_installments': int(partial_cfg.get('max_installments', 3)),
+            'min_installment_amount': str(partial_cfg.get('min_installment_amount', '500.00')),
+            'activation_rule': str(partial_cfg.get('activation_rule', 'FULL_PAYMENT_ONLY')),
+            'allow_booking_with_outstanding_balance': bool(partial_cfg.get('allow_booking_with_outstanding_balance', False)),
+        }
 
         return {
             'program': {'id': str(program.id), 'name': program.name, 'code': program.code},
@@ -3222,6 +3251,190 @@ class LeadConversionService:
             'coupon': coupon_preview,
             'entitlements': entitlements,
             'payment_providers': available_providers,
+            'partial_payment': partial_info,
+        }
+
+    # ------------------------------------------------------------------
+    # RAZORPAY CHECKOUT ORDER CREATION
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def create_checkout_order(
+        cls,
+        lead: Lead,
+        package_version_id: str,
+        branch_id: str,
+        coupon_code: Optional[str] = None,
+        is_partial_payment: bool = False,
+        partial_amount: Optional[Any] = None,
+        channel: str = 'STAFF',
+        actor_user=None,
+        db_alias: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Creates/prepares an internal SWEAT Order and creates an official Razorpay Order.
+        Recalculates pricing, discount, and tax server-side.
+        Returns public key_id, razorpay_order_id, and amount in paise.
+        """
+        from decimal import Decimal as _D
+        from .services_razorpay import RazorpayService, RazorpayConfigError
+        from .models_org import Branch
+        from .models_commerce import Order, PaymentTransaction
+        from .services_commerce import CommerceService
+
+        if not RazorpayService.is_configured():
+            raise ValidationError("Razorpay is not configured on this server.", code="RAZORPAY_NOT_CONFIGURED")
+
+        alias = db_alias or get_tenant_db_alias() or 'default'
+
+        try:
+            branch = Branch.objects.using(alias).get(id=branch_id)
+        except Branch.DoesNotExist:
+            raise ValidationError(f"Branch {branch_id} not found.")
+
+        pv, package_price, program = cls._resolve_purchasable_version(
+            package_version_id, branch, alias
+        )
+        pkg = pv.package
+
+        # 1. Identity resolution
+        user_profile, _ = cls.resolve_or_create_member_identity(
+            lead=lead,
+            branch=branch,
+            actor_user=actor_user,
+            db_alias=alias,
+        )
+
+        # 2. Build order items_data
+        unit_price = package_price.base_price
+        tax_pct = package_price.tax_percent if not package_price.prices_include_tax else _D('0.000')
+
+        items_data = [{
+            'item_type': 'PACKAGE',
+            'package_id': str(pkg.id),
+            'package_version_id': str(pv.id),
+            'package_price_id': str(package_price.id),
+            'item_name_snapshot': f"{program.name} — {pkg.name} (v{pv.version_number})",
+            'quantity': '1.00',
+            'unit_price': str(unit_price),
+            'tax_percent': str(tax_pct),
+            'discount_amount': '0.00',
+        }]
+
+        # 3. Check for existing pending or partially paid order for this lead & package
+        existing_order = Order.objects.using(alias).filter(
+            lead=lead,
+            items__package_version_id=str(pv.id),
+            status__in=['PENDING_PAYMENT', 'PARTIALLY_PAID'],
+        ).order_by('-created_at').first()
+
+        if existing_order:
+            order = existing_order
+        else:
+            order = CommerceService.create_order(
+                branch=branch,
+                items_data=items_data,
+                user_profile=user_profile,
+                lead=lead,
+                sold_by=actor_user,
+                order_type='NEW_MEMBERSHIP',
+                source='SALES',
+                notes=f"CRM Lead checkout: {lead.first_name} {lead.last_name}",
+                created_by=actor_user,
+                db_alias=alias,
+            )
+
+        # 4. Optional coupon redemption (if not yet applied)
+        if coupon_code and coupon_code.strip() and order.discount_amount == _D('0.00'):
+            from .services_discounts import DiscountCouponEngineService
+            try:
+                DiscountCouponEngineService.redeem_coupon(
+                    order=order,
+                    code_str=coupon_code,
+                    user_profile=user_profile,
+                    created_by_user=actor_user,
+                    db_alias=alias,
+                )
+                order.refresh_from_db(using=alias)
+            except ValidationError as e:
+                err_msg = e.message if hasattr(e, 'message') else str(e)
+                raise ValidationError(f"Coupon error: {err_msg}")
+
+        # 5. Authoritative balance & partial payment validation
+        from .services_payment_policy import PaymentPolicyService
+        total_amount, total_paid, outstanding, count = PaymentPolicyService.calculate_order_balance(order, db_alias=alias)
+        if outstanding <= _D('0.00'):
+            raise ValidationError("This order has already been fully paid.", code="ORDER_ALREADY_PAID")
+
+        if is_partial_payment and partial_amount is not None:
+            charge_amount = PaymentPolicyService.validate_partial_payment(
+                order=order,
+                requested_amount=_D(str(partial_amount)),
+                db_alias=alias,
+            )
+        else:
+            charge_amount = outstanding
+
+        amount_paise = RazorpayService.convert_inr_to_paise(charge_amount)
+        key_id, _ = RazorpayService.get_credentials(db_alias=alias)
+
+        # 6. Create official Razorpay order
+        rzp_order = RazorpayService.create_order(
+            amount_paise=amount_paise,
+            receipt=order.order_number,
+            currency=order.currency,
+            notes={
+                'internal_order_id': str(order.id),
+                'lead_id': str(lead.id),
+                'order_number': order.order_number,
+            },
+            db_alias=alias,
+        )
+
+        # 7. Record INITIATED PaymentTransaction
+        PaymentTransaction.objects.using(alias).update_or_create(
+            order=order,
+            provider='RAZORPAY',
+            status='INITIATED',
+            defaults={
+                'amount': order.total_amount,
+                'currency': order.currency,
+                'idempotency_key': f"rzp_order_{rzp_order['id']}",
+                'metadata': {
+                    'razorpay_order_id': rzp_order['id'],
+                    'receipt': order.order_number,
+                }
+            }
+        )
+
+        # 8. Resolve tenant Razorpay checkout config (method enablement, paylater hide, config_id)
+        config_id, checkout_config = PaymentPolicyService.get_razorpay_checkout_config(
+            organization=branch.organization,
+            branch=branch,
+            db_alias=alias,
+        )
+
+        return {
+            'order_id': str(order.id),
+            'order_number': order.order_number,
+            'razorpay_order_id': rzp_order['id'],
+            'key_id': key_id,
+            'config_id': config_id,
+            'config': checkout_config,
+            'amount': amount_paise,
+            'currency': order.currency,
+            'total_order_amount': str(total_amount),
+            'already_paid_amount': str(total_paid),
+            'outstanding_balance': str(outstanding),
+            'charge_amount': str(charge_amount),
+            'is_partial_payment': is_partial_payment,
+            'name': 'SWEAT',
+            'description': f"Membership - {pkg.name} ({'Partial' if is_partial_payment else 'Full'})",
+            'prefill': {
+                'name': f"{lead.first_name or ''} {lead.last_name or ''}".strip() or 'Guest',
+                'email': lead.email_normalized or '',
+                'contact': lead.phone_normalized or '',
+            }
         }
 
     # ------------------------------------------------------------------
@@ -3242,6 +3455,12 @@ class LeadConversionService:
         actor_user=None,
         idempotency_key: Optional[str] = None,
         db_alias: Optional[str] = None,
+        razorpay_order_id: Optional[str] = None,
+        razorpay_payment_id: Optional[str] = None,
+        razorpay_signature: Optional[str] = None,
+        order_id: Optional[str] = None,
+        channel: str = 'STAFF',
+        **kwargs,
     ) -> Dict[str, Any]:
         """
         Execute the full Lead → Member conversion.
@@ -3281,17 +3500,29 @@ class LeadConversionService:
         alias = db_alias or get_tenant_db_alias() or 'default'
         org = lead.organization
 
-        # ── Validate payment provider (do this before idempotency) ────
-        valid_providers = [c[0] for c in PaymentTransaction.PROVIDER_CHOICES]
-        if payment_provider not in valid_providers:
-            raise ValidationError(
-                f"Invalid payment provider '{payment_provider}'. "
-                f"Valid choices: {valid_providers}"
-            )
+        # ── Authoritative Payment Policy Provider Validation ──────────
+        from .services_payment_policy import PaymentPolicyService
+        PaymentPolicyService.validate_payment_provider(
+            provider=payment_provider,
+            channel=channel,
+            organization=org,
+            db_alias=alias,
+        )
 
         amount = _D(str(payment_amount))
         if amount <= _D('0.00'):
             raise ValidationError("Payment amount must be greater than zero.")
+
+        # ── Razorpay Payment Signature Verification (fail closed) ──────
+        if payment_provider == 'RAZORPAY':
+            from .services_razorpay import RazorpayService, RazorpayVerificationError
+            if not razorpay_payment_id or not razorpay_order_id or not razorpay_signature:
+                raise ValidationError(
+                    "Razorpay payment verification parameters (razorpay_order_id, razorpay_payment_id, razorpay_signature) are required.",
+                    code="RAZORPAY_PARAMS_MISSING"
+                )
+            if not RazorpayService.verify_payment_signature(razorpay_order_id, razorpay_payment_id, razorpay_signature, db_alias=alias):
+                raise ValidationError("Invalid Razorpay payment signature.", code="RAZORPAY_SIGNATURE_INVALID")
 
         # ── Payment recording authority enforcement ────────────────────
         if actor_user and not getattr(actor_user, 'is_superuser', False):
@@ -3359,7 +3590,7 @@ class LeadConversionService:
 
                 existing_order = None
                 for cand in existing_candidates:
-                    if cand.status == 'PENDING_PAYMENT':
+                    if cand.status in ['PENDING_PAYMENT', 'PARTIALLY_PAID']:
                         existing_order = cand
                         break
                     elif cand.status == 'PAID':
@@ -3401,12 +3632,248 @@ class LeadConversionService:
                     except ValidationError as e:
                         raise ValidationError(f"Coupon error: {e.message if hasattr(e, 'message') else str(e)}")
 
-                # Validate submitted amount vs authoritative order total
-                if amount < order.total_amount:
+                # Authoritative balance and partial payment validation
+                from .services_payment_policy import PaymentPolicyService
+                policy = PaymentPolicyService.get_effective_policy(org, branch=branch, package=pkg, package_version=pv, db_alias=alias)
+                total_amount, total_paid, outstanding, success_count = PaymentPolicyService.calculate_order_balance(order, db_alias=alias)
+
+                if outstanding <= _D('0.00'):
+                    raise ValidationError("This order has already been fully paid.", code="ORDER_ALREADY_PAID")
+
+                if amount > outstanding:
                     raise ValidationError(
-                        f"Payment amount {amount} is less than required total {order.total_amount}. "
-                        "Full payment required before membership activation."
+                        f"Payment amount {amount} exceeds outstanding balance {outstanding}.",
+                        code="AMOUNT_EXCEEDS_OUTSTANDING"
                     )
+
+                if amount < outstanding:
+                    # Validate partial payment constraints
+                    PaymentPolicyService.validate_partial_payment(order, amount, policy=policy, db_alias=alias)
+
+                # ── CASH APPROVAL WORKFLOW ────────────────────────────────────
+                if payment_provider == 'CASH' and policy.get('cash_policy', {}).get('require_approval', True):
+                    from .services_approvals import AdminApprovalService
+                    from .models_catalog import PackageEntitlementDefinition
+                    from .models_memberships import (
+                        Membership, MembershipContractSnapshot, MembershipEntitlement,
+                        MembershipEntitlementLedger, MembershipBranchHistory,
+                        MembershipStatusHistory, MembershipPackageHistory,
+                    )
+                    from .models_crm import LeadConversion, SalesFollowupTask
+                    from datetime import timedelta, datetime
+
+                    # Record PENDING payment transaction (awaiting approval)
+                    cash_txn = PaymentTransaction.objects.using(alias).create(
+                        order=order,
+                        user_profile=user_profile,
+                        provider='CASH',
+                        payment_method='CASH',
+                        amount=amount,
+                        currency=order.currency,
+                        status='PENDING',
+                        paid_at=None,
+                        metadata={
+                            'cash_recorded_by': str(actor_user.id) if actor_user else '',
+                            'cash_recorded_by_name': getattr(actor_user, 'display_name', '') if actor_user else '',
+                            'recorded_by_name': getattr(actor_user, 'display_name', '') if actor_user else '',
+                            'cash_recorded_at': timezone.now().isoformat(),
+                            'branch_id': str(branch.id),
+                            'branch_name': branch.name,
+                            'receiving_agent_id': str(actor_user.id) if actor_user else '',
+                            'receiving_agent_name': getattr(actor_user, 'display_name', '') if actor_user else '',
+                            'notes': f"Cash collection awaiting approval: {amount} {order.currency}",
+                        }
+                    )
+
+                    req = AdminApprovalService.create_approval_request(
+                        organization=org,
+                        request_type='CASH_PAYMENT_APPROVAL',
+                        entity_type='PaymentTransaction',
+                        entity_id=cash_txn.id,
+                        requested_by_user=actor_user or lead_locked.assigned_sales_user or TenantUser.objects.using(alias).first(),
+                        requested_payload={
+                            'order_id': str(order.id),
+                            'order_number': order.order_number,
+                            'lead_id': str(lead_locked.id),
+                            'member_name': f"{lead_locked.first_name} {lead_locked.last_name}".strip(),
+                            'amount': str(amount),
+                            'currency': order.currency,
+                            'branch_id': str(branch.id),
+                            'branch_name': branch.name,
+                            'recorded_by': getattr(actor_user, 'display_name', 'Staff'),
+                            'recorded_by_id': str(actor_user.id) if actor_user else '',
+                        },
+                        db_alias=alias,
+                    )
+
+                    cash_txn.metadata['approval_request_id'] = str(req.id)
+                    cash_txn.save(using=alias, update_fields=['metadata'])
+
+                    # ── Create Provisional Membership & Initial Capped Entitlements ──
+                    provisional_limit = int(policy.get('cash_policy', {}).get('provisional_sessions_allowed', 4))
+                    start = start_date if isinstance(start_date, _date) else (
+                        _date.fromisoformat(start_date) if isinstance(start_date, str) and start_date else timezone.now().date()
+                    )
+                    duration_value = pv.duration_value or 1
+                    duration_unit = pv.duration_unit or 'MONTH'
+                    if duration_unit == 'DAY':
+                        end = start + timedelta(days=duration_value)
+                    elif duration_unit == 'WEEK':
+                        end = start + timedelta(weeks=duration_value)
+                    elif duration_unit == 'MONTH':
+                        end = start + timedelta(days=duration_value * 30)
+                    elif duration_unit == 'YEAR':
+                        end = start + timedelta(days=duration_value * 365)
+                    else:
+                        end = start + timedelta(days=30)
+
+                    membership_number = f"MEM-{uuid.uuid4().hex[:8].upper()}"
+                    provisional_ref = f"PROVISIONAL_CASH_PENDING:limit={provisional_limit}:req={req.id}"
+
+                    membership = Membership.objects.using(alias).create(
+                        user_profile=user_profile,
+                        program=pkg.program,
+                        package=pkg,
+                        package_version=pv,
+                        package_price=package_price,
+                        source_order=order,
+                        source_order_item=order_item,
+                        purchase_branch=branch,
+                        home_branch=branch,
+                        membership_number=membership_number,
+                        start_date=start,
+                        end_date=end,
+                        status='ACTIVE',
+                        legacy_reference=provisional_ref,
+                        activated_at=timezone.now(),
+                    )
+
+                    entitlements_def_qs = PackageEntitlementDefinition.objects.using(alias).filter(package_version=pv)
+                    entitlements_data = []
+                    for ed in entitlements_def_qs:
+                        entitlements_data.append({
+                            'id': str(ed.id),
+                            'entitlement_type': ed.entitlement_type,
+                            'reference_type': ed.reference_type,
+                            'reference_id': str(ed.reference_id) if ed.reference_id else None,
+                            'allocated_units': str(ed.allocated_units) if ed.allocated_units else None,
+                            'is_unlimited': ed.is_unlimited,
+                        })
+
+                    MembershipContractSnapshot.objects.using(alias).create(
+                        membership=membership,
+                        package=pkg,
+                        package_version=pv,
+                        package_price=package_price,
+                        package_name_snapshot=order_item.item_name_snapshot or pkg.name,
+                        purchase_price=order_item.unit_price_snapshot,
+                        discount_amount=order_item.discount_amount,
+                        tax_amount=order_item.tax_amount,
+                        final_amount=order_item.total_amount,
+                        currency=order.currency,
+                        duration_value=duration_value,
+                        duration_unit=duration_unit,
+                        start_date=start,
+                        end_date=end,
+                        entitlements_snapshot=entitlements_data,
+                        purchase_branch=branch,
+                        source_order=order,
+                        source_order_item=order_item,
+                    )
+
+                    now_dt = timezone.now()
+                    end_dt = timezone.make_aware(datetime.combine(end, datetime.max.time()))
+
+                    for ed in entitlements_def_qs:
+                        prov_units = min(ed.allocated_units or _D(str(provisional_limit)), _D(str(provisional_limit)))
+                        ent = MembershipEntitlement.objects.using(alias).create(
+                            membership=membership,
+                            source_definition=ed,
+                            entitlement_type=ed.entitlement_type,
+                            reference_type=ed.reference_type,
+                            reference_id=ed.reference_id,
+                            allocated_units=prov_units,
+                            consumed_units=_D('0.00'),
+                            is_unlimited=False,
+                            valid_from=now_dt,
+                            valid_until=end_dt,
+                            status='ACTIVE',
+                        )
+
+                        MembershipEntitlementLedger.objects.using(alias).create(
+                            membership_entitlement=ent,
+                            transaction_type='ALLOCATION',
+                            units=prov_units,
+                            reason_code='PROVISIONAL_CASH_ALLOCATION',
+                            reason_text=f"Provisional allocation pending cash payment approval (limit {provisional_limit} sessions)",
+                            balance_after=prov_units,
+                            created_by_user=actor_user,
+                        )
+
+                    MembershipBranchHistory.objects.using(alias).create(
+                        membership=membership,
+                        to_branch=branch,
+                        change_type='INITIAL',
+                        reason="Membership purchase at home branch (provisional cash pending)",
+                        changed_by_user=actor_user,
+                    )
+
+                    MembershipStatusHistory.objects.using(alias).create(
+                        membership=membership,
+                        from_status=None,
+                        to_status='ACTIVE',
+                        reason_code='PROVISIONAL_CASH_ACTIVATION',
+                        reason_text=f"Provisional membership created pending cash approval (limit {provisional_limit} sessions)",
+                        changed_by_user=actor_user,
+                    )
+
+                    MembershipPackageHistory.objects.using(alias).create(
+                        membership=membership,
+                        to_package=pkg,
+                        to_package_version=pv,
+                        change_type='UPGRADE',
+                        order=order,
+                        changed_by_user=actor_user,
+                        reason="Provisional package activation pending cash approval",
+                    )
+
+                    LeadConversion.objects.using(alias).create(
+                        lead=lead_locked,
+                        user_profile=user_profile,
+                        converted_at=timezone.now(),
+                        converted_by_user=actor_user,
+                        order_id=order.id,
+                        membership_id=membership.id,
+                        package_id=pkg.id,
+                        package_version_id=pv.id,
+                        conversion_source='CRM_WIZARD',
+                    )
+
+                    lead_locked.converted_user_profile = user_profile
+                    lead_locked.current_status = 'CONVERTED'
+                    lead_locked.save(using=alias, update_fields=['converted_user_profile', 'current_status', 'updated_at'])
+
+                    SalesFollowupTask.objects.using(alias).filter(
+                        lead=lead_locked,
+                        status='PENDING',
+                    ).update(
+                        status='COMPLETED',
+                        outcome='CONVERTED_CASH_PENDING',
+                    )
+
+                    return {
+                        'status': 'PENDING_APPROVAL',
+                        'order_id': str(order.id),
+                        'order_number': order.order_number,
+                        'transaction_id': str(cash_txn.id),
+                        'approval_request_id': str(req.id),
+                        'membership_id': str(membership.id),
+                        'membership_number': membership.membership_number,
+                        'provisional_sessions': provisional_limit,
+                        'amount': str(amount),
+                        'currency': order.currency,
+                        'message': f"Cash payment recorded ({amount} {order.currency}) and submitted for manager approval. Provisional membership created with {provisional_limit} sessions allowed pending approval.",
+                    }
 
                 # ── Idempotency key for the payment txn ────────────────────
                 payment_idem_key = f"payment-{idem_key}"
@@ -3415,29 +3882,59 @@ class LeadConversionService:
                 # Lock the order (Lead is already locked above)
                 order = Order.objects.using(alias).select_for_update().get(id=order.id)
 
+                if payment_provider == 'RAZORPAY':
+                    from .services_razorpay import RazorpayService
+                    # Cross-check with Razorpay server API against charged installment amount
+                    expected_amount_paise = RazorpayService.convert_inr_to_paise(amount)
+                    RazorpayService.fetch_and_verify_payment(
+                        razorpay_payment_id=razorpay_payment_id,
+                        expected_order_id=razorpay_order_id,
+                        expected_amount_paise=expected_amount_paise,
+                        expected_currency=order.currency,
+                        db_alias=alias,
+                    )
+
                 if order.status == 'PAID':
                     # Post-payment recovery: payment was already completed, retrieve records
                     txn = PaymentTransaction.objects.using(alias).filter(order=order, status='SUCCESS').first()
                     invoice = MemberInvoice.objects.using(alias).filter(order=order).first()
                 else:
                     # Record payment — records SUCCESS, marks order PAID if fully covered
+                    provider_txn_id = razorpay_payment_id if payment_provider == 'RAZORPAY' else None
+                    pay_metadata = {
+                        'razorpay_order_id': razorpay_order_id,
+                        'razorpay_payment_id': razorpay_payment_id,
+                        'razorpay_signature': razorpay_signature,
+                        'verified_at': timezone.now().isoformat(),
+                    } if payment_provider == 'RAZORPAY' else {}
+
                     txn, invoice = CommerceService.record_payment(
                         order_id=str(order.id),
                         amount=amount,
                         provider=payment_provider,
                         payment_method=payment_method or payment_provider,
+                        provider_transaction_id=provider_txn_id,
                         idempotency_key=payment_idem_key,
+                        metadata=pay_metadata,
                         actor=actor_user,
                         db_alias=alias,
                     )
 
-                # Verify order reached PAID before activating membership
                 order.refresh_from_db(using=alias)
-                if order.status != 'PAID':
-                    raise ValidationError(
-                        f"Order is {order.status} after payment of {amount}. "
-                        f"Order total is {order.total_amount}. Full payment required."
-                    )
+                total_amount, total_paid, outstanding, success_count = PaymentPolicyService.calculate_order_balance(order, db_alias=alias)
+                should_activate = PaymentPolicyService.should_activate_membership(order, total_paid, policy=policy, db_alias=alias)
+
+                if not should_activate:
+                    return {
+                        'status': 'PARTIAL_PAYMENT_RECORDED',
+                        'order_id': str(order.id),
+                        'order_number': order.order_number,
+                        'order_status': order.status,
+                        'total_paid': str(total_paid),
+                        'outstanding_balance': str(outstanding),
+                        'membership_activated': False,
+                        'message': 'Partial payment recorded. Remaining balance required for membership activation.',
+                    }
 
                 # Activate membership
                 if isinstance(start_date, str) and start_date:
@@ -3571,3 +4068,96 @@ class LeadConversionService:
         )
 
         return result
+
+
+    @classmethod
+    def _finalize_conversion_for_order(
+        cls,
+        order,
+        start_date=None,
+        actor_user=None,
+        db_alias: Optional[str] = None,
+    ):
+        """
+        Activates membership and finalizes CRM conversion when an order payment is completed or approved.
+        """
+        alias = db_alias or 'default'
+        lead_locked = order.lead
+        if not lead_locked or lead_locked.current_status == 'CONVERTED':
+            return None
+
+        from .models_catalog import PackageVersion
+        from .models_crm import LeadConversion, SalesFollowupTask
+        from .models_memberships import Membership
+        from .services_memberships import MembershipLifecycleService
+        from .services_stage_automation import CRMStageAutomationService
+
+        order_item = order.items.using(alias).filter(item_type='PACKAGE').first()
+        if not order_item or not order_item.package_version:
+            return None
+
+        pv = order_item.package_version
+        pkg = pv.package
+        user_profile = order.user_profile
+        if not user_profile:
+            user_profile, _ = cls.resolve_or_create_member_identity(
+                lead=lead_locked,
+                branch=order.branch,
+                actor_user=actor_user,
+                db_alias=alias,
+            )
+            order.user_profile = user_profile
+            order.save(using=alias, update_fields=['user_profile'])
+
+        if isinstance(start_date, str) and start_date:
+            from datetime import date as _d
+            start = _d.fromisoformat(start_date)
+        elif isinstance(start_date, date):
+            start = start_date
+        else:
+            start = timezone.now().date()
+
+        membership = Membership.objects.using(alias).filter(user_profile=user_profile).first()
+        if not membership:
+            membership = MembershipLifecycleService.activate_membership_from_order(
+                order=order,
+                order_item=order_item,
+                start_date=start,
+                db_alias=alias,
+                created_by_user=actor_user,
+            )
+
+        conversion = LeadConversion.objects.using(alias).filter(lead=lead_locked).first()
+        if not conversion:
+            conversion = LeadConversion.objects.using(alias).create(
+                lead=lead_locked,
+                user_profile=user_profile,
+                converted_at=timezone.now(),
+                converted_by_user=actor_user,
+                order_id=order.id,
+                membership_id=membership.id,
+                package_id=pkg.id,
+                package_version_id=pv.id,
+                conversion_source='CRM_WIZARD',
+            )
+
+        lead_locked.converted_user_profile = user_profile
+        lead_locked.save(using=alias, update_fields=['converted_user_profile', 'updated_at'])
+
+        SalesFollowupTask.objects.using(alias).filter(
+            lead=lead_locked,
+            status='PENDING',
+        ).update(
+            status='COMPLETED',
+            outcome='Lead successfully converted to active member.',
+        )
+
+        CRMStageAutomationService.evaluate_and_transition(
+            lead=lead_locked,
+            trigger_event='LEAD_CONVERTED',
+            context={'conversion': conversion, 'order': order},
+            actor_user=actor_user,
+            db_alias=alias,
+        )
+
+        return membership

@@ -1039,12 +1039,15 @@ class MemberViewSet(viewsets.ViewSet):
         if org:
             qs = qs.filter(user__organization=org)
 
+        # Strict Member Criteria:
+        # A mobile user is strictly a Lead until they purchase a package/program.
+        # Customer members must have an active/past membership, a converted lead record,
+        # a completed paid order, or explicit manual creation by studio staff.
         member_condition = (
-            (Q(member_number__isnull=False) & ~Q(member_number=''))
-            | (Q(acquisition_source__isnull=False) & ~Q(acquisition_source=''))
-            | Q(memberships__isnull=False)
+            Q(memberships__isnull=False)
             | Q(lead_conversions__isnull=False)
-            | Q(orders__isnull=False)
+            | Q(orders__status='PAID')
+            | (Q(acquisition_source='MANUAL_CREATE') & Q(member_number__isnull=False) & ~Q(member_number=''))
         )
         return qs.filter(member_condition).distinct()
 

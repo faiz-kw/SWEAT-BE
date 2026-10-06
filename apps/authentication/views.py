@@ -2208,7 +2208,7 @@ class PublicBrandingView(APIView):
             # Return tenant-specific public branding
             try:
                 tenant = Tenant.objects.using('default').filter(
-                    slug=tenant_slug, status='Active'
+                    slug=tenant_slug, status__iexact='ACTIVE'
                 ).select_related('branding').first()
                 if not tenant:
                     return Response(

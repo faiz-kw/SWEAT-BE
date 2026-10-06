@@ -72,9 +72,15 @@ class ApprovalRequestViewSet(viewsets.ModelViewSet):
         if not action_val:
             return Response({'detail': 'action is required (APPROVED or REJECTED).'}, status=status.HTTP_400_BAD_REQUEST)
 
-        approver = request.user if hasattr(request.user, 'tenantuser') else None
+        if isinstance(request.user, TenantUser):
+            approver = request.user
+        elif hasattr(request.user, 'tenantuser'):
+            approver = request.user.tenantuser
+        else:
+            email = getattr(request.user, 'email', '')
+            db_alias = getattr(approval_req._state, 'db', 'default')
+            approver = TenantUser.objects.using(db_alias).filter(email=email).first() if email else None
         if not approver:
-            # Fallback to requested user if system test
             approver = approval_req.requested_by_user
 
         try:

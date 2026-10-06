@@ -114,12 +114,13 @@ def _get_or_create_user_profile(user, alias, branch=None):
     if not profile:
         profile = UserProfile.objects.using(alias).create(
             user=user,
-            member_number=f"SW-{str(uuid.uuid4())[:6].upper()}",
+            member_number=None,
             first_name_snapshot=user.first_name,
             last_name_snapshot=user.last_name,
             preferred_branch=branch or user.home_branch,
             member_status='ACTIVE',
-            member_type='MEMBER',
+            member_type='TRIAL',
+            acquisition_source='MOBILE_APP',
         )
     return profile
 
@@ -279,8 +280,10 @@ class MobileRegisterView(APIView):
                 'email': user.email,
                 'first_name': user.first_name,
                 'last_name': user.last_name,
-                'phone': user.phone,
-                'member_number': profile.member_number,
+                'phone': user.phone or '',
+                'role': 'member',
+                'role_code': 'MEMBER',
+                'member_number': profile.member_number or '',
                 'home_branch': {
                     'id': str(branch.id) if branch else None,
                     'name': branch.name if branch else 'SWEAT Studio',
@@ -357,8 +360,10 @@ class MobileLoginView(APIView):
                 'email': user.email,
                 'first_name': user.first_name,
                 'last_name': user.last_name,
-                'phone': user.phone,
-                'member_number': profile.member_number,
+                'phone': user.phone or '',
+                'role': 'member',
+                'role_code': 'MEMBER',
+                'member_number': profile.member_number or '',
                 'avatar_url': user.avatar_url or '',
                 'home_branch': {
                     'id': str(user.home_branch.id) if user.home_branch else None,
@@ -366,6 +371,292 @@ class MobileLoginView(APIView):
                 } if user.home_branch else None,
             },
         }, status=status.HTTP_200_OK)
+
+
+
+
+def _process_social_login(request, email, first_name, last_name, avatar_url, provider):
+    """
+    Common handler for verified social login payloads (Google / Facebook).
+    Creates or looks up the TenantUser, associates UserProfile,
+    automatically creates/links a Lead in CRM (source: MOBILE_APP, status: NEW_LEAD),
+    and returns standard JWT access/refresh tokens.
+    """
+    alias, tenant = _resolve_mobile_tenant_and_db(request)
+    if not alias or not tenant:
+        return Response(
+            {'detail': 'Studio service is temporarily unavailable. Please try again.'},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    with transaction.atomic(using=alias):
+        # 1. Lookup existing user by email
+        user = TenantUser.objects.using(alias).filter(email__iexact=email).first()
+        is_new_user = False
+
+        org = Organization.objects.using(alias).first()
+        if not org:
+            return Response(
+                {'detail': 'Studio organization configuration not found.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        branch = Branch.objects.using(alias).filter(status='ACTIVE').first()
+
+        if not user:
+            is_new_user = True
+            base_username = email.split('@')[0] if '@' in email else f"{provider.lower()}_user"
+            username = base_username
+            idx = 1
+            while TenantUser.objects.using(alias).filter(username__iexact=username).exists():
+                username = f"{base_username}_{idx}"
+                idx += 1
+
+            user = TenantUser(
+                organization=org,
+                username=username,
+                email=email,
+                phone='',
+                first_name=first_name,
+                last_name=last_name or '',
+                display_name=f"{first_name} {last_name}".strip(),
+                avatar_url=avatar_url or '',
+                home_branch=branch,
+                user_type='MEMBER',
+                status='ACTIVE',
+                is_login_allowed=True,
+            )
+            user.set_password(str(uuid.uuid4()))
+            user.save(using=alias)
+
+            # Assign MEMBER Role
+            member_role = Role.objects.using(alias).filter(code='MEMBER').first()
+            if not member_role:
+                member_role = Role.objects.using(alias).create(
+                    organization=org,
+                    code='MEMBER',
+                    name='Studio Member',
+                    scope='BRANCH',
+                    is_system=True,
+                    is_active=True,
+                )
+
+            RoleAssignment.objects.using(alias).create(
+                user=user,
+                role=member_role,
+                branch=branch,
+                is_active=True,
+            )
+
+            try:
+                sync_tenant_user_identity(user, tenant_id=tenant.id, db=alias)
+            except Exception as e:
+                logger.warning("Could not sync directory identity for %s: %s", email, e)
+        else:
+            # Update user profile details if blank
+            updated_user_fields = []
+            if avatar_url and not user.avatar_url:
+                user.avatar_url = avatar_url
+                updated_user_fields.append('avatar_url')
+            if first_name and not user.first_name:
+                user.first_name = first_name
+                updated_user_fields.append('first_name')
+            if last_name and not user.last_name:
+                user.last_name = last_name
+                updated_user_fields.append('last_name')
+            if updated_user_fields:
+                user.save(using=alias, update_fields=updated_user_fields)
+
+        # 2. Ensure UserProfile exists (member_type='TRIAL' until package purchase)
+        profile = _get_or_create_user_profile(user, alias, branch=branch)
+
+        # 3. Automatically create or link CRM Lead record with source 'MOBILE_APP'
+        try:
+            lead_source, _ = LeadSource.objects.using(alias).get_or_create(
+                organization=org,
+                code='MOBILE_APP',
+                defaults={'name': 'Mobile App', 'source_type': 'MOBILE_APP', 'status': 'ACTIVE'}
+            )
+
+            lead = Lead.objects.using(alias).filter(
+                models.Q(email_normalized__iexact=email) |
+                (models.Q(phone_normalized=user.phone) if user.phone else models.Q(pk=None))
+            ).first()
+
+            if not lead:
+                CRMLeadService.create_lead(
+                    organization=org,
+                    first_name=first_name,
+                    last_name=last_name or '',
+                    phone=user.phone or '',
+                    email=email,
+                    branch=branch or user.home_branch,
+                    lead_source=lead_source,
+                    assigned_sales_user=None,
+                    actor_user=None,
+                    extra_fields={'converted_user_profile': profile},
+                    db_alias=alias,
+                )
+            else:
+                lead.converted_user_profile = profile
+                lead.latest_touch_source = f'MOBILE_{provider.upper()}'
+                lead.save(using=alias, update_fields=['converted_user_profile', 'latest_touch_source'])
+        except Exception as crm_err:
+            logger.warning("Could not auto-create CRM lead for %s %s: %s", provider, email, crm_err)
+
+        user.last_login_at = timezone.now()
+        user.save(using=alias, update_fields=['last_login_at'])
+
+        # 4. Generate JWT tokens
+        tokens = _build_tenant_token(user, tenant, alias)
+
+        home_branch_info = {
+            'id': str(user.home_branch.id),
+            'name': user.home_branch.name,
+        } if user.home_branch else None
+
+        return Response({
+            'access': str(tokens.access_token),
+            'refresh': str(tokens),
+            'user': {
+                'id': str(user.id),
+                'email': user.email,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+                'phone': user.phone or '',
+                'role': 'member',
+                'role_code': 'MEMBER',
+                'member_number': profile.member_number or '',
+                'avatar_url': user.avatar_url or '',
+                'home_branch': home_branch_info,
+            },
+            'is_new_user': is_new_user,
+            'message': f'Logged in successfully via {provider.title()}.',
+        }, status=status.HTTP_200_OK if not is_new_user else status.HTTP_201_CREATED)
+
+
+class MobileGoogleAuthView(APIView):
+    """
+    POST /api/v1/mobile/auth/google/
+    Authenticate or Register mobile user via Google OAuth ID token.
+    Automatically captures new users as CRM Leads (NEW_LEAD, MOBILE_APP).
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        data = request.data or {}
+        token = data.get('id_token') or data.get('token') or data.get('access_token')
+        if not token:
+            return Response(
+                {'detail': 'Google id_token is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        google_user_info = None
+
+        # 1. Try google-auth verification
+        try:
+            from google.oauth2 import id_token as google_id_token
+            from google.auth.transport import requests as google_requests
+            client_id = getattr(settings, 'GOOGLE_OAUTH_CLIENT_ID', None)
+            google_user_info = google_id_token.verify_oauth2_token(
+                token,
+                google_requests.Request(),
+                audience=client_id if client_id else None
+            )
+        except Exception as e_verify:
+            logger.info("google_id_token verification exception (%s), trying Google tokeninfo endpoint...", e_verify)
+            # Fallback to Google tokeninfo API endpoint
+            try:
+                import requests as http_req
+                resp = http_req.get(
+                    'https://oauth2.googleapis.com/tokeninfo',
+                    params={'id_token': token},
+                    timeout=10
+                )
+                if resp.status_code == 200:
+                    google_user_info = resp.json()
+            except Exception as e_net:
+                logger.warning("Google tokeninfo fallback failed: %s", e_net)
+
+        if not google_user_info or not google_user_info.get('email'):
+            return Response(
+                {'detail': 'Invalid or expired Google token.'},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        email = google_user_info.get('email').strip().lower()
+        first_name = (google_user_info.get('given_name') or google_user_info.get('name') or email.split('@')[0]).strip()
+        last_name = (google_user_info.get('family_name') or '').strip()
+        picture = google_user_info.get('picture') or ''
+
+        return _process_social_login(
+            request=request,
+            email=email,
+            first_name=first_name,
+            last_name=last_name,
+            avatar_url=picture,
+            provider='GOOGLE',
+        )
+
+
+class MobileFacebookAuthView(APIView):
+    """
+    POST /api/v1/mobile/auth/facebook/
+    Authenticate or Register mobile user via Facebook Graph API access token.
+    Automatically captures new users as CRM Leads (NEW_LEAD, MOBILE_APP).
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        data = request.data or {}
+        access_token = data.get('access_token') or data.get('token')
+        if not access_token:
+            return Response(
+                {'detail': 'Facebook access_token is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        fb_user_info = None
+        try:
+            import requests as http_req
+            fb_resp = http_req.get(
+                'https://graph.facebook.com/me',
+                params={
+                    'fields': 'id,name,first_name,last_name,email,picture.type(large)',
+                    'access_token': access_token,
+                },
+                timeout=10
+            )
+            if fb_resp.status_code == 200:
+                fb_user_info = fb_resp.json()
+            else:
+                logger.warning("Facebook Graph API returned %s: %s", fb_resp.status_code, fb_resp.text)
+        except Exception as e:
+            logger.warning("Facebook Graph API request failed: %s", e)
+
+        if not fb_user_info or not fb_user_info.get('id'):
+            return Response(
+                {'detail': 'Invalid or expired Facebook access token.'},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        fb_id = fb_user_info['id']
+        email = (fb_user_info.get('email') or f"fb_{fb_id}@facebook.user").strip().lower()
+        first_name = (fb_user_info.get('first_name') or fb_user_info.get('name') or 'Facebook User').strip()
+        last_name = (fb_user_info.get('last_name') or '').strip()
+        picture = ''
+        if isinstance(fb_user_info.get('picture'), dict):
+            picture = fb_user_info['picture'].get('data', {}).get('url', '')
+
+        return _process_social_login(
+            request=request,
+            email=email,
+            first_name=first_name,
+            last_name=last_name,
+            avatar_url=picture,
+            provider='FACEBOOK',
+        )
 
 
 class MobileMeView(APIView):
@@ -1495,6 +1786,18 @@ class MobileCheckoutOrderView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
+        requested_provider = str(request.data.get('payment_provider', 'RAZORPAY')).strip().upper()
+        if requested_provider == 'CASH':
+            return Response(
+                {'detail': 'Cash payment is not permitted for member self-service. Only online payments are accepted.', 'code': 'PAYMENT_METHOD_NOT_ALLOWED_FOR_CHANNEL'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if requested_provider not in ['RAZORPAY', 'ONLINE', '']:
+            return Response(
+                {'detail': f"Payment provider '{requested_provider}' is not supported. Only RAZORPAY is accepted.", 'code': 'UNSUPPORTED_PAYMENT_PROVIDER'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         user = request.user
         alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
         profile = _get_or_create_user_profile(user, alias)
@@ -1563,18 +1866,46 @@ class MobileCheckoutOrderView(APIView):
                 total_price=final_amount,
             )
 
-        # Generate simulated/real Razorpay order structure
-        razorpay_order_id = f"order_{str(uuid.uuid4().hex)[:14]}"
+        # Generate real Razorpay order via official service
+        from .services_razorpay import RazorpayService
+        if not RazorpayService.is_configured(db_alias=alias):
+            return Response(
+                {'detail': 'Razorpay is not configured on this server.', 'code': 'RAZORPAY_NOT_CONFIGURED'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        amount_paise = RazorpayService.convert_inr_to_paise(final_amount)
+        key_id, _ = RazorpayService.get_credentials(db_alias=alias)
+        rzp_order = RazorpayService.create_order(
+            amount_paise=amount_paise,
+            receipt=order.order_number,
+            currency=order.currency,
+            notes={
+                'internal_order_id': str(order.id),
+                'user_id': str(user.id),
+                'order_number': order.order_number,
+            },
+            db_alias=alias,
+        )
+
+        from .services_payment_policy import PaymentPolicyService
+        config_id, checkout_config = PaymentPolicyService.get_razorpay_checkout_config(
+            organization=org,
+            branch=branch,
+            db_alias=alias,
+        )
 
         return Response({
             'order_id': str(order.id),
             'order_number': order.order_number,
-            'razorpay_order_id': razorpay_order_id,
-            'amount_in_paise': int(final_amount * 100),
+            'razorpay_order_id': rzp_order['id'],
+            'amount_in_paise': amount_paise,
             'amount': float(final_amount),
-            'currency': 'INR',
+            'currency': order.currency,
             'package_name': package.name,
-            'key_id': getattr(settings, 'RAZORPAY_KEY_ID', 'rzp_test_sweat_elite'),
+            'key_id': key_id,
+            'config_id': config_id,
+            'config': checkout_config,
         }, status=status.HTTP_201_CREATED)
 
 
@@ -1591,7 +1922,22 @@ class MobileCheckoutVerifyView(APIView):
         profile = _get_or_create_user_profile(user, alias)
 
         order_id = request.data.get('order_id')
-        payment_id = request.data.get('razorpay_payment_id') or f"pay_{str(uuid.uuid4().hex)[:14]}"
+        razorpay_order_id = request.data.get('razorpay_order_id')
+        payment_id = request.data.get('razorpay_payment_id')
+        signature = request.data.get('razorpay_signature')
+
+        if not payment_id or not razorpay_order_id or not signature:
+            return Response(
+                {'detail': 'razorpay_order_id, razorpay_payment_id, and razorpay_signature are required.', 'code': 'RAZORPAY_PARAMS_MISSING'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        from .services_razorpay import RazorpayService
+        if not RazorpayService.verify_payment_signature(razorpay_order_id, payment_id, signature, db_alias=alias):
+            return Response(
+                {'detail': 'Invalid Razorpay payment signature.', 'code': 'RAZORPAY_SIGNATURE_INVALID'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         try:
             order = Order.objects.using(alias).select_related('organization', 'branch').get(id=order_id, user_profile=profile)
@@ -1605,6 +1951,20 @@ class MobileCheckoutVerifyView(APIView):
         if not order_item:
             return Response({'detail': 'Invalid order items.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Cross-check with Razorpay server API
+        expected_paise = RazorpayService.convert_inr_to_paise(order.total_amount)
+        try:
+            RazorpayService.fetch_and_verify_payment(
+                razorpay_payment_id=payment_id,
+                expected_order_id=razorpay_order_id,
+                expected_amount_paise=expected_paise,
+                expected_currency=order.currency,
+                db_alias=alias,
+            )
+        except Exception as e:
+            code_val = getattr(e, 'code', 'RAZORPAY_VERIFICATION_FAILED')
+            return Response({'detail': str(e), 'code': code_val}, status=status.HTTP_400_BAD_REQUEST)
+
         with transaction.atomic(using=alias):
             # 1. Record payment transaction
             PaymentTransaction.objects.using(alias).create(
@@ -1612,9 +1972,14 @@ class MobileCheckoutVerifyView(APIView):
                 amount=order.total_amount,
                 currency=order.currency,
                 provider='RAZORPAY',
+                payment_method='RAZORPAY',
                 provider_transaction_id=payment_id,
                 status='SUCCESS',
-                payload_json=request.data,
+                metadata={
+                    'razorpay_order_id': razorpay_order_id,
+                    'razorpay_payment_id': payment_id,
+                    'razorpay_signature': signature,
+                },
             )
 
             # 2. Mark order as PAID
@@ -1629,6 +1994,12 @@ class MobileCheckoutVerifyView(APIView):
                 created_by_user=user,
                 db_alias=alias,
             )
+
+            # 3b. Elevate user profile to full Member status upon package purchase
+            if not profile.member_number:
+                profile.member_number = f"SW-{str(uuid.uuid4())[:6].upper()}"
+            profile.member_type = 'MEMBER'
+            profile.save(using=alias, update_fields=['member_number', 'member_type'])
 
             # 4. Advance CRM Lead status to CONVERTED
             try:

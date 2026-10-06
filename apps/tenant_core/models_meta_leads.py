@@ -110,6 +110,7 @@ class MetaLeadImport(models.Model):
         ('NEEDS_MAPPING', 'Needs mapping'),
         ('NEEDS_ASSIGNMENT', 'Needs branch assignment'),
         ('NEEDS_REVIEW', 'Repeat enquiry review'),
+        ('RESOLVED', 'Resolved'),
         ('FAILED', 'Failed'),
     ]
     MODES = [

@@ -33,7 +33,7 @@ class MetaSignatureTests(SimpleTestCase):
             map_answers([{'name': 'email', 'values': ['a@example.test', 'b@example.test']}], {'email': 'email'})
 
 
-@override_settings(DEBUG=True)
+@override_settings(DEBUG=True, ROOT_URLCONF='apps.tenant_core.urls')
 class MetaDevelopmentTests(TestCase):
     databases = {'default', 'tenant_test', 'tenant_other'}
 
@@ -361,3 +361,88 @@ class MetaDevelopmentTests(TestCase):
         }, format='json')
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.data['field_defaults'], {'fitness_goal': 'Strength Training', 'country': 'India'})
+
+    def test_repeat_enquiry_resolution_flow(self):
+        from apps.tenant_core.models_audit_outbox import BusinessAuditEvent
+        from apps.tenant_core.models_crm import SalesFollowupTask
+        # 1. Create first import (becomes IMPORTED)
+        event1, _ = receive_simulation(self.org, self.payload, self.user)
+        self.assertEqual(event1.status, 'IMPORTED')
+        self.assertEqual(Lead.objects.count(), 1)
+        lead_id = event1.lead_id
+
+        # 2. Resend same contact in new submission -> held for review
+        payload2 = {**self.payload, 'external_lead_id': 'submission-repeat'}
+        event2, _ = receive_simulation(self.org, payload2, self.user)
+        self.assertEqual(event2.status, 'NEEDS_REVIEW')
+        self.assertEqual(event2.error_code, 'EXISTING_CONTACT')
+        self.assertEqual(Lead.objects.count(), 1)
+        initial_tasks = SalesFollowupTask.objects.count()
+
+        # 3. Test list / detail endpoint exposes matched_lead and full external_lead_id
+        detail_res = self.client.get(f'/meta-lead-imports/{event2.id}/')
+        self.assertEqual(detail_res.status_code, 200)
+        self.assertIsNotNone(detail_res.data.get('matched_lead'))
+        self.assertEqual(detail_res.data['matched_lead']['id'], str(lead_id))
+        self.assertEqual(detail_res.data['external_lead_id'], 'submission-repeat')
+
+        # 4. Resolve repeat submission with a reason
+        resolve_res = self.client.post(
+            f'/meta-lead-imports/{event2.id}/resolve/',
+            {'reason': 'Handled by gym receptionist directly', 'action': 'DISMISSED'},
+            format='json'
+        )
+        self.assertEqual(resolve_res.status_code, 200)
+        self.assertEqual(resolve_res.data['status'], 'RESOLVED')
+        self.assertIsNotNone(resolve_res.data.get('resolution'))
+        self.assertEqual(resolve_res.data['resolution']['reason'], 'Handled by gym receptionist directly')
+        self.assertEqual(resolve_res.data['resolution']['resolved_by_id'], str(self.user.id))
+
+        # Refresh event2 from DB
+        event2.refresh_from_db()
+        self.assertEqual(event2.status, 'RESOLVED')
+        self.assertEqual(str(event2.lead_id), str(lead_id))
+        self.assertIn('resolution', event2.mapping_snapshot)
+
+        # Verify Lead count and Task count remain strictly unchanged
+        self.assertEqual(Lead.objects.count(), 1)
+        self.assertEqual(SalesFollowupTask.objects.count(), initial_tasks)
+
+        # Verify BusinessAuditEvent recorded
+        audit = BusinessAuditEvent.objects.filter(
+            organization=self.org,
+            entity_type='MetaLeadImport',
+            entity_id=event2.id,
+            action_code='META_IMPORT_RESOLVED'
+        ).first()
+        self.assertIsNotNone(audit)
+        self.assertEqual(audit.metadata.get('reason'), 'Handled by gym receptionist directly')
+
+        # 5. Verify Repeated clicks are safe and idempotent
+        repeat_resolve = self.client.post(
+            f'/meta-lead-imports/{event2.id}/resolve/',
+            {'reason': 'Another click', 'action': 'DISMISSED'},
+            format='json'
+        )
+        self.assertEqual(repeat_resolve.status_code, 200)
+        self.assertEqual(repeat_resolve.data['status'], 'RESOLVED')
+        self.assertEqual(Lead.objects.count(), 1)
+        self.assertEqual(SalesFollowupTask.objects.count(), initial_tasks)
+
+        # 6. Verify retrying a resolved import is safe and does not create duplicates
+        retry_res = self.client.post(f'/meta-lead-imports/{event2.id}/retry/')
+        self.assertEqual(retry_res.status_code, 200)
+        self.assertEqual(retry_res.data['status'], 'RESOLVED')
+        self.assertEqual(Lead.objects.count(), 1)
+        self.assertEqual(SalesFollowupTask.objects.count(), initial_tasks)
+
+    def test_repeat_enquiry_resolution_requires_permission(self):
+        other_user = TenantUser.objects.create(organization=self.org, email='staff@example.test', first_name='Staff')
+        other_user.is_superuser = False
+        other_user._auth_type = 'tenant'
+        client = APIClient()
+        client.force_authenticate(other_user)
+
+        event, _ = receive_simulation(self.org, {**self.payload, 'external_lead_id': 'perm-test'})
+        res = client.post(f'/meta-lead-imports/{event.id}/resolve/', {'reason': 'test'}, format='json')
+        self.assertEqual(res.status_code, 403)

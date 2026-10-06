@@ -1219,19 +1219,93 @@ class LeadViewSet(viewsets.ModelViewSet):
             )
 
         try:
+            channel = request.query_params.get('channel') or request.data.get('channel', 'STAFF')
             quote = LeadConversionService.get_conversion_quote(
                 lead=lead,
                 package_version_id=str(package_version_id),
                 branch_id=str(branch_id),
                 coupon_code=coupon_code,
+                channel=channel,
                 db_alias=alias,
             )
             return Response(quote)
         except ValidationError as exc:
             msg = exc.message if hasattr(exc, 'message') else str(exc)
-            return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)
+            code = getattr(exc, 'code', 'VALIDATION_ERROR')
+            return Response({'error': msg, 'code': code}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as exc:
             logger.exception("Error in conversion_quote: %s", exc)
+            return Response({'error': str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=True, methods=['post'], url_path='checkout-order')
+    def checkout_order(self, request, pk=None):
+        """
+        POST /api/v1/tenant/leads/{id}/checkout-order/
+
+        Prepares a checkout session for a lead purchase.
+        For Razorpay:
+          - Server-side authoritative pricing (quote, discount, tax)
+          - Creates or reuses pending internal Order
+          - Creates official Razorpay order in integer paise
+          - Returns public key_id, razorpay_order_id, amount, and prefill
+        """
+        from .services_crm import (
+            LeadConversionService, check_payment_recording_permission
+        )
+        lead = self.get_object()
+        alias = _get_db(request)
+
+        package_version_id = request.data.get('package_version_id')
+        branch_id = request.data.get('branch_id')
+        coupon_code = request.data.get('coupon_code')
+
+        if not package_version_id or not branch_id:
+            return Response(
+                {'error': 'package_version_id and branch_id are required'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        permitted_branches = get_user_effective_branch_ids(request.user, alias)
+        if permitted_branches is not None and str(branch_id) not in permitted_branches:
+            return Response(
+                {'error': 'You do not have permission to initiate checkout for this branch.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        has_pay_perm, _ = check_payment_recording_permission(
+            request.user, branch_id=str(branch_id), request=request, db_alias=alias
+        )
+        if not has_pay_perm:
+            return Response(
+                {
+                    'error': 'Permission denied: payment confirmation permission (finance.payments.create) required to initiate payment.',
+                    'code': 'PAYMENT_AUTHORITY_REQUIRED',
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        try:
+            is_partial = request.data.get('is_partial_payment', False)
+            partial_amt = request.data.get('partial_amount')
+            channel = request.data.get('channel', 'STAFF')
+            checkout_data = LeadConversionService.create_checkout_order(
+                lead=lead,
+                package_version_id=str(package_version_id),
+                branch_id=str(branch_id),
+                coupon_code=coupon_code,
+                is_partial_payment=is_partial,
+                partial_amount=partial_amt,
+                channel=channel,
+                actor_user=request.user,
+                db_alias=alias,
+            )
+            return Response(checkout_data, status=status.HTTP_200_OK)
+        except ValidationError as exc:
+            msg = exc.message if hasattr(exc, 'message') else str(exc)
+            code = getattr(exc, 'code', 'VALIDATION_ERROR')
+            return Response({'error': msg, 'code': code}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as exc:
+            logger.exception("Error in checkout_order: %s", exc)
             return Response({'error': str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(detail=True, methods=['post'], url_path='convert')
@@ -1301,6 +1375,7 @@ class LeadViewSet(viewsets.ModelViewSet):
                 )
 
         try:
+            channel = request.data.get('channel', 'STAFF')
             result = LeadConversionService.execute_conversion(
                 lead=lead,
                 package_version_id=str(package_version_id),
@@ -1313,7 +1388,14 @@ class LeadViewSet(viewsets.ModelViewSet):
                 actor_user=request.user,
                 idempotency_key=request.data.get('idempotency_key'),
                 db_alias=alias,
+                razorpay_order_id=request.data.get('razorpay_order_id'),
+                razorpay_payment_id=request.data.get('razorpay_payment_id'),
+                razorpay_signature=request.data.get('razorpay_signature'),
+                order_id=request.data.get('order_id'),
+                channel=channel,
             )
+            if result.get('status') == 'PENDING_APPROVAL':
+                return Response(result, status=status.HTTP_202_ACCEPTED)
             return Response(result, status=status.HTTP_201_CREATED)
 
         except IdempotencyConflictError as exc:

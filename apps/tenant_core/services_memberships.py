@@ -270,6 +270,12 @@ class MembershipLifecycleService:
             if membership.status != 'ACTIVE':
                 raise ValidationError(f"Cannot consume sessions: Membership is {membership.status}.")
 
+            if membership.legacy_reference and 'PROVISIONAL_CASH_LIMIT_REACHED' in membership.legacy_reference:
+                raise ValidationError(
+                    "PAYMENT_APPROVAL_PENDING_LIMIT_REACHED: Cash payment approval is still pending and provisional session limit has been reached.",
+                    code="PAYMENT_APPROVAL_PENDING_LIMIT_REACHED"
+                )
+
             ent = MembershipEntitlement.objects.using(alias).select_for_update().filter(
                 membership=membership,
                 entitlement_type=entitlement_type,
@@ -277,16 +283,33 @@ class MembershipLifecycleService:
             ).first()
 
             if not ent:
+                if membership.legacy_reference and 'PROVISIONAL_CASH' in membership.legacy_reference:
+                    membership.legacy_reference = "PROVISIONAL_CASH_LIMIT_REACHED:limit=provisional"
+                    membership.save(using=alias, update_fields=['legacy_reference', 'updated_at'])
+                    raise ValidationError(
+                        "PAYMENT_APPROVAL_PENDING_LIMIT_REACHED: Cash payment approval is still pending and provisional session limit has been reached.",
+                        code="PAYMENT_APPROVAL_PENDING_LIMIT_REACHED"
+                    )
                 raise ValidationError(f"No active entitlement of type '{entitlement_type}' found on this membership.")
 
             if not ent.is_unlimited:
                 remaining = ent.remaining_units
                 if remaining is not None and remaining < units:
+                    if membership.legacy_reference and 'PROVISIONAL_CASH' in membership.legacy_reference:
+                        membership.legacy_reference = f"PROVISIONAL_CASH_LIMIT_REACHED:limit={ent.allocated_units}"
+                        membership.save(using=alias, update_fields=['legacy_reference', 'updated_at'])
+                        raise ValidationError(
+                            "PAYMENT_APPROVAL_PENDING_LIMIT_REACHED: Cash payment approval is still pending and provisional session limit has been reached.",
+                            code="PAYMENT_APPROVAL_PENDING_LIMIT_REACHED"
+                        )
                     raise ValidationError(f"Insufficient entitlement units. Required: {units}, Remaining: {remaining}.")
 
                 ent.consumed_units += units
                 if ent.allocated_units and ent.consumed_units >= ent.allocated_units:
                     ent.status = 'EXHAUSTED'
+                    if membership.legacy_reference and 'PROVISIONAL_CASH' in membership.legacy_reference:
+                        membership.legacy_reference = f"PROVISIONAL_CASH_LIMIT_REACHED:limit={ent.allocated_units}"
+                        membership.save(using=alias, update_fields=['legacy_reference', 'updated_at'])
                 ent.save(using=alias, update_fields=['consumed_units', 'status', 'updated_at'])
                 balance_after = ent.remaining_units
             else:

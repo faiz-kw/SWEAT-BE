@@ -1616,6 +1616,7 @@ class OrganizationSettingsViewSet(TenantDBMixin, viewsets.ModelViewSet):
         'list': 'core.settings.view',
         'retrieve': 'core.settings.view',
         'current': 'core.settings.view',
+        'payment_policy': 'core.settings.view',
         'create': 'core.settings.edit',
         'update': 'core.settings.edit',
         'partial_update': 'core.settings.edit',
@@ -1662,6 +1663,28 @@ class OrganizationSettingsViewSet(TenantDBMixin, viewsets.ModelViewSet):
             return Response(serializer.data)
 
         return Response(OrganizationSettingsSerializer(settings_obj).data)
+
+    @action(detail=False, methods=['get', 'put', 'patch'], url_path='payment-policy')
+    def payment_policy(self, request):
+        """Get or update tenant payment policies and methods configuration."""
+        db = self.get_db()
+        org = Organization.objects.using(db).first()
+        if not org:
+            return Response({'error': 'Organization not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        from .services_payment_policy import PaymentPolicyService
+
+        if request.method in ['PUT', 'PATCH']:
+            updated = PaymentPolicyService.update_organization_policy(
+                organization=org,
+                policy_data=request.data,
+                actor=getattr(request, 'user', None),
+                db_alias=db,
+            )
+            return Response(updated, status=status.HTTP_200_OK)
+
+        policy = PaymentPolicyService.get_effective_policy(org, db_alias=db)
+        return Response(policy, status=status.HTTP_200_OK)
 
 
 class BranchSettingsViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
