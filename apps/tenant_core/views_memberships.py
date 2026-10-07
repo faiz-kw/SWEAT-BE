@@ -74,16 +74,16 @@ class MembershipViewSet(viewsets.ModelViewSet):
     serializer_class = MembershipSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
     required_module = 'core'
-    required_submodule = 'settings'
-    required_permission = 'core.settings.view'
+    required_submodule = 'users'
+    required_permission = 'core.users.view'
     permission_action_map = {
-        'create': 'core.settings.edit',
-        'update': 'core.settings.edit',
-        'destroy': 'core.settings.edit',
-        'activate': 'core.settings.edit',
-        'consume_entitlement': 'core.settings.edit',
-        'reverse_entitlement': 'core.settings.edit',
-        'freeze': 'core.settings.edit',
+        'create': 'core.users.edit',
+        'update': 'core.users.edit',
+        'destroy': 'core.users.edit',
+        'activate': 'core.users.edit',
+        'consume_entitlement': 'core.users.edit',
+        'reverse_entitlement': 'core.users.edit',
+        'freeze': 'core.users.edit',
     }
     pagination_class = MembershipPagination
     filter_backends = [filters.OrderingFilter]

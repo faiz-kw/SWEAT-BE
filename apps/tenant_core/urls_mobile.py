@@ -1,6 +1,7 @@
 from django.urls import path
 from .views_mobile import (
     MobileRegisterView,
+    MobileLeadCaptureView,
     MobileLoginView,
     MobileGoogleAuthView,
     MobileFacebookAuthView,
@@ -31,6 +32,9 @@ app_name = 'mobile_api'
 urlpatterns = [
     # 1. Auth & Profile
     path('auth/register/', MobileRegisterView.as_view(), name='mobile-register'),
+    path('leads/', MobileLeadCaptureView.as_view(), name='mobile-leads'),
+    path('leads/register/', MobileLeadCaptureView.as_view(), name='mobile-leads-register'),
+    path('lead/', MobileLeadCaptureView.as_view(), name='mobile-lead-direct'),
     path('auth/login/', MobileLoginView.as_view(), name='mobile-login'),
     path('auth/google/', MobileGoogleAuthView.as_view(), name='mobile-auth-google'),
     path('auth/facebook/', MobileFacebookAuthView.as_view(), name='mobile-auth-facebook'),

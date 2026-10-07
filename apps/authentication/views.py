@@ -527,6 +527,21 @@ class UniversalLoginView(APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
+        from django.utils import timezone
+        if getattr(user, 'suspended_until', None) and user.suspended_until > timezone.now():
+            reset_login_lockout(request, identifier, tenant_id=tenant_id_str)
+            return Response(
+                {'error': f'Account is suspended until {user.suspended_until.strftime("%Y-%m-%d %H:%M")}. Contact your administrator.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if getattr(user, 'deactivated_at', None) is not None:
+            reset_login_lockout(request, identifier, tenant_id=tenant_id_str)
+            return Response(
+                {'error': 'Account has been deactivated. Contact your administrator.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         if getattr(user, 'organization', None) and user.organization.status != 'ACTIVE':
             reset_login_lockout(request, identifier, tenant_id=tenant_id_str)
             return Response(
@@ -1806,15 +1821,45 @@ class PasswordResetConfirmView(APIView):
         elif account_type == 'TENANT':
             from apps.master.models_tenant import Tenant
             from apps.tenant_core.models_users import TenantUser
+            from config.routers import set_tenant_db_alias
             tenant = Tenant.objects.using('default').filter(id=tenant_id).first()
             if not tenant:
                 return Response({'error': 'Organization not found.'}, status=status.HTTP_404_NOT_FOUND)
             db_alias = _register_and_resolve_tenant(tenant)
+            set_tenant_db_alias(db_alias)
             user = TenantUser.objects.using(db_alias).filter(id=subject_id).first()
             if not user:
                 return Response({'error': 'Account not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+            # Prevent reactivating intentionally suspended or deactivated accounts
+            from django.utils import timezone
+            if user.status in ('SUSPENDED', 'BLOCKED', 'DEACTIVATED') or not user.is_login_allowed:
+                return Response(
+                    {'error': f'Account is {user.status.lower()} and cannot be activated via password setup. Contact your administrator.'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            if getattr(user, 'suspended_until', None) and user.suspended_until > timezone.now():
+                return Response(
+                    {'error': f'Account is suspended until {user.suspended_until.strftime("%Y-%m-%d %H:%M")}. Contact your administrator.'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            if getattr(user, 'deactivated_at', None) is not None:
+                return Response(
+                    {'error': 'Account has been deactivated. Contact your administrator.'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
             user.set_password(new_password)
+            if user.status in ('INVITED', 'INACTIVE'):
+                user.status = 'ACTIVE'
+                user.is_login_allowed = True
+                user.activated_at = user.activated_at or timezone.now()
             user.save(using=db_alias)
+            try:
+                from apps.master.services_auth_directory import sync_tenant_user_identity
+                sync_tenant_user_identity(user, tenant_id=tenant.id, db=db_alias)
+            except Exception as e:
+                logger.error("Failed to sync identity after password reset: %s", e)
             return Response({'message': 'Password has been reset successfully.'}, status=status.HTTP_200_OK)
 
         return Response({'error': 'Invalid account type.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -1903,9 +1948,16 @@ class AcceptInviteView(APIView):
         # Set password and activate the account
         user.set_password(new_password)
         user.status = 'ACTIVE'
+        user.is_login_allowed = True
         user.activated_at = timezone.now()
         user.email_verified_at = user.email_verified_at or timezone.now()
         user.save(using=db_alias)
+
+        try:
+            from apps.master.services_auth_directory import sync_tenant_user_identity
+            sync_tenant_user_identity(user, tenant_id=tenant.id, db=db_alias)
+        except Exception as e:
+            logger.error("Failed to sync identity after invite acceptance: %s", e)
 
         logger.info(
             "Staff account activated via invite link: user_id=%s tenant=%s",
@@ -2176,7 +2228,23 @@ class PasswordResetConfirmView(APIView):
             if not user:
                 return Response({'error': 'Account not found.'}, status=status.HTTP_404_NOT_FOUND)
             user.set_password(new_password)
+            is_suspended = (
+                user.status in ('SUSPENDED', 'BLOCKED', 'DEACTIVATED')
+                or user.deactivated_at is not None
+                or user.deactivation_reason is not None
+                or (user.suspended_until is not None and user.suspended_until > timezone.now())
+            )
+            if not is_suspended:
+                if user.status in ('INVITED', 'INACTIVE'):
+                    user.status = 'ACTIVE'
+                    user.is_login_allowed = True
+                    user.activated_at = user.activated_at or timezone.now()
             user.save(using=db_alias)
+            try:
+                from apps.master.services_auth_directory import sync_tenant_user_identity
+                sync_tenant_user_identity(user, tenant_id=tenant.id, db=db_alias)
+            except Exception as e:
+                logger.error("Failed to sync identity after universal password reset: %s", e)
             return Response({'message': 'Password has been reset successfully.'}, status=status.HTTP_200_OK)
 
         return Response({'error': 'Invalid account type.'}, status=status.HTTP_400_BAD_REQUEST)

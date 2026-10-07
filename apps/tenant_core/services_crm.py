@@ -227,6 +227,8 @@ class CRMLeadService:
         db_alias: Optional[str] = None,
     ) -> Lead:
         alias = db_alias or get_tenant_db_alias() or 'default'
+        if actor_user and (not getattr(actor_user, 'is_authenticated', False) or not hasattr(actor_user, 'organization_id')):
+            actor_user = None
 
         with transaction.atomic(using=alias):
             extra = dict(extra_fields or {})
@@ -854,6 +856,8 @@ class CRMLeadService:
         tracking assignment changes and logging audit events.
         """
         alias = db_alias or get_tenant_db_alias() or 'default'
+        if actor_user and (not getattr(actor_user, 'is_authenticated', False) or not hasattr(actor_user, 'organization_id')):
+            actor_user = None
 
         with transaction.atomic(using=alias):
             fields_to_update = dict(data)
@@ -943,6 +947,8 @@ class CRMLeadService:
         db_alias: Optional[str] = None,
     ) -> Lead:
         alias = db_alias or get_tenant_db_alias() or 'default'
+        if actor_user and (not getattr(actor_user, 'is_authenticated', False) or not hasattr(actor_user, 'organization_id')):
+            actor_user = None
 
         with transaction.atomic(using=alias):
             old_status = lead.current_status
@@ -2453,6 +2459,8 @@ class CRMLeadService:
         db_alias: Optional[str] = None,
     ) -> IntakeSubmission:
         alias = db_alias or get_tenant_db_alias() or 'default'
+        if actor_user and (not getattr(actor_user, 'is_authenticated', False) or not hasattr(actor_user, 'organization_id')):
+            actor_user = None
 
         with transaction.atomic(using=alias):
             submission = IntakeSubmission.objects.using(alias).create(
@@ -2492,6 +2500,8 @@ class CRMLeadService:
         db_alias: Optional[str] = None,
     ) -> LeadActivity:
         alias = db_alias or get_tenant_db_alias() or 'default'
+        if actor_user and (not getattr(actor_user, 'is_authenticated', False) or not hasattr(actor_user, 'organization_id')):
+            actor_user = None
 
         with transaction.atomic(using=alias):
             act_time = activity_at or timezone.now()
@@ -2663,6 +2673,8 @@ class CRMLeadService:
         db_alias: Optional[str] = None,
     ) -> SalesFollowupTask:
         alias = db_alias or get_tenant_db_alias() or 'default'
+        if actor_user and (not getattr(actor_user, 'is_authenticated', False) or not hasattr(actor_user, 'organization_id')):
+            actor_user = None
 
         with transaction.atomic(using=alias):
             old_due = task.due_at
@@ -2703,6 +2715,8 @@ class CRMLeadService:
         db_alias: Optional[str] = None,
     ) -> SalesFollowupTask:
         alias = db_alias or get_tenant_db_alias() or 'default'
+        if actor_user and (not getattr(actor_user, 'is_authenticated', False) or not hasattr(actor_user, 'organization_id')):
+            actor_user = None
 
         with transaction.atomic(using=alias):
             task.status = 'CANCELLED'
@@ -2851,8 +2865,46 @@ class LeadConversionService:
             )
 
         # Reuse existing
+        # Reuse existing
         existing_user = phone_user or email_user
         if existing_user:
+            # Distinguish unprovisioned prospect from intentionally suspended/deactivated account
+            is_intentionally_suspended = (
+                existing_user.status in ('SUSPENDED', 'BLOCKED', 'DEACTIVATED')
+                or existing_user.deactivated_at is not None
+                or existing_user.deactivation_reason is not None
+                or (existing_user.suspended_until is not None and existing_user.suspended_until > timezone.now())
+            )
+            if is_intentionally_suspended:
+                logger.warning(
+                    "Reused user %s for lead %s is intentionally suspended/deactivated (%s: %s). Preserving suspension.",
+                    existing_user.id, lead.id, existing_user.status, existing_user.deactivation_reason,
+                )
+            else:
+                user_updated_fields = []
+                if existing_user.status in ('INACTIVE', 'INVITED'):
+                    if existing_user.has_usable_password():
+                        existing_user.status = 'ACTIVE'
+                        existing_user.activated_at = existing_user.activated_at or timezone.now()
+                        user_updated_fields.extend(['status', 'activated_at'])
+                    else:
+                        existing_user.status = 'INVITED'
+                        user_updated_fields.append('status')
+                if not existing_user.is_login_allowed:
+                    existing_user.is_login_allowed = True
+                    user_updated_fields.append('is_login_allowed')
+                if not existing_user.home_branch and branch:
+                    existing_user.home_branch = branch
+                    user_updated_fields.append('home_branch')
+                if user_updated_fields:
+                    existing_user.save(using=alias, update_fields=user_updated_fields)
+
+                try:
+                    from apps.master.services_auth_directory import sync_tenant_user_identity
+                    sync_tenant_user_identity(existing_user, tenant_id=org.id, db=alias)
+                except Exception as ex:
+                    logger.warning("Failed to sync identity for reused user %s: %s", existing_user.id, ex)
+
             try:
                 profile = existing_user.profile
                 # Ensure customer member markers are set if previously missing (e.g. staff becoming member)
@@ -2879,12 +2931,10 @@ class LeadConversionService:
                 )
             return profile, False
 
-        # Create new identity: INVITED status, no password stored
-        # Build a safe unique email — lead may have no email (use phone-based placeholder)
+        # Create new identity: INVITED status, secure invite flow (never assign a shared/default password)
         if email:
             user_email = email
         elif phone:
-            # Derive a placeholder email for identity storage; not for login
             safe_phone = phone.replace('+', '').replace(' ', '')
             user_email = f"member.{safe_phone}@{org.id.hex[:8]}.internal"
         else:
@@ -2899,13 +2949,23 @@ class LeadConversionService:
                 last_name=lead.last_name,
                 display_name=f"{lead.first_name} {lead.last_name}".strip(),
                 user_type='MEMBER',
-                status='ACTIVE',
+                status='INVITED',
                 is_login_allowed=True,
                 home_branch=branch,
             )
-            # Default password for newly converted member accounts
-            new_user.set_password('Sweat@2026!')
+            # Secure invite setup: do not assign a shared/default password
+            from django.contrib.auth.hashers import make_password
+            if hasattr(new_user, 'set_unusable_password') and callable(getattr(new_user, 'set_unusable_password')):
+                new_user.set_unusable_password()
+            else:
+                new_user.password_hash = make_password(None)
             new_user.save(using=alias)
+
+            try:
+                from apps.master.services_auth_directory import sync_tenant_user_identity
+                sync_tenant_user_identity(new_user, tenant_id=org.id, db=alias)
+            except Exception as ex:
+                logger.warning("Failed to sync identity for new user %s: %s", new_user.id, ex)
 
             # Assign to branch
             UserBranch.objects.using(alias).create(
@@ -3545,6 +3605,26 @@ class LeadConversionService:
                 lead_locked = Lead.objects.using(alias).select_for_update().get(id=lead.id)
                 from .models_crm import LeadConversion
                 if lead_locked.current_status == 'CONVERTED' or getattr(lead_locked, 'converted_user_profile_id', None) or LeadConversion.objects.using(alias).filter(lead=lead_locked).exists():
+                    existing_conv = LeadConversion.objects.using(alias).filter(lead=lead_locked).first()
+                    if existing_conv and (payment_provider == 'RAZORPAY' or existing_conv.order_id):
+                        from .models_memberships import Membership
+                        existing_mem = Membership.objects.using(alias).filter(id=existing_conv.membership_id).first()
+                        existing_order = Order.objects.using(alias).filter(id=existing_conv.order_id).first()
+                        logger.info(
+                            "Lead %s already converted (conversion %s, order %s). Returning idempotent success.",
+                            lead_locked.id, existing_conv.id, existing_conv.order_id
+                        )
+                        return {
+                            'status': 'SUCCESS',
+                            'lead_id': str(lead_locked.id),
+                            'membership_id': str(existing_mem.id) if existing_mem else str(existing_conv.membership_id),
+                            'membership_number': getattr(existing_mem, 'membership_number', ''),
+                            'order_id': str(existing_order.id) if existing_order else str(existing_conv.order_id),
+                            'order_number': existing_order.order_number if existing_order else '',
+                            'user_profile_id': str(existing_conv.user_profile_id),
+                            'already_converted': True,
+                            'message': 'Lead conversion already completed (webhook convergence).',
+                        }
                     raise LeadAlreadyConvertedError(
                         f"This lead has already been converted to a member. The CRM sales journey is terminal."
                     )
@@ -3784,8 +3864,11 @@ class LeadConversionService:
                     now_dt = timezone.now()
                     end_dt = timezone.make_aware(datetime.combine(end, datetime.max.time()))
 
+                    rem_prov_budget = _D(str(provisional_limit))
                     for ed in entitlements_def_qs:
-                        prov_units = min(ed.allocated_units or _D(str(provisional_limit)), _D(str(provisional_limit)))
+                        ed_cap = ed.allocated_units or rem_prov_budget
+                        prov_units = min(ed_cap, rem_prov_budget)
+                        rem_prov_budget = max(_D('0.00'), rem_prov_budget - prov_units)
                         ent = MembershipEntitlement.objects.using(alias).create(
                             membership=membership,
                             source_definition=ed,

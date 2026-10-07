@@ -547,7 +547,20 @@ class MembershipLifecycleService:
             membership.save(using=alias, update_fields=['status', 'cancelled_at', 'updated_at'])
 
             # Expire entitlements
-            membership.entitlements.filter(status='ACTIVE').update(status='EXPIRED')
+            for ent in membership.entitlements.filter(status='ACTIVE'):
+                rem = ent.remaining_units or Decimal('0.00')
+                if rem > Decimal('0.00'):
+                    MembershipEntitlementLedger.objects.using(alias).create(
+                        membership_entitlement=ent,
+                        transaction_type='EXPIRY',
+                        units=-rem,
+                        reason_code='MEMBERSHIP_CANCELLED',
+                        reason_text=reason_text or "Forfeited remaining units upon membership cancellation",
+                        balance_after=Decimal('0.00'),
+                        created_by_user=actor_user,
+                    )
+                ent.status = 'EXPIRED'
+                ent.save(using=alias, update_fields=['status', 'updated_at'])
 
             MembershipStatusHistory.objects.using(alias).create(
                 membership=membership,
@@ -759,8 +772,15 @@ class MembershipLifecycleService:
             if ent.status == 'EXHAUSTED':
                 ent.status = 'ACTIVE'
         else:
-            ent.consumed_units += abs(units_delta)
-            if ent.allocated_units and ent.consumed_units >= ent.allocated_units:
+            reduction = abs(units_delta)
+            min_allowed = ent.consumed_units or Decimal('0.00')
+            if ent.allocated_units is not None and (ent.allocated_units - reduction) < min_allowed:
+                raise ValidationError(
+                    f"Cannot reduce allocation by {reduction} units. {ent.consumed_units} unit(s) have already been consumed. "
+                    f"Maximum possible reduction is {ent.allocated_units - min_allowed} unit(s)."
+                )
+            ent.allocated_units = (ent.allocated_units or Decimal('0.00')) - reduction
+            if ent.allocated_units <= min_allowed:
                 ent.status = 'EXHAUSTED'
 
         ent.save(using=alias, update_fields=['allocated_units', 'consumed_units', 'status', 'updated_at'])

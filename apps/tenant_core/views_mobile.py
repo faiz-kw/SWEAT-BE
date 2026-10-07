@@ -145,17 +145,20 @@ class MobileRegisterView(APIView):
         phone = (data.get('phone') or '').strip()
         branch_id = data.get('branch_id')
 
-        if not email or not password or not first_name:
+        # If email is missing but phone is supplied, generate internal email
+        if not email and phone:
+            clean_digits = re.sub(r'\D', '', phone)[-10:]
+            email = f"user_{clean_digits}@sweat.internal"
+
+        if not email or not first_name:
             return Response(
-                {'detail': 'Email, password, and first name are required.'},
+                {'detail': 'First name and either email or phone number are required.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if len(password) < 8:
-            return Response(
-                {'detail': 'Password must be at least 8 characters long.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        # Ensure a secure password exists even if omitted from simple lead registration
+        if not password or len(password) < 8:
+            password = f"Sweat@{uuid.uuid4().hex[:8]}" 
 
         alias, tenant = _resolve_mobile_tenant_and_db(request)
         if not alias or not tenant:
@@ -248,6 +251,25 @@ class MobileRegisterView(APIView):
                     (models.Q(phone_normalized=phone) if phone else models.Q(pk=None))
                 ).first()
 
+                # Extract all lead form fields from intake
+                extra_lead_data = {'converted_user_profile': profile}
+                if data.get('gender'):
+                    extra_lead_data['gender'] = data.get('gender')
+                if data.get('date_of_birth') or data.get('birthday'):
+                    extra_lead_data['date_of_birth'] = data.get('date_of_birth') or data.get('birthday')
+                if data.get('fitness_goal') or data.get('goal'):
+                    extra_lead_data['fitness_goal'] = data.get('fitness_goal') or data.get('goal')
+                if data.get('area') or data.get('location'):
+                    extra_lead_data['area'] = data.get('area') or data.get('location')
+                if data.get('country'):
+                    extra_lead_data['country'] = data.get('country')
+                if data.get('interested_program_id') or data.get('program_id'):
+                    from .models_catalog import Program
+                    p_id = data.get('interested_program_id') or data.get('program_id')
+                    prog_obj = Program.objects.using(alias).filter(id=p_id).first()
+                    if prog_obj:
+                        extra_lead_data['interested_program'] = prog_obj
+
                 if not lead:
                     CRMLeadService.create_lead(
                         organization=org,
@@ -259,7 +281,7 @@ class MobileRegisterView(APIView):
                         lead_source=lead_source,
                         assigned_sales_user=None,
                         actor_user=None,
-                        extra_fields={'converted_user_profile': profile},
+                        extra_fields=extra_lead_data,
                         db_alias=alias,
                     )
                 else:
@@ -375,11 +397,11 @@ class MobileLoginView(APIView):
 
 
 
-def _process_social_login(request, email, first_name, last_name, avatar_url, provider):
+def _process_social_login(request, email, first_name, last_name, avatar_url, provider, phone='', branch_id=None):
     """
     Common handler for verified social login payloads (Google / Facebook).
     Creates or looks up the TenantUser, associates UserProfile,
-    automatically creates/links a Lead in CRM (source: MOBILE_APP, status: NEW_LEAD),
+    automatically creates/links a Lead in CRM (status: NEW_LEAD),
     and returns standard JWT access/refresh tokens.
     """
     alias, tenant = _resolve_mobile_tenant_and_db(request)
@@ -401,7 +423,17 @@ def _process_social_login(request, email, first_name, last_name, avatar_url, pro
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
-        branch = Branch.objects.using(alias).filter(status='ACTIVE').first()
+        branch = None
+        if branch_id and isinstance(branch_id, str):
+            try:
+                uuid.UUID(str(branch_id).strip())
+                branch = Branch.objects.using(alias).filter(id=branch_id, status='ACTIVE').first()
+            except (ValueError, TypeError):
+                branch = None
+        if not branch:
+            branch = Branch.objects.using(alias).filter(status='ACTIVE').first()
+
+        clean_phone = (phone or '').strip()
 
         if not user:
             is_new_user = True
@@ -416,7 +448,7 @@ def _process_social_login(request, email, first_name, last_name, avatar_url, pro
                 organization=org,
                 username=username,
                 email=email,
-                phone='',
+                phone=clean_phone,
                 first_name=first_name,
                 last_name=last_name or '',
                 display_name=f"{first_name} {last_name}".strip(),
@@ -464,43 +496,64 @@ def _process_social_login(request, email, first_name, last_name, avatar_url, pro
             if last_name and not user.last_name:
                 user.last_name = last_name
                 updated_user_fields.append('last_name')
+            if clean_phone and not user.phone:
+                user.phone = clean_phone
+                updated_user_fields.append('phone')
             if updated_user_fields:
                 user.save(using=alias, update_fields=updated_user_fields)
 
         # 2. Ensure UserProfile exists (member_type='TRIAL' until package purchase)
         profile = _get_or_create_user_profile(user, alias, branch=branch)
 
-        # 3. Automatically create or link CRM Lead record with source 'MOBILE_APP'
+        # 3. Automatically create or link CRM Lead record in CRM & Sales -> Leads
         try:
-            lead_source, _ = LeadSource.objects.using(alias).get_or_create(
-                organization=org,
-                code='MOBILE_APP',
-                defaults={'name': 'Mobile App', 'source_type': 'MOBILE_APP', 'status': 'ACTIVE'}
-            )
+            source_code = 'GOOGLE' if provider.upper() == 'GOOGLE' else ('META' if provider.upper() == 'FACEBOOK' else 'MOBILE_APP')
+            lead_source = LeadSource.objects.using(alias).filter(organization=org, code=source_code).first()
+            if not lead_source:
+                lead_source, _ = LeadSource.objects.using(alias).get_or_create(
+                    organization=org,
+                    code='MOBILE_APP',
+                    defaults={'name': 'Mobile App', 'source_type': 'MOBILE_APP', 'status': 'ACTIVE'}
+                )
 
             lead = Lead.objects.using(alias).filter(
                 models.Q(email_normalized__iexact=email) |
                 (models.Q(phone_normalized=user.phone) if user.phone else models.Q(pk=None))
             ).first()
 
+            lead_phone = clean_phone or user.phone or ''
+
             if not lead:
-                CRMLeadService.create_lead(
+                extra_lead = {
+                    'converted_user_profile': profile,
+                    'first_touch_source': f"{provider.title()} Sign-In (App)",
+                    'latest_touch_source': f"MOBILE_{provider.upper()}",
+                    'campaign_reference': f"{provider.title()} Mobile OAuth",
+                }
+                lead = CRMLeadService.create_lead(
                     organization=org,
                     first_name=first_name,
                     last_name=last_name or '',
-                    phone=user.phone or '',
+                    phone=lead_phone,
                     email=email,
                     branch=branch or user.home_branch,
                     lead_source=lead_source,
-                    assigned_sales_user=None,
+                    assigned_sales_user=None,  # Runs Round-Robin auto-assignment
                     actor_user=None,
-                    extra_fields={'converted_user_profile': profile},
+                    extra_fields=extra_lead,
                     db_alias=alias,
                 )
             else:
                 lead.converted_user_profile = profile
-                lead.latest_touch_source = f'MOBILE_{provider.upper()}'
-                lead.save(using=alias, update_fields=['converted_user_profile', 'latest_touch_source'])
+                lead.latest_touch_source = f"MOBILE_{provider.upper()}"
+                update_fields = ['converted_user_profile', 'latest_touch_source']
+                if not lead.branch and (branch or user.home_branch):
+                    lead.branch = branch or user.home_branch
+                    update_fields.append('branch')
+                if lead_phone and not lead.phone_normalized:
+                    lead.phone_normalized = lead_phone
+                    update_fields.append('phone_normalized')
+                lead.save(using=alias, update_fields=update_fields)
         except Exception as crm_err:
             logger.warning("Could not auto-create CRM lead for %s %s: %s", provider, email, crm_err)
 
@@ -590,6 +643,9 @@ class MobileGoogleAuthView(APIView):
         last_name = (google_user_info.get('family_name') or '').strip()
         picture = google_user_info.get('picture') or ''
 
+        phone = data.get('phone') or data.get('contactNumber') or ''
+        branch_id = data.get('branch_id') or data.get('branch') or None
+
         return _process_social_login(
             request=request,
             email=email,
@@ -597,6 +653,8 @@ class MobileGoogleAuthView(APIView):
             last_name=last_name,
             avatar_url=picture,
             provider='GOOGLE',
+            phone=phone,
+            branch_id=branch_id,
         )
 
 
@@ -649,6 +707,9 @@ class MobileFacebookAuthView(APIView):
         if isinstance(fb_user_info.get('picture'), dict):
             picture = fb_user_info['picture'].get('data', {}).get('url', '')
 
+        phone = data.get('phone') or data.get('contactNumber') or ''
+        branch_id = data.get('branch_id') or data.get('branch') or None
+
         return _process_social_login(
             request=request,
             email=email,
@@ -656,6 +717,8 @@ class MobileFacebookAuthView(APIView):
             last_name=last_name,
             avatar_url=picture,
             provider='FACEBOOK',
+            phone=phone,
+            branch_id=branch_id,
         )
 
 
@@ -1683,12 +1746,11 @@ class MobileMyCreditsView(APIView):
         alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
         profile = _get_or_create_user_profile(user, alias)
 
+        today = timezone.now().date()
         memberships = (
             Membership.objects.using(alias)
             .filter(
                 user_profile=profile,
-                status='ACTIVE',
-                end_date__gte=timezone.now().date(),
             )
             .select_related('package')
             .prefetch_related('entitlements')
@@ -1700,26 +1762,33 @@ class MobileMyCreditsView(APIView):
 
         for m in memberships:
             entitlements = list(m.entitlements.all())
-            allocated = sum(float(e.allocated_units) for e in entitlements)
-            consumed = sum(float(e.consumed_units) for e in entitlements)
+            allocated = sum(float(e.allocated_units or 0.0) for e in entitlements)
+            consumed = sum(float(e.consumed_units or 0.0) for e in entitlements)
             remaining = max(0.0, allocated - consumed)
             is_unlimited = any(e.is_unlimited for e in entitlements)
-            days_left = max(0, (m.end_date - timezone.now().date()).days)
+            days_left = max(0, (m.end_date - today).days) if m.end_date else 0
 
-            if not is_unlimited:
+            # Distinguish active vs expired vs cancelled memberships
+            effective_status = m.status
+            if m.status == 'ACTIVE' and m.end_date and m.end_date < today:
+                effective_status = 'EXPIRED'
+
+            if effective_status == 'ACTIVE' and not is_unlimited:
                 total_remaining_credits += int(remaining)
 
             packs.append({
                 'membership_id': str(m.id),
                 'package_name': m.package.name,
+                'status': effective_status,
                 'allocated_sessions': allocated,
                 'consumed_sessions': consumed,
                 'remaining_sessions': 'Unlimited' if is_unlimited else remaining,
                 'is_unlimited': is_unlimited,
-                'start_date': m.start_date.isoformat(),
-                'end_date': m.end_date.isoformat(),
+                'start_date': m.start_date.isoformat() if m.start_date else None,
+                'end_date': m.end_date.isoformat() if m.end_date else None,
                 'days_remaining': days_left,
-                'near_expiry': days_left <= 7 or (not is_unlimited and remaining <= 2),
+                'near_expiry': effective_status == 'ACTIVE' and (days_left <= 7 or (not is_unlimited and remaining <= 2)),
+                'can_renew': effective_status in ('ACTIVE', 'EXPIRED'),
             })
 
         return Response({
@@ -1945,7 +2014,16 @@ class MobileCheckoutVerifyView(APIView):
             return Response({'detail': 'Order not found.'}, status=status.HTTP_404_NOT_FOUND)
 
         if order.status == 'PAID':
-            return Response({'detail': 'Order has already been processed.'}, status=status.HTTP_200_OK)
+            membership = Membership.objects.using(alias).filter(source_order=order).first()
+            return Response({
+                'detail': 'Payment successful! Your session pack is now active.',
+                'membership_id': str(membership.id) if membership else None,
+                'package_name': membership.package.name if (membership and membership.package) else '',
+                'start_date': membership.start_date.isoformat() if (membership and membership.start_date) else '',
+                'end_date': membership.end_date.isoformat() if (membership and membership.end_date) else '',
+                'order_number': order.order_number,
+                'already_processed': True,
+            }, status=status.HTTP_200_OK)
 
         order_item = order.items.filter(item_type='PACKAGE').first()
         if not order_item:
@@ -2342,3 +2420,149 @@ class MobileCancelPTAppointmentView(APIView):
             'appointment_id': str(appt.id),
             'status': 'CANCELLED',
         }, status=status.HTTP_200_OK)
+
+
+class MobileLeadCaptureView(APIView):
+    """
+    POST /api/v1/mobile/leads/
+    Public, unauthenticated lead creation endpoint.
+    Accepts complete lead intake payload (First Name, Last Name, Email, Phone, Gender,
+    Birthday, Branch, Program, Country, Location/Area, Goal) and creates the prospect
+    directly in the CRM Leads panel with Round-Robin representative assignment.
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        data = request.data or {}
+        first_name = (data.get('first_name') or data.get('firstName') or '').strip()
+        last_name = (data.get('last_name') or data.get('lastName') or '').strip()
+        email = (data.get('email') or data.get('emailAddress') or '').strip().lower()
+        phone = (data.get('phone') or data.get('contactNumber') or '').strip()
+
+        if not first_name:
+            return Response(
+                {'detail': 'First name is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not email and not phone:
+            return Response(
+                {'detail': 'Either email address or contact number is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        alias, tenant = _resolve_mobile_tenant_and_db(request)
+        if not alias or not tenant:
+            return Response(
+                {'detail': 'Studio service is temporarily unavailable. Please try again.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        with transaction.atomic(using=alias):
+            org = Organization.objects.using(alias).filter(status='ACTIVE').order_by('-created_at').first()
+            if not org:
+                return Response(
+                    {'detail': 'Studio organization configuration not found.'},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+
+            # Resolve Branch safely
+            branch_id = data.get('branch_id') or data.get('location_id') or data.get('locationId')
+            branch_name = data.get('branch_name') or data.get('branch')
+            branch = None
+            if branch_id and isinstance(branch_id, str):
+                try:
+                    uuid.UUID(str(branch_id).strip())
+                    branch = Branch.objects.using(alias).filter(id=branch_id, status='ACTIVE').first()
+                except (ValueError, TypeError):
+                    branch = None
+            if not branch and branch_name and isinstance(branch_name, str):
+                branch = Branch.objects.using(alias).filter(name__icontains=branch_name.strip(), status='ACTIVE').first()
+            if not branch:
+                branch = Branch.objects.using(alias).filter(status='ACTIVE').first()
+
+            # Resolve Program
+            program_id = data.get('interested_program_id') or data.get('program_id')
+            program_name = data.get('interested_in') or data.get('program_name')
+            program = None
+            if program_id:
+                program = Program.objects.using(alias).filter(id=program_id, status='ACTIVE').first()
+            if not program and program_name:
+                program = Program.objects.using(alias).filter(name__icontains=program_name, status='ACTIVE').first()
+
+            # Resolve Lead Source
+            source_code = data.get('lead_source') or 'MOBILE_APP'
+            lead_source, _ = LeadSource.objects.using(alias).get_or_create(
+                organization=org,
+                code=source_code,
+                defaults={'name': 'Mobile App', 'source_type': 'MOBILE_APP', 'status': 'ACTIVE'}
+            )
+
+            # Build extra enrichment fields
+            extra_fields = {}
+            if data.get('gender'):
+                extra_fields['gender'] = data.get('gender')
+            if data.get('date_of_birth') or data.get('birthday'):
+                extra_fields['date_of_birth'] = data.get('date_of_birth') or data.get('birthday')
+            if data.get('fitness_goal') or data.get('goal'):
+                extra_fields['fitness_goal'] = data.get('fitness_goal') or data.get('goal')
+            if data.get('area') or data.get('location'):
+                extra_fields['area'] = data.get('area') or data.get('location')
+            if data.get('country'):
+                extra_fields['country'] = data.get('country')
+            if program:
+                extra_fields['interested_program'] = program
+
+            # Auto-create or update CRM Lead
+            lead = Lead.objects.using(alias).filter(
+                models.Q(email_normalized__iexact=email) if email else models.Q(pk=None) |
+                (models.Q(phone_normalized=phone) if phone else models.Q(pk=None))
+            ).first()
+
+            if not lead:
+                lead = CRMLeadService.create_lead(
+                    organization=org,
+                    first_name=first_name,
+                    last_name=last_name or '',
+                    phone=phone or '',
+                    email=email,
+                    branch=branch,
+                    lead_source=lead_source,
+                    assigned_sales_user=None,  # Runs configured auto-assignment (Round-Robin)
+                    actor_user=None,
+                    extra_fields=extra_fields,
+                    db_alias=alias,
+                )
+                created = True
+            else:
+                created = False
+                updated_fields = []
+                if branch and not lead.branch:
+                    lead.branch = branch
+                    updated_fields.append('branch')
+                if program and not lead.interested_program:
+                    lead.interested_program = program
+                    updated_fields.append('interested_program')
+                for k, v in extra_fields.items():
+                    if hasattr(lead, k) and not getattr(lead, k):
+                        setattr(lead, k, v)
+                        updated_fields.append(k)
+                if updated_fields:
+                    lead.save(using=alias, update_fields=updated_fields)
+
+        return Response({
+            'status': 'success',
+            'lead_id': str(lead.id),
+            'message': 'Lead registered successfully. Details are visible in the CRM Leads panel.',
+            'lead': {
+                'id': str(lead.id),
+                'first_name': lead.first_name,
+                'last_name': lead.last_name,
+                'email': lead.email_normalized,
+                'phone': lead.phone_normalized,
+                'status': lead.current_status,
+                'branch': branch.name if branch else None,
+                'is_new': created,
+            }
+        }, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+

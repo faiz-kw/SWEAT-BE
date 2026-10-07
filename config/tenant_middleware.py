@@ -346,8 +346,24 @@ class TenantDatabaseMiddleware:
         path = request.path_info
         is_exempt = any(path.startswith(prefix) for prefix in TENANT_EXEMPT_PREFIXES)
 
+        tenant_id = None
         if not is_exempt:
             tenant_id = _extract_tenant_id_from_jwt(request)
+
+            # Allow open public lead capture: resolve tenant DB via header or default to 'sweat'
+            if not tenant_id and (path.startswith('/api/v1/tenant/leads/') or request.headers.get('X-Tenant-Slug') or request.META.get('HTTP_X_TENANT_SLUG')):
+                from apps.master.models_tenant import Tenant
+                slug = (
+                    request.headers.get('X-Tenant-Slug')
+                    or request.META.get('HTTP_X_TENANT_SLUG')
+                    or request.GET.get('tenant')
+                    or 'sweat'
+                )
+                t_obj = Tenant.objects.using('default').filter(slug=slug, status='ACTIVE').first()
+                if not t_obj:
+                    t_obj = Tenant.objects.using('default').filter(status='ACTIVE').first()
+                if t_obj:
+                    tenant_id = str(t_obj.id)
 
             if tenant_id:
                 try:

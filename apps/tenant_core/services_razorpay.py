@@ -355,3 +355,302 @@ class RazorpayService:
             )
 
         return payment
+
+    @classmethod
+    def get_webhook_secret(cls, db_alias: Optional[str] = None) -> str:
+        """
+        Resolves Razorpay webhook secret from tenant integration configuration
+        or falls back to settings/environment.
+        """
+        alias = db_alias or 'default'
+        if alias and alias != 'default':
+            try:
+                from .models_infra import Integration
+                from config.secrets import SecretResolver, SecretResolutionError
+
+                integration = Integration.objects.using(alias).filter(
+                    integration_type='PAYMENT',
+                    provider__iexact='Razorpay',
+                    status='ACTIVE',
+                ).first()
+
+                if integration:
+                    config = integration.configuration or {}
+                    cand_secret = config.get('webhook_secret') or config.get('WEBHOOK_SECRET')
+                    if cand_secret:
+                        return str(cand_secret).strip()
+
+                    if integration.secret_reference:
+                        try:
+                            resolved = SecretResolver.resolve(f"{integration.secret_reference}/webhook_secret")
+                            if resolved:
+                                return str(resolved).strip()
+                        except SecretResolutionError:
+                            pass
+            except Exception as e:
+                logger.debug("Error checking tenant Integration row for webhook secret: %s", type(e).__name__)
+
+        # Fallback to settings / env
+        fallback_secret = getattr(settings, 'RAZORPAY_WEBHOOK_SECRET', None) or os.getenv('RAZORPAY_WEBHOOK_SECRET', '')
+        if fallback_secret:
+            return str(fallback_secret).strip()
+
+        # In dev/test/uat fallback to KEY_SECRET if WEBHOOK_SECRET not explicitly set
+        try:
+            _, key_secret = cls.get_credentials(db_alias=alias)
+            return key_secret
+        except Exception:
+            return ''
+
+    @classmethod
+    def verify_webhook_signature(
+        cls,
+        raw_body: bytes,
+        signature: str,
+        secret: Optional[str] = None,
+        db_alias: Optional[str] = None,
+    ) -> bool:
+        """
+        Verifies the HMAC-SHA256 signature sent by Razorpay in X-Razorpay-Signature
+        against the raw request bytes and the tenant webhook secret.
+        """
+        if not signature or not raw_body:
+            return False
+
+        webhook_secret = secret or cls.get_webhook_secret(db_alias=db_alias)
+        if not webhook_secret:
+            logger.warning("No Razorpay webhook secret configured for signature verification.")
+            return False
+
+        import hmac
+        import hashlib
+
+        if isinstance(raw_body, str):
+            raw_body = raw_body.encode('utf-8')
+
+        expected_signature = hmac.new(
+            webhook_secret.encode('utf-8'),
+            raw_body,
+            hashlib.sha256
+        ).hexdigest()
+
+        return hmac.compare_digest(str(expected_signature).lower(), str(signature).lower().strip())
+
+
+class RazorpayPaymentFinalizerService:
+    """
+    Authoritative, idempotent convergence service for Razorpay payments.
+    Both CRM checkout callbacks, mobile checkout callbacks, and Razorpay webhooks
+    converge strictly on this service to guarantee:
+    1. Exactly-once payment recording and invoice generation.
+    2. Exactly-once membership activation and entitlement quota allocation.
+    3. Seamless identity linkage (reusing existing user_profile without duplicate accounts).
+    4. Outbox event publication and audit history logging.
+    5. Clean recovery from captured payments with interrupted local activations.
+    """
+
+    @classmethod
+    def finalize_payment(
+        cls,
+        razorpay_order_id: str,
+        razorpay_payment_id: str,
+        razorpay_signature: Optional[str] = None,
+        order_id: Optional[str] = None,
+        source: str = 'CALLBACK',  # 'CALLBACK', 'WEBHOOK', 'MOBILE_CALLBACK', 'RECOVERY'
+        payment_method: Optional[str] = None,
+        start_date = None,
+        actor_user = None,
+        db_alias: Optional[str] = None,
+        raw_event: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        from datetime import date
+        from django.db import transaction
+        from django.utils import timezone
+        from .models_commerce import Order, PaymentTransaction, MemberInvoice
+        from .models_memberships import Membership
+        from .models_crm import Lead
+        from .services_commerce import CommerceService
+        from .services_memberships import MembershipLifecycleService
+
+        alias = db_alias or 'default'
+
+        if not razorpay_order_id or not razorpay_payment_id:
+            raise RazorpayVerificationError(
+                "Both razorpay_order_id and razorpay_payment_id are required for finalization.",
+                code="RAZORPAY_PARAMS_MISSING"
+            )
+
+        # 1. Verification for callbacks
+        if source in ('CALLBACK', 'MOBILE_CALLBACK'):
+            if not razorpay_signature:
+                raise RazorpayVerificationError(
+                    "Razorpay signature is required for checkout callback.",
+                    code="RAZORPAY_SIGNATURE_MISSING"
+                )
+            if not RazorpayService.verify_payment_signature(razorpay_order_id, razorpay_payment_id, razorpay_signature, db_alias=alias):
+                raise RazorpayVerificationError(
+                    "Invalid Razorpay payment signature.",
+                    code="RAZORPAY_SIGNATURE_INVALID"
+                )
+
+        # 2. Locate internal order
+        order = None
+        if order_id:
+            order = Order.objects.using(alias).filter(id=order_id).first()
+
+        if not order and razorpay_order_id:
+            # Check by PaymentTransaction metadata
+            tx = PaymentTransaction.objects.using(alias).filter(
+                metadata__razorpay_order_id=razorpay_order_id
+            ).select_related('order').first()
+            if tx:
+                order = tx.order
+            else:
+                # Check idempotency_key
+                tx_idem = PaymentTransaction.objects.using(alias).filter(
+                    idempotency_key=f"rzp_order_{razorpay_order_id}"
+                ).select_related('order').first()
+                if tx_idem:
+                    order = tx_idem.order
+
+        if not order and raw_event:
+            # Check notes from raw webhook event
+            payment_entity = raw_event.get('payload', {}).get('payment', {}).get('entity', {})
+            order_entity = raw_event.get('payload', {}).get('order', {}).get('entity', {})
+            notes = payment_entity.get('notes') or order_entity.get('notes') or {}
+            internal_id = notes.get('internal_order_id')
+            if internal_id:
+                order = Order.objects.using(alias).filter(id=internal_id).first()
+
+        if not order:
+            logger.error("Cannot find internal order for Razorpay order %s (payment %s)", razorpay_order_id, razorpay_payment_id)
+            raise RazorpayVerificationError(
+                f"Internal order not found for Razorpay order {razorpay_order_id}",
+                code="ORDER_NOT_FOUND"
+            )
+
+        # 3. Server-side API cross-check when credentials configured
+        if RazorpayService.is_configured(db_alias=alias):
+            expected_paise = RazorpayService.convert_inr_to_paise(order.total_amount)
+            try:
+                RazorpayService.fetch_and_verify_payment(
+                    razorpay_payment_id=razorpay_payment_id,
+                    expected_order_id=razorpay_order_id,
+                    expected_amount_paise=expected_paise,
+                    expected_currency=order.currency,
+                    db_alias=alias,
+                )
+            except Exception as e:
+                # If error is mismatch, reject
+                if isinstance(e, RazorpayVerificationError):
+                    logger.warning("Razorpay API cross-check verification failed: %s", e)
+                    raise
+
+        # 4. Atomic finalization
+        with transaction.atomic(using=alias):
+            order = Order.objects.using(alias).select_for_update().get(id=order.id)
+            lead_locked = None
+            if order.lead:
+                lead_locked = Lead.objects.using(alias).select_for_update().filter(id=order.lead.id).first()
+
+            # Ensure user profile exists on order
+            if not order.user_profile and lead_locked:
+                from .services_crm import LeadConversionService
+                profile, _ = LeadConversionService.resolve_or_create_member_identity(
+                    lead=lead_locked,
+                    branch=order.branch,
+                    actor_user=actor_user,
+                    db_alias=alias,
+                )
+                order.user_profile = profile
+                order.save(using=alias, update_fields=['user_profile'])
+
+            existing_membership = Membership.objects.using(alias).filter(source_order=order).first()
+            if not existing_membership and order.user_profile:
+                existing_membership = Membership.objects.using(alias).filter(
+                    user_profile=order.user_profile,
+                    status__in=['ACTIVE', 'SUSPENDED', 'EXPIRED']
+                ).order_by('-created_at').first()
+
+            # Check if order is already paid AND membership is active (Idempotent replay)
+            if order.status == 'PAID' and existing_membership:
+                logger.info(
+                    "Razorpay payment already finalized for order %s, membership %s. Returning existing state.",
+                    order.id, existing_membership.id
+                )
+                return {
+                    'status': 'ALREADY_FINALIZED',
+                    'order_id': str(order.id),
+                    'order_number': order.order_number,
+                    'membership_id': str(existing_membership.id),
+                    'membership_status': existing_membership.status,
+                    'membership_activated': True,
+                    'message': 'Payment already finalized and membership active.',
+                }
+
+            # If order is not paid, record payment
+            if order.status != 'PAID':
+                provider_txn_id = razorpay_payment_id
+                payment_idem_key = f"rzp_pay_{razorpay_payment_id}"
+                pay_metadata = {
+                    'razorpay_order_id': razorpay_order_id,
+                    'razorpay_payment_id': razorpay_payment_id,
+                    'razorpay_signature': razorpay_signature or '',
+                    'source': source,
+                    'finalized_at': timezone.now().isoformat(),
+                }
+                CommerceService.record_payment(
+                    order_id=str(order.id),
+                    amount=order.total_amount,
+                    provider='RAZORPAY',
+                    payment_method=payment_method or 'RAZORPAY',
+                    provider_transaction_id=provider_txn_id,
+                    idempotency_key=payment_idem_key,
+                    metadata=pay_metadata,
+                    actor=actor_user,
+                    db_alias=alias,
+                )
+                order.refresh_from_db(using=alias)
+
+            # Activate membership if not active
+            membership = existing_membership
+            if not membership:
+                order_item = order.items.using(alias).filter(item_type='PACKAGE').first()
+                if not order_item or not order_item.package_version:
+                    raise ValidationError("Order is missing a valid package version item.")
+
+                if isinstance(start_date, str) and start_date:
+                    from datetime import date as _d
+                    s_date = _d.fromisoformat(start_date)
+                elif isinstance(start_date, date):
+                    s_date = start_date
+                else:
+                    s_date = timezone.now().date()
+
+                membership = MembershipLifecycleService.activate_membership_from_order(
+                    order=order,
+                    order_item=order_item,
+                    start_date=s_date,
+                    db_alias=alias,
+                    created_by_user=actor_user,
+                )
+
+            # Finalize CRM Lead conversion if lead is associated and not yet converted
+            if lead_locked and lead_locked.current_status != 'CONVERTED':
+                from .services_crm import LeadConversionService
+                LeadConversionService._finalize_conversion_for_order(
+                    order=order,
+                    start_date=start_date,
+                    actor_user=actor_user,
+                    db_alias=alias,
+                )
+
+            return {
+                'status': 'SUCCESS',
+                'order_id': str(order.id),
+                'order_number': order.order_number,
+                'membership_id': str(membership.id) if membership else None,
+                'membership_status': membership.status if membership else None,
+                'membership_activated': bool(membership),
+                'source': source,
+            }

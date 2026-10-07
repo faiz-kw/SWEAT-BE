@@ -111,12 +111,14 @@ class MemberInvoiceSerializer(serializers.ModelSerializer):
     member_name = serializers.SerializerMethodField()
     branch_name = serializers.ReadOnlyField(source='branch.name')
     order_number = serializers.ReadOnlyField(source='order.order_number')
+    package_name = serializers.SerializerMethodField()
+    payment_reference = serializers.SerializerMethodField()
 
     class Meta:
         model = MemberInvoice
         fields = [
             'id', 'invoice_number', 'order', 'order_number', 'user_profile', 'member_name',
-            'branch', 'branch_name', 'subtotal', 'discount_amount',
+            'branch', 'branch_name', 'package_name', 'payment_reference', 'subtotal', 'discount_amount',
             'reward_amount', 'tax_amount', 'total_amount', 'currency',
             'status', 'file', 'issued_at', 'created_at', 'updated_at',
         ]
@@ -126,6 +128,22 @@ class MemberInvoiceSerializer(serializers.ModelSerializer):
         if obj.user_profile:
             return f"{obj.user_profile.first_name_snapshot or ''} {obj.user_profile.last_name_snapshot or ''}".strip()
         return ''
+
+    def get_package_name(self, obj):
+        try:
+            item = obj.order.items.first()
+            return item.item_name_snapshot if item else 'Membership Plan'
+        except Exception:
+            return 'Membership Plan'
+
+    def get_payment_reference(self, obj):
+        try:
+            txn = obj.order.payments.filter(status='SUCCESS').first()
+            if txn:
+                return txn.provider_transaction_id or str(txn.id)
+            return ''
+        except Exception:
+            return ''
 
 
 class OrderSerializer(serializers.ModelSerializer):

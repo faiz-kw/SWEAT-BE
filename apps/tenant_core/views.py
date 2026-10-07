@@ -1668,7 +1668,7 @@ class OrganizationSettingsViewSet(TenantDBMixin, viewsets.ModelViewSet):
     def payment_policy(self, request):
         """Get or update tenant payment policies and methods configuration."""
         db = self.get_db()
-        org = Organization.objects.using(db).first()
+        org = _get_request_org(request, db) or Organization.objects.using(db).first()
         if not org:
             return Response({'error': 'Organization not found.'}, status=status.HTTP_404_NOT_FOUND)
 

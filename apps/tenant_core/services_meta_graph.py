@@ -113,15 +113,11 @@ class MetaLeadNotFoundError(MetaGraphAPIError):
 
 
 def get_meta_app_credentials() -> Tuple[str, str, str]:
-
     """Retrieve platform Meta App ID, Secret, and Webhook Verify Token."""
-
-    app_id = getattr(settings, 'META_APP_ID', None) or ''
-
-    app_secret = getattr(settings, 'META_APP_SECRET', None) or ''
-
-    verify_token = getattr(settings, 'META_WEBHOOK_VERIFY_TOKEN', None) or ''
-
+    import os
+    app_id = getattr(settings, 'META_APP_ID', None) or os.getenv('META_APP_ID', '')
+    app_secret = getattr(settings, 'META_APP_SECRET', None) or os.getenv('META_APP_SECRET', '')
+    verify_token = getattr(settings, 'META_WEBHOOK_VERIFY_TOKEN', None) or os.getenv('META_WEBHOOK_VERIFY_TOKEN', '')
     return str(app_id).strip(), str(app_secret).strip(), str(verify_token).strip()
 
 

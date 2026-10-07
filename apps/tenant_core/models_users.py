@@ -127,6 +127,14 @@ class TenantUser(models.Model):
     def check_password(self, raw_password: str) -> bool:
         return django_check_password(raw_password, self.password_hash)
 
+    def set_unusable_password(self):
+        from django.contrib.auth.hashers import make_password
+        self.password_hash = make_password(None)
+
+    def has_usable_password(self) -> bool:
+        from django.contrib.auth.hashers import is_password_usable
+        return is_password_usable(self.password_hash)
+
     @property
     def is_accessible(self):
         return self.status == 'ACTIVE' and self.is_login_allowed

@@ -1341,6 +1341,34 @@ class MemberViewSet(viewsets.ViewSet):
                     is_login_allowed=True,
                     password_hash='',
                 )
+            else:
+                is_suspended = (
+                    user.status in ('SUSPENDED', 'BLOCKED', 'DEACTIVATED')
+                    or user.deactivated_at is not None
+                    or user.deactivation_reason is not None
+                    or (user.suspended_until is not None and user.suspended_until > timezone.now())
+                )
+                if not is_suspended:
+                    ufields = []
+                    if user.status in ('INACTIVE', 'INVITED'):
+                        if user.has_usable_password():
+                            user.status = 'ACTIVE'
+                            user.activated_at = user.activated_at or timezone.now()
+                            ufields.extend(['status', 'activated_at'])
+                        else:
+                            user.status = 'INVITED'
+                            ufields.append('status')
+                    if not user.is_login_allowed:
+                        user.is_login_allowed = True
+                        ufields.append('is_login_allowed')
+                    if ufields:
+                        user.save(using=alias, update_fields=ufields)
+
+            try:
+                from apps.master.services_auth_directory import sync_tenant_user_identity
+                sync_tenant_user_identity(user, tenant_id=org.id, db=alias)
+            except Exception as ex:
+                logger.warning("Failed to sync identity for member user %s: %s", user.id, ex)
 
             mem_number = f"MEM-{uuid.uuid4().hex[:6].upper()}"
             profile, created = UserProfile.objects.using(alias).get_or_create(
@@ -1877,6 +1905,10 @@ class MemberViewSet(viewsets.ViewSet):
         active_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
         if not active_m:
             return Response({'error': 'No membership found to adjust.'}, status=status.HTTP_400_BAD_REQUEST)
+        if active_m.legacy_reference and 'PROVISIONAL_CASH_PENDING' in active_m.legacy_reference:
+            return Response({
+                'error': 'Cannot manually adjust sessions on a provisional membership pending cash approval. Await payment approval or update payment.'
+            }, status=status.HTTP_400_BAD_REQUEST)
 
         entitlement_type = request.data.get('entitlement_type', 'HOME_BRANCH_SESSION')
         units_delta = Decimal(str(request.data.get('units_delta', '1.0')))
@@ -2113,6 +2145,73 @@ class MemberViewSet(viewsets.ViewSet):
                     'invoice_id': str(invoice.id) if invoice else None,
                     'member': serialize_member(profile, alias),
                 }, status=status.HTTP_200_OK)
+
+        # Route CASH payment through managerial approval workflow to prevent approval bypass
+        is_cash = str(provider).upper() == 'CASH' or str(payment_method).upper() == 'CASH'
+        if is_cash:
+            # Check for existing pending cash collections to prevent duplicate collections
+            pending_cash_sum = PaymentTransaction.objects.using(alias).filter(
+                order=order, status='PENDING', payment_method='CASH'
+            ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+            effective_rem = rem - pending_cash_sum
+            if amt > effective_rem:
+                return Response({
+                    'error': f"Payment amount (₹{amt}) exceeds remaining uncommitted balance (₹{effective_rem}). "
+                             f"Existing cash collections awaiting approval: ₹{pending_cash_sum}."
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            txn = PaymentTransaction.objects.using(alias).create(
+                id=uuid.uuid4(),
+                order=order,
+                user_profile=profile,
+                amount=amt,
+                currency=order.currency or 'INR',
+                provider='CASH',
+                payment_method='CASH',
+                status='PENDING',
+                idempotency_key=idempotency_key or f"CASH-{uuid.uuid4().hex[:12]}",
+                metadata={
+                    'collected_via': 'MEMBER_DIRECTORY_OUTSTANDING',
+                    'collected_by_user_id': str(request.user.id),
+                    'collected_by_name': getattr(request.user, 'display_name', 'Staff'),
+                    'member_profile_id': str(profile.id),
+                }
+            )
+
+            from .services_approvals import AdminApprovalService
+            approval_req = AdminApprovalService.create_approval_request(
+                organization=org,
+                request_type='CASH_PAYMENT_APPROVAL',
+                entity_type='PaymentTransaction',
+                entity_id=txn.id,
+                requested_by_user=request.user,
+                requested_payload={
+                    'order_id': str(order.id),
+                    'order_number': order.order_number,
+                    'member_id': str(profile.id),
+                    'member_name': f"{profile.first_name_snapshot} {profile.last_name_snapshot}".strip() or profile.user.display_name,
+                    'amount': str(amt),
+                    'currency': order.currency,
+                    'branch_id': str(order.branch_id or profile.preferred_branch_id or ''),
+                    'branch_name': profile.preferred_branch.name if profile.preferred_branch else '',
+                    'recorded_by': getattr(request.user, 'display_name', 'Staff'),
+                    'recorded_by_id': str(request.user.id),
+                    'source': 'OUTSTANDING_COLLECTION',
+                },
+                db_alias=alias,
+            )
+
+            txn.metadata['approval_request_id'] = str(approval_req.id)
+            txn.save(using=alias, update_fields=['metadata'])
+
+            return Response({
+                'success': True,
+                'status': 'PENDING_APPROVAL',
+                'message': f"Cash payment of ₹{amt} recorded and submitted for manager approval (Approval Req: {approval_req.id}).",
+                'transaction_id': str(txn.id),
+                'approval_request_id': str(approval_req.id),
+                'member': serialize_member(profile, alias),
+            }, status=status.HTTP_202_ACCEPTED)
 
         try:
             txn, invoice = CommerceService.record_payment(

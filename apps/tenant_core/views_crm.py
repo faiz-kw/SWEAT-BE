@@ -134,7 +134,7 @@ def get_user_effective_branch_ids(user, db_alias: str = 'default') -> Optional[S
         None: Organization-wide access (all branches permitted)
         Set[str]: Exact set of branch UUID strings the user is permitted to access
     """
-    if getattr(user, 'is_superuser', False):
+    if not user or not getattr(user, 'is_authenticated', False) or getattr(user, 'is_superuser', False):
         return None
 
     from .models_rbac import RoleAssignment
@@ -253,7 +253,7 @@ class LeadSourceViewSet(viewsets.ModelViewSet):
             action_code='CRM_LEAD_SOURCE_CREATED',
             entity_type='LeadSource',
             entity_id=instance.id,
-            actor_user=getattr(self.request, 'user', None),
+            actor_user=self.request.user if (hasattr(self.request, 'user') and getattr(self.request.user, 'is_authenticated', False) and hasattr(self.request.user, 'organization_id')) else None,
             metadata={'code': instance.code, 'name': instance.name, 'source_type': instance.source_type},
             db_alias=alias,
         )
@@ -272,7 +272,7 @@ class LeadSourceViewSet(viewsets.ModelViewSet):
             action_code=action_code,
             entity_type='LeadSource',
             entity_id=instance.id,
-            actor_user=getattr(self.request, 'user', None),
+            actor_user=self.request.user if (hasattr(self.request, 'user') and getattr(self.request.user, 'is_authenticated', False) and hasattr(self.request.user, 'organization_id')) else None,
             metadata={'code': instance.code, 'name': instance.name, 'status': instance.status},
             db_alias=alias,
         )
@@ -329,6 +329,13 @@ class LeadSourceViewSet(viewsets.ModelViewSet):
 class LeadViewSet(viewsets.ModelViewSet):
     serializer_class = LeadSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
+
+    def get_permissions(self):
+        if self.action == 'create':
+            # Keep lead creation open so normal users who sign up / submit forms from the app or website can register as leads
+            from rest_framework.permissions import AllowAny
+            return [AllowAny()]
+        return [permission() for permission in self.permission_classes]
     required_module = 'crm'
     required_submodule = 'leads'
     required_permission = 'crm.leads.view'
@@ -443,13 +450,19 @@ class LeadViewSet(viewsets.ModelViewSet):
         if branch and permitted_branches is not None and str(branch.id) not in permitted_branches:
             raise PermissionDenied("You do not have permission to create leads for this branch.")
 
-        if not branch and permitted_branches is not None:
-            if len(permitted_branches) == 1:
-                branch_obj = Branch.objects.using(alias).filter(id=list(permitted_branches)[0], organization=org).first()
-                if branch_obj:
-                    branch = branch_obj
-            else:
-                raise PermissionDenied("A branch selection is required for branch-scoped staff.")
+        if not branch:
+            if permitted_branches is not None and len(permitted_branches) == 1:
+                branch = Branch.objects.using(alias).filter(id=list(permitted_branches)[0], organization=org).first()
+            if not branch:
+                branch = Branch.objects.using(alias).filter(organization=org, status='ACTIVE').first()
+
+        lead_source = serializer.validated_data.get('lead_source')
+        if not lead_source:
+            lead_source, _ = LeadSource.objects.using(alias).get_or_create(
+                organization=org,
+                code='MOBILE_APP',
+                defaults={'name': 'Mobile App', 'source_type': 'MOBILE_APP', 'status': 'ACTIVE'}
+            )
 
         req_mode = self.request.data.get('assignment_mode')
         assignment_mode = str(req_mode).upper() if req_mode else None
@@ -483,9 +496,9 @@ class LeadViewSet(viewsets.ModelViewSet):
             phone=serializer.validated_data.get('phone_normalized'),
             email=serializer.validated_data.get('email_normalized'),
             branch=branch,
-            lead_source=serializer.validated_data.get('lead_source'),
+            lead_source=lead_source or serializer.validated_data.get('lead_source'),
             assigned_sales_user=assigned_sales_user if assignment_mode != 'AUTO' else None,
-            actor_user=getattr(self.request, 'user', None),
+            actor_user=self.request.user if (hasattr(self.request, 'user') and getattr(self.request.user, 'is_authenticated', False) and hasattr(self.request.user, 'organization_id')) else None,
             extra_fields=extra_fields,
             attribution_data=serializer.validated_data.get('attribution'),
             db_alias=alias,
@@ -2401,7 +2414,7 @@ class CRMStageSlaPolicyViewSet(viewsets.ModelViewSet):
             action_code='CRM_SLA_POLICY_CREATED',
             entity_type='CRMStageSlaPolicy',
             entity_id=instance.id,
-            actor_user=getattr(self.request, 'user', None),
+            actor_user=self.request.user if (hasattr(self.request, 'user') and getattr(self.request.user, 'is_authenticated', False) and hasattr(self.request.user, 'organization_id')) else None,
             metadata={'stage': instance.canonical_stage, 'target': f"{instance.response_target_value} {instance.response_target_unit}"},
             db_alias=alias,
         )
@@ -2416,7 +2429,7 @@ class CRMStageSlaPolicyViewSet(viewsets.ModelViewSet):
             action_code='CRM_SLA_POLICY_UPDATED',
             entity_type='CRMStageSlaPolicy',
             entity_id=instance.id,
-            actor_user=getattr(self.request, 'user', None),
+            actor_user=self.request.user if (hasattr(self.request, 'user') and getattr(self.request.user, 'is_authenticated', False) and hasattr(self.request.user, 'organization_id')) else None,
             metadata={'stage': instance.canonical_stage, 'target': f"{instance.response_target_value} {instance.response_target_unit}"},
             db_alias=alias,
         )
@@ -2456,7 +2469,7 @@ class CRMStageAutomationRuleViewSet(viewsets.ModelViewSet):
             action_code='CRM_STAGE_AUTOMATION_RULE_CREATED',
             entity_type='CRMStageAutomationRule',
             entity_id=instance.id,
-            actor_user=getattr(self.request, 'user', None),
+            actor_user=self.request.user if (hasattr(self.request, 'user') and getattr(self.request.user, 'is_authenticated', False) and hasattr(self.request.user, 'organization_id')) else None,
             metadata={'event': instance.trigger_event, 'to_stage': instance.to_stage},
             db_alias=alias,
         )
@@ -2471,7 +2484,7 @@ class CRMStageAutomationRuleViewSet(viewsets.ModelViewSet):
             action_code='CRM_STAGE_AUTOMATION_RULE_UPDATED',
             entity_type='CRMStageAutomationRule',
             entity_id=instance.id,
-            actor_user=getattr(self.request, 'user', None),
+            actor_user=self.request.user if (hasattr(self.request, 'user') and getattr(self.request.user, 'is_authenticated', False) and hasattr(self.request.user, 'organization_id')) else None,
             metadata={'event': instance.trigger_event, 'to_stage': instance.to_stage, 'is_enabled': instance.is_enabled},
             db_alias=alias,
         )
@@ -2485,7 +2498,7 @@ class CRMStageAutomationRuleViewSet(viewsets.ModelViewSet):
             action_code='CRM_STAGE_AUTOMATION_RULE_DELETED',
             entity_type='CRMStageAutomationRule',
             entity_id=instance.id,
-            actor_user=getattr(self.request, 'user', None),
+            actor_user=self.request.user if (hasattr(self.request, 'user') and getattr(self.request.user, 'is_authenticated', False) and hasattr(self.request.user, 'organization_id')) else None,
             metadata={'event': instance.trigger_event, 'to_stage': instance.to_stage},
             db_alias=alias,
         )
@@ -2836,7 +2849,7 @@ class CRMAttentionPolicyViewSet(viewsets.ModelViewSet):
             action_code='CRM_ATTENTION_POLICY_CREATED',
             entity_type='CRMAttentionPolicy',
             entity_id=instance.id,
-            actor_user=getattr(self.request, 'user', None),
+            actor_user=self.request.user if (hasattr(self.request, 'user') and getattr(self.request.user, 'is_authenticated', False) and hasattr(self.request.user, 'organization_id')) else None,
             db_alias=alias,
         )
 
@@ -2850,7 +2863,7 @@ class CRMAttentionPolicyViewSet(viewsets.ModelViewSet):
             action_code='CRM_ATTENTION_POLICY_UPDATED',
             entity_type='CRMAttentionPolicy',
             entity_id=instance.id,
-            actor_user=getattr(self.request, 'user', None),
+            actor_user=self.request.user if (hasattr(self.request, 'user') and getattr(self.request.user, 'is_authenticated', False) and hasattr(self.request.user, 'organization_id')) else None,
             db_alias=alias,
         )
 

@@ -9,6 +9,7 @@ Implements:
 
 import uuid
 import logging
+from decimal import Decimal
 from typing import Optional, Dict, Any
 from django.db import transaction
 from django.utils import timezone
@@ -363,14 +364,35 @@ class AdminApprovalService:
         txn.metadata['rejection_reason'] = action_record.comment or ''
         txn.save(using=alias)
 
-        # Cancel provisional membership upon cash payment rejection
-        from .models_memberships import Membership, MembershipStatusHistory
+        # Cancel provisional membership upon cash payment rejection and append compensating ledger reversals
+        from .models_memberships import Membership, MembershipStatusHistory, MembershipEntitlementLedger
         membership = Membership.objects.using(alias).filter(source_order=txn.order).first()
         if membership and membership.legacy_reference and 'PROVISIONAL_CASH' in membership.legacy_reference:
             membership.status = 'CANCELLED'
             membership.legacy_reference = f"CASH_REJECTED:reason={action_record.comment or 'Payment rejected'}"
             membership.save(using=alias, update_fields=['status', 'legacy_reference', 'updated_at'])
-            membership.entitlements.using(alias).update(status='INACTIVE')
+
+            # Append compensating reversal for each active provisional entitlement
+            for ent in membership.entitlements.using(alias).filter(status='ACTIVE'):
+                rem = ent.remaining_units or Decimal('0.00')
+                if rem > Decimal('0.00'):
+                    already_reversed = MembershipEntitlementLedger.objects.using(alias).filter(
+                        membership_entitlement=ent,
+                        reason_code='PROVISIONAL_CASH_REJECTED_REVERSAL',
+                    ).exists()
+                    if not already_reversed:
+                        MembershipEntitlementLedger.objects.using(alias).create(
+                            membership_entitlement=ent,
+                            transaction_type='REVERSAL',
+                            units=-rem,
+                            reason_code='PROVISIONAL_CASH_REJECTED_REVERSAL',
+                            reason_text=f"Provisional allocation reversed upon cash payment rejection: {action_record.comment or 'Payment rejected'}",
+                            balance_after=Decimal('0.00'),
+                            created_by_user=action_record.approver_user,
+                        )
+                ent.status = 'INACTIVE'
+                ent.save(using=alias, update_fields=['status', 'updated_at'])
+
             MembershipStatusHistory.objects.using(alias).create(
                 membership=membership,
                 from_status='ACTIVE',

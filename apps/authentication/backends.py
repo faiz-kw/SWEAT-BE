@@ -281,6 +281,17 @@ class TenantJWTAuthentication(BaseAuthentication):
                 'User login is disabled. Contact your administrator.'
             )
 
+        from django.utils import timezone
+        if getattr(user, 'suspended_until', None) and user.suspended_until > timezone.now():
+            raise AuthenticationFailed(
+                f'User account is suspended until {user.suspended_until.strftime("%Y-%m-%d %H:%M")}. Contact your administrator.'
+            )
+
+        if getattr(user, 'deactivated_at', None) is not None:
+            raise AuthenticationFailed(
+                'User account has been deactivated. Contact your administrator.'
+            )
+
         # Attach authentication context — consumed by RBAC permission classes
         user._auth_type = 'tenant'
         user._tenant_id = tenant_id
