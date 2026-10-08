@@ -107,13 +107,14 @@ class ClassTemplateSerializer(serializers.ModelSerializer):
     code = serializers.CharField(required=False, allow_blank=True, max_length=100)
     name = serializers.CharField(required=False, allow_blank=True, max_length=200)
     category_name = serializers.CharField(source='category.name', read_only=True)
+    category_code = serializers.CharField(source='category.code', read_only=True)
     program_name = serializers.CharField(source='program.name', read_only=True)
     specialty_requirements = ClassSpecialtyRequirementSerializer(many=True, read_only=True)
 
     class Meta:
         model = ClassTemplate
         fields = [
-            'id', 'organization', 'category', 'category_name', 'program', 'program_name',
+            'id', 'organization', 'category', 'category_name', 'category_code', 'program', 'program_name',
             'code', 'name', 'description', 'default_duration_minutes', 'default_capacity',
             'default_trial_capacity', 'default_waitlist_capacity', 'default_delivery_mode',
             'allow_booking', 'allow_trial', 'allow_waitlist', 'allow_reschedule',
@@ -163,6 +164,11 @@ class ClassTemplateSerializer(serializers.ModelSerializer):
 
 class ClassScheduleRuleSerializer(serializers.ModelSerializer):
     class_name = serializers.CharField(source='class_template.name', read_only=True)
+    category = serializers.UUIDField(source='class_template.category_id', read_only=True)
+    category_name = serializers.CharField(source='class_template.category.name', read_only=True)
+    category_code = serializers.CharField(source='class_template.category.code', read_only=True)
+    program = serializers.UUIDField(source='class_template.program_id', read_only=True)
+    program_name = serializers.CharField(source='class_template.program.name', read_only=True)
     branch_name = serializers.CharField(source='branch.name', read_only=True)
     recurrence_type = serializers.CharField(required=False, default='WEEKLY')
     delivery_mode = serializers.CharField(required=False, default='OFFLINE')
@@ -171,7 +177,8 @@ class ClassScheduleRuleSerializer(serializers.ModelSerializer):
     class Meta:
         model = ClassScheduleRule
         fields = [
-            'id', 'class_template', 'class_name', 'branch', 'branch_name',
+            'id', 'class_template', 'class_name', 'category', 'category_name', 'category_code',
+            'program', 'program_name', 'branch', 'branch_name',
             'recurrence_type', 'days_of_week', 'start_time', 'end_time',
             'valid_from', 'valid_until', 'delivery_mode', 'capacity_override',
             'trial_capacity_override', 'waitlist_capacity_override', 'status',
@@ -280,6 +287,11 @@ class ClassOccurrenceTrainerSerializer(serializers.ModelSerializer):
 
 class ClassOccurrenceSerializer(serializers.ModelSerializer):
     class_name = serializers.CharField(source='class_template.name', read_only=True)
+    category = serializers.UUIDField(source='class_template.category_id', read_only=True)
+    category_name = serializers.CharField(source='class_template.category.name', read_only=True)
+    category_code = serializers.CharField(source='class_template.category.code', read_only=True)
+    program = serializers.UUIDField(source='class_template.program_id', read_only=True)
+    program_name = serializers.CharField(source='class_template.program.name', read_only=True)
     branch_name = serializers.CharField(source='branch.name', read_only=True)
     branch_latitude = serializers.DecimalField(source='branch.latitude', max_digits=10, decimal_places=7, read_only=True)
     branch_longitude = serializers.DecimalField(source='branch.longitude', max_digits=10, decimal_places=7, read_only=True)
@@ -385,12 +397,16 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
             return {'checked_in': False, 'status': 'UNKNOWN'}
 
     def get_booking_count(self, obj):
+        if getattr(obj, 'annotated_booking_count', None) is not None:
+            return obj.annotated_booking_count
         try:
-            return sum(1 for b in obj.bookings.all() if b.status in ['CONFIRMED', 'RESERVED', 'COMPLETED'])
+            return sum(1 for b in obj.bookings.all() if b.status in ['CONFIRMED', 'RESERVED', 'COMPLETED', 'ATTENDED', 'BOOKED'])
         except Exception:
             return 0
 
     def get_waitlist_count(self, obj):
+        if getattr(obj, 'annotated_waitlist_count', None) is not None:
+            return obj.annotated_waitlist_count
         try:
             return sum(1 for b in obj.bookings.all() if b.status == 'WAITLISTED')
         except Exception:
@@ -398,7 +414,13 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
 
     def get_active_content(self, obj):
         try:
-            latest = obj.content_assignments.filter(status='ACTIVE').select_related('content_item').order_by('-assigned_at').first()
+            cache = getattr(obj, '_prefetched_objects_cache', None)
+            if cache and 'content_assignments' in cache:
+                active_list = [ca for ca in cache['content_assignments'] if ca.status == 'ACTIVE' and ca.content_item]
+                active_list.sort(key=lambda ca: ca.assigned_at or timezone.now(), reverse=True)
+                latest = active_list[0] if active_list else None
+            else:
+                latest = obj.content_assignments.filter(status='ACTIVE').select_related('content_item').order_by('-assigned_at').first()
             if latest and latest.content_item:
                 return {
                     'id': str(latest.id),
@@ -414,7 +436,8 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
     class Meta:
         model = ClassOccurrence
         fields = [
-            'id', 'class_template', 'class_name', 'schedule_rule', 'branch', 'branch_name',
+            'id', 'class_template', 'class_name', 'category', 'category_name', 'category_code',
+            'program', 'program_name', 'schedule_rule', 'branch', 'branch_name',
             'branch_latitude', 'branch_longitude', 'branch_geofence_radius_meters', 'branch_geofence_enforcement',
             'occurrence_date', 'start_at', 'end_at', 'start_time', 'end_time', 'delivery_mode',
             'online_provider', 'online_join_url', 'capacity', 'trial_capacity',

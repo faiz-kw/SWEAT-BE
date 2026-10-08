@@ -6,9 +6,29 @@ import logging
 from datetime import date
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.core.exceptions import ValidationError
+
+
+class ClassesPagination(PageNumberPagination):
+    page_size = 500
+    page_size_query_param = 'page_size'
+    max_page_size = 2000
+
+    def get_paginated_response(self, data):
+        summary = getattr(self, '_classes_summary', None) or {}
+        return Response({
+            'count': self.page.paginator.count,
+            'total_pages': self.page.paginator.num_pages,
+            'current_page': self.page.number,
+            'page_size': self.get_page_size(self.request),
+            'next': self.get_next_link(),
+            'previous': self.get_previous_link(),
+            'summary': summary,
+            'results': data,
+        })
 
 from .context import get_tenant_db_alias
 from .models_classes import (
@@ -288,6 +308,7 @@ class ClassBranchAvailabilityViewSet(viewsets.ModelViewSet):
 
 class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
     serializer_class = ClassScheduleRuleSerializer
+    pagination_class = ClassesPagination
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
     required_module = 'ops'
     required_submodule = 'classes'
@@ -295,15 +316,79 @@ class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
     permission_action_map = {'create': 'ops.classes.create', 'update': 'ops.classes.edit', 'partial_update': 'ops.classes.edit', 'destroy': 'ops.classes.delete', 'generate_occurrences': 'ops.classes.create'}
 
     def get_queryset(self):
+        from django.db.models import Q, Count
         alias = _get_db(self.request)
-        qs = ClassScheduleRule.objects.using(alias).all()
+        qs = ClassScheduleRule.objects.using(alias).select_related(
+            'class_template', 'class_template__category', 'class_template__program', 'branch'
+        ).all()
         permitted_branches = get_user_effective_branch_ids(self.request.user, alias)
         if permitted_branches is not None:
             qs = qs.filter(branch_id__in=permitted_branches)
         branch_id = self.request.query_params.get('branch_id')
         if branch_id:
             qs = qs.filter(branch_id=branch_id)
-        return qs.order_by('start_time')
+
+        category_id = (self.request.query_params.get('category_id') or self.request.query_params.get('category') or '').strip()
+        if category_id and category_id.upper() != 'ALL':
+            qs = qs.filter(class_template__category_id=category_id)
+
+        category_code = (self.request.query_params.get('category_code') or '').strip()
+        if category_code and category_code.upper() != 'ALL':
+            qs = qs.filter(class_template__category__code__iexact=category_code)
+
+        if self.action == 'list' and getattr(self, 'paginator', None) is not None:
+            self.paginator._classes_summary = qs.aggregate(
+                total_count=Count('id'),
+                active_count=Count('id', filter=Q(status='ACTIVE')),
+                inactive_count=Count('id', filter=~Q(status='ACTIVE')),
+            )
+
+        status_param = self.request.query_params.get('status')
+        if status_param and status_param.upper() != 'ALL':
+            qs = qs.filter(status__iexact=status_param.strip())
+
+        date_param = (self.request.query_params.get('date') or self.request.query_params.get('occurrence_date') or '').strip()
+        if date_param:
+            try:
+                from datetime import datetime as dt_parser
+                parsed_date = dt_parser.strptime(date_param, '%Y-%m-%d').date()
+                iso_weekday = parsed_date.isoweekday()
+                qs = qs.filter(
+                    valid_from__lte=parsed_date
+                ).filter(
+                    Q(valid_until__isnull=True) | Q(valid_until__gte=parsed_date)
+                ).filter(
+                    Q(days_of_week__contains=[iso_weekday]) | Q(days_of_week__contains=[str(iso_weekday)])
+                )
+            except ValueError:
+                pass
+
+        from_date_param = (self.request.query_params.get('from_date') or '').strip()
+        if from_date_param:
+            qs = qs.filter(Q(valid_until__isnull=True) | Q(valid_until__gte=from_date_param))
+
+        to_date_param = (self.request.query_params.get('to_date') or '').strip()
+        if to_date_param:
+            qs = qs.filter(valid_from__lte=to_date_param)
+
+        day_of_week_param = (self.request.query_params.get('day_of_week') or '').strip()
+        if day_of_week_param and day_of_week_param.upper() != 'ALL':
+            try:
+                dow = int(day_of_week_param)
+                qs = qs.filter(Q(days_of_week__contains=[dow]) | Q(days_of_week__contains=[str(dow)]))
+            except ValueError:
+                pass
+
+        search_param = (self.request.query_params.get('search') or '').strip()
+        if search_param:
+            qs = qs.filter(
+                Q(class_template__name__icontains=search_param) |
+                Q(class_template__category__name__icontains=search_param) |
+                Q(class_template__program__name__icontains=search_param) |
+                Q(branch__name__icontains=search_param)
+            )
+
+        return qs.order_by('start_time', 'id')
 
     def perform_create(self, serializer):
         rule = serializer.save()
@@ -375,6 +460,7 @@ class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
 
 class ClassOccurrenceViewSet(viewsets.ModelViewSet):
     serializer_class = ClassOccurrenceSerializer
+    pagination_class = ClassesPagination
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
     required_module = 'ops'
     required_submodule = 'classes'
@@ -382,6 +468,8 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
     permission_action_map = {'create': 'ops.classes.create', 'update': 'ops.classes.edit', 'partial_update': 'ops.classes.edit', 'destroy': 'ops.classes.delete', 'assign_trainer': 'ops.classes.edit', 'assign_content': 'ops.classes.edit'}
 
     def get_queryset(self):
+        from django.db.models import Q, Exists, OuterRef, Prefetch
+        from .models_bookings import Booking
         alias = _get_db(self.request)
         qs = ClassOccurrence.objects.using(alias).all()
 
@@ -391,17 +479,25 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             qs = qs.filter(branch_id__in=permitted_branches)
 
         branch_id = self.request.query_params.get('branch_id')
+        category_id = (self.request.query_params.get('category_id') or self.request.query_params.get('category') or '').strip()
+        category_code = (self.request.query_params.get('category_code') or '').strip()
         occ_date = self.request.query_params.get('occurrence_date')
         status_param = self.request.query_params.get('status')
         trainer_id = self.request.query_params.get('trainer_id')
         from_date = self.request.query_params.get('from_date')
         to_date = self.request.query_params.get('to_date')
+        check_in_param = self.request.query_params.get('check_in_status')
+        search_param = (self.request.query_params.get('search') or '').strip()
 
         if branch_id:
             qs = qs.filter(branch_id=branch_id)
+        if category_id and category_id.upper() != 'ALL':
+            qs = qs.filter(class_template__category_id=category_id)
+        if category_code and category_code.upper() != 'ALL':
+            qs = qs.filter(class_template__category__code__iexact=category_code)
         if occ_date:
             qs = qs.filter(occurrence_date=occ_date)
-        if status_param:
+        if status_param and status_param.upper() != 'ALL':
             qs = qs.filter(status=status_param)
         if trainer_id:
             qs = qs.filter(trainer_assignments__trainer_profile_id=trainer_id)
@@ -410,10 +506,40 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
         if to_date:
             qs = qs.filter(occurrence_date__lte=to_date)
 
-        return qs.select_related('class_template', 'branch').prefetch_related(
+        if check_in_param and check_in_param.upper() != 'ALL':
+            confirmed_trainer = ClassOccurrenceTrainer.objects.using(alias).filter(
+                occurrence_id=OuterRef('pk'),
+                status='CONFIRMED',
+            )
+            if check_in_param.upper() == 'CHECKED_IN':
+                qs = qs.filter(Exists(confirmed_trainer))
+            elif check_in_param.upper() == 'PENDING':
+                qs = qs.filter(~Exists(confirmed_trainer))
+
+        if search_param:
+            matching_trainer = ClassOccurrenceTrainer.objects.using(alias).filter(
+                Q(trainer_profile__trainer_code__icontains=search_param) |
+                Q(trainer_profile__employee_profile__user_profile__user__first_name__icontains=search_param) |
+                Q(trainer_profile__employee_profile__user_profile__user__last_name__icontains=search_param) |
+                Q(trainer_profile__employee_profile__user_profile__first_name_snapshot__icontains=search_param) |
+                Q(trainer_profile__employee_profile__user_profile__last_name_snapshot__icontains=search_param),
+                occurrence_id=OuterRef('pk'),
+            )
+            qs = qs.filter(
+                Q(class_template__name__icontains=search_param) |
+                Q(class_template__category__name__icontains=search_param) |
+                Q(class_template__program__name__icontains=search_param) |
+                Q(branch__name__icontains=search_param) |
+                Exists(matching_trainer)
+            )
+
+        return qs.select_related(
+            'class_template', 'class_template__category', 'class_template__program', 'branch'
+        ).prefetch_related(
             'trainer_assignments__trainer_profile__employee_profile__user_profile__user',
-            'bookings'
-        ).order_by('start_at').distinct()
+            'content_assignments__content_item',
+            Prefetch('bookings', queryset=Booking.objects.using(alias).only('id', 'occurrence_id', 'status')),
+        ).order_by('start_at', 'id').distinct()
 
     def get_serializer_context(self):
         context = super().get_serializer_context()

@@ -206,6 +206,8 @@ class OrderSerializer(serializers.ModelSerializer):
             if count > 1:
                 return f"{name} (+{count - 1} more)"
             return name or 'Membership Package'
+        if obj.notes and obj.notes.strip():
+            return obj.notes.strip()
         return 'Membership Order'
 
 

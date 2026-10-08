@@ -302,7 +302,11 @@ class UniversalLoginView(APIView):
                 'error': "Please enter your organization code to sign in. If you don't have a code or your account hasn't been activated, contact your organization administrator.",
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        tenant = Tenant.objects.using('default').filter(slug=tenant_slug, status='ACTIVE').first()
+        from django.db.models import Q as _TenantQ
+        tenant = Tenant.objects.using('default').filter(
+            _TenantQ(slug__iexact=tenant_slug) | _TenantQ(code__iexact=tenant_slug),
+            status='ACTIVE',
+        ).first()
         identity = resolve_identity(identifier, account_type='TENANT', tenant_id=tenant.id) if tenant else None
         if not identity and tenant:
             try:
@@ -940,13 +944,23 @@ class MeView(APIView):
                     }
                     # Enabled modules and submodules come from master TenantModule — real data
                     enabled_modules_list = []
-                    for tm in tenant.enabled_modules_set.filter(is_enabled=True).select_related('module'):
-                        enabled_modules_list.append(tm.module.code)
+                    for tm in tenant.enabled_modules_set.filter(is_enabled=True).select_related('module').prefetch_related('module__submodules'):
+                        m_code = (tm.module.code or '').lower()
+                        if m_code and m_code not in enabled_modules_list:
+                            enabled_modules_list.append(m_code)
+                        subs = []
                         if tm.configuration and isinstance(tm.configuration, dict):
                             subs = tm.configuration.get('enabled_submodules') or []
+                        if subs:
                             for s in subs:
-                                if s not in enabled_modules_list:
+                                if s and s not in enabled_modules_list:
                                     enabled_modules_list.append(s)
+                        elif m_code:
+                            # If no submodule restriction is configured, all active submodules of this module are enabled
+                            for sub in tm.module.submodules.filter(is_active=True):
+                                sub_path = f"/{m_code}/{(sub.code or '').lower()}"
+                                if sub_path not in enabled_modules_list:
+                                    enabled_modules_list.append(sub_path)
                     enabled_modules = enabled_modules_list
                     # Branding from master DB
                     if hasattr(tenant, 'branding') and tenant.branding:
@@ -985,8 +999,23 @@ class MeView(APIView):
                     RoleModuleAccess,
                     RoleSubmoduleAccess,
                     RolePermissionSetItem,
+                    Permission,
+                    ModuleCatalog,
                 )
                 from apps.tenant_core.models_org import Branch
+
+                # Fallback if master TenantModule was empty: load enabled modules from tenant DB ModuleCatalog
+                if not enabled_modules:
+                    for mc in ModuleCatalog.objects.using(db_alias).filter(is_enabled=True).prefetch_related('submodules'):
+                        mc_code = (mc.module_code or mc.code or '').lower()
+                        if mc_code and mc_code not in enabled_modules:
+                            enabled_modules.append(mc_code)
+                        for sm in mc.submodules.filter(is_enabled=True):
+                            sm_code = (sm.submodule_code or sm.code or '').lower()
+                            if mc_code and sm_code:
+                                sm_path = f"/{mc_code}/{sm_code}"
+                                if sm_path not in enabled_modules:
+                                    enabled_modules.append(sm_path)
 
                 assignments = (
                     RoleAssignment.objects.using(db_alias)
@@ -1014,6 +1043,13 @@ class MeView(APIView):
                             'city': loc.city if loc else '',
                             'address': ra.branch.address or (loc.area if loc else ''),
                         })
+
+                # Sort active_roles so ORG_ADMIN / ORG-scoped roles always take precedence as primary_role
+                active_roles.sort(
+                    key=lambda r: (
+                        0 if r.get('code') in ('ORG_ADMIN', 'TENANT_ADMIN') else (1 if r.get('scope') == 'ORG' else 2)
+                    )
+                )
 
                 # If user has ORG scope or no explicit branch restrictions, they can view ALL active branches in the organization
                 if is_org_wide:
@@ -1046,16 +1082,20 @@ class MeView(APIView):
                             p_code = item.permission.permission_code or item.permission.code
                             if p_code:
                                 perm_codes.add(p_code)
-                    user_permissions = sorted(list(perm_codes))
 
                     # Calculate role-permitted modules/submodules
                     if is_org_wide:
-                        # Org Admin gets all tenant-enabled modules and submodules
+                        # Org Admin gets all tenant-enabled modules and submodules + all catalog permissions
                         user_accessible_modules = list(enabled_modules)
-                        for essential in ['crm.settings.view', 'crm.settings.edit', 'core.settings.view']:
-                            if essential not in user_permissions:
-                                user_permissions.append(essential)
+                        for p in Permission.objects.using(db_alias).all():
+                            p_code = p.permission_code or p.code
+                            if p_code:
+                                perm_codes.add(p_code)
+                        for essential in ['crm.settings.view', 'crm.settings.edit', 'core.settings.view', '*']:
+                            perm_codes.add(essential)
+                        user_permissions = sorted(list(perm_codes))
                     else:
+                        user_permissions = sorted(list(perm_codes))
                         # Intersect role module/submodule grants with tenant's enabled_modules
                         tenant_mod_codes_lower = {m.lower() for m in enabled_modules}
                         accessible = set()
@@ -1089,6 +1129,7 @@ class MeView(APIView):
                 else:
                     if is_org_wide:
                         user_accessible_modules = list(enabled_modules)
+                        user_permissions = ['*']
                     else:
                         user_accessible_modules = []
 
@@ -1295,6 +1336,7 @@ class TokenRefreshView(APIView):
       - Inclusion in OutstandingToken table via refresh.outstand()
       - Rejection of reused old refresh tokens with 401 Unauthorized
     """
+    authentication_classes = []
     permission_classes = [AllowAny]
     throttle_classes = [TokenRefreshRateThrottle]
 
@@ -1374,9 +1416,13 @@ class LogoutView(APIView):
     This ensures that even if a refresh token is stolen after logout, it
     cannot be used to obtain a new access token.
     """
+    authentication_classes = []
     permission_classes = [AllowAny]
 
     def post(self, request):
+        from config.routers import set_tenant_db_alias
+        set_tenant_db_alias(None)
+
         refresh_token_str = request.data.get('refresh') or request.COOKIES.get('refresh_token')
 
         if refresh_token_str:
@@ -1395,7 +1441,7 @@ class LogoutView(APIView):
                 logger.error('LogoutView: Unexpected error blacklisting token: %s', e)
 
         resp = Response({'message': 'Logged out successfully.'})
-        delete_refresh_cookie(resp)
+        delete_refresh_cookie(resp, request=request)
         return resp
 
 

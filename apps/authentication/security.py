@@ -117,8 +117,19 @@ def set_refresh_cookie(response, refresh_token_str: str, request=None) -> None:
     )
 
 
-def delete_refresh_cookie(response) -> None:
+def delete_refresh_cookie(response, request=None) -> None:
     """Clear the refresh token cookie on a DRF Response."""
+    params = get_refresh_cookie_params(request)
+    response.set_cookie(
+        'refresh_token',
+        '',
+        max_age=0,
+        expires='Thu, 01 Jan 1970 00:00:00 GMT',
+        path=params.get('path', '/'),
+        secure=params.get('secure', False),
+        httponly=True,
+        samesite=params.get('samesite', 'Lax'),
+    )
     response.delete_cookie(
         'refresh_token',
         path='/',

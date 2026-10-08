@@ -90,7 +90,11 @@ class TrainerProfileSerializer(serializers.ModelSerializer):
         b_ids = set()
         if user.home_branch_id:
             b_ids.add(str(user.home_branch_id))
-        assignments = user.branch_assignments.using(alias).filter(status='ACTIVE')
+        prefetched_branches = getattr(user, '_prefetched_objects_cache', {}).get('branch_assignments')
+        if prefetched_branches is not None:
+            assignments = [a for a in prefetched_branches if a.status == 'ACTIVE']
+        else:
+            assignments = user.branch_assignments.using(alias).filter(status='ACTIVE')
         for a in assignments:
             b_ids.add(str(a.branch_id))
         pref = obj.employee_profile.user_profile.preferred_branch_id
@@ -104,7 +108,11 @@ class TrainerProfileSerializer(serializers.ModelSerializer):
         names = []
         if user.home_branch:
             names.append(user.home_branch.name)
-        assignments = user.branch_assignments.using(alias).filter(status='ACTIVE').select_related('branch')
+        prefetched_branches = getattr(user, '_prefetched_objects_cache', {}).get('branch_assignments')
+        if prefetched_branches is not None:
+            assignments = [a for a in prefetched_branches if a.status == 'ACTIVE']
+        else:
+            assignments = user.branch_assignments.using(alias).filter(status='ACTIVE').select_related('branch')
         for a in assignments:
             if a.branch and a.branch.name not in names:
                 names.append(a.branch.name)
@@ -112,7 +120,11 @@ class TrainerProfileSerializer(serializers.ModelSerializer):
 
     def get_specialties(self, obj):
         alias = obj._state.db or 'default'
-        assignments = obj.specialty_assignments.using(alias).filter(status='ACTIVE').select_related('trainer_specialty')
+        prefetched_specs = getattr(obj, '_prefetched_objects_cache', {}).get('specialty_assignments')
+        if prefetched_specs is not None:
+            assignments = [a for a in prefetched_specs if a.status == 'ACTIVE']
+        else:
+            assignments = obj.specialty_assignments.using(alias).filter(status='ACTIVE').select_related('trainer_specialty')
         return [
             {
                 'id': str(a.id),

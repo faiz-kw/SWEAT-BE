@@ -969,6 +969,8 @@ class PackageSerializer(serializers.ModelSerializer):
                     'allocated_units': str(e.allocated_units) if e.allocated_units is not None else None,
                     'is_unlimited': e.is_unlimited,
                     'extra_unit_price': str(e.extra_unit_price) if e.extra_unit_price is not None else None,
+                    'validity_days': e.validity_days,
+                    'configuration': e.configuration or {},
                 }
                 for e in active.entitlement_definitions.filter(status='ACTIVE')
             ]

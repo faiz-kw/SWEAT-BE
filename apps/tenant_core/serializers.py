@@ -289,48 +289,65 @@ class TenantUserSerializer(serializers.ModelSerializer):
             return None
         return (getattr(hb, 'address', '') or '').strip()
 
-    def get_role(self, obj):
+    def _get_role_assignments(self, obj):
+        cache = getattr(obj, '_prefetched_objects_cache', None)
+        if cache and 'role_assignments' in cache:
+            return list(cache['role_assignments'])
         db = obj._state.db or 'default'
+        from .models_rbac import RoleAssignment
+        return list(RoleAssignment.objects.using(db).filter(user=obj).select_related('role', 'branch'))
+
+    def _get_user_departments(self, obj):
+        cache = getattr(obj, '_prefetched_objects_cache', None)
+        if cache and 'department_memberships' in cache:
+            return list(cache['department_memberships'])
+        db = obj._state.db or 'default'
+        from .models_users import UserDepartment
+        return list(UserDepartment.objects.using(db).filter(user=obj).select_related('department'))
+
+    def get_role(self, obj):
         try:
-            from .models_rbac import RoleAssignment
-            ra = RoleAssignment.objects.using(db).filter(user=obj, is_active=True).select_related('role').first()
-            if ra and ra.role:
-                return ra.role.code
+            for ra in self._get_role_assignments(obj):
+                if ra.is_active and ra.role:
+                    return ra.role.code
         except Exception:
             pass
         return 'STAFF'
 
     def get_role_name(self, obj):
-        db = obj._state.db or 'default'
         try:
-            from .models_rbac import RoleAssignment
-            ra = RoleAssignment.objects.using(db).filter(user=obj, is_active=True).select_related('role').first()
-            if ra and ra.role:
-                return ra.role.name
+            for ra in self._get_role_assignments(obj):
+                if ra.is_active and ra.role:
+                    return ra.role.name
         except Exception:
             pass
         return 'Staff Member'
 
     def get_branch_access(self, obj):
-        from .models_rbac import RoleAssignment
-        rows = RoleAssignment.objects.using(obj._state.db).filter(
-            user=obj, role__scope='BRANCH', branch__isnull=False,
-        ).select_related('branch')
-        # Older edits may leave multiple historical assignments. Active wins.
-        access = {}
-        for row in rows:
-            key = (str(row.role_id), str(row.branch_id))
-            enabled = row.is_active and row.status == 'ACTIVE'
-            if key not in access or enabled:
-                access[key] = {'role_id': key[0], 'branch_id': key[1],
-                               'branch_name': row.branch.name, 'enabled': enabled}
-        return list(access.values())
+        try:
+            rows = [
+                ra for ra in self._get_role_assignments(obj)
+                if ra.role and ra.role.scope == 'BRANCH' and ra.branch_id is not None
+            ]
+            # Older edits may leave multiple historical assignments. Active wins.
+            access = {}
+            for row in rows:
+                key = (str(row.role_id), str(row.branch_id))
+                enabled = row.is_active and row.status == 'ACTIVE'
+                if key not in access or enabled:
+                    access[key] = {
+                        'role_id': key[0],
+                        'branch_id': key[1],
+                        'branch_name': row.branch.name if row.branch else '',
+                        'enabled': enabled,
+                    }
+            return list(access.values())
+        except Exception:
+            return []
 
     def get_roles(self, obj):
-        db = obj._state.db or 'default'
         try:
-            from .models_rbac import RoleAssignment
-            ras = RoleAssignment.objects.using(db).filter(user=obj, is_active=True).select_related('role', 'branch')
+            ras = [ra for ra in self._get_role_assignments(obj) if ra.is_active and ra.role]
             return [{
                 'id': str(ra.role.id),
                 'code': ra.role.code,
@@ -338,27 +355,23 @@ class TenantUserSerializer(serializers.ModelSerializer):
                 'scope': ra.role.scope,
                 'branch_id': str(ra.branch.id) if ra.branch else None,
                 'branch_name': ra.branch.name if ra.branch else None,
-            } for ra in ras if ra.role]
+            } for ra in ras]
         except Exception:
             return []
 
     def get_department(self, obj):
-        db = obj._state.db or 'default'
         try:
-            from .models_users import UserDepartment
-            ud = UserDepartment.objects.using(db).filter(user=obj, status='ACTIVE').select_related('department').first()
-            if ud and ud.department:
-                return ud.department.name
+            for ud in self._get_user_departments(obj):
+                if ud.status == 'ACTIVE' and ud.department:
+                    return ud.department.name
         except Exception:
             pass
         return ''
 
     def get_departments(self, obj):
-        db = obj._state.db or 'default'
         try:
-            from .models_users import UserDepartment
-            uds = UserDepartment.objects.using(db).filter(user=obj, status='ACTIVE').select_related('department')
-            return [{'id': str(ud.department.id), 'name': ud.department.name, 'code': ud.department.code} for ud in uds if ud.department]
+            uds = [ud for ud in self._get_user_departments(obj) if ud.status == 'ACTIVE' and ud.department]
+            return [{'id': str(ud.department.id), 'name': ud.department.name, 'code': ud.department.code} for ud in uds]
         except Exception:
             return []
 

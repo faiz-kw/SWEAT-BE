@@ -166,6 +166,8 @@ class BookingListSerializer(serializers.ModelSerializer):
         return obj.user_profile.user.email if (obj.user_profile and obj.user_profile.user) else None
 
     def get_parq_status(self, obj):
+        if getattr(obj, 'has_parq_submission', None) is not None:
+            return 'CLEARED' if obj.has_parq_submission else 'PENDING'
         if not obj.user_profile:
             return 'NOT_REQUIRED'
         from .models_crm import IntakeSubmission
@@ -174,8 +176,13 @@ class BookingListSerializer(serializers.ModelSerializer):
         return 'CLEARED' if has_sub else 'PENDING'
 
     def get_attendance_record(self, obj):
-        alias = obj._state.db or 'default'
-        att = obj.attendance_records.using(alias).first()
+        cache = getattr(obj, '_prefetched_objects_cache', None)
+        if cache and 'attendance_records' in cache:
+            recs = list(cache['attendance_records'])
+            att = recs[0] if recs else None
+        else:
+            alias = obj._state.db or 'default'
+            att = obj.attendance_records.using(alias).first()
         if not att:
             return None
         return {

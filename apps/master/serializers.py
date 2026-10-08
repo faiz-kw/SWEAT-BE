@@ -49,13 +49,22 @@ class TenantSerializer(serializers.ModelSerializer):
 
     def get_enabled_modules(self, obj):
         modules = []
-        for tm in obj.enabled_modules_set.filter(is_enabled=True).select_related('module'):
-            modules.append(tm.module.code)
+        for tm in obj.enabled_modules_set.filter(is_enabled=True).select_related('module').prefetch_related('module__submodules'):
+            m_code = (tm.module.code or '').lower()
+            if m_code and m_code not in modules:
+                modules.append(m_code)
+            subs = []
             if tm.configuration and isinstance(tm.configuration, dict):
                 subs = tm.configuration.get('enabled_submodules') or []
+            if subs:
                 for s in subs:
-                    if s not in modules:
+                    if s and s not in modules:
                         modules.append(s)
+            elif m_code:
+                for sub in tm.module.submodules.filter(is_active=True):
+                    sub_path = f"/{m_code}/{(sub.code or '').lower()}"
+                    if sub_path not in modules:
+                        modules.append(sub_path)
         return modules
 
     def get_max_locations(self, obj):

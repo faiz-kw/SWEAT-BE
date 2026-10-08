@@ -1746,11 +1746,19 @@ class IntakeSubmissionViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         alias = _get_db(self.request)
-        qs = IntakeSubmission.objects.using(alias).select_related('intake_form', 'lead').prefetch_related('answers', 'answers__question')
+        qs = IntakeSubmission.objects.using(alias).select_related(
+            'intake_form', 'lead', 'lead__branch', 'user_profile', 'user_profile__preferred_branch'
+        ).prefetch_related('answers', 'answers__question')
         lead_id = self.request.query_params.get('lead_id')
         if lead_id:
             qs = qs.filter(lead_id=lead_id)
-        return qs
+        user_profile_id = self.request.query_params.get('user_profile_id')
+        if user_profile_id:
+            qs = qs.filter(user_profile_id=user_profile_id)
+        branch_id = self.request.query_params.get('branch_id') or self.request.query_params.get('branch') or self.request.query_params.get('location')
+        if branch_id and branch_id != 'all':
+            qs = qs.filter(Q(user_profile__preferred_branch_id=branch_id) | Q(lead__branch_id=branch_id))
+        return qs.order_by('-submitted_at')
 
 
 class TrialBookingViewSet(viewsets.ModelViewSet):

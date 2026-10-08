@@ -602,6 +602,28 @@ class DepartmentViewSet(TenantDBMixin, viewsets.ModelViewSet):
         return qs
 
 
+from rest_framework.pagination import PageNumberPagination as _BasePageNumberPagination
+
+
+class StaffUserPagination(_BasePageNumberPagination):
+    page_size = 20
+    page_size_query_param = 'page_size'
+    max_page_size = 500
+
+    def get_paginated_response(self, data):
+        summary = getattr(self, '_staff_summary', None) or {}
+        return Response({
+            'count': self.page.paginator.count,
+            'total_pages': self.page.paginator.num_pages,
+            'current_page': self.page.number,
+            'page_size': self.get_page_size(self.request),
+            'next': self.get_next_link(),
+            'previous': self.get_previous_link(),
+            'summary': summary,
+            'results': data,
+        })
+
+
 class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
     """
     Tenant user management.
@@ -609,6 +631,7 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
     Branch-scoped staff can only view and manage users within their assigned branch.
     """
     permission_classes = [TenantRBACPermission]
+    pagination_class = StaffUserPagination
     required_module = 'core'
     required_submodule = 'users'
     permission_prefix = 'core.users'
@@ -624,67 +647,129 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
 
     def get_queryset(self):
         db = self.get_db()
-        qs = TenantUser.objects.using(db).select_related('organization', 'home_branch').all()
+        qs = TenantUser.objects.using(db).select_related(
+            'organization',
+            'home_branch__location',
+            'profile__employee_profile__reporting_manager__user_profile__user',
+        ).prefetch_related(
+            'role_assignments__role',
+            'role_assignments__branch',
+            'department_memberships__department',
+        ).all()
         qs = self.filter_queryset_by_scope(qs)
 
         # Strictly exclude customer members from Administration -> Users (Staff & User Management).
         # Customer members must only be managed within the Members Module.
-        from django.db.models import Q, Exists, OuterRef
+        from django.db.models import Q, Exists, OuterRef, Count, Case, When, Value, IntegerField
         from .models_rbac import RoleAssignment
         from .models_workforce import EmployeeProfile
+        from .models_memberships import Membership
 
         has_staff_role = RoleAssignment.objects.using(db).filter(
             user=OuterRef('pk'),
             is_active=True
         ).exclude(role__code__iexact='MEMBER').exclude(role__name__iexact='MEMBER')
 
+        has_member_role = RoleAssignment.objects.using(db).filter(
+            user=OuterRef('pk'),
+            is_active=True,
+            role__code__iexact='MEMBER'
+        )
+
         has_employee_profile = EmployeeProfile.objects.using(db).filter(
+            user_profile__user=OuterRef('pk')
+        )
+
+        has_membership = Membership.objects.using(db).filter(
             user_profile__user=OuterRef('pk')
         )
 
         qs = qs.exclude(
             user_type__iexact='MEMBER'
         ).exclude(
-            role_assignments__role__code__iexact='MEMBER',
-            role_assignments__is_active=True
+            Exists(has_member_role),
+            ~Exists(has_staff_role)
         ).exclude(
             (
                 (Q(profile__member_number__isnull=False) & ~Q(profile__member_number=''))
                 | (Q(profile__acquisition_source__isnull=False) & ~Q(profile__acquisition_source=''))
-                | Q(profile__memberships__isnull=False)
+                | Exists(has_membership)
             ),
             ~Exists(has_staff_role),
             ~Exists(has_employee_profile)
-        ).distinct()
+        )
 
         branch_param = self.request.query_params.get('branch') or self.request.query_params.get('location')
         if branch_param and branch_param != 'all':
-            from django.db.models import Q
             try:
                 import uuid
                 branch_uuid = uuid.UUID(str(branch_param))
-                qs = qs.filter(Q(home_branch_id=branch_uuid) | Q(role_assignments__branch_id=branch_uuid, role_assignments__is_active=True)).distinct()
+                has_branch_role = RoleAssignment.objects.using(db).filter(
+                    user=OuterRef('pk'), branch_id=branch_uuid, is_active=True
+                )
+                qs = qs.filter(Q(home_branch_id=branch_uuid) | Exists(has_branch_role))
             except (ValueError, TypeError, AttributeError):
-                qs = qs.filter(Q(home_branch__name__iexact=str(branch_param)) | Q(role_assignments__branch__name__iexact=str(branch_param), role_assignments__is_active=True)).distinct()
+                has_branch_role = RoleAssignment.objects.using(db).filter(
+                    user=OuterRef('pk'), branch__name__iexact=str(branch_param), is_active=True
+                )
+                qs = qs.filter(Q(home_branch__name__iexact=str(branch_param)) | Exists(has_branch_role))
+
+        # Compute KPI summary on the branch-scoped staff queryset before search/role/status filters
+        if self.action == 'list' and getattr(self, 'paginator', None) is not None:
+            agg = qs.aggregate(
+                total_count=Count('id'),
+                active_count=Count('id', filter=Q(status__iexact='ACTIVE')),
+                invited_count=Count('id', filter=Q(status__iexact='INVITED')),
+                inactive_count=Count('id', filter=~Q(status__iexact='ACTIVE') & ~Q(status__iexact='INVITED')),
+            )
+            self.paginator._staff_summary = agg
 
         role_param = self.request.query_params.get('role')
         if role_param and role_param != 'all':
-            from django.db.models import Q
-            qs = qs.filter(
-                Q(role_assignments__role__name__iexact=str(role_param)) |
-                Q(role_assignments__role__code__iexact=str(role_param)),
-                role_assignments__is_active=True
-            ).distinct()
-
-        search_param = self.request.query_params.get('search')
-        if search_param:
-            from django.db.models import Q
-            qs = qs.filter(
-                Q(first_name__icontains=search_param) |
-                Q(last_name__icontains=search_param) |
-                Q(email__icontains=search_param) |
-                Q(phone__icontains=search_param)
+            has_matching_role = RoleAssignment.objects.using(db).filter(
+                Q(role__name__iexact=str(role_param)) | Q(role__code__iexact=str(role_param)),
+                user=OuterRef('pk'),
+                is_active=True,
             )
+            qs = qs.filter(Exists(has_matching_role))
+
+        dept_param = self.request.query_params.get('department')
+        if dept_param and dept_param != 'all':
+            from .models_users import UserDepartment
+            has_matching_dept = UserDepartment.objects.using(db).filter(
+                Q(department__name__iexact=str(dept_param)) | Q(department__code__iexact=str(dept_param)),
+                user=OuterRef('pk'),
+                status='ACTIVE',
+            )
+            qs = qs.filter(Exists(has_matching_dept))
+
+        status_param = self.request.query_params.get('status')
+        if status_param and status_param.lower() != 'all':
+            st_upper = status_param.strip().upper()
+            if st_upper == 'INACTIVE':
+                qs = qs.exclude(status__iexact='ACTIVE').exclude(status__iexact='INVITED')
+            else:
+                qs = qs.filter(status__iexact=st_upper)
+
+        search_param = (self.request.query_params.get('search') or '').strip()
+        if search_param:
+            for token in search_param.split():
+                qs = qs.filter(
+                    Q(first_name__icontains=token) |
+                    Q(last_name__icontains=token) |
+                    Q(email__icontains=token) |
+                    Q(username__icontains=token) |
+                    Q(phone__icontains=token)
+                )
+
+        qs = qs.annotate(
+            status_priority=Case(
+                When(status__iexact='ACTIVE', then=Value(0)),
+                When(status__iexact='INVITED', then=Value(1)),
+                default=Value(2),
+                output_field=IntegerField(),
+            )
+        ).order_by('status_priority', 'first_name', 'last_name', '-created_at')
 
         return qs
 
