@@ -151,13 +151,14 @@ class MetaOAuthCallbackRegressionTests(unittest.TestCase):
 
         # Obtain a real authenticated user and token for this tenant
         with tenant_database_context(str(self.tenant.id)) as alias:
-            user = TenantUser.objects.using(alias).filter(organization=self.org, status='ACTIVE', is_login_allowed=True).first()
+            user = TenantUser.objects.using(alias).filter(email='admin@sweat.com', status='ACTIVE').first() or TenantUser.objects.using(alias).filter(organization=self.org, status='ACTIVE', is_login_allowed=True).first()
             if not user:
                 user = TenantUser.objects.using(alias).create(
                     organization=self.org, email='admin@sweat.com', user_type='STAFF', status='ACTIVE', is_login_allowed=True
                 )
             token = _build_tenant_token(user, self.tenant, alias)
             access_token = str(token.access_token)
+            self.org = user.organization
 
         # 1. Call oauth_init via real authenticated API client
         auth_client = APIClient()
