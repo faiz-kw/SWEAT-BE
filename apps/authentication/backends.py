@@ -281,7 +281,6 @@ class TenantJWTAuthentication(BaseAuthentication):
                 'User login is disabled. Contact your administrator.'
             )
 
-        from django.utils import timezone
         if getattr(user, 'suspended_until', None) and user.suspended_until > timezone.now():
             raise AuthenticationFailed(
                 f'User account is suspended until {user.suspended_until.strftime("%Y-%m-%d %H:%M")}. Contact your administrator.'

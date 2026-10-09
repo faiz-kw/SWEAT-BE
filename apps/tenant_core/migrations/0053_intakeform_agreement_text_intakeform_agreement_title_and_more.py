@@ -7,7 +7,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('tenant_core', '0051_alter_metaleadimport_status'),
+        ('tenant_core', '0052_wod_content_library'),
     ]
 
     operations = [

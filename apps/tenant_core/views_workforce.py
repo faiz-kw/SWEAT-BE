@@ -21,8 +21,9 @@ from django.db import transaction
 from django.utils import timezone
 from rest_framework import viewsets, filters, status
 from rest_framework.decorators import action
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
-from django.db.models import Q
+from django.db.models import Q, Exists, OuterRef
 from django.utils.dateparse import parse_datetime
 from config.routers import get_tenant_db_alias
 
@@ -145,8 +146,26 @@ class EmployeeProfileViewSet(viewsets.ModelViewSet):
         serializer.save(organization=org)
 
 
+class TrainersPagination(PageNumberPagination):
+    page_size = 20
+    page_size_query_param = 'page_size'
+    max_page_size = 500
+
+    def get_paginated_response(self, data):
+        return Response({
+            'count': self.page.paginator.count,
+            'next': self.get_next_link(),
+            'previous': self.get_previous_link(),
+            'total_pages': self.page.paginator.num_pages,
+            'current_page': self.page.number,
+            'page_size': self.get_page_size(self.request),
+            'results': data,
+        })
+
+
 class TrainerProfileViewSet(viewsets.ModelViewSet):
     serializer_class = TrainerProfileSerializer
+    pagination_class = TrainersPagination
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
     required_module = 'ops'
     required_submodule = 'trainers'
@@ -160,7 +179,14 @@ class TrainerProfileViewSet(viewsets.ModelViewSet):
         'find_eligible': 'ops.trainers.view',
     }
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
-    search_fields = ['trainer_code', 'bio', 'employee_profile__user_profile__user__email']
+    search_fields = [
+        'trainer_code',
+        'bio',
+        'employee_profile__user_profile__user__email',
+        'employee_profile__user_profile__first_name_snapshot',
+        'employee_profile__user_profile__last_name_snapshot',
+        'employee_profile__user_profile__user__full_name',
+    ]
     ordering = ['trainer_code']
 
     @staticmethod
@@ -193,11 +219,19 @@ class TrainerProfileViewSet(viewsets.ModelViewSet):
         """
         Auto-syncs users with explicit trainer identity into TrainerProfile
         so organization admins do not have to manually re-register existing staff.
+        Only queries users who do not yet have a TrainerProfile.
         """
         try:
-            trainer_users = cls._trainer_users(alias, org).filter(status='ACTIVE')
+            existing_trainer_subq = TrainerProfile.objects.using(alias).filter(
+                employee_profile__user_profile__user_id=OuterRef('pk')
+            )
+            unsynced_trainer_users = cls._trainer_users(alias, org).filter(
+                status='ACTIVE'
+            ).filter(
+                ~Exists(existing_trainer_subq)
+            ).select_related('home_branch')
 
-            for user in trainer_users:
+            for user in unsynced_trainer_users:
                 # Do not auto-convert superusers who are not staff
                 if getattr(user, 'is_superuser', False) and user.user_type not in ('STAFF', 'TRAINER'):
                     continue

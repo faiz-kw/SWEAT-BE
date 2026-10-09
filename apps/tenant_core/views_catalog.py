@@ -31,9 +31,9 @@ logger = logging.getLogger(__name__)
 
 
 class CatalogPagination(PageNumberPagination):
-    page_size = 50
+    page_size = 500
     page_size_query_param = 'page_size'
-    max_page_size = 200
+    max_page_size = 2000
 
 
 def _get_db(request):
@@ -193,6 +193,11 @@ class ProgramTypeViewSet(viewsets.ModelViewSet):
         'deactivate': 'core.settings.edit',
         'reactivate': 'core.settings.edit',
     }
+
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve']:
+            return [RequireActiveTenantAndOrg()]
+        return super().get_permissions()
 
     def get_queryset(self):
         alias = _get_db(self.request)
@@ -674,6 +679,7 @@ class ProgramViewSet(viewsets.ModelViewSet):
 
 class PackageViewSet(viewsets.ModelViewSet):
     serializer_class = PackageSerializer
+    pagination_class = CatalogPagination
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
     required_module = 'core'
     required_submodule = 'settings'
@@ -691,6 +697,11 @@ class PackageViewSet(viewsets.ModelViewSet):
         'publish_version': 'core.settings.edit',
         'clone_modify_version': 'core.settings.edit',
     }
+
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve']:
+            return [RequireActiveTenantAndOrg()]
+        return super().get_permissions()
 
     def get_queryset(self):
         alias = _get_db(self.request)

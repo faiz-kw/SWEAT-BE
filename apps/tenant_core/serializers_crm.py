@@ -548,12 +548,37 @@ class IntakeSubmissionSerializer(serializers.ModelSerializer):
     membership_number = serializers.CharField(source='membership.membership_number', read_only=True, allow_null=True)
     program_name = serializers.CharField(source='program.name', read_only=True, allow_null=True)
     submitted_by_name = serializers.CharField(source='submitted_by_user.display_name', read_only=True, allow_null=True)
+    member_name = serializers.SerializerMethodField()
+    branch = serializers.SerializerMethodField()
+    branch_name = serializers.SerializerMethodField()
     answers = IntakeAnswerSerializer(many=True, read_only=True)
 
     class Meta:
         model = IntakeSubmission
         fields = '__all__'
         read_only_fields = ['id', 'created_at']
+
+    def get_member_name(self, obj):
+        if obj.user_profile:
+            name = f"{obj.user_profile.first_name_snapshot or ''} {obj.user_profile.last_name_snapshot or ''}".strip()
+            return name or obj.user_profile.member_number or "Member"
+        if obj.lead:
+            return f"{obj.lead.first_name or ''} {obj.lead.last_name or ''}".strip() or "Lead"
+        return "Member"
+
+    def get_branch(self, obj):
+        if obj.user_profile and obj.user_profile.preferred_branch_id:
+            return str(obj.user_profile.preferred_branch_id)
+        if obj.lead and obj.lead.branch_id:
+            return str(obj.lead.branch_id)
+        return None
+
+    def get_branch_name(self, obj):
+        if obj.user_profile and obj.user_profile.preferred_branch:
+            return obj.user_profile.preferred_branch.name
+        if obj.lead and obj.lead.branch:
+            return obj.lead.branch.name
+        return None
 
 
 class TrialBookingSerializer(serializers.ModelSerializer):

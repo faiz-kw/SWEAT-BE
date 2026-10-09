@@ -7,7 +7,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('tenant_core', '0052_intakeform_agreement_text_intakeform_agreement_title_and_more'),
+        ('tenant_core', '0053_intakeform_agreement_text_intakeform_agreement_title_and_more'),
     ]
 
     operations = [

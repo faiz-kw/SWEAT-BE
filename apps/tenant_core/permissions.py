@@ -141,6 +141,25 @@ class TenantRBACPermission(permissions.BasePermission):
                         raise
                     pass
 
+        # CUSTOMER_SELF_SERVICE_BYPASS: Allow authenticated members and leads to access customer self-service actions
+        user_type = getattr(user, 'user_type', None) or getattr(user, 'role', '').upper()
+        user_role = str(getattr(user, 'role', '')).lower()
+        if user_type in ('MEMBER', 'LEAD') or user_role in ('member', 'lead'):
+            view_name = view.__class__.__name__.lower()
+            act = getattr(view, 'action', None) or request.method.lower()
+            # A. Public read access to catalog, branches, schedules, discounts, packages
+            if request.method in permissions.SAFE_METHODS:
+                if any(k in view_name for k in ['branch', 'discount', 'coupon', 'class', 'catalog', 'package', 'occurrence', 'trainer', 'category', 'schedule', 'program']):
+                    return True
+            # B. Member booking self-service
+            if 'booking' in view_name:
+                if act in ['list', 'retrieve', 'create', 'cancel', 'reschedule', 'my_bookings']:
+                    return True
+            # C. Member & Lead trial bookings self-service
+            if 'trial' in view_name:
+                if act in ['create', 'list', 'retrieve', 'available_slots', 'request_reschedule', 'cancel']:
+                    return True
+
         allowed, reason, check_code = RBACAuthorizationEngine.evaluate(
             user=user,
             required_module=required_module,
@@ -180,6 +199,18 @@ class TenantRBACPermission(permissions.BasePermission):
         return True
 
     def has_object_permission(self, request, view, obj):
+        user = request.user
+        user_type = getattr(user, 'user_type', None) or getattr(user, 'role', '').upper()
+        user_role = str(getattr(user, 'role', '')).lower()
+        if user_type in ('MEMBER', 'LEAD') or user_role in ('member', 'lead'):
+            view_name = view.__class__.__name__.lower()
+            if hasattr(obj, 'user_profile') and getattr(obj.user_profile, 'user_id', None) == user.id:
+                return True
+            if hasattr(obj, 'lead') and (getattr(obj.lead, 'email_normalized', None) == user.email.lower() or (user.phone and getattr(obj.lead, 'phone_normalized', None) == user.phone)):
+                return True
+            if request.method in permissions.SAFE_METHODS:
+                return True
+
         # Validate object-level branch boundary if object has a branch
         branch_id = self._resolve_branch_id(request, view, obj=obj)
         required_module = getattr(view, 'required_module', None)

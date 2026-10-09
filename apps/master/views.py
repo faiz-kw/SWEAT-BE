@@ -82,10 +82,13 @@ class TenantViewSet(viewsets.ModelViewSet):
 
             all_modules = ProductModule.objects.using('default').all()
             for mod in all_modules:
-                is_on = mod.code in enabled_codes
+                mod_code_lower = (mod.code or '').lower()
+                is_on = mod_code_lower in enabled_codes
                 mod_submodules = [
                     item for item in raw_modules
-                    if item.startswith(f"/{mod.code}/") or item == f"/{mod.code}"
+                    if isinstance(item, str) and (
+                        item.lower().startswith(f"/{mod_code_lower}/") or item.lower() == f"/{mod_code_lower}"
+                    )
                 ]
                 TenantModule.objects.using('default').update_or_create(
                     tenant=tenant,
@@ -103,29 +106,33 @@ class TenantViewSet(viewsets.ModelViewSet):
                 from apps.authentication.views import _register_and_resolve_tenant
                 from config.routers import set_tenant_db_alias
                 from apps.tenant_core.models_rbac import ModuleCatalog, SubmoduleCatalog, BranchModule
-                from apps.tenant_core.models_org import Branch
+                from apps.tenant_core.models_org import Branch, Organization
                 from apps.master.provisioning import sync_tenant_catalog_and_rbac
 
                 db_alias = _register_and_resolve_tenant(tenant)
                 try:
                     # Sync latest product catalog and ensure RBAC grants are complete
-                    first_org = tenant.organizations.first() if hasattr(tenant, 'organizations') else None
+                    first_org = Organization.objects.using(db_alias).first()
                     sync_tenant_catalog_and_rbac(db_alias, org=first_org)
 
                     for mod in all_modules:
-                        is_on = mod.code in enabled_codes
-                        ModuleCatalog.objects.using(db_alias).filter(module_code=mod.code).update(is_enabled=is_on)
-                        if is_on:
-                            for br in Branch.objects.using(db_alias).all():
-                                BranchModule.objects.using(db_alias).update_or_create(
-                                    branch=br,
-                                    module_code=mod.code,
-                                    defaults={'is_enabled': True, 'status': 'ENABLED'}
+                        mod_code_lower = (mod.code or '').lower()
+                        is_on = mod_code_lower in enabled_codes
+                        mc = ModuleCatalog.objects.using(db_alias).filter(module_code__iexact=mod.code).first()
+                        if mc:
+                            mc.is_enabled = is_on
+                            mc.save(using=db_alias, update_fields=['is_enabled'])
+                            if is_on:
+                                for br in Branch.objects.using(db_alias).all():
+                                    BranchModule.objects.using(db_alias).update_or_create(
+                                        branch=br,
+                                        module_code=mc.module_code,
+                                        defaults={'module': mc, 'is_enabled': True, 'status': 'ENABLED'}
+                                    )
+                            else:
+                                BranchModule.objects.using(db_alias).filter(module_code__iexact=mod.code).update(
+                                    is_enabled=False, status='DISABLED'
                                 )
-                        else:
-                            BranchModule.objects.using(db_alias).filter(module_code=mod.code).update(
-                                is_enabled=False, status='DISABLED'
-                            )
                 finally:
                     set_tenant_db_alias(None)
             except Exception as e:
@@ -262,21 +269,158 @@ class TenantViewSet(viewsets.ModelViewSet):
         _register_tenant_connection(db_alias, db_name, data_source=ds, tenant_id=tenant.id)
         set_tenant_db_alias(db_alias)
         try:
-            users_qs = TenantUser.objects.using(db_alias).select_related('home_branch', 'organization').all().order_by('email')
-            # Support optional role or search filtering
-            search = request.query_params.get('search')
-            if search:
-                users_qs = users_qs.filter(
-                    models.Q(first_name__icontains=search) |
-                    models.Q(last_name__icontains=search) |
-                    models.Q(email__icontains=search)
+            from django.db.models import Q, Exists, OuterRef, Count, Case, When, Value, IntegerField
+            from apps.tenant_core.models_rbac import RoleAssignment
+            from apps.tenant_core.models_workforce import EmployeeProfile
+            from apps.tenant_core.models_memberships import Membership
+            from apps.tenant_core.models_users import UserDepartment
+
+            has_staff_role = RoleAssignment.objects.using(db_alias).filter(
+                user=OuterRef('pk'),
+                is_active=True,
+            ).exclude(role__code__iexact='MEMBER').exclude(role__name__iexact='MEMBER')
+
+            has_member_role = RoleAssignment.objects.using(db_alias).filter(
+                user=OuterRef('pk'),
+                is_active=True,
+                role__code__iexact='MEMBER',
+            )
+
+            has_employee_profile = EmployeeProfile.objects.using(db_alias).filter(
+                user_profile__user=OuterRef('pk')
+            )
+
+            has_membership = Membership.objects.using(db_alias).filter(
+                user_profile__user=OuterRef('pk')
+            )
+
+            users_qs = (
+                TenantUser.objects.using(db_alias)
+                .select_related(
+                    'organization',
+                    'home_branch__location',
+                    'profile__employee_profile__reporting_manager__user_profile__user',
                 )
+                .prefetch_related(
+                    'role_assignments__role',
+                    'role_assignments__branch',
+                    'department_memberships__department',
+                )
+                .exclude(user_type__iexact='MEMBER')
+                .exclude(Exists(has_member_role), ~Exists(has_staff_role))
+                .exclude(
+                    (
+                        (Q(profile__member_number__isnull=False) & ~Q(profile__member_number=''))
+                        | (Q(profile__acquisition_source__isnull=False) & ~Q(profile__acquisition_source=''))
+                        | Exists(has_membership)
+                    ),
+                    ~Exists(has_staff_role),
+                    ~Exists(has_employee_profile),
+                )
+            )
+
+            branch_param = request.query_params.get('branch') or request.query_params.get('location')
+            if branch_param and branch_param != 'all':
+                try:
+                    branch_uuid = uuid.UUID(str(branch_param))
+                    has_branch_role = RoleAssignment.objects.using(db_alias).filter(
+                        user=OuterRef('pk'), branch_id=branch_uuid, is_active=True
+                    )
+                    users_qs = users_qs.filter(Q(home_branch_id=branch_uuid) | Exists(has_branch_role))
+                except (ValueError, TypeError, AttributeError):
+                    has_branch_role = RoleAssignment.objects.using(db_alias).filter(
+                        user=OuterRef('pk'), branch__name__iexact=str(branch_param), is_active=True
+                    )
+                    users_qs = users_qs.filter(Q(home_branch__name__iexact=str(branch_param)) | Exists(has_branch_role))
+
+            summary = users_qs.aggregate(
+                total_count=Count('id'),
+                active_count=Count('id', filter=Q(status__iexact='ACTIVE')),
+                invited_count=Count('id', filter=Q(status__iexact='INVITED')),
+                inactive_count=Count('id', filter=~Q(status__iexact='ACTIVE') & ~Q(status__iexact='INVITED')),
+            )
+
+            role_param = request.query_params.get('role')
+            if role_param and role_param != 'all':
+                has_matching_role = RoleAssignment.objects.using(db_alias).filter(
+                    Q(role__name__iexact=str(role_param)) | Q(role__code__iexact=str(role_param)),
+                    user=OuterRef('pk'),
+                    is_active=True,
+                )
+                users_qs = users_qs.filter(Exists(has_matching_role))
+
+            dept_param = request.query_params.get('department')
+            if dept_param and dept_param != 'all':
+                has_matching_dept = UserDepartment.objects.using(db_alias).filter(
+                    Q(department__name__iexact=str(dept_param)) | Q(department__code__iexact=str(dept_param)),
+                    user=OuterRef('pk'),
+                    status='ACTIVE',
+                )
+                users_qs = users_qs.filter(Exists(has_matching_dept))
+
+            status_param = request.query_params.get('status')
+            if status_param and status_param.lower() != 'all':
+                st_upper = status_param.strip().upper()
+                if st_upper == 'INACTIVE':
+                    users_qs = users_qs.exclude(status__iexact='ACTIVE').exclude(status__iexact='INVITED')
+                else:
+                    users_qs = users_qs.filter(status__iexact=st_upper)
+
+            search = (request.query_params.get('search') or '').strip()
+            if search:
+                for token in search.split():
+                    users_qs = users_qs.filter(
+                        Q(first_name__icontains=token)
+                        | Q(last_name__icontains=token)
+                        | Q(email__icontains=token)
+                        | Q(username__icontains=token)
+                        | Q(phone__icontains=token)
+                    )
+
+            users_qs = users_qs.annotate(
+                status_priority=Case(
+                    When(status__iexact='ACTIVE', then=Value(0)),
+                    When(status__iexact='INVITED', then=Value(1)),
+                    default=Value(2),
+                    output_field=IntegerField(),
+                )
+            ).order_by('status_priority', 'first_name', 'last_name', '-created_at')
+
+            total_count = users_qs.count()
+            page_param = request.query_params.get('page')
+            page_size_param = request.query_params.get('page_size')
+            if page_param or page_size_param:
+                try:
+                    page_num = max(1, int(page_param or 1))
+                except (ValueError, TypeError):
+                    page_num = 1
+                try:
+                    page_size = min(500, max(1, int(page_size_param or 20)))
+                except (ValueError, TypeError):
+                    page_size = 20
+                total_pages = max(1, (total_count + page_size - 1) // page_size)
+                offset = (page_num - 1) * page_size
+                page_qs = list(users_qs[offset : offset + page_size])
+                serializer = TenantUserSerializer(page_qs, many=True)
+                return Response({
+                    'tenant_id': str(tenant.id),
+                    'tenant_slug': tenant.slug,
+                    'tenant_name': tenant.name,
+                    'count': total_count,
+                    'total_pages': total_pages,
+                    'current_page': page_num,
+                    'page_size': page_size,
+                    'summary': summary,
+                    'results': serializer.data,
+                })
+
             serializer = TenantUserSerializer(users_qs, many=True)
             return Response({
                 'tenant_id': str(tenant.id),
                 'tenant_slug': tenant.slug,
                 'tenant_name': tenant.name,
-                'count': users_qs.count(),
+                'count': total_count,
+                'summary': summary,
                 'results': serializer.data,
             })
         finally:

@@ -316,6 +316,10 @@ from .views_meta_leads import MetaLeadMappingViewSet, MetaLeadImportViewSet
 router.register(r'meta-lead-mappings', MetaLeadMappingViewSet, basename='meta-lead-mapping')
 router.register(r'meta-lead-imports', MetaLeadImportViewSet, basename='meta-lead-import')
 
+from .views_wod import WorkoutContentItemViewSet, WorkoutTagViewSet
+router.register(r'wod/content-items', WorkoutContentItemViewSet, basename='wod-content-item')
+router.register(r'wod/tags', WorkoutTagViewSet, basename='wod-tag')
+
 app_name = 'tenant_core'
 
 urlpatterns = [

@@ -110,8 +110,37 @@ def get_user_effective_branch_ids(user, db_alias: str = 'default') -> Optional[S
     return permitted
 
 
+from rest_framework.pagination import PageNumberPagination
+
+
+class BookingsPagination(PageNumberPagination):
+    page_size = 20
+    page_size_query_param = 'page_size'
+    max_page_size = 500
+
+    def get_page_size(self, request):
+        # If querying bookings for a single class occurrence (roster modal) without explicit page_size, allow up to 200
+        if request.query_params.get('occurrence_id') and not request.query_params.get('page_size'):
+            return 200
+        return super().get_page_size(request)
+
+    def get_paginated_response(self, data):
+        summary = getattr(self, '_bookings_summary', None) or {}
+        return Response({
+            'count': self.page.paginator.count,
+            'total_pages': self.page.paginator.num_pages,
+            'current_page': self.page.number,
+            'page_size': self.get_page_size(self.request),
+            'next': self.get_next_link(),
+            'previous': self.get_previous_link(),
+            'summary': summary,
+            'results': data,
+        })
+
+
 class BookingViewSet(viewsets.ModelViewSet):
     serializer_class = BookingSerializer
+    pagination_class = BookingsPagination
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
     required_module = 'ops'
     required_submodule = 'bookings'
@@ -134,18 +163,23 @@ class BookingViewSet(viewsets.ModelViewSet):
         return BookingSerializer
 
     def get_queryset(self):
+        from .models_crm import IntakeSubmission
         alias = _get_db(self.request)
 
-        # For list: only the joins needed by BookingListSerializer (no nested prefetch)
-        # For retrieve/detail: add full prefetch_related for nested history/events
         base_select = [
             'user_profile', 'user_profile__user', 'occurrence',
             'occurrence__class_template', 'branch', 'membership', 'membership__package', 'entitlement'
         ]
         qs = Booking.objects.using(alias).select_related(*base_select)
 
-        if getattr(self, 'action', 'list') != 'list':
-            qs = qs.prefetch_related('reschedules', 'status_history', 'cancellations', 'waitlist_events')
+        if getattr(self, 'action', 'list') == 'list':
+            qs = qs.annotate(
+                has_parq_submission=models.Exists(
+                    IntakeSubmission.objects.using(alias).filter(user_profile_id=models.OuterRef('user_profile_id'))
+                )
+            ).prefetch_related('attendance_records')
+        else:
+            qs = qs.prefetch_related('reschedules', 'status_history', 'cancellations', 'waitlist_events', 'attendance_records')
 
         # Branch scope enforcement
         permitted_branches = get_user_effective_branch_ids(self.request.user, alias)
@@ -162,12 +196,8 @@ class BookingViewSet(viewsets.ModelViewSet):
         if 'MEMBER' in user_roles and not (user_roles & staff_roles):
             qs = qs.filter(user_profile__user=self.request.user)
 
-        status_filter = self.request.query_params.get('status')
-        if status_filter:
-            qs = qs.filter(status=status_filter)
-
         branch_id = self.request.query_params.get('branch_id')
-        if branch_id:
+        if branch_id and branch_id != 'all':
             qs = qs.filter(branch_id=branch_id)
 
         occurrence_id = self.request.query_params.get('occurrence_id')
@@ -178,25 +208,53 @@ class BookingViewSet(viewsets.ModelViewSet):
         if user_id:
             qs = qs.filter(user_profile_id=user_id)
 
-        search = self.request.query_params.get('search')
-        if search:
-            qs = qs.filter(
-                models.Q(booking_number__icontains=search) |
-                models.Q(user_profile__first_name_snapshot__icontains=search) |
-                models.Q(user_profile__last_name_snapshot__icontains=search) |
-                models.Q(user_profile__user__email__icontains=search) |
-                models.Q(occurrence__class_template__name__icontains=search)
+        occ_date = self.request.query_params.get('occurrence_date')
+        if occ_date:
+            qs = qs.filter(occurrence__occurrence_date=occ_date)
+
+        from_date = self.request.query_params.get('from_date')
+        if from_date:
+            qs = qs.filter(occurrence__occurrence_date__gte=from_date)
+
+        to_date = self.request.query_params.get('to_date')
+        if to_date:
+            qs = qs.filter(occurrence__occurrence_date__lte=to_date)
+
+        # Compute KPI summary on branch/date-scoped queryset before status/search filters
+        if getattr(self, 'action', 'list') == 'list' and getattr(self, 'paginator', None) is not None and not occurrence_id:
+            self.paginator._bookings_summary = qs.aggregate(
+                total_count=models.Count('id'),
+                confirmed_count=models.Count('id', filter=models.Q(status='CONFIRMED')),
+                waitlisted_count=models.Count('id', filter=models.Q(status='WAITLISTED')),
+                attended_count=models.Count('id', filter=models.Q(status='ATTENDED')),
+                no_show_count=models.Count('id', filter=models.Q(status='NO_SHOW')),
+                cancelled_count=models.Count('id', filter=models.Q(status__in=['CANCELLED', 'LATE_CANCELLED'])),
             )
 
-        return qs.order_by('-booked_at')
+        status_filter = self.request.query_params.get('status')
+        if status_filter and status_filter.upper() != 'ALL':
+            qs = qs.filter(status=status_filter)
+
+        search = (self.request.query_params.get('search') or '').strip()
+        if search:
+            for token in search.split():
+                qs = qs.filter(
+                    models.Q(booking_number__icontains=token) |
+                    models.Q(user_profile__first_name_snapshot__icontains=token) |
+                    models.Q(user_profile__last_name_snapshot__icontains=token) |
+                    models.Q(user_profile__user__email__icontains=token) |
+                    models.Q(user_profile__user__phone__icontains=token) |
+                    models.Q(occurrence__class_template__name__icontains=token) |
+                    models.Q(branch__name__icontains=token)
+                )
+
+        return qs.order_by('-booked_at', '-created_at')
 
     def list(self, request, *args, **kwargs):
         alias = _get_db(request)
         queryset = self.filter_queryset(self.get_queryset())
-        serializer = self.get_serializer(queryset, many=True)
-        results = list(serializer.data)
 
-        # Unified Operations View: Include TrialBookings as first-class rows
+        # Unified Operations View: Include TrialBookings as first-class rows on page 1 or occurrence roster
         include_trials = request.query_params.get('include_trials', 'true').lower() in ['true', '1', 'yes']
         user_roles = set(
             RoleAssignment.objects.using(alias)
@@ -206,7 +264,9 @@ class BookingViewSet(viewsets.ModelViewSet):
         staff_roles = {'ORG_ADMIN', 'BRANCH_MANAGER', 'FRONT_DESK', 'TRAINER', 'SALES_REP', 'FINANCE_ADMIN'}
         is_member_only = 'MEMBER' in user_roles and not (user_roles & staff_roles)
 
-        if include_trials and not is_member_only:
+        trial_items = []
+        current_page_num = int(request.query_params.get('page', 1) or 1)
+        if include_trials and not is_member_only and current_page_num == 1:
             trial_qs = TrialBooking.objects.using(alias).select_related('lead', 'branch', 'assigned_trainer_profile')
 
             permitted_branches = get_user_effective_branch_ids(request.user, alias)
@@ -214,7 +274,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                 trial_qs = trial_qs.filter(branch_id__in=permitted_branches)
 
             branch_id = request.query_params.get('branch_id')
-            if branch_id:
+            if branch_id and branch_id != 'all':
                 trial_qs = trial_qs.filter(branch_id=branch_id)
 
             occurrence_id = request.query_params.get('occurrence_id')
@@ -222,13 +282,13 @@ class BookingViewSet(viewsets.ModelViewSet):
                 trial_qs = trial_qs.filter(class_occurrence_id=occurrence_id)
 
             status_filter = request.query_params.get('status')
-            if status_filter:
+            if status_filter and status_filter.upper() != 'ALL':
                 if status_filter == 'CONFIRMED':
                     trial_qs = trial_qs.filter(models.Q(status='CONFIRMED') | models.Q(confirmation_status='CONFIRMED'))
                 else:
                     trial_qs = trial_qs.filter(status=status_filter)
 
-            search = request.query_params.get('search')
+            search = (request.query_params.get('search') or '').strip()
             if search:
                 trial_qs = trial_qs.filter(
                     models.Q(lead__first_name__icontains=search) |
@@ -238,7 +298,8 @@ class BookingViewSet(viewsets.ModelViewSet):
                     models.Q(notes__icontains=search)
                 )
 
-            occ_ids = [t.class_occurrence_id for t in trial_qs if t.class_occurrence_id]
+            trial_list = list(trial_qs.order_by('-created_at')[:50])
+            occ_ids = [t.class_occurrence_id for t in trial_list if t.class_occurrence_id]
             occ_map = {}
             if occ_ids:
                 for occ in ClassOccurrence.objects.using(alias).filter(id__in=occ_ids).select_related('class_template'):
@@ -249,7 +310,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                         'end_at': occ.end_at.isoformat() if occ.end_at else None,
                     }
 
-            for t in trial_qs:
+            for t in trial_list:
                 occ_info = occ_map.get(t.class_occurrence_id, {})
                 title = occ_info.get('title')
                 if search and title and search.lower() not in title.lower() and not (
@@ -260,7 +321,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                 ):
                     continue
 
-                trial_item = {
+                trial_items.append({
                     'id': str(t.id),
                     'is_trial': True,
                     'booking_number': f"TRL-{str(t.id)[:8].upper()}",
@@ -288,9 +349,19 @@ class BookingViewSet(viewsets.ModelViewSet):
                     'lead_id': str(t.lead_id) if t.lead_id else None,
                     'created_at': t.created_at.isoformat() if t.created_at else None,
                     'updated_at': t.updated_at.isoformat() if t.updated_at else None,
-                }
-                results.append(trial_item)
+                })
 
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            results = list(serializer.data)
+            if trial_items:
+                results = trial_items + results
+                results.sort(key=lambda x: x.get('booked_at') or x.get('created_at') or '', reverse=True)
+            return self.get_paginated_response(results)
+
+        serializer = self.get_serializer(queryset[:200], many=True)
+        results = trial_items + list(serializer.data)
         results.sort(key=lambda x: x.get('booked_at') or x.get('created_at') or '', reverse=True)
         return Response(results)
 
@@ -806,6 +877,7 @@ class MemberAttendanceStateViewSet(viewsets.ModelViewSet):
 
 class AttendanceRecordViewSet(viewsets.ModelViewSet):
     serializer_class = AttendanceRecordSerializer
+    pagination_class = BookingsPagination
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
     required_module = 'members'
     required_submodule = 'attendance'
@@ -823,15 +895,24 @@ class AttendanceRecordViewSet(viewsets.ModelViewSet):
             'user_profile', 'user_profile__user', 'occurrence', 'occurrence__class_template', 'branch', 'booking'
         ).all()
         branch_id = self.request.query_params.get('branch_id')
-        if branch_id:
+        if branch_id and branch_id != 'all':
             qs = qs.filter(branch_id=branch_id)
         att_status = self.request.query_params.get('status')
-        if att_status:
+        if att_status and att_status.upper() != 'ALL':
             qs = qs.filter(status=att_status)
         occurrence_id = self.request.query_params.get('occurrence_id') or self.request.query_params.get('occurrence')
         if occurrence_id:
             qs = qs.filter(occurrence_id=occurrence_id)
-        return qs
+        search = (self.request.query_params.get('search') or '').strip()
+        if search:
+            qs = qs.filter(
+                models.Q(booking__booking_number__icontains=search) |
+                models.Q(user_profile__first_name_snapshot__icontains=search) |
+                models.Q(user_profile__last_name_snapshot__icontains=search) |
+                models.Q(user_profile__user__email__icontains=search) |
+                models.Q(occurrence__class_template__name__icontains=search)
+            )
+        return qs.order_by('-check_in_at', '-created_at')
 
 
 class AccessEventViewSet(viewsets.ModelViewSet):

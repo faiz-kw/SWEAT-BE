@@ -297,4 +297,17 @@ __all__ += [
     'MetaLeadImport',
 ]
 
+from .models_wod import (
+    WorkoutContentItem,
+    WorkoutTag,
+    WorkoutContentTag,
+)
+
+__all__ += [
+    'WorkoutContentItem',
+    'WorkoutTag',
+    'WorkoutContentTag',
+]
+
+
 

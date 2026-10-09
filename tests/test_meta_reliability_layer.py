@@ -532,5 +532,130 @@ class MetaReliabilityLayerTests(unittest.TestCase):
         self.assertNotIn('secret_key', content_str)
 
 
+    # 17. Broker / Redis dispatch failure leaves durable PENDING import
+    @patch('apps.tenant_core.views_meta_webhook.process_meta_lead_import_task.delay')
+    def test_17_redis_dispatch_failure_persists_pending_import(self, mock_delay):
+        mock_delay.side_effect = Exception("Redis connection refused (simulated broker outage)")
+
+        payload = {
+            'object': 'page',
+            'entry': [{
+                'id': self.test_page_id,
+                'changes': [{
+                    'field': 'leadgen',
+                    'value': {
+                        'page_id': self.test_page_id,
+                        'form_id': self.test_form_id,
+                        'leadgen_id': 'rel_lead_redis_fail_017',
+                    }
+                }]
+            }]
+        }
+        raw_body = json.dumps(payload).encode('utf-8')
+        sig = self._sign_payload(raw_body, 'test_secret')
+
+        request = self.factory.post(
+            '/api/v1/webhooks/meta/leads/',
+            data=raw_body,
+            content_type='application/json',
+            HTTP_X_HUB_SIGNATURE_256=sig,
+        )
+        view = MetaLeadWebhookView.as_view()
+        response = view(request)
+
+        # Webhook responds HTTP 200 without raising unhandled exception
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data.get('status'), 'received')
+        self.assertEqual(response.data.get('enqueued'), 0)
+        self.assertEqual(response.data.get('processed'), 0)
+        self.assertEqual(response.data.get('pending_recovery'), 1)
+
+        # Durable record exists in PostgreSQL with status PENDING
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            imp = MetaLeadImport.objects.using(alias).filter(external_lead_id='rel_lead_redis_fail_017').first()
+            self.assertIsNotNone(imp)
+            self.assertEqual(imp.status, 'PENDING')
+            self.assertEqual(imp.page_id, self.test_page_id)
+            self.assertEqual(imp.form_id, self.test_form_id)
+
+    # 18. Recovery service picks up stranded PENDING imports after Redis restored
+    @patch('apps.tenant_core.services_meta_leads.decrypt_token', return_value='valid_page_token')
+    def test_18_recovery_picks_up_stranded_pending_imports(self, mock_decrypt):
+        from apps.tenant_core.services_meta_recovery import recover_unprocessed_meta_imports
+
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            self.mapping.is_active = True
+            self.mapping.repeat_policy = 'CREATE_NEW'
+            self.mapping.save(using=alias)
+
+            imp = MetaLeadImport.objects.using(alias).create(
+                organization=self.org,
+                mode='LIVE',
+                page_id=self.test_page_id,
+                form_id=self.test_form_id,
+                external_lead_id='rel_lead_recovered_018',
+                field_data=[
+                    {'name': 'full_name', 'values': ['Recovered User']},
+                    {'name': 'phone_number', 'values': ['+919666655555']},
+                    {'name': 'email', 'values': ['recovered@test.com']},
+                ],
+                status='PENDING',
+            )
+
+        res = recover_unprocessed_meta_imports(
+            tenant_id=str(self.tenant.id),
+            min_age_seconds=0,
+            max_batch_size=10,
+            dispatch_async=False,
+        )
+
+        self.assertIn(str(imp.id), res.get('recovered_ids', []))
+
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            imp.refresh_from_db(using=alias)
+            self.assertEqual(imp.status, 'IMPORTED')
+            self.assertIsNotNone(imp.lead)
+
+    # 19. Duplicate webhook delivery after dispatch failure is idempotent
+    @patch('apps.tenant_core.views_meta_webhook.process_meta_lead_import_task.delay')
+    def test_19_duplicate_webhook_after_dispatch_failure_is_idempotent(self, mock_delay):
+        payload = {
+            'object': 'page',
+            'entry': [{
+                'id': self.test_page_id,
+                'changes': [{
+                    'field': 'leadgen',
+                    'value': {
+                        'page_id': self.test_page_id,
+                        'form_id': self.test_form_id,
+                        'leadgen_id': 'rel_lead_dup_fail_019',
+                    }
+                }]
+            }]
+        }
+        raw_body = json.dumps(payload).encode('utf-8')
+        sig = self._sign_payload(raw_body, 'test_secret')
+        view = MetaLeadWebhookView.as_view()
+
+        # First arrival: dispatch fails
+        mock_delay.side_effect = Exception("Broker unreachable")
+        req1 = self.factory.post('/api/v1/webhooks/meta/leads/', data=raw_body, content_type='application/json', HTTP_X_HUB_SIGNATURE_256=sig)
+        resp1 = view(req1)
+        self.assertEqual(resp1.status_code, 200)
+        self.assertEqual(resp1.data.get('pending_recovery'), 1)
+
+        # Second arrival: broker restored, dispatch succeeds
+        mock_delay.side_effect = None
+        req2 = self.factory.post('/api/v1/webhooks/meta/leads/', data=raw_body, content_type='application/json', HTTP_X_HUB_SIGNATURE_256=sig)
+        resp2 = view(req2)
+        self.assertEqual(resp2.status_code, 200)
+        self.assertEqual(resp2.data.get('enqueued'), 1)
+
+        # Verify only 1 MetaLeadImport record was created in database
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            imports = MetaLeadImport.objects.using(alias).filter(external_lead_id='rel_lead_dup_fail_019')
+            self.assertEqual(imports.count(), 1)
+
+
 if __name__ == '__main__':
     unittest.main()
