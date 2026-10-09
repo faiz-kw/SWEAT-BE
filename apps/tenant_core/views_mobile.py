@@ -56,7 +56,7 @@ from .models_org import Organization, Branch
 from .models_users import TenantUser
 from .models_rbac import Role, RoleAssignment
 from .models_workforce import UserProfile, TrainerProfile
-from .models_classes import ClassTemplate, ClassOccurrence, ClassPrice, PackageClassAccessRule
+from .models_classes import ClassTemplate, ClassOccurrence, ClassPrice, PackageClassAccessRule, ClassCategory
 from .models_bookings import Booking, BookingCancellation
 from .models_catalog import Package, PackageVersion, PackagePrice, PackageEntitlementDefinition
 from .models_memberships import Membership, MembershipEntitlement
