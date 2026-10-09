@@ -30,6 +30,17 @@ from .services_meta_graph import (
     MetaGraphAPIError,
 )
 
+from .meta_logging import (
+    log_meta_event,
+    EVT_GRAPH_FETCH_SUCCESS,
+    EVT_GRAPH_FETCH_FAILED,
+    EVT_MAPPING_FOUND,
+    EVT_MAPPING_MISSING,
+    EVT_LEAD_CREATED,
+    EVT_DUPLICATE_IGNORED,
+    EVT_IMPORT_QUEUED,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -222,6 +233,14 @@ def process_live_import(organization, event_id, actor_user=None, graph_client=No
                 event.ad_id = str(lead_data.get('ad_id') or '')
                 event.ad_name = str(lead_data.get('ad_name') or '')
                 event.is_organic = bool(lead_data.get('is_organic', False))
+                log_meta_event(
+                    EVT_GRAPH_FETCH_SUCCESS,
+                    "Retrieved lead details from Meta Graph API",
+                    import_id=str(event.id),
+                    page_id=event.page_id,
+                    form_id=event.form_id,
+                    leadgen_id=event.external_lead_id,
+                )
             except MetaRateLimitError as exc:
                 event.status = 'FAILED'
                 event.error_code = 'RATE_LIMITED'
@@ -262,7 +281,25 @@ def process_live_import(organization, event_id, actor_user=None, graph_client=No
             event.error_code = 'MAPPING_MISSING'
             event.error_message = f"No active mapping matches Page '{event.page_id}' and Form '{event.form_id}'. Configure and activate mapping to import."
             event.save(using=alias)
+            log_meta_event(
+                EVT_MAPPING_MISSING,
+                f"No active mapping matches Page '{event.page_id}' and Form '{event.form_id}'",
+                import_id=str(event.id),
+                page_id=event.page_id,
+                form_id=event.form_id,
+                status='NEEDS_MAPPING',
+                level=logging.WARNING,
+            )
             return event
+
+        log_meta_event(
+            EVT_MAPPING_FOUND,
+            f"Matched active form mapping: {mapping.name}",
+            import_id=str(event.id),
+            page_id=event.page_id,
+            form_id=event.form_id,
+            extra={'mapping_id': str(mapping.id)},
+        )
 
         event.mapping_version = mapping.version
         event.mapping_snapshot = {key: getattr(mapping, key) for key in (

@@ -27,6 +27,18 @@ from .services_memberships import MembershipLifecycleService
 from .context import get_current_tenant_db_alias
 
 
+class ParqRequiredValidationError(ValidationError):
+    """
+    Raised when class booking, waitlist entry, or rescheduling is blocked
+    because the membership's PAR-Q is pending completion and digital signature.
+    """
+    def __init__(self, message, code='PARQ_REQUIRED', membership=None, form=None):
+        super().__init__(message, code=code)
+        self.code = code
+        self.membership = membership
+        self.form = form
+
+
 class BookingWaitlistAttendanceService:
 
     @classmethod
@@ -324,6 +336,12 @@ class BookingWaitlistAttendanceService:
 
         # 4. Membership Specific Validations (if membership provided)
         if membership:
+            if getattr(membership, 'parq_status', 'COMPLETED') != 'COMPLETED':
+                return {
+                    'eligible': False,
+                    'reason_code': 'PARQ_REQUIRED',
+                    'reason_message': f"A completed and digitally signed PAR-Q is required before booking classes under membership {membership.membership_number}.",
+                }
             if membership.legacy_reference and 'PROVISIONAL_CASH_LIMIT_REACHED' in membership.legacy_reference:
                 return {
                     'eligible': False,
@@ -528,6 +546,22 @@ class BookingWaitlistAttendanceService:
 
                 if membership.end_date < timezone.now().date():
                     raise ValidationError("Membership has expired.")
+
+                # Gate: Verify PAR-Q completed and digitally signed for this specific membership
+                if getattr(membership, 'parq_status', 'PENDING') != 'COMPLETED':
+                    if not membership.parq_form:
+                        raise ParqRequiredValidationError(
+                            "No active PAR-Q form is configured for this program or organization. Please contact gym administration before booking.",
+                            code='PARQ_CONFIG_ERROR',
+                            membership=membership,
+                            form=None
+                        )
+                    raise ParqRequiredValidationError(
+                        f"A completed and digitally signed PAR-Q is required before booking classes under membership {membership.membership_number}.",
+                        code='PARQ_REQUIRED',
+                        membership=membership,
+                        form=membership.parq_form
+                    )
 
                 # Validate PackageClassAccessRule against member's package_version
                 access_res = cls.resolve_package_class_access(membership.package_version, occurrence, db_alias=alias)
@@ -954,6 +988,21 @@ class BookingWaitlistAttendanceService:
                         )
                         continue
 
+                    # Revalidate PAR-Q requirement at promotion time
+                    if getattr(membership, 'parq_status', 'PENDING') != 'COMPLETED':
+                        candidate.status = 'CANCELLED'
+                        candidate.waitlist_position = None
+                        candidate.save(using=alias, update_fields=['status', 'waitlist_position', 'updated_at'])
+                        BookingWaitlistEvent.objects.using(alias).create(
+                            booking=candidate,
+                            occurrence=occurrence,
+                            event_type='AUTO_CANCELLED',
+                            reason='Promotion blocked: PAR-Q form is pending completion and signature',
+                            triggered_by_type='SYSTEM',
+                            created_at=timezone.now()
+                        )
+                        continue
+
                     # Package class access check
                     access_res = cls.resolve_package_class_access(membership.package_version, occurrence, db_alias=alias)
                     if not access_res['allowed']:
@@ -1161,6 +1210,13 @@ class BookingWaitlistAttendanceService:
 
             # 5. Check Package Class Access for new occurrence
             if booking.membership:
+                if getattr(booking.membership, 'parq_status', 'PENDING') != 'COMPLETED':
+                    raise ParqRequiredValidationError(
+                        f"A completed and digitally signed PAR-Q is required before rescheduling under membership {booking.membership.membership_number}.",
+                        code='PARQ_REQUIRED',
+                        membership=booking.membership,
+                        form=booking.membership.parq_form
+                    )
                 access_res = cls.resolve_package_class_access(booking.membership.package_version, to_occ_locked, db_alias=alias)
                 if not access_res['allowed']:
                     raise ValidationError(f"Target class is not accessible under current package version: {access_res.get('reason')}")
@@ -1503,3 +1559,6 @@ class BookingWaitlistAttendanceService:
                     )
 
             return event
+
+
+BookingAttendanceService = BookingWaitlistAttendanceService

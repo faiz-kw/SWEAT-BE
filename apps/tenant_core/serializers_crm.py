@@ -543,6 +543,11 @@ class IntakeAnswerSerializer(serializers.ModelSerializer):
 
 class IntakeSubmissionSerializer(serializers.ModelSerializer):
     form_name = serializers.CharField(source='intake_form.name', read_only=True)
+    form_version = serializers.IntegerField(source='intake_form.version_number', read_only=True)
+    order_number = serializers.CharField(source='order.order_number', read_only=True, allow_null=True)
+    membership_number = serializers.CharField(source='membership.membership_number', read_only=True, allow_null=True)
+    program_name = serializers.CharField(source='program.name', read_only=True, allow_null=True)
+    submitted_by_name = serializers.CharField(source='submitted_by_user.display_name', read_only=True, allow_null=True)
     answers = IntakeAnswerSerializer(many=True, read_only=True)
 
     class Meta:

@@ -73,9 +73,12 @@ class MetaGraphAPIError(Exception):
 
 
 class MetaRateLimitError(MetaGraphAPIError):
-
     """Raised when Meta rate limits requests (code 4, 17, 32, 613, or HTTP 429)."""
+    pass
 
+
+class MetaGraphServerError(MetaGraphAPIError):
+    """Raised when Meta server returns HTTP 5xx or transient platform error (code 1, 2)."""
     pass
 
 
@@ -597,20 +600,19 @@ class MetaGraphClient:
 
 
 
+                        # Server / transient infrastructure errors
+            if code in (1, 2) or response.status_code >= 500:
+                raise MetaGraphServerError(f"Meta server error: {msg}", code=code, subcode=subcode, fbtrace_id=fbtrace)
+
             # Lead not found
-
             if code in (100, 33) and ('does not exist' in msg or 'not found' in msg):
-
                 raise MetaLeadNotFoundError(f"Lead not found on Meta: {msg}", code=code, subcode=subcode, fbtrace_id=fbtrace)
-
-
 
             raise MetaGraphAPIError(msg, code=code, subcode=subcode, fbtrace_id=fbtrace)
 
-
-
         if not response.ok:
-
+            if response.status_code >= 500:
+                raise MetaGraphServerError(f"Meta server error (HTTP {response.status_code})")
             response.raise_for_status()
 
 

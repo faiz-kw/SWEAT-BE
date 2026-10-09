@@ -98,12 +98,40 @@ class MembershipEntitlementSerializer(serializers.ModelSerializer):
 class MembershipBranchHistorySerializer(serializers.ModelSerializer):
     from_branch_name = serializers.ReadOnlyField(source='from_branch.name')
     to_branch_name = serializers.ReadOnlyField(source='to_branch.name')
+    membership_number = serializers.ReadOnlyField(source='membership.membership_number')
+    member_name = serializers.SerializerMethodField()
+    member_id = serializers.SerializerMethodField()
+    changed_by_name = serializers.SerializerMethodField()
+
+    def get_member_name(self, obj):
+        profile = getattr(obj.membership, 'user_profile', None)
+        if profile:
+            first = profile.first_name_snapshot or ''
+            last = profile.last_name_snapshot or ''
+            full = f"{first} {last}".strip()
+            if full:
+                return full
+            if profile.user:
+                return getattr(profile.user, 'full_name', '') or profile.user.email
+        return 'Member'
+
+    def get_member_id(self, obj):
+        profile = getattr(obj.membership, 'user_profile', None)
+        return str(profile.id) if profile else None
+
+    def get_changed_by_name(self, obj):
+        if obj.changed_by_user:
+            return getattr(obj.changed_by_user, 'full_name', '') or obj.changed_by_user.email
+        return 'Staff'
 
     class Meta:
         model = MembershipBranchHistory
         fields = [
             'id',
             'membership',
+            'membership_number',
+            'member_id',
+            'member_name',
             'from_branch',
             'from_branch_name',
             'to_branch',
@@ -112,6 +140,7 @@ class MembershipBranchHistorySerializer(serializers.ModelSerializer):
             'reason',
             'effective_at',
             'changed_by_user',
+            'changed_by_name',
             'created_at',
         ]
         read_only_fields = ['id', 'created_at']

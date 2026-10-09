@@ -63,7 +63,7 @@ from .models_memberships import Membership, MembershipEntitlement
 from .models_commerce import Order, OrderItem, PaymentTransaction
 from .models_discounts import DiscountCode
 from .models_crm import IntakeForm, IntakeQuestion, IntakeSubmission, TrialBooking, Lead, LeadSource, LeadConversion
-from .services_bookings import BookingWaitlistAttendanceService
+from .services_bookings import BookingWaitlistAttendanceService, ParqRequiredValidationError
 from .services_memberships import MembershipLifecycleService
 from .services_discounts import DiscountCouponEngineService
 from .services_crm import CRMLeadService
@@ -861,10 +861,85 @@ class MobileMeView(APIView):
 # 2. Studio Branches, Classes, Trainers & Daily Schedule Views
 # ============================================================================
 
+import math
+
+def _calculate_haversine_distance_km(lat1, lon1, lat2, lon2):
+    """
+    Calculate the great circle distance in kilometers between two points
+    on the earth (specified in decimal degrees) using Haversine formula.
+    """
+    try:
+        r = 6371.0  # Earth's radius in kilometers
+        phi1 = math.radians(float(lat1))
+        phi2 = math.radians(float(lat2))
+        delta_phi = math.radians(float(lat2) - float(lat1))
+        delta_lambda = math.radians(float(lon2) - float(lon1))
+
+        a = (
+            math.sin(delta_phi / 2.0) ** 2
+            + math.cos(phi1) * math.cos(phi2) * (math.sin(delta_lambda / 2.0) ** 2)
+        )
+        c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+        return r * c
+    except (ValueError, TypeError):
+        return None
+
+
+def _serialize_branch_dict(b, user_lat=None, user_lng=None):
+    """Serialize a branch record with full GPS coordinates, operating hours, and optional distance."""
+    b_lat = float(b.latitude) if b.latitude is not None else None
+    b_lng = float(b.longitude) if b.longitude is not None else None
+
+    dist_km = None
+    dist_m = None
+    if user_lat is not None and user_lng is not None and b_lat is not None and b_lng is not None:
+        calculated_km = _calculate_haversine_distance_km(user_lat, user_lng, b_lat, b_lng)
+        if calculated_km is not None:
+            dist_km = round(calculated_km, 2)
+            dist_m = int(round(calculated_km * 1000))
+
+    addr = getattr(b, 'address', '') or ''
+    addr_l1 = getattr(b, 'address_line_1', '') or getattr(b, 'address_line1', '') or ''
+    addr_l2 = getattr(b, 'address_line_2', '') or getattr(b, 'address_line2', '') or ''
+    full_address = addr or (f"{addr_l1}, {addr_l2}".strip(', ') if addr_l1 or addr_l2 else '')
+
+    open_time = getattr(b, 'business_open_time', None) or '06:00'
+    close_time = getattr(b, 'business_close_time', None) or '22:00'
+    if hasattr(b, 'opening_time') and b.opening_time:
+        open_time = b.opening_time.strftime('%H:%M')
+    if hasattr(b, 'closing_time') and b.closing_time:
+        close_time = b.closing_time.strftime('%H:%M')
+
+    return {
+        'id': str(b.id),
+        'name': b.name,
+        'code': b.code,
+        'address': full_address,
+        'address_line1': addr_l1,
+        'address_line2': addr_l2,
+        'city': getattr(b, 'address_city', None) or getattr(b, 'city', 'Mumbai'),
+        'postal_code': getattr(b, 'address_postal_code', '') or getattr(b, 'postal_code', ''),
+        'latitude': b_lat,
+        'longitude': b_lng,
+        'distance_km': dist_km,
+        'distance_meters': dist_m,
+        'is_nearest': False,
+        'geofence_radius_meters': getattr(b, 'geofence_radius_meters', 200) or 200,
+        'geofence_enforcement': getattr(b, 'geofence_enforcement', 'STRICT') or 'STRICT',
+        'is_passport_eligible': getattr(b, 'is_passport_eligible', False),
+        'phone': getattr(b, 'phone', '') or '',
+        'email': getattr(b, 'email', '') or '',
+        'opening_time': open_time,
+        'closing_time': close_time,
+    }
+
+
 class MobileBranchesView(APIView):
     """
     GET /api/v1/mobile/branches/
-    Lists all active SWEAT studio locations with addresses.
+    Lists all active studio branches with GPS coordinates (latitude, longitude, geofence radius).
+    Optional query parameters:
+      - lat, lng (or latitude, longitude): Calculates distance and sorts branches nearest-first!
     """
     permission_classes = [AllowAny]
 
@@ -873,23 +948,87 @@ class MobileBranchesView(APIView):
         if not alias:
             return Response([], status=status.HTTP_200_OK)
 
+        raw_lat = request.query_params.get('lat') or request.query_params.get('latitude')
+        raw_lng = request.query_params.get('lng') or request.query_params.get('lon') or request.query_params.get('longitude')
+
+        user_lat = None
+        user_lng = None
+        if raw_lat and raw_lng:
+            try:
+                user_lat = float(raw_lat)
+                user_lng = float(raw_lng)
+            except (ValueError, TypeError):
+                user_lat = None
+                user_lng = None
+
         branches = Branch.objects.using(alias).filter(status='ACTIVE').order_by('name')
-        results = []
-        for b in branches:
-            results.append({
-                'id': str(b.id),
-                'name': b.name,
-                'code': b.code,
-                'address_line1': getattr(b, 'address_line_1', '') or getattr(b, 'address_line1', '') or '',
-                'address_line2': getattr(b, 'address_line_2', '') or getattr(b, 'address_line2', '') or '',
-                'city': getattr(b, 'address_city', None) or getattr(b, 'city', 'Mumbai'),
-                'postal_code': getattr(b, 'address_postal_code', '') or getattr(b, 'postal_code', ''),
-                'phone': getattr(b, 'phone', '') or '',
-                'email': getattr(b, 'email', '') or '',
-                'opening_time': b.opening_time.strftime('%H:%M') if hasattr(b, 'opening_time') and b.opening_time else '06:00',
-                'closing_time': b.closing_time.strftime('%H:%M') if hasattr(b, 'closing_time') and b.closing_time else '22:00',
-            })
+        results = [
+            _serialize_branch_dict(b, user_lat=user_lat, user_lng=user_lng)
+            for b in branches
+        ]
+
+        if user_lat is not None and user_lng is not None:
+            results.sort(key=lambda x: (x['distance_km'] is None, x['distance_km'] if x['distance_km'] is not None else float('inf')))
+            if results and results[0]['distance_km'] is not None:
+                results[0]['is_nearest'] = True
+
         return Response(results)
+
+
+class MobileNearestBranchView(APIView):
+    """
+    GET /api/v1/mobile/branches/nearest/
+    Fetches the single nearest studio branch to the member's current GPS location.
+    Required query parameters:
+      - lat, lng (or latitude, longitude)
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            return Response({'detail': 'Studio service unavailable.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        raw_lat = request.query_params.get('lat') or request.query_params.get('latitude')
+        raw_lng = request.query_params.get('lng') or request.query_params.get('lon') or request.query_params.get('longitude')
+
+        if not raw_lat or not raw_lng:
+            return Response(
+                {'detail': 'Current GPS coordinates (lat, lng) are required to determine nearest branch.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            user_lat = float(raw_lat)
+            user_lng = float(raw_lng)
+        except (ValueError, TypeError):
+            return Response(
+                {'detail': 'Invalid latitude or longitude coordinates provided.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        branches = Branch.objects.using(alias).filter(status='ACTIVE')
+        results = [
+            _serialize_branch_dict(b, user_lat=user_lat, user_lng=user_lng)
+            for b in branches
+        ]
+
+        results.sort(key=lambda x: (x['distance_km'] is None, x['distance_km'] if x['distance_km'] is not None else float('inf')))
+
+        if not results or results[0]['distance_km'] is None:
+            return Response({'detail': 'No active branches found with GPS coordinates.'}, status=status.HTTP_404_NOT_FOUND)
+
+        nearest = results[0]
+        nearest['is_nearest'] = True
+
+        return Response({
+            'nearest_branch': nearest,
+            'member_location': {
+                'latitude': user_lat,
+                'longitude': user_lng,
+            },
+            'all_branches_by_distance': results,
+        }, status=status.HTTP_200_OK)
 
 
 class MobileClassesView(APIView):
@@ -1206,7 +1345,22 @@ class MobileClaimFreeTrialView(APIView):
                 created_by_user=user,
                 db_alias=alias,
             )
+        except ParqRequiredValidationError as e:
+            return Response({
+                'code': e.code,
+                'detail': str(e.message if hasattr(e, 'message') else e),
+                'error': str(e.message if hasattr(e, 'message') else e),
+                'membership_id': str(e.membership.id) if e.membership else None,
+                'form_id': str(e.form.id) if e.form else None,
+                'form_title': e.form.name if e.form else None,
+            }, status=status.HTTP_400_BAD_REQUEST)
         except ValidationError as e:
+            if getattr(e, 'code', None) in ['PARQ_REQUIRED', 'PARQ_CONFIG_ERROR']:
+                return Response({
+                    'code': getattr(e, 'code', 'PARQ_REQUIRED'),
+                    'detail': str(e.messages[0] if hasattr(e, 'messages') and e.messages else e),
+                    'error': str(e.messages[0] if hasattr(e, 'messages') and e.messages else e),
+                }, status=status.HTTP_400_BAD_REQUEST)
             detail = e.messages[0] if hasattr(e, 'messages') and e.messages else str(e)
             return Response({'detail': detail}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:

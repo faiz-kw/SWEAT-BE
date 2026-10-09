@@ -36,7 +36,7 @@ from django.utils.dateparse import parse_datetime
 from django.shortcuts import get_object_or_404
 from django.core.exceptions import ValidationError
 from rest_framework.exceptions import PermissionDenied
-from config.routers import get_tenant_db_alias
+from config.routers import get_tenant_db_alias, set_tenant_db_alias
 
 from .models_org import Organization, Branch
 from .models_users import TenantUser
@@ -105,12 +105,15 @@ logger = logging.getLogger(__name__)
 
 
 def _get_db(request):
-    return (
+    alias = (
         get_tenant_db_alias()
         or getattr(getattr(request, 'user', None), '_db_alias', None)
         or getattr(request, '_tenant_db_alias', None)
         or 'default'
     )
+    if alias and alias != 'default':
+        set_tenant_db_alias(alias)
+    return alias
 
 
 def _get_org(request):
@@ -1301,6 +1304,7 @@ class LeadViewSet(viewsets.ModelViewSet):
             is_partial = request.data.get('is_partial_payment', False)
             partial_amt = request.data.get('partial_amount')
             channel = request.data.get('channel', 'STAFF')
+            parq_sub_id = request.data.get('parq_submission_id')
             checkout_data = LeadConversionService.create_checkout_order(
                 lead=lead,
                 package_version_id=str(package_version_id),
@@ -1309,6 +1313,7 @@ class LeadViewSet(viewsets.ModelViewSet):
                 is_partial_payment=is_partial,
                 partial_amount=partial_amt,
                 channel=channel,
+                parq_submission_id=parq_sub_id,
                 actor_user=request.user,
                 db_alias=alias,
             )
@@ -1406,6 +1411,7 @@ class LeadViewSet(viewsets.ModelViewSet):
                 razorpay_signature=request.data.get('razorpay_signature'),
                 order_id=request.data.get('order_id'),
                 channel=channel,
+                parq_submission_id=request.data.get('parq_submission_id'),
             )
             if result.get('status') == 'PENDING_APPROVAL':
                 return Response(result, status=status.HTTP_202_ACCEPTED)
@@ -1636,6 +1642,8 @@ class IntakeFormViewSet(viewsets.ModelViewSet):
         'partial_update': 'crm.leads.edit',
         'destroy': 'crm.leads.delete',
         'submit': 'crm.leads.create',
+        'applicable_parq': 'crm.leads.view',
+        'submit_purchase': 'crm.leads.create',
     }
     ordering = ['-version_number']
 
@@ -1688,6 +1696,82 @@ class IntakeFormViewSet(viewsets.ModelViewSet):
             db_alias=alias,
         )
         return Response(IntakeSubmissionSerializer(submission).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['get'], url_path='applicable-parq')
+    def applicable_parq(self, request):
+        alias = _get_db(request)
+        org = _get_org(request)
+        program_id = request.query_params.get('program_id')
+        lead_id = request.query_params.get('lead_id')
+        user_profile_id = request.query_params.get('user_profile_id')
+
+        res = CRMLeadService.resolve_applicable_parq(
+            organization=org,
+            program_id=program_id,
+            lead_id=lead_id,
+            user_profile_id=user_profile_id,
+            db_alias=alias,
+        )
+        return Response(res, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='submit-purchase')
+    def submit_purchase(self, request, pk=None):
+        alias = _get_db(request)
+        form = self.get_object()
+        answers = request.data.get('answers', [])
+        lead_id = request.data.get('lead_id')
+        user_profile_id = request.data.get('user_profile_id')
+        program_id = request.data.get('program_id')
+        order_id = request.data.get('order_id')
+        agreement_accepted = bool(request.data.get('agreement_accepted', False))
+        agreement_text_snapshot = request.data.get('agreement_text_snapshot', '')
+        accepted_by_name = request.data.get('accepted_by_name')
+        signer_type = request.data.get('signer_type', 'MEMBER_DIRECT')
+        channel = request.data.get('channel', 'STAFF_ASSISTED')
+        idempotency_key = request.data.get('idempotency_key')
+
+        lead = None
+        if lead_id:
+            lead = Lead.objects.using(alias).filter(id=lead_id).first()
+
+        user_profile = None
+        if user_profile_id:
+            user_profile = UserProfile.objects.using(alias).filter(id=user_profile_id).first()
+        elif lead and getattr(lead, 'converted_member_profile', None):
+            user_profile = lead.converted_member_profile
+
+        program = None
+        if program_id:
+            program = Program.objects.using(alias).filter(id=program_id).first()
+
+        order = None
+        if order_id:
+            order = Order.objects.using(alias).filter(id=order_id).first()
+
+        try:
+            submission = CRMLeadService.submit_purchase_parq(
+                intake_form=form,
+                answers=answers,
+                lead=lead,
+                user_profile=user_profile,
+                program=program,
+                order=order,
+                agreement_accepted=agreement_accepted,
+                agreement_text_snapshot=agreement_text_snapshot,
+                accepted_by_name=accepted_by_name,
+                signer_type=signer_type,
+                channel=channel,
+                idempotency_key=idempotency_key,
+                actor_user=request.user if request.user and request.user.is_authenticated else None,
+                db_alias=alias,
+            )
+            return Response(IntakeSubmissionSerializer(submission).data, status=status.HTTP_201_CREATED)
+        except ValidationError as exc:
+            msg = exc.message if hasattr(exc, 'message') else str(exc)
+            return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as exc:
+            logger.exception("Error in submit_purchase PAR-Q: %s", exc)
+            return Response({'error': str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class IntakeQuestionViewSet(viewsets.ModelViewSet):

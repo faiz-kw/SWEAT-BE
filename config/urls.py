@@ -16,6 +16,8 @@ from apps.tenant_core.views_communication_webhook import CommunicationWebhookVie
 from apps.tenant_core.views_lead_webhook import PublicLeadCaptureView
 from apps.tenant_core.views_razorpay_webhook import RazorpayWebhookView
 from apps.tenant_core.views_meta_webhook import MetaLeadWebhookView
+from apps.tenant_core.views_legal import privacy_policy_view, terms_of_service_view, data_deletion_view
+from apps.tenant_core.views_health import HealthLivenessView, HealthReadinessView
 
 # Django admin branding
 admin.site.site_header = "PerformanceOS • Platform Control Panel"
@@ -24,6 +26,11 @@ admin.site.index_title = "Phase 1 Layer 1 — Master Control Panel"
 
 urlpatterns = [
     path('', RedirectView.as_view(url='/admin/', permanent=False)),
+    path('privacy-policy/', privacy_policy_view, name='privacy-policy'),
+    path('terms-of-service/', terms_of_service_view, name='terms-of-service'),
+    path('data-deletion/', data_deletion_view, name='data-deletion'),
+    path('health/', HealthLivenessView.as_view(), name='platform-liveness'),
+    path('ready/', HealthReadinessView.as_view(), name='platform-readiness'),
     path('admin/', admin.site.urls),
 
     # Auth — Platform login, Tenant login, Token refresh

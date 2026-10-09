@@ -513,6 +513,13 @@ class IntakeForm(models.Model):
     effective_from = models.DateTimeField(default=timezone.now)
     effective_until = models.DateTimeField(null=True, blank=True)
     status = models.CharField(max_length=20, choices=STATUSES, default='DRAFT')
+    agreement_title = models.CharField(max_length=255, default='Physical Activity Readiness & Assumption of Risk Agreement', blank=True)
+    agreement_text = models.TextField(blank=True, default='')
+    is_required_for_purchase = models.BooleanField(default=True)
+    requires_explicit_consent = models.BooleanField(default=True)
+    reassessment_days = models.IntegerField(default=365, help_text="Number of days a submission remains valid before requiring reassessment")
+    is_default_for_all_programs = models.BooleanField(default=True, help_text="If True, applies as default PAR-Q to all programs unless explicitly overridden")
+    assigned_programs = models.ManyToManyField(Program, blank=True, related_name='assigned_intake_forms')
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -657,6 +664,41 @@ class IntakeSubmission(models.Model):
         related_name='submitted_intakes',
         db_column='submitted_by_user_id',
     )
+    order = models.ForeignKey(
+        'Order',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='intake_submissions',
+        db_column='order_id',
+    )
+    membership = models.ForeignKey(
+        'Membership',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='intake_submissions',
+        db_column='membership_id',
+    )
+    program = models.ForeignKey(
+        Program,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='intake_submissions',
+        db_column='program_id',
+    )
+    agreement_accepted = models.BooleanField(default=False)
+    agreement_accepted_at = models.DateTimeField(null=True, blank=True)
+    agreement_text_snapshot = models.TextField(blank=True, default='')
+    form_snapshot = models.JSONField(default=dict, blank=True, null=True)
+    metadata = models.JSONField(default=dict, blank=True, null=True)
+    signature_data = models.TextField(null=True, blank=True)
+    signature_date = models.DateTimeField(null=True, blank=True)
+    signer_identity = models.CharField(max_length=255, null=True, blank=True)
+    signer_ip = models.CharField(max_length=64, null=True, blank=True)
+    signer_user_agent = models.TextField(null=True, blank=True)
+    status = models.CharField(max_length=30, default='COMPLETED')
     submitted_at = models.DateTimeField(default=timezone.now)
     created_at = models.DateTimeField(default=timezone.now)
 

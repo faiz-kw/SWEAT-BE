@@ -102,6 +102,26 @@ class MembershipLifecycleService:
 
             membership_number = f"MEM-{uuid.uuid4().hex[:8].upper()}"
 
+            # Resolve applicable active PAR-Q form for the program or organization
+            from .models_crm import IntakeForm
+            org = order.branch.organization if order.branch else (order.user_profile.preferred_branch.organization if order.user_profile and order.user_profile.preferred_branch else None)
+            parq_form = None
+            if org:
+                if package and package.program:
+                    parq_form = (
+                        IntakeForm.objects.using(alias)
+                        .filter(organization=org, status='ACTIVE', form_type__in=['PAR_Q', 'PARQ'], assigned_programs=package.program)
+                        .order_by('-version_number')
+                        .first()
+                    )
+                if not parq_form:
+                    parq_form = (
+                        IntakeForm.objects.using(alias)
+                        .filter(organization=org, status='ACTIVE', form_type__in=['PAR_Q', 'PARQ'], is_default_for_all_programs=True)
+                        .order_by('-version_number')
+                        .first()
+                    )
+
             membership = Membership.objects.using(alias).create(
                 user_profile=order.user_profile,
                 program=package.program,
@@ -116,6 +136,10 @@ class MembershipLifecycleService:
                 start_date=start,
                 end_date=end,
                 status='ACTIVE',
+                parq_status='PENDING',
+                parq_form=parq_form,
+                parq_submission=None,
+                parq_completed_at=None,
                 activated_at=timezone.now(),
             )
 
@@ -437,6 +461,28 @@ class MembershipLifecycleService:
                 changed_by_user=approved_by_user,
             )
 
+        # Handle existing bookings falling within the freeze window
+        if membership.user_profile:
+            try:
+                from .models_bookings import Booking
+                from .services_bookings import BookingAttendanceService
+                freeze_bookings = Booking.objects.using(alias).filter(
+                    user_profile=membership.user_profile,
+                    occurrence__start_at__date__gte=freeze_from,
+                    occurrence__start_at__date__lte=freeze_until,
+                    status__in=['CONFIRMED', 'RESERVED', 'WAITLISTED']
+                )
+                for bk in freeze_bookings:
+                    BookingAttendanceService.cancel_booking(
+                        booking=bk,
+                        cancellation_source='ADMIN',
+                        reason_text=f"Membership frozen from {freeze_from} to {freeze_until}.",
+                        actor_user=approved_by_user,
+                        db_alias=alias,
+                    )
+            except Exception as e:
+                logger.warning(f"Error cancelling bookings during freeze: {e}")
+
         return freeze
 
     @classmethod
@@ -540,6 +586,69 @@ class MembershipLifecycleService:
                 changed_by_user=actor_user,
                 reason=reason or f"Executed {change_type}",
             )
+
+            # Provision and adjust entitlements for upgraded target package version
+            for ped in target_package_version.entitlement_definitions.using(alias).all():
+                existing_ent = membership.entitlements.using(alias).filter(entitlement_type=ped.entitlement_type).first()
+                if existing_ent:
+                    if policy_rule.unused_session_handling == 'CARRY_FORWARD':
+                        add_units = ped.allocated_units or Decimal('0.00')
+                        if add_units > Decimal('0.00'):
+                            cls.adjust_entitlement(
+                                membership=membership,
+                                entitlement_type=ped.entitlement_type,
+                                units_delta=add_units,
+                                reason_code='UPGRADE_ALLOCATION',
+                                reason_text=f"Package upgrade to {target_package.name} (v{target_package_version.version_number})",
+                                actor_user=actor_user,
+                                db_alias=alias,
+                            )
+                    elif policy_rule.unused_session_handling == 'RESET':
+                        rem = existing_ent.remaining_units or Decimal('0.00')
+                        if rem > Decimal('0.00'):
+                            MembershipEntitlementLedger.objects.using(alias).create(
+                                membership_entitlement=existing_ent,
+                                transaction_type='EXPIRY',
+                                units=-rem,
+                                reason_code='UPGRADE_RESET',
+                                reason_text=f"Forfeited prior balance on upgrade to {target_package.name}",
+                                balance_after=Decimal('0.00'),
+                                created_by_user=actor_user,
+                            )
+                        existing_ent.allocated_units = ped.allocated_units
+                        existing_ent.consumed_units = Decimal('0.00')
+                        existing_ent.status = 'ACTIVE'
+                        existing_ent.save(using=alias, update_fields=['allocated_units', 'consumed_units', 'status', 'updated_at'])
+                        MembershipEntitlementLedger.objects.using(alias).create(
+                            membership_entitlement=existing_ent,
+                            transaction_type='ALLOCATION',
+                            units=ped.allocated_units or Decimal('0.00'),
+                            reason_code='UPGRADE_RESET_ALLOCATION',
+                            reason_text=f"Reset allocation on upgrade to {target_package.name}",
+                            balance_after=ped.allocated_units or Decimal('0.00'),
+                            created_by_user=actor_user,
+                        )
+                else:
+                    new_ent = MembershipEntitlement.objects.using(alias).create(
+                        membership=membership,
+                        source_definition=ped,
+                        entitlement_type=ped.entitlement_type,
+                        allocated_units=ped.allocated_units,
+                        consumed_units=Decimal('0.00'),
+                        is_unlimited=ped.is_unlimited,
+                        valid_from=timezone.now(),
+                        valid_until=timezone.make_aware(datetime.combine(membership.end_date, datetime.max.time())),
+                        status='ACTIVE',
+                    )
+                    MembershipEntitlementLedger.objects.using(alias).create(
+                        membership_entitlement=new_ent,
+                        transaction_type='ALLOCATION',
+                        units=ped.allocated_units or Decimal('0.00'),
+                        reason_code='UPGRADE_NEW_ALLOCATION',
+                        reason_text=f"Initial allocation on upgrade to {target_package.name}",
+                        balance_after=ped.allocated_units or Decimal('0.00'),
+                        created_by_user=actor_user,
+                    )
         elif change_type == 'CANCELLATION':
             old_st = membership.status
             membership.status = 'CANCELLED'
@@ -720,7 +829,43 @@ class MembershipLifecycleService:
         membership.cancelled_at = timezone.now()
         membership.save(using=alias, update_fields=['status', 'cancelled_at', 'updated_at'])
 
-        membership.entitlements.filter(status='ACTIVE').update(status='EXPIRED')
+        # Expire entitlements and append forfeiture ledger records
+        for ent in membership.entitlements.using(alias).filter(status='ACTIVE'):
+            rem = ent.remaining_units or Decimal('0.00')
+            if rem > Decimal('0.00'):
+                MembershipEntitlementLedger.objects.using(alias).create(
+                    membership_entitlement=ent,
+                    transaction_type='EXPIRY',
+                    units=-rem,
+                    reason_code='MEMBERSHIP_CANCELLED',
+                    reason_text=reason_text or "Forfeited remaining units upon membership cancellation",
+                    balance_after=Decimal('0.00'),
+                    created_by_user=actor_user,
+                )
+            ent.status = 'EXPIRED'
+            ent.save(using=alias, update_fields=['status', 'updated_at'])
+
+        # Cancel any upcoming bookings
+        if membership.user_profile:
+            try:
+                from .models_bookings import Booking
+                from .services_bookings import BookingAttendanceService
+                now_dt = timezone.now()
+                future_bookings = Booking.objects.using(alias).filter(
+                    user_profile=membership.user_profile,
+                    occurrence__start_at__gte=now_dt,
+                    status__in=['CONFIRMED', 'RESERVED', 'WAITLISTED']
+                )
+                for bk in future_bookings:
+                    BookingAttendanceService.cancel_booking(
+                        booking=bk,
+                        cancellation_source='ADMIN',
+                        reason_text=f"Membership cancelled: {reason_text or 'Staff action'}",
+                        actor_user=actor_user,
+                        db_alias=alias,
+                    )
+            except Exception as e:
+                logger.warning(f"Error cancelling bookings on membership cancellation: {e}")
 
         MembershipStatusHistory.objects.using(alias).create(
             membership=membership,

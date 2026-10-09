@@ -7,6 +7,7 @@ from .views_mobile import (
     MobileFacebookAuthView,
     MobileMeView,
     MobileBranchesView,
+    MobileNearestBranchView,
     MobileClassesView,
     MobileTrainersView,
     MobileScheduleView,
@@ -42,6 +43,7 @@ urlpatterns = [
     path('me/', MobileMeView.as_view(), name='mobile-me-direct'),
 
     # 2. Studio Catalog & Schedule
+    path('branches/nearest/', MobileNearestBranchView.as_view(), name='mobile-branches-nearest'),
     path('branches/', MobileBranchesView.as_view(), name='mobile-branches'),
     path('classes/', MobileClassesView.as_view(), name='mobile-classes'),
     path('trainers/', MobileTrainersView.as_view(), name='mobile-trainers'),

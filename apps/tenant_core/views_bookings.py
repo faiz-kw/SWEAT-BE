@@ -48,7 +48,7 @@ from .serializers_bookings import (
     AttendanceRecordSerializer,
     AccessEventSerializer,
 )
-from .services_bookings import BookingWaitlistAttendanceService
+from .services_bookings import BookingWaitlistAttendanceService, ParqRequiredValidationError
 
 
 def _get_db(request):
@@ -412,7 +412,22 @@ class BookingViewSet(viewsets.ModelViewSet):
             )
             serializer = self.get_serializer(booking)
             return Response(serializer.data, status=status.HTTP_201_CREATED)
+        except ParqRequiredValidationError as e:
+            return Response({
+                'code': e.code,
+                'detail': str(e.message if hasattr(e, 'message') else e),
+                'error': str(e.message if hasattr(e, 'message') else e),
+                'membership_id': str(e.membership.id) if e.membership else None,
+                'form_id': str(e.form.id) if e.form else None,
+                'form_title': e.form.name if e.form else None,
+            }, status=status.HTTP_400_BAD_REQUEST)
         except ValidationError as e:
+            if getattr(e, 'code', None) in ['PARQ_REQUIRED', 'PARQ_CONFIG_ERROR']:
+                return Response({
+                    'code': getattr(e, 'code', 'PARQ_REQUIRED'),
+                    'detail': str(e.messages[0] if hasattr(e, 'messages') and e.messages else e),
+                    'error': str(e.messages[0] if hasattr(e, 'messages') and e.messages else e),
+                }, status=status.HTTP_400_BAD_REQUEST)
             detail = e.message_dict if hasattr(e, 'message_dict') else (e.messages[0] if hasattr(e, 'messages') and e.messages else str(e))
             return Response({'detail': detail}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
@@ -522,7 +537,22 @@ class BookingViewSet(viewsets.ModelViewSet):
             )
             serializer = self.get_serializer(rescheduled_booking)
             return Response(serializer.data, status=status.HTTP_200_OK)
+        except ParqRequiredValidationError as e:
+            return Response({
+                'code': e.code,
+                'detail': str(e.message if hasattr(e, 'message') else e),
+                'error': str(e.message if hasattr(e, 'message') else e),
+                'membership_id': str(e.membership.id) if e.membership else None,
+                'form_id': str(e.form.id) if e.form else None,
+                'form_title': e.form.name if e.form else None,
+            }, status=status.HTTP_400_BAD_REQUEST)
         except ValidationError as e:
+            if getattr(e, 'code', None) in ['PARQ_REQUIRED', 'PARQ_CONFIG_ERROR']:
+                return Response({
+                    'code': getattr(e, 'code', 'PARQ_REQUIRED'),
+                    'detail': str(e.messages[0] if hasattr(e, 'messages') and e.messages else e),
+                    'error': str(e.messages[0] if hasattr(e, 'messages') and e.messages else e),
+                }, status=status.HTTP_400_BAD_REQUEST)
             detail = e.message_dict if hasattr(e, 'message_dict') else (e.messages[0] if hasattr(e, 'messages') and e.messages else str(e))
             return Response({'detail': detail}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:

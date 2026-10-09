@@ -2486,6 +2486,222 @@ class CRMLeadService:
             return submission
 
     @classmethod
+    def resolve_applicable_parq(
+        cls,
+        organization,
+        program_id: Optional[str] = None,
+        package_version_id: Optional[str] = None,
+        package_id: Optional[str] = None,
+        user_profile_id: Optional[str] = None,
+        lead_id: Optional[str] = None,
+        db_alias: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        alias = db_alias or get_tenant_db_alias() or 'default'
+        from .models_catalog import Program, PackageVersion, Package
+        from .serializers_crm import IntakeFormSerializer, IntakeSubmissionSerializer
+        from .models_crm import IntakeForm, IntakeSubmission, Lead
+        from .models_workforce import UserProfile
+
+        program = None
+        if program_id:
+            program = Program.objects.using(alias).filter(id=program_id).first()
+        elif package_version_id:
+            pv = PackageVersion.objects.using(alias).select_related('package', 'package__program').filter(id=package_version_id).first()
+            if pv and pv.package:
+                program = pv.package.program
+        elif package_id:
+            pkg = Package.objects.using(alias).select_related('program').filter(id=package_id).first()
+            if pkg:
+                program = pkg.program
+
+        # 1. Program-specific active PAR-Q form
+        active_form = None
+        if program:
+            active_form = (
+                IntakeForm.objects.using(alias)
+                .filter(organization=organization, status='ACTIVE', form_type__in=['PAR_Q', 'PARQ'], assigned_programs=program)
+                .prefetch_related('questions', 'questions__options')
+                .order_by('-version_number')
+                .first()
+            )
+
+        # 2. Organization-wide default active PAR-Q form
+        if not active_form:
+            active_form = (
+                IntakeForm.objects.using(alias)
+                .filter(organization=organization, status='ACTIVE', form_type__in=['PAR_Q', 'PARQ'], is_default_for_all_programs=True)
+                .prefetch_related('questions', 'questions__options')
+                .order_by('-version_number')
+                .first()
+            )
+
+        # 3. Explicit handling if not configured
+        if not active_form:
+            return {
+                'configured': False,
+                'form': None,
+                'is_reusable': False,
+                'requires_completion': False,
+                'message': 'No active PAR-Q form is configured for this program or organization.',
+            }
+
+        # Check existing submissions for reuse / reassessment
+        user_profile = None
+        if user_profile_id:
+            user_profile = UserProfile.objects.using(alias).filter(id=user_profile_id).first()
+        lead = None
+        if lead_id:
+            lead = Lead.objects.using(alias).filter(id=lead_id).first()
+            if not user_profile and lead and getattr(lead, 'converted_member_profile', None):
+                user_profile = lead.converted_member_profile
+
+        reassessment_cutoff = timezone.now() - timedelta(days=active_form.reassessment_days or 365)
+        latest_sub = None
+
+        if user_profile:
+            latest_sub = (
+                IntakeSubmission.objects.using(alias)
+                .filter(user_profile=user_profile, intake_form=active_form, submitted_at__gte=reassessment_cutoff)
+                .order_by('-submitted_at')
+                .first()
+            )
+        elif lead:
+            latest_sub = (
+                IntakeSubmission.objects.using(alias)
+                .filter(lead=lead, intake_form=active_form, submitted_at__gte=reassessment_cutoff)
+                .order_by('-submitted_at')
+                .first()
+            )
+
+        is_reusable = latest_sub is not None
+
+        return {
+            'configured': True,
+            'form': IntakeFormSerializer(active_form).data,
+            'is_reusable': is_reusable,
+            'requires_completion': active_form.is_required_for_purchase and not is_reusable,
+            'reassessment_days': active_form.reassessment_days or 365,
+            'agreement_title': active_form.agreement_title or 'Physical Activity Readiness & Assumption of Risk Agreement',
+            'agreement_text': active_form.agreement_text or '',
+            'requires_explicit_consent': active_form.requires_explicit_consent,
+            'existing_submission': IntakeSubmissionSerializer(latest_sub).data if latest_sub else None,
+        }
+
+    @classmethod
+    def submit_purchase_parq(
+        cls,
+        intake_form: IntakeForm,
+        answers: List[Dict[str, Any]],
+        lead: Optional[Lead] = None,
+        user_profile: Optional[UserProfile] = None,
+        program: Optional[Any] = None,
+        order: Optional[Any] = None,
+        agreement_accepted: bool = False,
+        agreement_text_snapshot: str = '',
+        accepted_by_name: Optional[str] = None,
+        signer_type: str = 'MEMBER_DIRECT',
+        channel: str = 'STAFF_ASSISTED',
+        idempotency_key: Optional[str] = None,
+        actor_user: Optional[TenantUser] = None,
+        db_alias: Optional[str] = None,
+    ) -> IntakeSubmission:
+        alias = db_alias or get_tenant_db_alias() or 'default'
+
+        # Idempotency replay check
+        if idempotency_key:
+            existing = (
+                IntakeSubmission.objects.using(alias)
+                .filter(metadata__idempotency_key=idempotency_key)
+                .first()
+            )
+            if existing:
+                return existing
+
+        # Validate required questions
+        active_questions = list(intake_form.questions.using(alias).filter(status='ACTIVE').order_by('display_order'))
+        answers_by_qid = {str(a.get('question_id')): a for a in answers if a.get('question_id')}
+
+        for q in active_questions:
+            if q.is_required:
+                ans = answers_by_qid.get(str(q.id))
+                if not ans:
+                    raise ValidationError(f"Question '{q.question_text}' is required.")
+                has_val = False
+                for k in ('boolean_value', 'text_value', 'numeric_value', 'date_value', 'json_value'):
+                    if k in ans and ans[k] is not None and str(ans[k]).strip() != '':
+                        has_val = True
+                        break
+                if not has_val:
+                    raise ValidationError(f"Question '{q.question_text}' is required.")
+
+        # Validate explicit consent if configured
+        if intake_form.requires_explicit_consent and not agreement_accepted:
+            raise ValidationError("Explicit agreement acceptance is required.")
+
+        # Build immutable form snapshot
+        form_snapshot = {
+            'form_id': str(intake_form.id),
+            'name': intake_form.name,
+            'form_type': intake_form.form_type,
+            'version_number': intake_form.version_number,
+            'agreement_title': intake_form.agreement_title,
+            'agreement_text': agreement_text_snapshot or intake_form.agreement_text,
+            'program_id': str(program.id) if program else None,
+            'program_name': program.name if program else None,
+            'questions': [
+                {
+                    'id': str(q.id),
+                    'question_text': q.question_text,
+                    'question_type': q.question_type,
+                    'category': q.category,
+                    'is_required': q.is_required,
+                    'is_sensitive': q.is_sensitive,
+                    'display_order': q.display_order,
+                    'options': [{'label': o.label, 'value': o.value} for o in q.options.using(alias).filter(status='ACTIVE')],
+                }
+                for q in active_questions
+            ],
+        }
+
+        metadata = {
+            'accepted_by_name': accepted_by_name or (f"{user_profile.first_name_snapshot} {user_profile.last_name_snapshot}".strip() if user_profile else (f"{lead.first_name} {lead.last_name}".strip() if lead else '')),
+            'signer_type': signer_type,
+            'channel': channel,
+            'idempotency_key': idempotency_key,
+        }
+
+        with transaction.atomic(using=alias):
+            submission = IntakeSubmission.objects.using(alias).create(
+                intake_form=intake_form,
+                lead=lead,
+                user_profile=user_profile,
+                program=program,
+                order=order,
+                submitted_by_user=actor_user,
+                agreement_accepted=agreement_accepted,
+                agreement_accepted_at=timezone.now() if agreement_accepted else None,
+                agreement_text_snapshot=agreement_text_snapshot or intake_form.agreement_text,
+                form_snapshot=form_snapshot,
+                metadata=metadata,
+                status='COMPLETED',
+            )
+
+            for q in active_questions:
+                ans_data = answers_by_qid.get(str(q.id))
+                if ans_data:
+                    IntakeAnswer.objects.using(alias).create(
+                        submission=submission,
+                        question=q,
+                        text_value=ans_data.get('text_value'),
+                        numeric_value=ans_data.get('numeric_value'),
+                        boolean_value=ans_data.get('boolean_value'),
+                        date_value=ans_data.get('date_value'),
+                        json_value=ans_data.get('json_value', {}),
+                    )
+
+            return submission
+
+    @classmethod
     def record_lead_activity(
         cls,
         lead: Lead,
@@ -3328,6 +3544,7 @@ class LeadConversionService:
         is_partial_payment: bool = False,
         partial_amount: Optional[Any] = None,
         channel: str = 'STAFF',
+        parq_submission_id: Optional[str] = None,
         actor_user=None,
         db_alias: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -3364,6 +3581,8 @@ class LeadConversionService:
             actor_user=actor_user,
             db_alias=alias,
         )
+
+        # Note: PAR-Q completion is enforced at class booking, not during purchase checkout
 
         # 2. Build order items_data
         unit_price = package_price.base_price
@@ -3474,6 +3693,14 @@ class LeadConversionService:
             db_alias=alias,
         )
 
+        if parq_submission_id:
+            sub = IntakeSubmission.objects.using(alias).filter(id=parq_submission_id).first()
+            if sub and not sub.order:
+                sub.order = order
+                if user_profile and not sub.user_profile:
+                    sub.user_profile = user_profile
+                sub.save(using=alias, update_fields=['order', 'user_profile'])
+
         return {
             'order_id': str(order.id),
             'order_number': order.order_number,
@@ -3520,6 +3747,7 @@ class LeadConversionService:
         razorpay_signature: Optional[str] = None,
         order_id: Optional[str] = None,
         channel: str = 'STAFF',
+        parq_submission_id: Optional[str] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """
@@ -3920,6 +4148,24 @@ class LeadConversionService:
                         reason="Provisional package activation pending cash approval",
                     )
 
+                    # Link PAR-Q submission if present
+                    resolved_sub = None
+                    if parq_submission_id:
+                        resolved_sub = IntakeSubmission.objects.using(alias).filter(id=parq_submission_id).first()
+                    if resolved_sub:
+                        updates = []
+                        if not resolved_sub.order:
+                            resolved_sub.order = order
+                            updates.append('order')
+                        if not resolved_sub.membership:
+                            resolved_sub.membership = membership
+                            updates.append('membership')
+                        if not resolved_sub.user_profile:
+                            resolved_sub.user_profile = user_profile
+                            updates.append('user_profile')
+                        if updates:
+                            resolved_sub.save(using=alias, update_fields=updates)
+
                     LeadConversion.objects.using(alias).create(
                         lead=lead_locked,
                         user_profile=user_profile,
@@ -4055,6 +4301,24 @@ class LeadConversionService:
 
                 # Auto-complete pending followup tasks for the converted lead
                 from .models_crm import SalesFollowupTask
+                # Link PAR-Q submission if present
+                resolved_sub = None
+                if parq_submission_id:
+                    resolved_sub = IntakeSubmission.objects.using(alias).filter(id=parq_submission_id).first()
+                if resolved_sub:
+                    updates = []
+                    if not resolved_sub.order:
+                        resolved_sub.order = order
+                        updates.append('order')
+                    if not resolved_sub.membership:
+                        resolved_sub.membership = membership
+                        updates.append('membership')
+                    if not resolved_sub.user_profile:
+                        resolved_sub.user_profile = user_profile
+                        updates.append('user_profile')
+                    if updates:
+                        resolved_sub.save(using=alias, update_fields=updates)
+
                 SalesFollowupTask.objects.using(alias).filter(
                     lead=lead_locked,
                     status='PENDING',

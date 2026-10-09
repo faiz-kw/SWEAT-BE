@@ -96,6 +96,18 @@ class MetaLeadMapping(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    def clean(self):
+        super().clean()
+        from django.core.exceptions import ValidationError
+        if self.page_id and not str(self.page_id).strip().isdigit():
+            raise ValidationError({'page_id': 'Facebook Page ID must contain digits only.'})
+        if self.form_id and not str(self.form_id).strip().isdigit():
+            raise ValidationError({'form_id': 'Facebook Form ID must contain digits only.'})
+
+    def save(self, *args, **kwargs):
+        self.clean()
+        super().save(*args, **kwargs)
+
     class Meta:
         app_label = 'tenant_core'
         db_table = 'crm_meta_lead_mappings'
@@ -106,12 +118,15 @@ class MetaLeadMapping(models.Model):
 class MetaLeadImport(models.Model):
     STATUSES = [
         ('PENDING', 'Pending'),
+        ('PROCESSING', 'Processing'),
         ('IMPORTED', 'Imported'),
+        ('RETRYING', 'Retrying'),
         ('NEEDS_MAPPING', 'Needs mapping'),
         ('NEEDS_ASSIGNMENT', 'Needs branch assignment'),
         ('NEEDS_REVIEW', 'Repeat enquiry review'),
         ('RESOLVED', 'Resolved'),
         ('FAILED', 'Failed'),
+        ('DEAD_LETTER', 'Dead letter'),
     ]
     MODES = [
         ('SIMULATOR', 'Simulator'),

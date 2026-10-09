@@ -34,6 +34,11 @@ TENANT_EXEMPT_PREFIXES = (
     '/api/schema/',
     '/api/docs/',
     '/static/',
+    '/privacy-policy/',
+    '/terms-of-service/',
+    '/data-deletion/',
+    '/health/',
+    '/ready/',
 )
 
 # Thread lock to protect mutation of settings.DATABASES at runtime

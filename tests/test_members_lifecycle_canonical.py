@@ -94,6 +94,7 @@ class MembersLifecycleCanonicalTestCase(APITestCase):
             ('members', 'Member Operations'),
             ('memberships', 'Memberships & Changes'),
             ('commerce', 'Commerce & Billing'),
+            ('finance', 'Finance & Payments'),
             ('crm', 'CRM & Pipeline'),
             ('cs', 'Customer Success & Health'),
         ]:
@@ -228,9 +229,13 @@ class MembersLifecycleCanonicalTestCase(APITestCase):
         crm_mod = ModuleCatalog.objects.using('tenant_test').get(module_code='crm')
         comm_mod = ModuleCatalog.objects.using('tenant_test').get(module_code='commerce')
         mship_mod = ModuleCatalog.objects.using('tenant_test').get(module_code='memberships')
+        fin_mod = ModuleCatalog.objects.using('tenant_test').get(module_code='finance')
 
         sub_users, _ = SubmoduleCatalog.objects.using('tenant_test').get_or_create(
             module=core_mod, submodule_code='users', defaults={'name': 'Users', 'is_enabled': True}
+        )
+        sub_payments, _ = SubmoduleCatalog.objects.using('tenant_test').get_or_create(
+            module=fin_mod, submodule_code='payments', defaults={'name': 'Payments', 'is_enabled': True}
         )
         sub_health, _ = SubmoduleCatalog.objects.using('tenant_test').get_or_create(
             module=cs_mod, submodule_code='member-health', defaults={'name': 'Member Health', 'is_enabled': True}
@@ -266,6 +271,10 @@ class MembersLifecycleCanonicalTestCase(APITestCase):
             permission_code="crm.leads.view",
             defaults={"module": crm_mod, "submodule": sub_leads, "source_permission_id": uuid.uuid4(), "code": "crm.leads.view", "action": "view", "label": "Can view Leads", "is_active": True}
         )
+        self.perm_fin_pay, _ = Permission.objects.using('tenant_test').get_or_create(
+            permission_code="finance.payments.create",
+            defaults={"module": fin_mod, "submodule": sub_payments, "source_permission_id": uuid.uuid4(), "code": "finance.payments.create", "action": "create", "label": "Create Payments", "is_active": True}
+        )
 
         # 1. Org Admin Role Setup (full access)
         self.org_admin_role, _ = Role.objects.using('tenant_test').get_or_create(
@@ -276,15 +285,15 @@ class MembersLifecycleCanonicalTestCase(APITestCase):
         admin_ps, _ = RolePermissionSet.objects.using('tenant_test').get_or_create(
             role=self.org_admin_role, name="Admin PSet", defaults={"is_active": True}
         )
-        for m in [core_mod, members_mod, crm_mod, cs_mod, comm_mod, mship_mod]:
+        for m in [core_mod, members_mod, crm_mod, cs_mod, comm_mod, mship_mod, fin_mod]:
             RoleModuleAccess.objects.using('tenant_test').get_or_create(
                 role=self.org_admin_role, module=m, defaults={"permission_set": admin_ps, "can_access": True, "is_visible": True}
             )
-        for s in [sub_users, sub_health, sub_360, sub_leads]:
+        for s in [sub_users, sub_health, sub_360, sub_leads, sub_payments]:
             RoleSubmoduleAccess.objects.using('tenant_test').get_or_create(
                 role=self.org_admin_role, submodule=s, defaults={"permission_set": admin_ps, "can_access": True, "is_visible": True}
             )
-        for p in [perm_core_view, perm_core_edit, perm_core_create, self.health_perm, self.members_perm, self.leads_perm]:
+        for p in [perm_core_view, perm_core_edit, perm_core_create, self.health_perm, self.members_perm, self.leads_perm, self.perm_fin_pay]:
             RolePermissionSetItem.objects.using('tenant_test').get_or_create(
                 permission_set=admin_ps, permission=p, defaults={"granted": True, "is_allowed": True}
             )
@@ -642,3 +651,348 @@ class MembersLifecycleCanonicalTestCase(APITestCase):
         answers_dict = {a['question_text']: a['answer'] for a in sub_admin['answers']}
         self.assertEqual(answers_dict["Do you have a heart condition or high blood pressure?"], "True")
         self.assertEqual(answers_dict["Current medications"], "Beta blockers")
+
+    # =========================================================================
+    # 7. CASH RENEWAL REQUIRES APPROVAL (Action A - Gated)
+    # =========================================================================
+    def test_cash_renewal_requires_manager_approval(self):
+        old_mem, _ = self._create_active_membership()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.admin_token}")
+        response = self.client.post(
+            f"/api/v1/tenant/members/{self.member_profile.id}/renew/",
+            {
+                "package_id": str(self.pkg1.id),
+                "payment_amount": 5000.00,
+                "payment_method": "CASH",
+                "payment_provider": "CASH",
+                "reason": "Cash renewal front desk"
+            },
+            format='json'
+        )
+        set_tenant_db_alias('tenant_test')
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        data = response.json()
+        self.assertTrue(data['success'])
+        self.assertIn('submitted for manager approval', data['message'])
+
+        # Verify PaymentTransaction is PENDING
+        from apps.tenant_core.models_commerce import PaymentTransaction
+        txn = PaymentTransaction.objects.using('tenant_test').filter(order_id=data['order_id']).first()
+        self.assertIsNotNone(txn)
+        self.assertEqual(txn.status, 'PENDING')
+        self.assertEqual(txn.payment_method, 'CASH')
+
+        # Verify ApprovalRequest created
+        from apps.tenant_core.models_approvals import ApprovalRequest
+        appr = ApprovalRequest.objects.using('tenant_test').filter(entity_id=txn.id).first()
+        self.assertIsNotNone(appr)
+        self.assertEqual(appr.request_type, 'CASH_PAYMENT_APPROVAL')
+        self.assertEqual(appr.status, 'PENDING')
+
+        # Verify provisional membership is PENDING_PAYMENT with INACTIVE entitlements
+        prov_mem = Membership.objects.using('tenant_test').get(id=data['new_membership_id'])
+        self.assertEqual(prov_mem.status, 'PENDING_PAYMENT')
+        for ent in prov_mem.entitlements.using('tenant_test').all():
+            self.assertEqual(ent.status, 'INACTIVE')
+
+    # =========================================================================
+    # 8. EXTEND VALIDITY (Action C)
+    # =========================================================================
+    def test_extend_validity_updates_dates_and_preserves_sessions(self):
+        mem, _ = self._create_active_membership()
+        initial_end = mem.end_date
+        ent = mem.entitlements.using('tenant_test').first()
+        initial_rem = ent.remaining_units
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.admin_token}")
+        response = self.client.post(
+            f"/api/v1/tenant/members/{self.member_profile.id}/extend/",
+            {"days": 14, "reason": "Medical extension verified"},
+            format='json'
+        )
+        set_tenant_db_alias('tenant_test')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertTrue(data['success'])
+
+        mem.refresh_from_db(using='tenant_test')
+        self.assertEqual(mem.end_date, initial_end + timedelta(days=14))
+
+        # Sessions preserved, not reset
+        ent.refresh_from_db(using='tenant_test')
+        self.assertEqual(ent.remaining_units, initial_rem)
+
+        # Status history logged
+        hist = MembershipStatusHistory.objects.using('tenant_test').filter(
+            membership=mem, reason_code='EXTENSION_APPLIED'
+        ).first()
+        self.assertIsNotNone(hist)
+
+    # =========================================================================
+    # 9. FREEZE & UNFREEZE (Action D)
+    # =========================================================================
+    def test_freeze_and_unfreeze_flow(self):
+        mem, _ = self._create_active_membership()
+        today = timezone.now().date()
+        freeze_start = today
+        freeze_end = today + timedelta(days=9)
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.admin_token}")
+        resp_freeze = self.client.post(
+            f"/api/v1/tenant/members/{self.member_profile.id}/freeze/",
+            {
+                "freeze_from": freeze_start.isoformat(),
+                "freeze_until": freeze_end.isoformat(),
+                "reason": "Travel out of country"
+            },
+            format='json'
+        )
+        set_tenant_db_alias('tenant_test')
+        self.assertEqual(resp_freeze.status_code, status.HTTP_200_OK)
+
+        mem.refresh_from_db(using='tenant_test')
+        self.assertEqual(mem.status, 'FROZEN')
+
+        # Unfreeze
+        resp_unfreeze = self.client.post(
+            f"/api/v1/tenant/members/{self.member_profile.id}/unfreeze/",
+            {"reason": "Early return from travel"},
+            format='json'
+        )
+        set_tenant_db_alias('tenant_test')
+        self.assertEqual(resp_unfreeze.status_code, status.HTTP_200_OK)
+
+        mem.refresh_from_db(using='tenant_test')
+        self.assertEqual(mem.status, 'ACTIVE')
+
+    # =========================================================================
+    # 10. CANCEL MEMBERSHIP & FORFEIT ENTITLEMENTS (Action F)
+    # =========================================================================
+    def test_cancel_membership_and_forfeits_entitlements(self):
+        mem, _ = self._create_active_membership()
+        ent = mem.entitlements.using('tenant_test').first()
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.admin_token}")
+        response = self.client.post(
+            f"/api/v1/tenant/members/{self.member_profile.id}/cancel/",
+            {"reason": "Moving to a different city"},
+            format='json'
+        )
+        set_tenant_db_alias('tenant_test')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        mem.refresh_from_db(using='tenant_test')
+        self.assertEqual(mem.status, 'CANCELLED')
+
+        ent.refresh_from_db(using='tenant_test')
+        self.assertEqual(ent.status, 'EXPIRED')
+
+        # Forfeiture ledger entry appended
+        expiry_ledger = MembershipEntitlementLedger.objects.using('tenant_test').filter(
+            membership_entitlement=ent,
+            transaction_type='EXPIRY',
+            reason_code='MEMBERSHIP_CANCELLED'
+        ).first()
+        self.assertIsNotNone(expiry_ledger)
+
+    # =========================================================================
+    # 11. ADJUST SESSIONS BOUNDS & IDEMPOTENCY (Action G)
+    # =========================================================================
+    def test_adjust_sessions_bounds_and_idempotency(self):
+        mem, _ = self._create_active_membership()
+        ent = mem.entitlements.using('tenant_test').first()
+        initial_alloc = ent.allocated_units
+
+        # 1. Unauthorized actor -> 403
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.sales_token}")
+        resp_unauth = self.client.post(
+            f"/api/v1/tenant/members/{self.member_profile.id}/adjust-entitlement/",
+            {"entitlement_id": str(ent.id), "delta": 2, "reason": "Bonus sessions"},
+            format='json'
+        )
+        self.assertEqual(resp_unauth.status_code, status.HTTP_403_FORBIDDEN)
+
+        # 2. Empty reason -> 400
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.admin_token}")
+        resp_no_reason = self.client.post(
+            f"/api/v1/tenant/members/{self.member_profile.id}/adjust-entitlement/",
+            {"entitlement_id": str(ent.id), "delta": 2, "reason": "  "},
+            format='json'
+        )
+        self.assertEqual(resp_no_reason.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # 3. Valid adjustment with idempotency key
+        idem_key = f"ADJ-TEST-{uuid.uuid4().hex[:8]}"
+        resp_valid = self.client.post(
+            f"/api/v1/tenant/members/{self.member_profile.id}/adjust-entitlement/",
+            {"entitlement_id": str(ent.id), "delta": 3, "reason": "Customer goodwill credit", "idempotency_key": idem_key},
+            format='json'
+        )
+        set_tenant_db_alias('tenant_test')
+        self.assertEqual(resp_valid.status_code, status.HTTP_200_OK)
+        ent.refresh_from_db(using='tenant_test')
+        self.assertEqual(ent.allocated_units, initial_alloc + Decimal('3.00'))
+
+        # 4. Replay with identical idempotency key does not double-adjust
+        resp_replay = self.client.post(
+            f"/api/v1/tenant/members/{self.member_profile.id}/adjust-entitlement/",
+            {"entitlement_id": str(ent.id), "delta": 3, "reason": "Customer goodwill credit", "idempotency_key": idem_key},
+            format='json'
+        )
+        self.assertEqual(resp_replay.status_code, status.HTTP_200_OK)
+        ent.refresh_from_db(using='tenant_test')
+        self.assertEqual(ent.allocated_units, initial_alloc + Decimal('3.00'))
+
+    # =========================================================================
+    # 12. COLLECT OUTSTANDING DEBT & CASH APPROVAL (Action H)
+    # =========================================================================
+    def test_collect_outstanding_debt_and_cash_approval(self):
+        mem, _ = self._create_active_membership()
+        # Create an unpaid order of 2500
+        order = Order.objects.using('tenant_test').create(
+            order_number=f"ORD-TEST-{uuid.uuid4().hex[:6]}",
+            user_profile=self.member_profile,
+            branch=self.branch1,
+            order_type='NEW_MEMBERSHIP',
+            subtotal=Decimal('2500.00'),
+            total_amount=Decimal('2500.00'),
+            currency='INR',
+            status='PENDING_PAYMENT',
+        )
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.admin_token}")
+
+        # 1. Over-collection rejected (requesting 5000 on 2500 debt)
+        resp_over = self.client.post(
+            f"/api/v1/tenant/members/{self.member_profile.id}/collect-outstanding/",
+            {"order_id": str(order.id), "amount": 5000.00, "payment_method": "CASH"},
+            format='json'
+        )
+        self.assertEqual(resp_over.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('cannot exceed order outstanding balance', resp_over.json()['error'])
+
+        # 2. Cash collection -> 202 ACCEPTED with ApprovalRequest
+        resp_cash = self.client.post(
+            f"/api/v1/tenant/members/{self.member_profile.id}/collect-outstanding/",
+            {"order_id": str(order.id), "amount": 1000.00, "payment_method": "CASH"},
+            format='json'
+        )
+        set_tenant_db_alias('tenant_test')
+        self.assertEqual(resp_cash.status_code, status.HTTP_202_ACCEPTED)
+        self.assertIn('submitted for manager approval', resp_cash.json()['message'])
+
+        # 3. Partial Card collection (1500 of 2500) -> PARTIALLY_PAID (cash remains unsettled)
+        resp_card1 = self.client.post(
+            f"/api/v1/tenant/members/{self.member_profile.id}/collect-outstanding/",
+            {"order_id": str(order.id), "amount": 1500.00, "payment_method": "CARD"},
+            format='json'
+        )
+        set_tenant_db_alias('tenant_test')
+        self.assertEqual(resp_card1.status_code, status.HTTP_201_CREATED)
+        order.refresh_from_db(using='tenant_test')
+        self.assertEqual(order.status, 'PARTIALLY_PAID')
+
+        # 4. Final Card collection (remaining 1000) -> PAID
+        resp_card2 = self.client.post(
+            f"/api/v1/tenant/members/{self.member_profile.id}/collect-outstanding/",
+            {"order_id": str(order.id), "amount": 1000.00, "payment_method": "CARD"},
+            format='json'
+        )
+        set_tenant_db_alias('tenant_test')
+        self.assertEqual(resp_card2.status_code, status.HTTP_201_CREATED)
+        order.refresh_from_db(using='tenant_test')
+        self.assertEqual(order.status, 'PAID')
+
+    # =========================================================================
+    # 13. CHECK-IN: FACILITY VS CLASS & DEBOUNCE (Action I)
+    # =========================================================================
+    def test_check_in_facility_vs_class_and_debounce(self):
+        mem, _ = self._create_active_membership()
+        ent = mem.entitlements.using('tenant_test').first()
+        initial_consumed = ent.consumed_units
+
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.admin_token}")
+
+        # 1. Facility entry -> Does NOT consume sessions!
+        resp_fac = self.client.post(
+            f"/api/v1/tenant/members/{self.member_profile.id}/check-in/",
+            {"record_type": "FACILITY", "method": "FRONT_DESK", "branch_id": str(self.branch1.id)},
+            format='json'
+        )
+        set_tenant_db_alias('tenant_test')
+        self.assertEqual(resp_fac.status_code, status.HTTP_201_CREATED)
+        self.assertIn('Facility Entry', resp_fac.json()['message'])
+        ent.refresh_from_db(using='tenant_test')
+        self.assertEqual(ent.consumed_units, initial_consumed)
+
+        # 2. Duplicate facility check-in within 15 min debounced
+        resp_dup = self.client.post(
+            f"/api/v1/tenant/members/{self.member_profile.id}/check-in/",
+            {"record_type": "FACILITY", "method": "FRONT_DESK", "branch_id": str(self.branch1.id)},
+            format='json'
+        )
+        self.assertEqual(resp_dup.status_code, status.HTTP_200_OK)
+        self.assertIn('already checked in', resp_dup.json()['message'])
+
+        # 3. Class check-in -> Consumes 1 session unit!
+        resp_class = self.client.post(
+            f"/api/v1/tenant/members/{self.member_profile.id}/check-in/",
+            {"record_type": "CLASS", "consume_session": True, "method": "FRONT_DESK", "branch_id": str(self.branch1.id)},
+            format='json'
+        )
+        set_tenant_db_alias('tenant_test')
+        self.assertEqual(resp_class.status_code, status.HTTP_201_CREATED)
+        self.assertIn('Class Session', resp_class.json()['message'])
+        ent.refresh_from_db(using='tenant_test')
+        self.assertEqual(ent.consumed_units, initial_consumed + Decimal('1.00'))
+
+    # =========================================================================
+    # 14. MEMBER 360 ALL SIX TABS PAYLOAD & WORKSPACES
+    # =========================================================================
+    def test_member_360_all_six_tabs_payload(self):
+        mem, _ = self._create_active_membership()
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.admin_token}")
+        resp = self.client.get(f"/api/v1/tenant/members/{self.member_profile.id}/360/")
+        set_tenant_db_alias('tenant_test')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        data = resp.json()
+
+        # Tab 1: Overview
+        self.assertIn('overview', data)
+        self.assertIn('contact', data['overview'])
+        self.assertIn('entitlement_summary', data['overview'])
+        self.assertIn('current_membership', data['overview'])
+
+        # Tab 2: Timeline
+        self.assertIn('timeline', data)
+        self.assertIsInstance(data['timeline'], list)
+
+        # Tab 3: Memberships & Passbook
+        self.assertIn('memberships', data)
+        self.assertIn('passbook', data)
+        self.assertIn('balances', data['passbook'])
+        self.assertIn('ledger', data['passbook'])
+
+        # Tab 4: Bookings & Attendance
+        self.assertIn('bookings_and_attendance', data)
+        self.assertIn('upcoming_bookings', data['bookings_and_attendance'])
+        self.assertIn('past_bookings', data['bookings_and_attendance'])
+        self.assertIn('attendance_records', data['bookings_and_attendance'])
+
+        # Tab 5: Finance
+        self.assertIn('finance', data)
+        self.assertIn('summary', data['finance'])
+        self.assertIn('orders', data['finance'])
+        self.assertIn('payments', data['finance'])
+
+        # Tab 6: Health & Forms
+        self.assertIn('health_and_forms', data)
+        self.assertIn('submissions', data['health_and_forms'])
+
+    def test_membership_branch_histories_endpoint(self):
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.admin_token}")
+        resp = self.client.get("/api/v1/tenant/membership-branch-histories/")
+        set_tenant_db_alias('tenant_test')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        data = resp.json()
+        self.assertIn('results', data)

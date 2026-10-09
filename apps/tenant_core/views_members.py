@@ -33,7 +33,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.db.models import Q, Sum
-from config.routers import get_tenant_db_alias
+from config.routers import get_tenant_db_alias, set_tenant_db_alias
 
 from .models_org import Branch, Organization
 from .models_users import TenantUser
@@ -83,12 +83,15 @@ logger = logging.getLogger(__name__)
 
 
 def _get_db(request):
-    return (
+    alias = (
         get_tenant_db_alias()
         or getattr(getattr(request, 'user', None), '_db_alias', None)
         or getattr(request, '_tenant_db_alias', None)
         or 'default'
     )
+    if alias and alias != 'default':
+        set_tenant_db_alias(alias)
+    return alias
 
 
 def _get_org(request):
@@ -876,7 +879,12 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
 
     # 7. Health & Forms (Intake submissions with sensitive health permission check)
     can_view_health = False
-    if requesting_user and (getattr(requesting_user, 'is_superuser', False) or getattr(requesting_user, 'is_staff', False)):
+    if requesting_user and (
+        getattr(requesting_user, 'is_superuser', False) or
+        getattr(requesting_user, 'is_staff', False) or
+        getattr(requesting_user, 'user_type', '') in ['STAFF', 'ADMIN', 'SUPERADMIN'] or
+        (profile.user_id and getattr(requesting_user, 'id', None) == profile.user_id)
+    ):
         can_view_health = True
     elif requesting_user:
         try:
@@ -895,28 +903,101 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
     intake_subs = (
         IntakeSubmission.objects.using(alias)
         .filter(user_profile=profile)
-        .select_related('intake_form')
+        .select_related('intake_form', 'program', 'order', 'membership', 'submitted_by_user')
         .prefetch_related('answers', 'answers__question')
         .order_by('-submitted_at')
     )
     for sub in intake_subs:
         answers = []
         if can_view_health:
-            for ans in sub.answers.all():
-                val = ans.text_value or ans.numeric_value or ans.boolean_value or ans.date_value or ans.json_value
-                answers.append({
-                    'question_id': str(ans.question.id),
-                    'question_text': ans.question.question_text,
-                    'question_type': ans.question.question_type,
-                    'answer': str(val) if val is not None else '',
-                })
+            snapshot_questions = sub.form_snapshot.get('questions') if isinstance(getattr(sub, 'form_snapshot', None), dict) else None
+            if snapshot_questions:
+                for sq in snapshot_questions:
+                    ans_val = sq.get('submitted_answer')
+                    answers.append({
+                        'question_id': str(sq.get('id', '')),
+                        'question_text': sq.get('question_text', ''),
+                        'question_type': sq.get('question_type', 'TEXT'),
+                        'category': sq.get('category', 'GENERAL'),
+                        'is_sensitive': False,
+                        'answer': str(ans_val) if ans_val is not None else '',
+                        'boolean_value': ans_val if isinstance(ans_val, bool) else None,
+                        'text_value': str(ans_val) if ans_val is not None else '',
+                    })
+            else:
+                for ans in sub.answers.all():
+                    val = ans.text_value or ans.numeric_value or ans.boolean_value or ans.date_value or ans.json_value
+                    answers.append({
+                        'question_id': str(ans.question.id) if ans.question else '',
+                        'question_text': ans.question.question_text if ans.question else '',
+                        'question_type': ans.question.question_type if ans.question else 'TEXT',
+                        'category': getattr(ans.question, 'category', 'GENERAL') if ans.question else 'GENERAL',
+                        'is_sensitive': getattr(ans.question, 'is_sensitive', False) if ans.question else False,
+                        'answer': str(val) if val is not None else '',
+                        'boolean_value': ans.boolean_value,
+                        'numeric_value': float(ans.numeric_value) if ans.numeric_value is not None else None,
+                        'text_value': ans.text_value,
+                    })
+
+        meta = getattr(sub, 'metadata', {}) or {}
+        accepted_name = meta.get('accepted_by_name') or (sub.submitted_by_user.display_name if sub.submitted_by_user else (sub.signer_identity or 'Member'))
+        signer_type = meta.get('signer_type', 'MEMBER_DIRECT')
+        channel = meta.get('channel', 'MEMBER_PORTAL')
+
+        historical_title = (sub.form_snapshot.get('form_title') if isinstance(getattr(sub, 'form_snapshot', None), dict) else None) or (getattr(sub.intake_form, 'name', None) or 'PAR-Q Form')
+        historical_version = (sub.form_snapshot.get('version_number') if isinstance(getattr(sub, 'form_snapshot', None), dict) else None) or (getattr(sub.intake_form, 'version_number', 1) if sub.intake_form else 1)
+        historical_ag_title = (sub.form_snapshot.get('agreement_title') if isinstance(getattr(sub, 'form_snapshot', None), dict) else None) or (getattr(sub.intake_form, 'agreement_title', 'Physical Activity Readiness & Assumption of Risk Agreement') if sub.intake_form else 'Physical Activity Readiness & Assumption of Risk Agreement')
+
         submissions_data.append({
             'id': str(sub.id),
-            'form_title': getattr(sub.intake_form, 'name', None) or getattr(sub.intake_form, 'title', None) or 'Health Questionnaire',
+            'form_id': str(sub.intake_form.id) if sub.intake_form else None,
+            'form_title': historical_title,
+            'form_version': historical_version,
+            'form_type': getattr(sub.intake_form, 'form_type', 'PAR_Q') if sub.intake_form else 'PAR_Q',
             'submitted_at': sub.submitted_at.isoformat(),
-            'status': 'COMPLETED',
+            'status': getattr(sub, 'status', 'COMPLETED') or 'COMPLETED',
+            'program_name': sub.program.name if sub.program else None,
+            'order_number': sub.order.order_number if sub.order else None,
+            'membership_number': sub.membership.membership_number if sub.membership else None,
+            'agreement_accepted': getattr(sub, 'agreement_accepted', False),
+            'agreement_accepted_at': sub.agreement_accepted_at.isoformat() if getattr(sub, 'agreement_accepted_at', None) else None,
+            'agreement_title': historical_ag_title,
+            'agreement_text_snapshot': getattr(sub, 'agreement_text_snapshot', '') or (getattr(sub.intake_form, 'agreement_text', '') if sub.intake_form else ''),
+            'accepted_by_name': accepted_name,
+            'signer_type': signer_type,
+            'channel': channel,
+            'submitted_by': sub.submitted_by_user.display_name if sub.submitted_by_user else accepted_name,
+            'signature_data': sub.signature_data if can_view_health else None,
+            'signature_date': sub.signature_date.isoformat() if getattr(sub, 'signature_date', None) else None,
+            'signer_identity': sub.signer_identity or accepted_name,
             'sensitive_data_restricted': not can_view_health,
             'answers': answers,
+            'form_snapshot': getattr(sub, 'form_snapshot', None),
+        })
+
+    # Build purchase-specific PAR-Q requirements per membership
+    parq_requirements = []
+    mem_records = (
+        Membership.objects.using(alias)
+        .filter(user_profile=profile)
+        .select_related('program', 'package', 'package_version', 'parq_form', 'parq_submission')
+        .order_by('-created_at')
+    )
+    for m in mem_records:
+        p_name = m.program.name if m.program else (m.package.program.name if m.package and m.package.program else 'General')
+        pkg_name = m.package.name if m.package else 'Membership'
+        form_title = m.parq_form.name if m.parq_form else 'PAR-Q Form'
+        parq_requirements.append({
+            'membership_id': str(m.id),
+            'membership_number': m.membership_number,
+            'program_name': p_name,
+            'package_name': pkg_name,
+            'membership_status': m.status,
+            'parq_status': getattr(m, 'parq_status', 'PENDING'),
+            'parq_completed_at': m.parq_completed_at.isoformat() if getattr(m, 'parq_completed_at', None) else None,
+            'form_title': form_title,
+            'form_id': str(m.parq_form.id) if m.parq_form else None,
+            'submission_id': str(m.parq_submission.id) if getattr(m, 'parq_submission', None) else None,
         })
 
     # Next booking for Overview
@@ -988,6 +1069,10 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         'health_and_forms': {
             'submissions': submissions_data,
         },
+        'par_q_form': {
+            'requirements': parq_requirements,
+            'submissions': submissions_data,
+        },
     }
 
 
@@ -1047,6 +1132,8 @@ class MemberViewSet(viewsets.ViewSet):
             Q(memberships__isnull=False)
             | Q(lead_conversions__isnull=False)
             | Q(orders__status='PAID')
+            | (Q(member_number__isnull=False) & ~Q(member_number=''))
+            | Q(member_type='MEMBER')
             | (Q(acquisition_source='MANUAL_CREATE') & Q(member_number__isnull=False) & ~Q(member_number=''))
         )
         return qs.filter(member_condition).distinct()
@@ -1472,6 +1559,7 @@ class MemberViewSet(viewsets.ViewSet):
         Canonical Membership Renewal:
         Preserves existing historical Membership unchanged and activates a new commercial Membership
         contract via Order & Payment with contract snapshot and entitlement provisioning.
+        Enforces start date rules, carry-forward handling, and payment approval workflows.
         """
         alias = _get_db(request)
         org = _get_org(request)
@@ -1541,72 +1629,179 @@ class MemberViewSet(viewsets.ViewSet):
                 db_alias=alias,
             )
 
-            # 2. Record payment (safe/test payment)
+            payment_provider = request.data.get('payment_provider', 'CARD')
+            payment_method = request.data.get('payment_method', 'CARD')
+            is_cash = str(payment_provider).upper() == 'CASH' or str(payment_method).upper() == 'CASH'
             payment_amount = request.data.get('payment_amount')
             pay_amt = Decimal(str(payment_amount)) if payment_amount is not None else order.total_amount
-            if pay_amt > Decimal('0.00'):
+            carry_forward = request.data.get('carry_forward', True)
+
+            if is_cash and pay_amt > Decimal('0.00'):
+                txn = PaymentTransaction.objects.using(alias).create(
+                    id=uuid.uuid4(),
+                    order=order,
+                    user_profile=profile,
+                    amount=pay_amt,
+                    currency=order.currency or 'INR',
+                    provider='CASH',
+                    payment_method='CASH',
+                    status='PENDING',
+                    idempotency_key=f"CASH-RENEW-{uuid.uuid4().hex[:12]}",
+                    metadata={
+                        'collected_via': 'MEMBERSHIP_RENEWAL',
+                        'collected_by_user_id': str(request.user.id),
+                        'collected_by_name': getattr(request.user, 'display_name', 'Staff'),
+                        'member_profile_id': str(profile.id),
+                    }
+                )
+                from .services_approvals import AdminApprovalService
+                approval_req = AdminApprovalService.create_approval_request(
+                    organization=org,
+                    request_type='CASH_PAYMENT_APPROVAL',
+                    entity_type='PaymentTransaction',
+                    entity_id=txn.id,
+                    requested_by_user=request.user,
+                    requested_payload={
+                        'order_id': str(order.id),
+                        'order_number': order.order_number,
+                        'member_id': str(profile.id),
+                        'member_name': f"{profile.first_name_snapshot} {profile.last_name_snapshot}".strip() or profile.user.display_name,
+                        'amount': str(pay_amt),
+                        'currency': order.currency,
+                        'branch_id': str(order.branch_id or profile.preferred_branch_id or ''),
+                        'branch_name': profile.preferred_branch.name if profile.preferred_branch else '',
+                        'recorded_by': getattr(request.user, 'display_name', 'Staff'),
+                        'recorded_by_id': str(request.user.id),
+                        'source': 'RENEWAL_CASH_APPROVAL',
+                    },
+                    db_alias=alias,
+                )
+                txn.metadata['approval_request_id'] = str(approval_req.id)
+                txn.save(using=alias, update_fields=['metadata'])
+
+                order_item = order.items.first()
+                new_membership = MembershipLifecycleService.activate_membership_from_order(
+                    order=order,
+                    order_item=order_item,
+                    start_date=renewal_start,
+                    db_alias=alias,
+                    created_by_user=request.user,
+                )
+                new_membership.status = 'PENDING_PAYMENT'
+                new_membership.legacy_reference = f"PROVISIONAL_CASH_PENDING:{approval_req.id}"
+                new_membership.save(using=alias, update_fields=['status', 'legacy_reference', 'updated_at'])
+                new_membership.entitlements.using(alias).update(status='INACTIVE')
+
+                return Response({
+                    'success': True,
+                    'status': 'PENDING_APPROVAL',
+                    'message': f"Renewal order {order.order_number} created. Cash payment of ₹{pay_amt} submitted for manager approval (Approval Req: {approval_req.id}).",
+                    'old_membership_id': str(active_m.id),
+                    'new_membership_id': str(new_membership.id),
+                    'approval_request_id': str(approval_req.id),
+                    'order_id': str(order.id),
+                    'member': serialize_member(profile, alias),
+                }, status=status.HTTP_202_ACCEPTED)
+
+            elif pay_amt == Decimal('0.00'):
+                order_item = order.items.first()
+                new_membership = MembershipLifecycleService.activate_membership_from_order(
+                    order=order,
+                    order_item=order_item,
+                    start_date=renewal_start,
+                    db_alias=alias,
+                    created_by_user=request.user,
+                )
+                new_membership.status = 'PENDING_PAYMENT'
+                new_membership.save(using=alias, update_fields=['status', 'updated_at'])
+                new_membership.entitlements.using(alias).update(status='INACTIVE')
+
+                return Response({
+                    'success': True,
+                    'message': f"Renewal order {order.order_number} created (Payment Pending). Membership will activate upon payment.",
+                    'old_membership_id': str(active_m.id),
+                    'new_membership_id': str(new_membership.id),
+                    'order_id': str(order.id),
+                    'member': serialize_member(profile, alias),
+                }, status=status.HTTP_201_CREATED)
+
+            else:
                 CommerceService.record_payment(
                     order_id=str(order.id),
                     amount=pay_amt,
-                    provider=request.data.get('payment_provider', 'CASH'),
-                    payment_method=request.data.get('payment_method', 'CASH'),
+                    provider=payment_provider,
+                    payment_method=payment_method,
                     actor=request.user,
                     db_alias=alias,
                 )
+                order_item = order.items.first()
+                new_membership = MembershipLifecycleService.activate_membership_from_order(
+                    order=order,
+                    order_item=order_item,
+                    start_date=renewal_start,
+                    db_alias=alias,
+                    created_by_user=request.user,
+                )
 
-            # 3. Activate new membership contract snapshot & entitlements
-            order_item = order.items.first()
-            new_membership = MembershipLifecycleService.activate_membership_from_order(
-                order=order,
-                order_item=order_item,
-                start_date=renewal_start,
-                db_alias=alias,
-                created_by_user=request.user,
-            )
+                if carry_forward:
+                    for old_ent in active_m.entitlements.using(alias).filter(status='ACTIVE'):
+                        rem = old_ent.remaining_units or Decimal('0.00')
+                        if rem > Decimal('0.00'):
+                            matching_ent = new_membership.entitlements.using(alias).filter(entitlement_type=old_ent.entitlement_type).first()
+                            if matching_ent:
+                                MembershipLifecycleService.adjust_entitlement(
+                                    membership=new_membership,
+                                    entitlement_type=matching_ent.entitlement_type,
+                                    units_delta=rem,
+                                    reason_code='CARRY_FORWARD',
+                                    reason_text=f"Carried forward {rem} unused units from {active_m.membership_number}",
+                                    actor_user=request.user,
+                                    db_alias=alias,
+                                )
 
-            # 4. Status history on prior membership
-            MembershipStatusHistory.objects.using(alias).create(
-                membership=active_m,
-                from_status=active_m.status,
-                to_status=active_m.status,
-                reason_code='RENEWAL_CONTRACT_CREATED',
-                reason_text=f"Renewed under new membership contract {new_membership.membership_number} (Order {order.order_number}).",
-                changed_by_user=request.user,
-            )
+                # Status history on prior membership
+                MembershipStatusHistory.objects.using(alias).create(
+                    membership=active_m,
+                    from_status=active_m.status,
+                    to_status=active_m.status,
+                    reason_code='RENEWAL_CONTRACT_CREATED',
+                    reason_text=f"Renewed under new membership contract {new_membership.membership_number} (Order {order.order_number}).",
+                    changed_by_user=request.user,
+                )
 
-            # 5. Status history on new membership
-            MembershipStatusHistory.objects.using(alias).create(
-                membership=new_membership,
-                from_status='DRAFT',
-                to_status='ACTIVE',
-                reason_code='RENEWAL_ACTIVATED',
-                reason_text=f"Activated via renewal of {active_m.membership_number}.",
-                changed_by_user=request.user,
-            )
+                # Status history on new membership
+                MembershipStatusHistory.objects.using(alias).create(
+                    membership=new_membership,
+                    from_status='DRAFT',
+                    to_status='ACTIVE',
+                    reason_code='RENEWAL_ACTIVATED',
+                    reason_text=f"Activated via renewal of {active_m.membership_number}.",
+                    changed_by_user=request.user,
+                )
 
-            # 6. Audit event
-            record_business_audit(
-                organization=org,
-                branch=branch,
-                module='memberships',
-                action_code='MEMBERSHIP_RENEWED',
-                entity_type='Membership',
-                entity_id=new_membership.id,
-                actor_user=request.user,
-                event_description=f"Membership {active_m.membership_number} renewed as {new_membership.membership_number}",
-                db_alias=alias,
-            )
+                # Audit event
+                record_business_audit(
+                    organization=org,
+                    branch=branch,
+                    module='memberships',
+                    action_code='MEMBERSHIP_RENEWED',
+                    entity_type='Membership',
+                    entity_id=new_membership.id,
+                    actor_user=request.user,
+                    event_description=f"Membership {active_m.membership_number} renewed as {new_membership.membership_number}",
+                    db_alias=alias,
+                )
 
-        return Response({
-            'success': True,
-            'message': f"Membership renewed successfully as {new_membership.membership_number}.",
-            'old_membership_id': str(active_m.id),
-            'new_membership_id': str(new_membership.id),
-            'start_date': str(new_membership.start_date),
-            'end_date': str(new_membership.end_date),
-            'order_id': str(order.id),
-            'member': serialize_member(profile, alias),
-        }, status=status.HTTP_201_CREATED)
+                return Response({
+                    'success': True,
+                    'message': f"Membership renewed successfully as {new_membership.membership_number}.",
+                    'old_membership_id': str(active_m.id),
+                    'new_membership_id': str(new_membership.id),
+                    'start_date': str(new_membership.start_date),
+                    'end_date': str(new_membership.end_date),
+                    'order_id': str(order.id),
+                    'member': serialize_member(profile, alias),
+                }, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['post'], url_path='upgrade')
     def upgrade(self, request, pk=None):
@@ -1895,12 +2090,27 @@ class MemberViewSet(viewsets.ViewSet):
     def adjust_entitlement(self, request, pk=None):
         """
         Controlled adjustment of session entitlement units with append-only ledger entry.
+        Restricted to authorized staff. Enforces signed quantity, non-empty reason,
+        reservation bounds protection, and idempotent replay.
         """
         alias = _get_db(request)
         org = _get_org(request)
         profile = self.get_member_profile(alias, org, pk)
         if not profile:
             return Response({'detail': 'Member not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Enforce staff permission
+        user = request.user
+        if not (getattr(user, 'is_superuser', False) or getattr(user, 'is_staff', False) or getattr(user, '_auth_type', None) == 'platform'):
+            from .rbac_engine import RBACAuthorizationEngine
+            allowed, _, _ = RBACAuthorizationEngine.evaluate(
+                user=user,
+                required_permission='core.users.edit',
+                branch_id=str(profile.preferred_branch_id) if profile.preferred_branch_id else None,
+                request=request,
+            )
+            if not allowed:
+                return Response({'error': 'Permission denied: authorized staff permission required to adjust sessions.'}, status=status.HTTP_403_FORBIDDEN)
 
         active_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
         if not active_m:
@@ -1910,27 +2120,104 @@ class MemberViewSet(viewsets.ViewSet):
                 'error': 'Cannot manually adjust sessions on a provisional membership pending cash approval. Await payment approval or update payment.'
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        entitlement_type = request.data.get('entitlement_type', 'HOME_BRANCH_SESSION')
-        units_delta = Decimal(str(request.data.get('units_delta', '1.0')))
+        entitlement_type = request.data.get('entitlement_type')
+        if not entitlement_type and request.data.get('entitlement_id'):
+            ent_match = MembershipEntitlement.objects.using(alias).filter(id=request.data.get('entitlement_id')).first()
+            if ent_match:
+                entitlement_type = ent_match.entitlement_type
+        if not entitlement_type:
+            return Response({'error': 'Entitlement pool is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        raw_delta = request.data.get('units_delta') if request.data.get('units_delta') is not None else request.data.get('delta')
+        if raw_delta is None:
+            return Response({'error': 'Units delta quantity is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            units_delta = Decimal(str(raw_delta))
+        except Exception:
+            return Response({'error': 'Invalid numerical value for units_delta.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if units_delta == Decimal('0.00'):
+            return Response({'error': 'Adjustment quantity cannot be zero.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        reason_text = request.data.get('reason_text') or request.data.get('reason')
+        if not reason_text or not str(reason_text).strip():
+            return Response({'error': 'A specific reason is required for session adjustment.'}, status=status.HTTP_400_BAD_REQUEST)
+
         reason_code = request.data.get('reason_code', 'STAFF_ADJUSTMENT')
-        reason_text = request.data.get('reason_text', 'Admin session credit adjustment')
+        idempotency_key = request.data.get('idempotency_key') or request.headers.get('Idempotency-Key')
+
+        # Idempotency check: retrying must not apply the adjustment twice
+        if idempotency_key:
+            from .models_audit_outbox import IdempotencyRecord
+            existing_record = IdempotencyRecord.objects.using(alias).filter(
+                organization=org,
+                idempotency_key=idempotency_key,
+                operation_type='ADJUST_ENTITLEMENT',
+                status='COMPLETED',
+            ).first()
+            if existing_record and existing_record.response_snapshot:
+                return Response(existing_record.response_snapshot, status=status.HTTP_200_OK)
+
+        # Check reservations: respect reservations and prevent invalid balances
+        from .models_bookings import Booking
+        active_reservations = Booking.objects.using(alias).filter(
+            user_profile=profile,
+            membership=active_m,
+            status__in=['CONFIRMED', 'RESERVED', 'WAITLISTED'],
+            occurrence__start_at__gte=timezone.now(),
+        ).count()
+
+        ent = MembershipEntitlement.objects.using(alias).filter(membership=active_m, entitlement_type=entitlement_type).first()
+        if ent and not ent.is_unlimited and units_delta < Decimal('0.00'):
+            current_rem = ent.remaining_units or Decimal('0.00')
+            if (current_rem + units_delta) < Decimal(str(active_reservations)):
+                return Response({
+                    'error': f"Cannot reduce session allocation by {abs(units_delta)} units. Member has {active_reservations} active upcoming booking reservation(s). Available balance ({current_rem}) would fall below reserved capacity."
+                }, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            ledger = MembershipLifecycleService.adjust_entitlement(
-                membership=active_m,
-                entitlement_type=entitlement_type,
-                units_delta=units_delta,
-                reason_code=reason_code,
-                reason_text=reason_text,
-                actor_user=request.user,
-                db_alias=alias,
-            )
-            return Response({
-                'success': True,
-                'message': f"Adjusted {units_delta:+f} {entitlement_type} units (Balance: {ledger.balance_after})",
-                'balance_after': float(ledger.balance_after) if ledger.balance_after is not None else None,
-                'member': serialize_member(profile, alias),
-            }, status=status.HTTP_200_OK)
+            with transaction.atomic(using=alias):
+                ledger = MembershipLifecycleService.adjust_entitlement(
+                    membership=active_m,
+                    entitlement_type=entitlement_type,
+                    units_delta=units_delta,
+                    reason_code=reason_code,
+                    reason_text=reason_text,
+                    actor_user=request.user,
+                    db_alias=alias,
+                )
+                record_business_audit(
+                    organization=org,
+                    branch=active_m.home_branch,
+                    module='memberships',
+                    action_code='ENTITLEMENT_ADJUSTED',
+                    entity_type='MembershipEntitlement',
+                    entity_id=ledger.membership_entitlement.id,
+                    actor_user=request.user,
+                    event_description=f"Adjusted {units_delta:+f} {entitlement_type} units: {reason_text}",
+                    db_alias=alias,
+                )
+                resp_data = {
+                    'success': True,
+                    'message': f"Adjusted {units_delta:+f} {entitlement_type} units (Balance: {ledger.balance_after})",
+                    'balance_after': float(ledger.balance_after) if ledger.balance_after is not None else None,
+                    'member': serialize_member(profile, alias),
+                }
+
+                if idempotency_key:
+                    from .models_audit_outbox import IdempotencyRecord
+                    IdempotencyRecord.objects.using(alias).create(
+                        organization=org,
+                        idempotency_key=idempotency_key,
+                        operation_type='ADJUST_ENTITLEMENT',
+                        actor_user=request.user,
+                        resource_type='MembershipEntitlement',
+                        resource_id=ledger.membership_entitlement.id,
+                        status='COMPLETED',
+                        response_snapshot=resp_data,
+                    )
+
+            return Response(resp_data, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -2096,8 +2383,8 @@ class MemberViewSet(viewsets.ViewSet):
 
         order_id = request.data.get('order_id')
         amount = request.data.get('amount')
-        provider = request.data.get('provider', 'CASH')
-        payment_method = request.data.get('payment_method', 'CASH')
+        payment_method = request.data.get('payment_method') or 'CASH'
+        provider = request.data.get('provider') or ('CASH' if str(payment_method).upper() == 'CASH' else 'INTERNAL_TERMINAL')
         idempotency_key = request.data.get('idempotency_key') or request.headers.get('Idempotency-Key')
 
         if not order_id:
@@ -2236,7 +2523,9 @@ class MemberViewSet(viewsets.ViewSet):
     @action(detail=True, methods=['post'], url_path='check-in')
     def check_in(self, request, pk=None):
         """
-        Records member attendance check-in and consumes entitlement session if active.
+        Records member attendance check-in.
+        Distinguishes facility check-in from class attendance and session consumption.
+        Prevents duplicate check-in within recent debounce window.
         """
         alias = _get_db(request)
         org = _get_org(request)
@@ -2246,63 +2535,136 @@ class MemberViewSet(viewsets.ViewSet):
 
         loc_id = request.data.get('location') or request.data.get('branch_id')
         method = request.data.get('method', 'Front Desk')
+        record_type = request.data.get('record_type', 'FACILITY').upper()
+        booking_id = request.data.get('booking_id')
+        consume_session = request.data.get('consume_session', False)
+
         branch = None
         if loc_id:
             branch = Branch.objects.using(alias).filter(id=loc_id).first()
         if not branch:
             branch = profile.preferred_branch or Branch.objects.using(alias).filter(organization=org).first()
 
-        record = None
-        if branch:
+        now = timezone.now()
+
+        # Prevent duplicate check-in within 15 minutes at the same branch or for the same booking
+        recent_cutoff = now - timedelta(minutes=15)
+        if booking_id:
+            existing_booking_att = AttendanceRecord.objects.using(alias).filter(
+                booking_id=booking_id,
+                status='PRESENT',
+            ).first()
+            if existing_booking_att:
+                return Response({
+                    'success': True,
+                    'message': f"Member already checked in for this booking at {existing_booking_att.check_in_at.strftime('%H:%M') if existing_booking_att.check_in_at else 'earlier'}.",
+                    'record': {
+                        'id': str(existing_booking_att.id),
+                        'check_in_time': existing_booking_att.check_in_at.isoformat() if existing_booking_att.check_in_at else str(now),
+                        'branch_id': str(branch.id) if branch else None,
+                    }
+                }, status=status.HTTP_200_OK)
+        else:
+            existing_recent = AttendanceRecord.objects.using(alias).filter(
+                user_profile=profile,
+                branch=branch,
+                status='PRESENT',
+                check_in_at__gte=recent_cutoff,
+            ).first()
+            if existing_recent and not consume_session and record_type == 'FACILITY':
+                return Response({
+                    'success': True,
+                    'message': f"Member already checked in at {branch.name if branch else 'branch'} at {existing_recent.check_in_at.strftime('%H:%M') if existing_recent.check_in_at else 'earlier'}. Duplicate check-in skipped.",
+                    'record': {
+                        'id': str(existing_recent.id),
+                        'check_in_time': existing_recent.check_in_at.isoformat() if existing_recent.check_in_at else str(now),
+                        'branch_id': str(branch.id) if branch else None,
+                    }
+                }, status=status.HTTP_200_OK)
+
+        booking = None
+        if booking_id:
+            from .models_bookings import Booking
+            booking = Booking.objects.using(alias).filter(id=booking_id, user_profile=profile).first()
+            if not booking:
+                return Response({'error': 'Class booking not found for this member.'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Log AccessEvent (ENTRY)
+        from .services_bookings import BookingAttendanceService
+        try:
+            BookingAttendanceService.log_access_event(
+                user_profile=profile,
+                branch=branch,
+                event_type='ENTRY',
+                device_reference='FRONT_DESK_PORTAL',
+                booking=booking,
+                db_alias=alias,
+            )
+        except Exception as e:
+            logger.warning(f"Could not log access event: {e}")
+
+        # If booking exists, record attendance via BookingAttendanceService
+        if booking:
+            record = BookingAttendanceService.record_attendance(
+                booking=booking,
+                status='PRESENT',
+                check_in_method='FRONT_DESK' if 'desk' in method.lower() else 'QR',
+                marked_by_user=request.user,
+                db_alias=alias,
+            )
+        else:
             record = AttendanceRecord.objects.using(alias).create(
                 user_profile=profile,
                 branch=branch,
                 status='PRESENT',
                 check_in_status='SUCCESSFUL',
                 check_in_method='FRONT_DESK' if 'desk' in method.lower() else 'QR',
-                check_in_at=timezone.now(),
+                check_in_at=now,
+                marked_by_user=request.user,
             )
-
-            # Consume entitlement session from active membership if available
-            active_m = (
-                Membership.objects.using(alias)
-                .filter(user_profile=profile, status='ACTIVE')
-                .order_by('-created_at')
-                .first()
-            )
-            if active_m:
-                # Prioritize home branch session entitlement if check-in is at home branch
-                is_home = (branch and active_m.home_branch and branch.id == active_m.home_branch.id)
-                ent = None
-                if is_home:
-                    ent = MembershipEntitlement.objects.using(alias).filter(
-                        membership=active_m, status='ACTIVE', entitlement_type__icontains='HOME'
-                    ).first()
-                if not ent:
-                    ent = MembershipEntitlement.objects.using(alias).filter(
-                        membership=active_m, status='ACTIVE'
-                    ).first()
-                if ent:
-                    try:
-                        MembershipLifecycleService.consume_entitlement(
-                            membership=active_m,
-                            entitlement_type=ent.entitlement_type,
-                            units=Decimal('1.00'),
-                            reason_text=f"Check-in at {branch.name}",
-                            created_by_user=request.user,
-                            db_alias=alias,
-                        )
-                    except Exception as e:
-                        logger.warning(f"Entitlement consumption skipped on check-in: {e}")
+            # Only consume entitlement if explicitly requested (e.g. drop-in class or configured policy)
+            if consume_session or record_type == 'CLASS':
+                active_m = (
+                    Membership.objects.using(alias)
+                    .filter(user_profile=profile, status='ACTIVE')
+                    .order_by('-created_at')
+                    .first()
+                )
+                if active_m:
+                    is_home = (branch and active_m.home_branch and branch.id == active_m.home_branch.id)
+                    ent = None
+                    if is_home:
+                        ent = MembershipEntitlement.objects.using(alias).filter(
+                            membership=active_m, status='ACTIVE', entitlement_type__icontains='HOME'
+                        ).first()
+                    if not ent:
+                        ent = MembershipEntitlement.objects.using(alias).filter(
+                            membership=active_m, status='ACTIVE'
+                        ).first()
+                    if ent:
+                        try:
+                            MembershipLifecycleService.consume_entitlement(
+                                membership=active_m,
+                                entitlement_type=ent.entitlement_type,
+                                units=Decimal('1.00'),
+                                reason_text=f"Class session check-in at {branch.name if branch else 'branch'}",
+                                created_by_user=request.user,
+                                db_alias=alias,
+                            )
+                        except Exception as e:
+                            logger.warning(f"Entitlement consumption error: {e}")
 
         return Response({
             'success': True,
-            'message': f"Check-in recorded for {profile.first_name_snapshot or 'Member'} at {branch.name if branch else 'Branch'}",
+            'message': f"Check-in recorded for {profile.first_name_snapshot or 'Member'} at {branch.name if branch else 'Branch'} ({'Class Session' if (booking or consume_session or record_type == 'CLASS') else 'Facility Entry'}).",
             'record': {
                 'id': str(record.id) if record else None,
-                'check_in_time': str(timezone.now()),
+                'check_in_time': str(now),
                 'branch_id': str(branch.id) if branch else None,
+                'booking_id': str(booking.id) if booking else None,
+                'type': 'CLASS' if (booking or consume_session or record_type == 'CLASS') else 'FACILITY',
             },
+            'member': serialize_member(profile, alias),
         }, status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=['get'], url_path='payment-methods')

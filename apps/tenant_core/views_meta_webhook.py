@@ -1,16 +1,17 @@
-﻿"""
-apps/tenant_core/views_meta_webhook.py — Public Webhook Gateway for Meta Lead Ads.
+"""
+apps/tenant_core/views_meta_webhook.py - Public Webhook Gateway for Meta Lead Ads.
 
 Endpoints:
-- GET /api/v1/webhooks/meta/leads/ — Webhook challenge verification (hub.mode, hub.challenge, hub.verify_token)
-- POST /api/v1/webhooks/meta/leads/ — Inbound leadgen notification receiver (X-Hub-Signature-256 HMAC validated)
-- GET/POST /api/v1/webhooks/meta/leads/<tenant_public_id>/ — Tenant-specific endpoint for dedicated Meta apps
+- GET /api/v1/webhooks/meta/leads/ - Webhook challenge verification (hub.mode, hub.challenge, hub.verify_token)
+- POST /api/v1/webhooks/meta/leads/ - Inbound leadgen notification receiver (X-Hub-Signature-256 HMAC validated)
+- GET/POST /api/v1/webhooks/meta/leads/<tenant_public_id>/ - Tenant-specific endpoint for dedicated Meta apps
 
 Security:
 - Strict HMAC-SHA256 signature verification over raw request body using META_APP_SECRET.
 - Safe tenant resolution: Tenant is determined by verified Page ID registration in Master DB, NEVER from untrusted client parameters.
 - Durable idempotency: Receipts committed to tenant DB before async task dispatch.
 - Bounded processing: Returns HTTP 200 within <2s, offloading Graph API retrieval to Celery worker.
+- Production-safe structured logging on all lifecycle events.
 """
 import json
 import logging
@@ -30,6 +31,16 @@ from apps.tenant_core.meta_lead_rules import verify_signature
 from apps.tenant_core.services_meta_graph import get_meta_app_credentials
 from apps.tenant_core.services_meta_leads import receive_live_webhook_event
 from apps.tenant_core.tasks_meta_leads import process_meta_lead_import_task
+from apps.tenant_core.meta_logging import (
+    log_meta_event,
+    EVT_WEBHOOK_RECEIVED,
+    EVT_SIGNATURE_FAILED,
+    EVT_PAGE_RESOLVED,
+    EVT_PAGE_RESOLUTION_FAILED,
+    EVT_IMPORT_QUEUED,
+    EVT_DUPLICATE_IGNORED,
+    EVT_PROCESSING_FAILED,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +74,6 @@ class MetaLeadWebhookView(APIView):
             tenant = self._resolve_tenant(tenant_public_id)
             if not tenant:
                 return Response({'error': 'Invalid tenant identifier'}, status=status.HTTP_404_NOT_FOUND)
-            # In tenant DB, check Integration model or use platform token
             with tenant_database_context(tenant.id) as alias:
                 from apps.tenant_core.models_infra import Integration
                 integ = Integration.objects.using(alias).filter(integration_type='LEADS', provider__iexact='META').first()
@@ -86,8 +96,16 @@ class MetaLeadWebhookView(APIView):
         Inbound real-time lead notification from Meta.
         Payload contains page ID, form ID, and leadgen ID.
         """
+        correlation_id = getattr(request, 'correlation_id', '-') or request.headers.get('X-Request-ID', '-')
         raw_body = request.body
         signature = request.headers.get('X-Hub-Signature-256') or request.META.get('HTTP_X_HUB_SIGNATURE_256', '')
+
+        log_meta_event(
+            EVT_WEBHOOK_RECEIVED,
+            "Inbound Meta leadgen webhook received",
+            correlation_id=correlation_id,
+            extra={'content_length': len(raw_body)},
+        )
 
         _, app_secret, _ = get_meta_app_credentials()
         if not app_secret:
@@ -95,7 +113,12 @@ class MetaLeadWebhookView(APIView):
             return Response({'error': 'Server security configuration incomplete'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         if not verify_signature(raw_body, signature, app_secret):
-            logger.warning("Meta Webhook rejected: Invalid HMAC-SHA256 signature.")
+            log_meta_event(
+                EVT_SIGNATURE_FAILED,
+                "Meta webhook rejected: Invalid HMAC-SHA256 signature",
+                correlation_id=correlation_id,
+                level=logging.WARNING,
+            )
             return Response({'error': 'Invalid signature'}, status=status.HTTP_403_FORBIDDEN)
 
         try:
@@ -107,7 +130,10 @@ class MetaLeadWebhookView(APIView):
             return Response({'status': 'ignored_non_page_object'}, status=status.HTTP_200_OK)
 
         entries = payload.get('entry', [])
-        processed_count = 0
+        total_received = 0
+        enqueued_count = 0
+        pending_recovery_count = 0
+        duplicate_ignored_count = 0
 
         for entry in entries:
             page_id = str(entry.get('id') or '')
@@ -125,11 +151,31 @@ class MetaLeadWebhookView(APIView):
                 if not leadgen_id:
                     continue
 
+                total_received += 1
+
                 # Safe Tenant Resolution
                 tenant = self._resolve_tenant_for_page(change_page_id, tenant_public_id)
                 if not tenant:
-                    logger.warning("Unrouted Meta leadgen event: Page '%s' is not mapped to any active tenant. Event acknowledged.", change_page_id)
+                    log_meta_event(
+                        EVT_PAGE_RESOLUTION_FAILED,
+                        f"Unrouted Meta leadgen event: Page '{change_page_id}' is not mapped to any active tenant. Event acknowledged.",
+                        correlation_id=correlation_id,
+                        page_id=change_page_id,
+                        form_id=form_id,
+                        leadgen_id=leadgen_id,
+                        level=logging.WARNING,
+                    )
                     continue
+
+                log_meta_event(
+                    EVT_PAGE_RESOLVED,
+                    f"Resolved Page '{change_page_id}' to tenant '{tenant.slug}' ({tenant.id})",
+                    correlation_id=correlation_id,
+                    tenant_id=str(tenant.id),
+                    page_id=change_page_id,
+                    form_id=form_id,
+                    leadgen_id=leadgen_id,
+                )
 
                 try:
                     with tenant_database_context(tenant.id) as alias:
@@ -138,6 +184,7 @@ class MetaLeadWebhookView(APIView):
                             logger.error("Active organization not found for tenant %s", tenant.slug)
                             continue
 
+                        # 1. Durable PostgreSQL commit before async dispatch
                         event, created = receive_live_webhook_event(
                             organization=org,
                             page_id=change_page_id,
@@ -147,15 +194,105 @@ class MetaLeadWebhookView(APIView):
                             alias=alias,
                         )
 
-                        if created or event.status == 'PENDING':
-                            # Enqueue async task for Graph API retrieval & CRM ingestion
-                            process_meta_lead_import_task.delay(str(tenant.id), str(event.id))
-                            processed_count += 1
+                        if created:
+                            # 2. Protected Celery dispatch: failure leaves record safely in PENDING
+                            try:
+                                process_meta_lead_import_task.delay(str(tenant.id), str(event.id))
+                                enqueued_count += 1
+                                log_meta_event(
+                                    EVT_IMPORT_QUEUED,
+                                    "Durable MetaLeadImport created and Celery task enqueued",
+                                    correlation_id=correlation_id,
+                                    import_id=str(event.id),
+                                    tenant_id=str(tenant.id),
+                                    page_id=change_page_id,
+                                    form_id=form_id,
+                                    leadgen_id=leadgen_id,
+                                    status='PENDING',
+                                )
+                            except Exception as dispatch_exc:
+                                pending_recovery_count += 1
+                                logger.error(
+                                    "Celery dispatch failed for MetaLeadImport %s (tenant %s): %s. "
+                                    "Record safely committed as PENDING in PostgreSQL for background recovery.",
+                                    event.id, tenant.slug, dispatch_exc,
+                                )
+                                log_meta_event(
+                                    EVT_PROCESSING_FAILED,
+                                    f"Celery task dispatch failed ({type(dispatch_exc).__name__}). Import preserved as PENDING for background recovery.",
+                                    correlation_id=correlation_id,
+                                    import_id=str(event.id),
+                                    tenant_id=str(tenant.id),
+                                    page_id=change_page_id,
+                                    form_id=form_id,
+                                    leadgen_id=leadgen_id,
+                                    status='PENDING',
+                                    error_code='DISPATCH_FAILED',
+                                    extra={'dispatch_error': str(dispatch_exc)[:100]},
+                                    level=logging.ERROR,
+                                )
+                        elif event.status in ('PENDING', 'RETRYING'):
+                            # Existing pending event re-dispatched
+                            try:
+                                process_meta_lead_import_task.delay(str(tenant.id), str(event.id))
+                                enqueued_count += 1
+                                log_meta_event(
+                                    EVT_IMPORT_QUEUED,
+                                    "Existing pending MetaLeadImport re-enqueued for processing",
+                                    correlation_id=correlation_id,
+                                    import_id=str(event.id),
+                                    tenant_id=str(tenant.id),
+                                    page_id=change_page_id,
+                                    form_id=form_id,
+                                    leadgen_id=leadgen_id,
+                                    status=event.status,
+                                )
+                            except Exception as dispatch_exc:
+                                pending_recovery_count += 1
+                                logger.error(
+                                    "Celery re-dispatch failed for MetaLeadImport %s (tenant %s): %s. "
+                                    "Record remains %s for recovery.",
+                                    event.id, tenant.slug, dispatch_exc, event.status,
+                                )
+                                log_meta_event(
+                                    EVT_PROCESSING_FAILED,
+                                    f"Celery task re-dispatch failed ({type(dispatch_exc).__name__}). Import remains {event.status} for recovery.",
+                                    correlation_id=correlation_id,
+                                    import_id=str(event.id),
+                                    tenant_id=str(tenant.id),
+                                    page_id=change_page_id,
+                                    form_id=form_id,
+                                    leadgen_id=leadgen_id,
+                                    status=event.status,
+                                    error_code='DISPATCH_FAILED',
+                                    extra={'dispatch_error': str(dispatch_exc)[:100]},
+                                    level=logging.ERROR,
+                                )
+                        else:
+                            duplicate_ignored_count += 1
+                            log_meta_event(
+                                EVT_DUPLICATE_IGNORED,
+                                f"Duplicate Meta leadgen webhook received. Acknowledged idempotently (current status: {event.status}).",
+                                correlation_id=correlation_id,
+                                import_id=str(event.id),
+                                tenant_id=str(tenant.id),
+                                page_id=change_page_id,
+                                form_id=form_id,
+                                leadgen_id=leadgen_id,
+                                status=event.status,
+                            )
 
                 except Exception as exc:
                     logger.exception("Error ingesting Meta webhook for tenant %s page %s: %s", tenant.slug, change_page_id, exc)
 
-        return Response({'status': 'received', 'processed': processed_count}, status=status.HTTP_200_OK)
+        return Response({
+            'status': 'received',
+            'processed': enqueued_count,
+            'received': total_received,
+            'enqueued': enqueued_count,
+            'pending_recovery': pending_recovery_count,
+            'duplicates_ignored': duplicate_ignored_count,
+        }, status=status.HTTP_200_OK)
 
     def _resolve_tenant(self, public_id: str) -> Tenant | None:
         """Resolve tenant by UUID or slug in Master DB."""

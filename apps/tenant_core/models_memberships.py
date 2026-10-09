@@ -65,6 +65,29 @@ class Membership(models.Model):
     activated_at = models.DateTimeField(null=True, blank=True)
     cancelled_at = models.DateTimeField(null=True, blank=True)
     legacy_reference = models.CharField(max_length=150, null=True, blank=True)
+    PARQ_STATUS_CHOICES = [
+        ('PENDING', 'Pending Signature'),
+        ('COMPLETED', 'Completed'),
+        ('WAIVED', 'Waived'),
+    ]
+    parq_status = models.CharField(max_length=20, choices=PARQ_STATUS_CHOICES, default='PENDING', db_index=True)
+    parq_form = models.ForeignKey(
+        'IntakeForm',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='required_memberships',
+        db_column='parq_form_id',
+    )
+    parq_submission = models.ForeignKey(
+        'IntakeSubmission',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='satisfied_memberships',
+        db_column='parq_submission_id',
+    )
+    parq_completed_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

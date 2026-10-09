@@ -12,7 +12,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-load_dotenv(BASE_DIR / '.env')
+load_dotenv(BASE_DIR / '.env', override=True)
 
 # ---------------------------------------------------------------------------
 # Security — Critical settings validated at startup
@@ -113,7 +113,7 @@ ROOT_URLCONF = 'config.urls'
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
+        'DIRS': [BASE_DIR / 'templates'],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -209,6 +209,9 @@ AUTH_PASSWORD_VALIDATORS = [
 LOGIN_REDIRECT_URL = '/admin/'
 LOGOUT_REDIRECT_URL = '/admin/login/'
 FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173')
+BACKEND_PUBLIC_URL = os.getenv('BACKEND_PUBLIC_URL', '').rstrip('/')
+META_REDIRECT_URI = os.getenv('META_REDIRECT_URI', '').strip()
+PRIVACY_CONTACT_EMAIL = os.getenv('PRIVACY_CONTACT_EMAIL', '').strip()
 
 # ---------------------------------------------------------------------------
 # Internationalization
@@ -361,8 +364,29 @@ TENANT_PROVISION_DB_HOST = os.getenv('PROVISION_DB_HOST', _parsed.hostname or 'l
 TENANT_PROVISION_DB_PORT = int(os.getenv('PROVISION_DB_PORT', str(_parsed.port or 5432)))
 
 # ---------------------------------------------------------------------------
-# Structured Logging
+# Structured Logging & Rotating File Handler
 # ---------------------------------------------------------------------------
+LOG_DIR = os.getenv('LOG_DIR', str(BASE_DIR / 'logs'))
+ENABLE_FILE_LOGGING = os.getenv('ENABLE_FILE_LOGGING', 'true').lower() in ('true', '1', 'yes')
+LOG_MAX_BYTES = int(os.getenv('LOG_MAX_BYTES', str(10 * 1024 * 1024)))  # 10 MB default
+LOG_BACKUP_COUNT = int(os.getenv('LOG_BACKUP_COUNT', '5'))  # 5 rotations = 50 MB max per log file
+
+_file_logging_available = False
+if ENABLE_FILE_LOGGING:
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        _test_file = os.path.join(LOG_DIR, '.write_test')
+        with open(_test_file, 'w') as _f:
+            _f.write('ok')
+        os.remove(_test_file)
+        _file_logging_available = True
+    except (OSError, PermissionError):
+        _file_logging_available = False
+
+_base_handlers = ['console']
+if _file_logging_available:
+    _base_handlers.append('file_app')
+
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
@@ -385,12 +409,12 @@ LOGGING = {
         },
     },
     'root': {
-        'handlers': ['console'],
+        'handlers': _base_handlers,
         'level': os.getenv('LOG_LEVEL', 'DEBUG' if DEBUG else 'INFO'),
     },
     'loggers': {
         'django': {
-            'handlers': ['console'],
+            'handlers': _base_handlers,
             'level': os.getenv('DJANGO_LOG_LEVEL', 'INFO'),
             'propagate': False,
         },
@@ -400,22 +424,45 @@ LOGGING = {
             'propagate': False,
         },
         'apps': {
-            'handlers': ['console'],
+            'handlers': _base_handlers,
             'level': os.getenv('APP_LOG_LEVEL', 'DEBUG' if DEBUG else 'INFO'),
             'propagate': False,
         },
+        'apps.tenant_core.meta': {
+            'handlers': ['console', 'file_meta'] if _file_logging_available else ['console'],
+            'level': os.getenv('META_LOG_LEVEL', 'INFO'),
+            'propagate': False,
+        },
         'config': {
-            'handlers': ['console'],
+            'handlers': _base_handlers,
             'level': os.getenv('APP_LOG_LEVEL', 'DEBUG' if DEBUG else 'INFO'),
             'propagate': False,
         },
         'redis': {
-            'handlers': ['console'],
+            'handlers': _base_handlers,
             'level': 'INFO',
             'propagate': False,
         },
     },
 }
+
+if _file_logging_available:
+    LOGGING['handlers']['file_app'] = {
+        'class': 'logging.handlers.RotatingFileHandler',
+        'filename': os.path.join(LOG_DIR, 'application.log'),
+        'maxBytes': LOG_MAX_BYTES,
+        'backupCount': LOG_BACKUP_COUNT,
+        'formatter': 'structured',
+        'encoding': 'utf-8',
+    }
+    LOGGING['handlers']['file_meta'] = {
+        'class': 'logging.handlers.RotatingFileHandler',
+        'filename': os.path.join(LOG_DIR, 'meta_integration.log'),
+        'maxBytes': LOG_MAX_BYTES,
+        'backupCount': LOG_BACKUP_COUNT,
+        'formatter': 'structured',
+        'encoding': 'utf-8',
+    }
 
 # ---------------------------------------------------------------------------
 # Celery & Redis — Asynchronous Job Infrastructure (Sprint 7)
@@ -521,6 +568,8 @@ META_APP_ID = os.getenv('META_APP_ID', '').strip()
 META_APP_SECRET = os.getenv('META_APP_SECRET', '').strip()
 META_WEBHOOK_VERIFY_TOKEN = os.getenv('META_WEBHOOK_VERIFY_TOKEN', '').strip()
 META_TOKEN_ENCRYPTION_KEY = os.getenv('META_TOKEN_ENCRYPTION_KEY', '').strip()
+BACKEND_PUBLIC_URL = os.getenv('BACKEND_PUBLIC_URL', '').strip()
+META_REDIRECT_URI = os.getenv('META_REDIRECT_URI', '').strip()
 
 
 
@@ -530,3 +579,19 @@ META_TOKEN_ENCRYPTION_KEY = os.getenv('META_TOKEN_ENCRYPTION_KEY', '').strip()
 RAZORPAY_KEY_ID = os.getenv('RAZORPAY_KEY_ID', '').strip()
 RAZORPAY_KEY_SECRET = os.getenv('RAZORPAY_KEY_SECRET', '').strip()
 RAZORPAY_WEBHOOK_SECRET = os.getenv('RAZORPAY_WEBHOOK_SECRET', '').strip()
+
+
+# ---------------------------------------------------------------------------
+# Email / SMTP Configuration
+# Reads Gmail SMTP values + App Password from .env.
+# EMAIL_USE_TLS and EMAIL_USE_SSL are parsed as booleans.
+# ---------------------------------------------------------------------------
+EMAIL_BACKEND = os.getenv('EMAIL_BACKEND', 'django.core.mail.backends.smtp.EmailBackend').strip()
+EMAIL_HOST = os.getenv('EMAIL_HOST', 'smtp.gmail.com').strip()
+EMAIL_PORT = int(os.getenv('EMAIL_PORT', '587'))
+EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'True').strip().lower() in ('true', '1', 't', 'yes')
+EMAIL_USE_SSL = os.getenv('EMAIL_USE_SSL', 'False').strip().lower() in ('true', '1', 't', 'yes')
+EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', '').strip()
+EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '').strip()
+DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', EMAIL_HOST_USER).strip()
+SERVER_EMAIL = DEFAULT_FROM_EMAIL
