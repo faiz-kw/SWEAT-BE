@@ -35,7 +35,7 @@ from rest_framework.exceptions import ValidationError
 from apps.master.models_tenant import Tenant, MetaPageRegistry
 from apps.tenant_core.context import tenant_database_context
 from config.routers import set_tenant_db_alias
-from apps.tenant_core.models_org import Organization, Branch
+from apps.tenant_core.models_org import Organization, Branch, Location
 from apps.tenant_core.models_users import TenantUser
 from apps.tenant_core.models_crm import Lead, LeadSource
 from apps.tenant_core.models_meta_leads import (
@@ -56,15 +56,25 @@ class MetaReliabilityLayerTests(unittest.TestCase):
         if not self.tenant:
             self.tenant = Tenant.objects.using('default').create(slug='sweat', name='SWEAT', status='ACTIVE')
 
+        from apps.master.models import TenantDataSource
+        TenantDataSource.objects.using('default').get_or_create(
+            tenant=self.tenant,
+            defaults={"db_name": "tenant_test", "database_name": "tenant_test", "status": "ACTIVE"}
+        )
+
         with tenant_database_context(str(self.tenant.id)) as alias:
             self.alias = alias
             self.org = Organization.objects.using(alias).filter(status='ACTIVE').first()
             if not self.org:
                 self.org = Organization.objects.using(alias).create(name='SWEAT Organization', status='ACTIVE')
 
+            loc = Location.objects.using(alias).filter(organization=self.org).first()
+            if not loc:
+                loc = Location.objects.using(alias).create(organization=self.org, name='Default Location', code='DEF')
+
             self.branch = Branch.objects.using(alias).filter(organization=self.org, status='ACTIVE').first()
             if not self.branch:
-                self.branch = Branch.objects.using(alias).create(organization=self.org, name='Main Branch', status='ACTIVE')
+                self.branch = Branch.objects.using(alias).create(organization=self.org, location=loc, name='Main Branch', status='ACTIVE')
 
             self.lead_source = LeadSource.objects.using(alias).filter(organization=self.org, source_type='META').first()
             if not self.lead_source:

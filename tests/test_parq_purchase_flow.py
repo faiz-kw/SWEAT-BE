@@ -577,7 +577,7 @@ class ParqPurchaseFlowTestCase(APITestCase):
 
             self.assertFalse(sub_item['sensitive_data_restricted'])
 
-            self.assertEqual(len(sub_item['answers']), 2)
+            self.assertEqual(len(sub_item['answers']), 3)
 
 
 

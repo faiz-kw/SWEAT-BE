@@ -144,10 +144,11 @@ class RBACAuthorizationEngine:
         try:
             # Load user's organization or first active org in tenant DB
             org_id = getattr(user, 'organization_id', None)
+            org = None
             if org_id:
-                org = Organization.objects.using(db_alias).only('id', 'status').get(id=org_id)
-            else:
-                org = Organization.objects.using(db_alias).only('id', 'status').first()
+                org = Organization.objects.using(db_alias).only('id', 'status').filter(id=org_id).first()
+            if not org or org.status != 'ACTIVE':
+                org = Organization.objects.using(db_alias).only('id', 'status').filter(status='ACTIVE').first()
         except Organization.DoesNotExist:
             return False, 'Organization not found in tenant database.', 'CHECK_2_ORG_NOT_FOUND'
 

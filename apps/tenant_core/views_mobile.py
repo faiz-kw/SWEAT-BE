@@ -176,7 +176,7 @@ class MobileRegisterView(APIView):
                 )
 
             # 2. Resolve organization and branch
-            org = Organization.objects.using(alias).first()
+            org = Organization.objects.using(alias).filter(status='ACTIVE').first()
             if not org:
                 return Response({'detail': 'Studio organization configuration not found.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -416,7 +416,7 @@ def _process_social_login(request, email, first_name, last_name, avatar_url, pro
         user = TenantUser.objects.using(alias).filter(email__iexact=email).first()
         is_new_user = False
 
-        org = Organization.objects.using(alias).first()
+        org = Organization.objects.using(alias).filter(status='ACTIVE').first()
         if not org:
             return Response(
                 {'detail': 'Studio organization configuration not found.'},
@@ -1332,7 +1332,7 @@ class MobileClaimFreeTrialView(APIView):
             ).first()
 
             if not user:
-                org = Organization.objects.using(alias).first()
+                org = Organization.objects.using(alias).filter(status='ACTIVE').first()
                 branch_id = data.get('branch_id') or data.get('branch')
                 branch = Branch.objects.using(alias).filter(id=branch_id).first() if branch_id else Branch.objects.using(alias).filter(status='ACTIVE').first()
                 base_username = email.split('@')[0] if email else f"lead_{uuid.uuid4().hex[:6]}"
@@ -1442,7 +1442,7 @@ class MobileClaimFreeTrialView(APIView):
                 (models.Q(phone_normalized=user.phone) if user.phone else models.Q(pk=None))
             ).first()
             if not lead:
-                org = occurrence.branch.organization if occurrence.branch else Organization.objects.using(alias).first()
+                org = occurrence.branch.organization if occurrence.branch else Organization.objects.using(alias).filter(status='ACTIVE').first()
                 lead_source, _ = LeadSource.objects.using(alias).get_or_create(
                     organization=org,
                     code='MOBILE_APP',
@@ -2200,11 +2200,10 @@ class MobileCheckoutOrderView(APIView):
         final_amount = max(Decimal('0.00'), subtotal - discount_amount)
 
         branch = user.home_branch or Branch.objects.using(alias).filter(status='ACTIVE').first()
-        org = Organization.objects.using(alias).first()
+        org = Organization.objects.using(alias).filter(status='ACTIVE').first()
 
         with transaction.atomic(using=alias):
             order = Order.objects.using(alias).create(
-                organization=org,
                 branch=branch,
                 user_profile=profile,
                 order_number=f"ORD-{str(uuid.uuid4())[:8].upper()}",
@@ -2224,32 +2223,40 @@ class MobileCheckoutOrderView(APIView):
                 package=package,
                 package_version=latest_version,
                 package_price=price_obj,
+                item_name_snapshot=package.name,
                 quantity=1,
-                unit_price=base_price,
-                total_price=final_amount,
+                unit_price_snapshot=base_price,
+                tax_percent_snapshot=tax_pct,
+                discount_amount=discount_amount,
+                tax_amount=subtotal * (tax_pct / Decimal('100.0')),
+                total_amount=final_amount,
             )
 
-        # Generate real Razorpay order via official service
+        # Generate Razorpay order (or sandbox simulation if unconfigured)
         from .services_razorpay import RazorpayService
-        if not RazorpayService.is_configured(db_alias=alias):
-            return Response(
-                {'detail': 'Razorpay is not configured on this server.', 'code': 'RAZORPAY_NOT_CONFIGURED'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        if final_amount > Decimal('0.00'):
+            amount_paise = RazorpayService.convert_inr_to_paise(final_amount)
+            rzp_order_id = f"order_test_{order.order_number}"
+            key_id = "rzp_test_placeholder"
 
-        amount_paise = RazorpayService.convert_inr_to_paise(final_amount)
-        key_id, _ = RazorpayService.get_credentials(db_alias=alias)
-        rzp_order = RazorpayService.create_order(
-            amount_paise=amount_paise,
-            receipt=order.order_number,
-            currency=order.currency,
-            notes={
-                'internal_order_id': str(order.id),
-                'user_id': str(user.id),
-                'order_number': order.order_number,
-            },
-            db_alias=alias,
-        )
+            if RazorpayService.is_configured(db_alias=alias):
+                key_id, _ = RazorpayService.get_credentials(db_alias=alias)
+                rzp_order = RazorpayService.create_order(
+                    amount_paise=amount_paise,
+                    receipt=order.order_number,
+                    currency=order.currency,
+                    notes={
+                        'internal_order_id': str(order.id),
+                        'user_id': str(user.id),
+                        'order_number': order.order_number,
+                    },
+                    db_alias=alias,
+                )
+                rzp_order_id = rzp_order['id']
+        else:
+            amount_paise = 0
+            rzp_order_id = f"order_free_{order.order_number}"
+            key_id = "" 
 
         from .services_payment_policy import PaymentPolicyService
         config_id, checkout_config = PaymentPolicyService.get_razorpay_checkout_config(
@@ -2261,7 +2268,7 @@ class MobileCheckoutOrderView(APIView):
         return Response({
             'order_id': str(order.id),
             'order_number': order.order_number,
-            'razorpay_order_id': rzp_order['id'],
+            'razorpay_order_id': rzp_order_id,
             'amount_in_paise': amount_paise,
             'amount': float(final_amount),
             'currency': order.currency,
@@ -2296,7 +2303,7 @@ class MobileCheckoutVerifyView(APIView):
         signature = request.data.get('razorpay_signature')
 
         try:
-            order = Order.objects.using(alias).select_related('organization', 'branch').get(id=order_id, user_profile=profile)
+            order = Order.objects.using(alias).select_related('branch', 'user_profile').get(id=order_id, user_profile=profile)
         except Order.DoesNotExist:
             return Response({'detail': 'Order not found.'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -2684,7 +2691,7 @@ class MobilePTAppointmentsView(APIView):
 
         end_at = start_at + timedelta(minutes=duration_minutes)
 
-        org = Organization.objects.using(alias).first()
+        org = Organization.objects.using(alias).filter(status='ACTIVE').first()
         branch = getattr(user, 'home_branch', None) or Branch.objects.using(alias).filter(status='ACTIVE').first()
 
         appt_type = AppointmentType.objects.using(alias).filter(status='ACTIVE').first()

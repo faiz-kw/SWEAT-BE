@@ -879,25 +879,29 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
 
     # 7. Health & Forms (Intake submissions with sensitive health permission check)
     can_view_health = False
-    if requesting_user and (
-        getattr(requesting_user, 'is_superuser', False) or
-        getattr(requesting_user, 'is_staff', False) or
-        getattr(requesting_user, 'user_type', '') in ['STAFF', 'ADMIN', 'SUPERADMIN'] or
-        (profile.user_id and getattr(requesting_user, 'id', None) == profile.user_id)
-    ):
+    if requesting_user and getattr(requesting_user, 'is_superuser', False):
+        can_view_health = True
+    elif requesting_user and (profile.user_id and getattr(requesting_user, 'id', None) == profile.user_id):
         can_view_health = True
     elif requesting_user:
         try:
             from .rbac_engine import RBACAuthorizationEngine
-            allowed, _, _ = RBACAuthorizationEngine.evaluate(
+            allowed, reason, check_code = RBACAuthorizationEngine.evaluate(
                 user=requesting_user,
                 required_permission='cs.member-health.view',
                 branch_id=str(profile.preferred_branch_id) if profile.preferred_branch_id else None,
                 request=request,
             )
-            can_view_health = allowed
+            if allowed:
+                can_view_health = True
+            elif reason == 'Denied' or check_code == 'CHECK_10_PERMISSION_DENIED':
+                can_view_health = False
+            elif getattr(requesting_user, 'is_staff', False) or getattr(requesting_user, 'user_type', None) in ['STAFF', 'ADMIN', 'SUPERADMIN']:
+                can_view_health = True
+            else:
+                can_view_health = False
         except Exception:
-            can_view_health = False
+            can_view_health = getattr(requesting_user, 'is_staff', False)
 
     submissions_data = []
     intake_subs = (
