@@ -533,8 +533,9 @@ class MetaReliabilityLayerTests(unittest.TestCase):
 
 
     # 17. Broker / Redis dispatch failure leaves durable PENDING import
+    @patch('apps.tenant_core.views_meta_webhook.get_meta_app_credentials', return_value=('app123', 'test_secret', 'token123'))
     @patch('apps.tenant_core.views_meta_webhook.process_meta_lead_import_task.delay')
-    def test_17_redis_dispatch_failure_persists_pending_import(self, mock_delay):
+    def test_17_redis_dispatch_failure_persists_pending_import(self, mock_delay, mock_creds):
         mock_delay.side_effect = Exception("Redis connection refused (simulated broker outage)")
 
         payload = {
@@ -617,8 +618,9 @@ class MetaReliabilityLayerTests(unittest.TestCase):
             self.assertIsNotNone(imp.lead)
 
     # 19. Duplicate webhook delivery after dispatch failure is idempotent
+    @patch('apps.tenant_core.views_meta_webhook.get_meta_app_credentials', return_value=('app123', 'test_secret', 'token123'))
     @patch('apps.tenant_core.views_meta_webhook.process_meta_lead_import_task.delay')
-    def test_19_duplicate_webhook_after_dispatch_failure_is_idempotent(self, mock_delay):
+    def test_19_duplicate_webhook_after_dispatch_failure_is_idempotent(self, mock_delay, mock_creds):
         payload = {
             'object': 'page',
             'entry': [{
