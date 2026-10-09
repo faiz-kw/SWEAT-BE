@@ -1154,10 +1154,22 @@ class MobileScheduleView(APIView):
             .order_by('start_at')
         )
 
-        if branch_id:
+        # Filter by branch (robust to 'all')
+        if branch_id and str(branch_id).lower() != 'all':
             qs = qs.filter(branch_id=branch_id)
-        if category_id:
-            qs = qs.filter(class_template__category_id=category_id)
+
+        # Filter by category/format (accepts UUID, code, or name, robust to 'all')
+        category_param = request.query_params.get('category') or category_id
+        if category_param and str(category_param).lower() != 'all':
+            import uuid
+            try:
+                cat_uuid = uuid.UUID(str(category_param))
+                qs = qs.filter(class_template__category_id=cat_uuid)
+            except (ValueError, AttributeError):
+                qs = qs.filter(
+                    models.Q(class_template__category__name__iexact=category_param)
+                    | models.Q(class_template__category__code__iexact=category_param)
+                )
 
         # Authenticated user bookings for this day to show 'CONFIRMED' / 'WAITLISTED' badges
         user_booking_map = {}
@@ -1249,6 +1261,8 @@ class MobileScheduleView(APIView):
                 'class_id': str(template.id) if template else None,
                 'class_name': template.name if template else 'Reformer Session',
                 'category': category.name if category else 'Pilates Reformer',
+                'category_id': str(category.id) if category else None,
+                'category_code': category.code if category else None,
                 'branch': {
                     'id': str(occ.branch.id) if occ.branch else None,
                     'name': occ.branch.name if occ.branch else 'SWEAT Studio',
@@ -1278,10 +1292,16 @@ class MobileScheduleView(APIView):
                 'is_included_in_plan': is_included,
             })
 
+        all_categories = [
+            {'id': str(cat.id), 'code': cat.code, 'name': cat.name}
+            for cat in ClassCategory.objects.using(alias).filter(status='ACTIVE').order_by('display_order', 'name')
+        ]
+
         return Response({
             'date': target_date.isoformat(),
             'branch_id': branch_id,
             'classes_count': len(results),
+            'categories': all_categories,
             'slots': results,
         })
 
@@ -2412,10 +2432,9 @@ class MobileCheckoutVerifyView(APIView):
 
             # 5. Advance CRM Lead status to CONVERTED
             try:
-                lead = Lead.objects.using(alias).filter(
-                    models.Q(email_normalized__iexact=user.email) |
-                    (models.Q(phone_normalized=user.phone) if user.phone else models.Q(pk=None))
-                ).first()
+                lead = Lead.objects.using(alias).filter(email_normalized__iexact=user.email).first()
+                if not lead and user.phone:
+                    lead = Lead.objects.using(alias).filter(phone_normalized=user.phone).first()
                 if lead:
                     lead.current_status = 'CONVERTED'
                     lead.converted_user_profile = profile
@@ -2910,3 +2929,27 @@ class MobileLeadCaptureView(APIView):
             }
         }, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
 
+
+
+class MobileClassCategoriesView(APIView):
+    """
+    GET /api/v1/mobile/categories/
+    Lists active class categories (formats) for the tenant.
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            return Response([], status=status.HTTP_200_OK)
+
+        categories = (
+            ClassCategory.objects.using(alias)
+            .filter(status='ACTIVE')
+            .order_by('display_order', 'name')
+        )
+        results = [
+            {'id': str(c.id), 'code': c.code, 'name': c.name, 'description': c.description or ''}
+            for c in categories
+        ]
+        return Response(results)
