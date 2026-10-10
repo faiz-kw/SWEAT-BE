@@ -102,6 +102,8 @@ class LeadSerializer(serializers.ModelSerializer):
     phone = serializers.CharField(required=False, allow_null=True, allow_blank=True, write_only=True)
     location = serializers.CharField(required=False, allow_null=True, allow_blank=True, write_only=True)
     goal = serializers.CharField(required=False, allow_null=True, allow_blank=True, write_only=True)
+    status = serializers.CharField(required=False, allow_null=True, allow_blank=True, write_only=True)
+    is_converted = serializers.BooleanField(required=False, write_only=True)
 
     class Meta:
         model = Lead
@@ -341,6 +343,13 @@ class LeadSerializer(serializers.ModelSerializer):
             attrs['area'] = attrs.pop('location')
         if 'goal' in attrs and not attrs.get('fitness_goal'):
             attrs['fitness_goal'] = attrs.pop('goal')
+        if 'status' in attrs:
+            val = attrs.pop('status')
+            if val and not attrs.get('current_status'):
+                attrs['current_status'] = val
+        if 'is_converted' in attrs:
+            if attrs.pop('is_converted') and not attrs.get('current_status'):
+                attrs['current_status'] = 'CONVERTED' 
 
         from .services_crm import validate_lead_email, validate_lead_phone
 
@@ -610,6 +619,44 @@ class TrialBookingSerializer(serializers.ModelSerializer):
         model = TrialBooking
         fields = '__all__'
         read_only_fields = ['id', 'created_at', 'updated_at', 'created_by_user']
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from config.routers import get_tenant_db_alias
+        request = self.context.get('request')
+        alias = None
+        if request:
+            user = getattr(request, 'user', None)
+            if user and hasattr(user, '_state'):
+                alias = getattr(user._state, 'db', None)
+        if not alias:
+            alias = get_tenant_db_alias() or 'default'
+
+        if alias and alias != 'default':
+            from .models_org import Branch
+            from .models_crm import Lead
+            from .models_workforce import TrainerProfile
+            if 'branch' in self.fields:
+                self.fields['branch'].queryset = Branch.objects.using(alias).all()
+            if 'lead' in self.fields:
+                self.fields['lead'].queryset = Lead.objects.using(alias).all()
+            if 'assigned_trainer_profile' in self.fields:
+                self.fields['assigned_trainer_profile'].queryset = TrainerProfile.objects.using(alias).all()
+
+    def create(self, validated_data):
+        from config.routers import get_tenant_db_alias
+        request = self.context.get('request')
+        alias = None
+        if request:
+            user = getattr(request, 'user', None)
+            if user and hasattr(user, '_state'):
+                alias = getattr(user._state, 'db', None)
+        if not alias:
+            alias = get_tenant_db_alias() or 'default'
+
+        instance = TrialBooking(**validated_data)
+        instance.save(using=alias)
+        return instance
 
     def _get_occurrence(self, obj):
         if not obj.class_occurrence_id:

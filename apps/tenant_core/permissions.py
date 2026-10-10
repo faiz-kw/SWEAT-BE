@@ -159,6 +159,10 @@ class TenantRBACPermission(permissions.BasePermission):
             if 'trial' in view_name:
                 if act in ['create', 'list', 'retrieve', 'available_slots', 'request_reschedule', 'cancel']:
                     return True
+            # D. Lead & Member self-service on leads (e.g. converting themselves, booking trial, or updating conversion status)
+            if 'lead' in view_name:
+                if act in ['convert', 'book_trial', 'partial_update', 'update', 'retrieve', 'patch', 'put']:
+                    return True
 
         allowed, reason, check_code = RBACAuthorizationEngine.evaluate(
             user=user,
@@ -204,6 +208,10 @@ class TenantRBACPermission(permissions.BasePermission):
         user_role = str(getattr(user, 'role', '')).lower()
         if user_type in ('MEMBER', 'LEAD') or user_role in ('member', 'lead'):
             view_name = view.__class__.__name__.lower()
+            if obj.__class__.__name__ == 'Lead':
+                if (getattr(obj, 'email_normalized', '').lower() == (user.email or '').lower() or
+                    (user.phone and getattr(obj, 'phone_normalized', '') == user.phone)):
+                    return True
             if hasattr(obj, 'user_profile') and getattr(obj.user_profile, 'user_id', None) == user.id:
                 return True
             if hasattr(obj, 'lead') and (getattr(obj.lead, 'email_normalized', None) == user.email.lower() or (user.phone and getattr(obj.lead, 'phone_normalized', None) == user.phone)):

@@ -158,8 +158,15 @@ class MembershipLifecycleService:
                     'is_unlimited': ed.is_unlimited,
                 })
 
+            # Resolve accepted terms document versions for order/member
+            from .models_catalog import TermsAcceptance
+            terms_acc_ids = list(TermsAcceptance.objects.using(alias).filter(order_id=order.id).values_list('terms_document_version_id', flat=True))
+            if not terms_acc_ids and order.user_profile:
+                terms_acc_ids = list(TermsAcceptance.objects.using(alias).filter(user_profile=order.user_profile).order_by('-accepted_at').values_list('terms_document_version_id', flat=True)[:1])
+
             # Create Immutable Contract Snapshot
             contract_snapshot = MembershipContractSnapshot.objects.using(alias).create(
+                terms_document_version_ids=[str(t_id) for t_id in terms_acc_ids],
                 membership=membership,
                 package=package,
                 package_version=package_version,

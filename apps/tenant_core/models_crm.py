@@ -1266,3 +1266,114 @@ class CRMStageAutomationRule(models.Model):
         return f"Rule({self.name}: {self.trigger_event} [{self.from_stage}->{self.to_stage}])"
 
 
+class CallSession(models.Model):
+    """
+    Persistent record of a voice call session (outbound AI call or inbound support).
+    Tracks provider attempt IDs, call lifecycle, duration, transcript turns, and extracted variables.
+    """
+    STATUS_CHOICES = [
+        ('QUEUED', 'Queued'),
+        ('INITIATED', 'Initiated'),
+        ('RINGING', 'Ringing'),
+        ('CONNECTED', 'Connected / In Progress'),
+        ('COMPLETED', 'Completed'),
+        ('BUSY', 'Busy'),
+        ('NO_ANSWER', 'No Answer'),
+        ('FAILED', 'Failed'),
+        ('CANCELLED', 'Cancelled'),
+    ]
+
+    DIRECTIONS = [
+        ('OUTBOUND', 'Outbound'),
+        ('INBOUND', 'Inbound'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey(
+        Organization,
+        on_delete=models.CASCADE,
+        related_name='call_sessions',
+        db_column='organization_id',
+    )
+    lead = models.ForeignKey(
+        Lead,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='call_sessions',
+        db_column='lead_id',
+    )
+    provider = models.CharField(max_length=50, default='SARVAM', help_text='Voice provider e.g. SARVAM')
+    provider_attempt_id = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text='Provider attempt/session identifier e.g. Sarvam attempt_id',
+    )
+    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default='QUEUED')
+    direction = models.CharField(max_length=20, choices=DIRECTIONS, default='OUTBOUND')
+    
+    agent_phone_number = models.CharField(max_length=50, blank=True, default='', help_text='Sender / Rented phone number')
+    user_phone_number = models.CharField(max_length=50, blank=True, default='', help_text='Recipient phone number in E.164')
+    
+    duration_seconds = models.FloatField(default=0.0, help_text='Billable call duration in seconds')
+    started_at = models.DateTimeField(null=True, blank=True)
+    ended_at = models.DateTimeField(null=True, blank=True)
+    
+    transcript = models.JSONField(
+        default=list,
+        blank=True,
+        help_text='Conversation turns list: [{"role": "agent"|"user", "en_text": "...", "indic_text": "..."}]',
+    )
+    final_agent_variables = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text='Variables extracted/updated by Sarvam voice agent during dialogue',
+    )
+    metadata = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text='Custom correlation metadata echoed by provider callback',
+    )
+    
+    error_code = models.CharField(max_length=100, blank=True, default='')
+    error_message = models.TextField(blank=True, default='')
+    
+    idempotency_key = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text='Deterministic client idempotency key to prevent duplicate call placement',
+    )
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        app_label = 'tenant_core'
+        db_table = 'crm_call_sessions'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['organization', 'status'], name='idx_call_org_status'),
+            models.Index(fields=['lead', 'created_at'], name='idx_call_lead_created'),
+            models.Index(fields=['provider', 'provider_attempt_id'], name='idx_call_prov_attempt'),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['organization', 'idempotency_key'],
+                condition=models.Q(idempotency_key__isnull=False),
+                name='uq_call_org_idempotency_key',
+            ),
+            models.UniqueConstraint(
+                fields=['organization', 'provider_attempt_id'],
+                condition=models.Q(provider_attempt_id__isnull=False),
+                name='uq_call_org_attempt_id',
+            ),
+        ]
+
+    def __str__(self):
+        return f"CallSession({self.id} {self.direction} to {self.user_phone_number} [{self.status}])"
+
+
+

@@ -839,6 +839,33 @@ class CRMLeadService:
                 },
             })
 
+        # 10. Voice Call Sessions
+        from .models_crm import CallSession
+        for cs in CallSession.objects.using(alias).filter(lead=lead):
+            status_label = cs.status.replace('_', ' ').title()
+            events.append({
+                'id': f"call-{cs.id}",
+                'event_type': 'VOICE_CALL',
+                'occurred_at': (cs.started_at or cs.created_at).isoformat(),
+                'title': f"AI Call: {status_label}",
+                'description': f"Duration: {int(cs.duration_seconds)}s • Provider: {cs.provider}" + (
+                    f" • Turns: {len(cs.transcript)}" if cs.transcript else ""
+                ),
+                'actor': f"{cs.provider.title()} Voice Agent",
+                'channel': 'VOICE',
+                'metadata': {
+                    'call_session_id': str(cs.id),
+                    'provider_attempt_id': cs.provider_attempt_id,
+                    'status': cs.status,
+                    'direction': cs.direction,
+                    'duration_seconds': cs.duration_seconds,
+                    'transcript': cs.transcript,
+                    'final_agent_variables': cs.final_agent_variables,
+                    'started_at': cs.started_at.isoformat() if cs.started_at else None,
+                    'ended_at': cs.ended_at.isoformat() if cs.ended_at else None,
+                },
+            })
+
         # Sort descending by occurred_at, with deterministic secondary sort on ID
         events.sort(key=lambda e: (e['occurred_at'], e['id']), reverse=True)
         return events[:limit]
@@ -4318,6 +4345,37 @@ class LeadConversionService:
                         updates.append('user_profile')
                     if updates:
                         resolved_sub.save(using=alias, update_fields=updates)
+
+                # Record Terms & Conditions Acceptance if present
+                terms_doc_ver_id = kwargs.get('terms_document_version_id')
+                terms_consent = kwargs.get('terms_consent_accepted')
+                terms_sig = kwargs.get('terms_signature_data')
+
+                if terms_consent or terms_doc_ver_id or terms_sig:
+                    try:
+                        from .models_catalog import TermsDocumentVersion, TermsAcceptance
+                        terms_ver = None
+                        if terms_doc_ver_id:
+                            terms_ver = TermsDocumentVersion.objects.using(alias).filter(id=terms_doc_ver_id).first()
+                        if not terms_ver:
+                            terms_ver = TermsDocumentVersion.objects.using(alias).filter(
+                                status__in=['ACTIVE', 'PUBLISHED'], terms_document__code='TERMS-PACKAGE-PURCHASE'
+                            ).order_by('-version_number').first()
+                        if terms_ver:
+                            TermsAcceptance.objects.using(alias).create(
+                                terms_document_version=terms_ver,
+                                lead=lead_locked,
+                                user_profile=user_profile,
+                                order_id=order.id,
+                                accepted_at=timezone.now(),
+                                accepted_via='WEB' if channel != 'MOBILE_APP' else 'MOBILE_APP',
+                                device_metadata={
+                                    'has_signature': bool(terms_sig),
+                                    'channel': channel,
+                                }
+                            )
+                    except Exception as t_err:
+                        logger.warning('Could not record terms acceptance during conversion: %s', t_err)
 
                 SalesFollowupTask.objects.using(alias).filter(
                     lead=lead_locked,

@@ -1401,6 +1401,20 @@ class LeadViewSet(viewsets.ModelViewSet):
         lead = self.get_object()
         alias = _get_db(request)
 
+        # Idempotency check: If lead is already converted (e.g. via mobile verifyPayment), return success
+        if lead.current_status == 'CONVERTED' or getattr(lead, 'converted_user_profile_id', None) or LeadConversion.objects.using(alias).filter(lead=lead).exists():
+            from apps.tenant_core.models_memberships import Membership
+            conv = LeadConversion.objects.using(alias).filter(lead=lead).first()
+            membership = Membership.objects.using(alias).filter(user_profile=lead.converted_user_profile).first() if lead.converted_user_profile else None
+            return Response({
+                'detail': 'Lead successfully converted to an active Member.',
+                'conversion_id': str(conv.id) if conv else str(lead.id),
+                'member_id': str(lead.converted_user_profile_id) if lead.converted_user_profile_id else None,
+                'membership_id': str(membership.id) if membership else None,
+                'status': 'CONVERTED',
+                'already_converted': True,
+            }, status=status.HTTP_200_OK)
+
         # Validate required fields
         package_version_id = request.data.get('package_version_id')
         branch_id = request.data.get('branch_id')
@@ -1457,6 +1471,9 @@ class LeadViewSet(viewsets.ModelViewSet):
                 order_id=request.data.get('order_id'),
                 channel=channel,
                 parq_submission_id=request.data.get('parq_submission_id'),
+                terms_document_version_id=request.data.get('terms_document_version_id'),
+                terms_consent_accepted=request.data.get('terms_consent_accepted'),
+                terms_signature_data=request.data.get('terms_signature_data'),
             )
             if result.get('status') == 'PENDING_APPROVAL':
                 return Response(result, status=status.HTTP_202_ACCEPTED)
@@ -1982,8 +1999,8 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("You do not have permission to book trials at this branch.")
 
         org = _get_org(request)
-        lead = get_object_or_404(Lead.objects.using(alias).filter(organization=org) if org else Lead.objects.using(alias), id=lead_id)
-        branch = get_object_or_404(Branch.objects.using(alias).filter(organization=org) if org else Branch.objects.using(alias), id=branch_id)
+        lead = get_object_or_404(Lead.objects.using(alias), id=lead_id)
+        branch = get_object_or_404(Branch.objects.using(alias), id=branch_id)
 
         try:
             start_str = request.data.get('scheduled_start')

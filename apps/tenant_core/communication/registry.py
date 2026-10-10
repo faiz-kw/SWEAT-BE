@@ -16,6 +16,7 @@ from .adapters import (
     TwilioSMSAdapter,
     MSG91SMSAdapter,
     GupshupSMSAdapter,
+    SarvamVoiceAdapter,
 )
 
 logger = logging.getLogger(__name__)
@@ -82,12 +83,17 @@ class CommunicationProviderRegistry:
             'WHATSAPP': 'WHATSAPP',
             'EMAIL': 'EMAIL',
             'SMS': 'OTHER',  # Integration.INTEGRATION_TYPE uses OTHER or custom for SMS
+            'VOICE': 'CALLING',
+            'AI_CALL': 'CALLING',
         }
         target_type = integration_type_map.get(channel_upper, channel_upper)
 
         query = Integration.objects.filter(status='ACTIVE')
         if channel_upper in ('WHATSAPP', 'EMAIL'):
             query = query.filter(integration_type=target_type)
+        elif channel_upper in ('VOICE', 'AI_CALL'):
+            from django.db.models import Q
+            query = query.filter(Q(integration_type='CALLING') | Q(provider__iexact='SARVAM'))
         else:
             # For SMS, allow matching provider in (TWILIO, MSG91, GUPSHUP_SMS) or type
             query = query.filter(provider__in=['TWILIO', 'MSG91', 'GUPSHUP_SMS', 'Twilio', 'MSG91', 'Gupshup'])
@@ -142,3 +148,6 @@ CommunicationProviderRegistry.register('SMS', 'TWILIO', TwilioSMSAdapter)
 CommunicationProviderRegistry.register('SMS', 'MSG91', MSG91SMSAdapter)
 CommunicationProviderRegistry.register('SMS', 'GUPSHUP_SMS', GupshupSMSAdapter)
 CommunicationProviderRegistry.register('SMS', 'GUPSHUP', GupshupSMSAdapter)
+CommunicationProviderRegistry.register('VOICE', 'SARVAM', SarvamVoiceAdapter)
+CommunicationProviderRegistry.register('AI_CALL', 'SARVAM', SarvamVoiceAdapter)
+

@@ -79,7 +79,7 @@ def _resolve_mobile_tenant_and_db(request):
     tenant_slug = (
         (request.headers.get('X-Tenant-Slug') if hasattr(request, 'headers') else None)
         or request.META.get('HTTP_X_TENANT_SLUG')
-        or request.query_params.get('tenant')
+        or (getattr(request, 'query_params', None) or getattr(request, 'GET', {})).get('tenant')
         or (request.data.get('tenant_slug') if hasattr(request, 'data') and isinstance(request.data, dict) else None)
         or 'sweat'
     )
@@ -1175,7 +1175,9 @@ class MobileScheduleView(APIView):
         user_booking_map = {}
         included_class_ids = None
         if request.user and request.user.is_authenticated:
-            user_profile = UserProfile.objects.using(alias).filter(user=request.user).first()
+            user_profile = _get_or_create_user_profile(request.user, alias)
+            if not user_profile and getattr(request.user, 'email', None):
+                user_profile = UserProfile.objects.using(alias).filter(user__email__iexact=request.user.email).first()
             if user_profile:
                 # Resolve active membership and its package class access rules
                 active_mem = (
@@ -1396,15 +1398,31 @@ class MobileClaimFreeTrialView(APIView):
         if not occurrence_id:
             return Response({'detail': 'occurrence_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # 1. Enforce 1-time Free Trial policy
-        has_trial = (
-            Booking.objects.using(alias).filter(user_profile=profile, booking_type='TRIAL').exists()
+        # 1. Enforce 1-time Free Trial policy with slot-level idempotency
+        # Check if booking for this exact occurrence already exists
+        existing_booking = Booking.objects.using(alias).filter(
+            user_profile=profile, occurrence_id=occurrence_id, booking_type='TRIAL'
+        ).first()
+
+        if existing_booking:
+            return Response({
+                'booking_id': str(existing_booking.id),
+                'booking_number': existing_booking.booking_number,
+                'status': existing_booking.status,
+                'waitlist_position': existing_booking.waitlist_position,
+                'is_free_trial': True,
+                'already_claimed': True,
+                'message': 'Free trial booked successfully! See you on the reformer.',
+            }, status=status.HTTP_200_OK)
+
+        has_other_trial = (
+            Booking.objects.using(alias).filter(user_profile=profile, booking_type='TRIAL').exclude(occurrence_id=occurrence_id).exists()
             or TrialBooking.objects.using(alias).filter(
                 models.Q(lead__email_normalized__iexact=user.email) |
                 (models.Q(lead__phone_normalized=user.phone) if user.phone else models.Q(pk=None))
-            ).exists()
+            ).exclude(class_occurrence_id=occurrence_id).exists()
         )
-        if has_trial:
+        if has_other_trial:
             return Response(
                 {
                     'detail': 'You have already redeemed your 1 free trial session. Please select a session pack to book this class.',
@@ -1682,7 +1700,9 @@ class MobileMyBookingsView(APIView):
                 'branch_name': branch.name if branch else 'SWEAT Studio',
                 'date': occ.occurrence_date.isoformat() if occ and occ.occurrence_date else None,
                 'start_at': occ.start_at.isoformat() if occ and occ.start_at else None,
+                'start_time': occ.start_at.isoformat() if occ and occ.start_at else None,
                 'end_at': occ.end_at.isoformat() if occ and occ.end_at else None,
+                'qr_pass': str(b.id),
                 'duration_minutes': template.default_duration_minutes if template else 50,
                 'trainer_name': trainer_name,
                 'booked_at': b.booked_at.isoformat() if b.booked_at else None,
@@ -2186,16 +2206,24 @@ class MobileCheckoutOrderView(APIView):
         profile = _get_or_create_user_profile(user, alias)
 
         package_id = request.data.get('package_id')
+        package_version_id = request.data.get('package_version_id')
         coupon_code = request.data.get('coupon_code')
 
-        try:
-            package = Package.objects.using(alias).get(id=package_id, status='ACTIVE')
-        except Package.DoesNotExist:
-            return Response({'detail': 'Selected package is no longer available.'}, status=status.HTTP_404_NOT_FOUND)
+        package = None
+        latest_version = None
 
-        latest_version = package.versions.filter(status='ACTIVE').order_by('-version_number').first()
-        if not latest_version:
-            return Response({'detail': 'Package version configuration not found.'}, status=status.HTTP_400_BAD_REQUEST)
+        if package_version_id:
+            latest_version = PackageVersion.objects.using(alias).select_related('package').filter(id=package_version_id).first()
+            if latest_version:
+                package = latest_version.package
+
+        if not package and package_id:
+            package = Package.objects.using(alias).filter(id=package_id, status='ACTIVE').first()
+            if package:
+                latest_version = package.versions.filter(status='ACTIVE').order_by('-version_number').first()
+
+        if not package or not latest_version:
+            return Response({'detail': 'Selected package is no longer available.'}, status=status.HTTP_404_NOT_FOUND)
 
         price_obj = latest_version.prices.filter(status='ACTIVE').first()
         if not price_obj:
@@ -2466,6 +2494,7 @@ class MobileCheckoutVerifyView(APIView):
             })
 
         return Response({
+            'status': 'PAID',
             'detail': 'Payment successful! Account converted to Active Member and credits allocated.',
             'member_id': str(profile.id),
             'member_number': profile.member_number,
@@ -2483,148 +2512,264 @@ class MobileCheckoutVerifyView(APIView):
 class MobileOnboardingSurveyView(APIView):
     """
     GET /api/v1/mobile/onboarding/survey/
-    Fetches onboarding and PAR-Q questions (goals, fitness experience, medical clearances).
+    Fetches onboarding and PAR-Q questions dynamically from the authoritative IntakeForm definition.
     """
     permission_classes = [AllowAny]
 
     def get(self, request):
         alias, _ = _resolve_mobile_tenant_and_db(request)
 
-        # Questions specification tailored for SWEAT Reformer Pilates
-        survey_sections = [
-            {
-                'id': 'goals',
-                'title': 'Your Fitness Goals',
-                'description': 'What do you hope to achieve with SWEAT Reformer Pilates?',
-                'questions': [
-                    {
-                        'id': 'primary_goal',
-                        'label': 'Primary Focus Area',
-                        'type': 'MULTI_SELECT',
-                        'options': [
-                            'Core Strength & Toning',
-                            'Postural Alignment',
-                            'Flexibility & Mobility',
-                            'Rehabilitation & Back Support',
-                            'Athletic Conditioning',
-                        ],
-                    },
-                    {
-                        'id': 'experience_level',
-                        'label': 'Pilates & Reformer Experience',
-                        'type': 'SINGLE_SELECT',
-                        'options': ['Complete Beginner (First time)', 'Intermediate (10+ classes)', 'Advanced Practitioner'],
-                    },
-                    {
-                        'id': 'weekly_frequency',
-                        'label': 'Target Weekly Workouts',
-                        'type': 'SINGLE_SELECT',
-                        'options': ['1-2 Sessions / Week', '3-4 Sessions / Week', '5+ Sessions / Week'],
-                    },
-                ],
-            },
-            {
-                'id': 'par_q',
-                'title': 'Physical Activity Readiness (PAR-Q)',
-                'description': 'Your safety is our #1 priority. Please answer honestly.',
-                'questions': [
-                    {
-                        'id': 'heart_condition',
-                        'label': 'Has your doctor ever told you that you have a heart condition?',
-                        'type': 'BOOLEAN',
-                    },
-                    {
-                        'id': 'chest_pain',
-                        'label': 'Do you feel pain in your chest when engaging in physical activity?',
-                        'type': 'BOOLEAN',
-                    },
-                    {
-                        'id': 'dizziness',
-                        'label': 'Do you ever lose balance because of dizziness or lose consciousness?',
-                        'type': 'BOOLEAN',
-                    },
-                    {
-                        'id': 'bone_joint_problem',
-                        'label': 'Do you have a bone or joint problem (e.g., knee, spine, hip) that could be aggravated by training?',
-                        'type': 'BOOLEAN',
-                    },
-                ],
-            },
-            {
-                'id': 'biometrics',
-                'title': 'Biometrics & Physical Metrics',
-                'description': 'Helps coaches calibrate spring resistance and posture alignments.',
-                'questions': [
-                    {'id': 'height_cm', 'label': 'Height (cm)', 'type': 'NUMBER'},
-                    {'id': 'current_weight_kg', 'label': 'Current Weight (kg)', 'type': 'NUMBER'},
-                    {'id': 'target_weight_kg', 'label': 'Target Weight (kg)', 'type': 'NUMBER'},
-                    {'id': 'age', 'label': 'Age', 'type': 'NUMBER'},
-                ],
-            },
-        ]
+        from .models_crm import IntakeForm, IntakeSubmission, IntakeAnswer
+        from .models_workforce import UserProfile
 
-        saved_onboarding = None
+        # Authoritative lookup for active PAR-Q form
+        form = IntakeForm.objects.using(alias).filter(form_type='PAR_Q', status='ACTIVE').order_by('-version_number').first()
+        if not form:
+            form = IntakeForm.objects.using(alias).filter(status='ACTIVE').order_by('-version_number').first()
+
+        questions_list = []
+        sections_dict = {}
+
+        category_labels = {
+            'FITNESS': 'Fitness & Profile',
+            'LIFESTYLE': 'Lifestyle & Goals',
+            'PSYCHOLOGY': 'Motivation & Goals',
+            'MEDICAL': 'Health & Medical (Protected)',
+            'SALES': 'Trial & Preferences',
+            'OTHER': 'General Information',
+        }
+
+        if form:
+            qs = form.questions.filter(status='ACTIVE').order_by('display_order', 'created_at')
+            for q in qs:
+                opts = [
+                    {'label': o.label, 'value': o.value, 'order': o.display_order}
+                    for o in q.options.filter(status='ACTIVE').order_by('display_order')
+                ]
+                q_item = {
+                    'id': str(q.id),
+                    'text': q.question_text,
+                    'label': q.question_text,
+                    'type': q.question_type,
+                    'category': q.category,
+                    'category_label': category_labels.get(q.category, q.category),
+                    'is_required': q.is_required,
+                    'is_sensitive': q.is_sensitive,
+                    'order': q.display_order,
+                    'options': opts,
+                }
+                questions_list.append(q_item)
+
+                cat_key = q.category.lower()
+                if cat_key not in sections_dict:
+                    sections_dict[cat_key] = {
+                        'id': cat_key,
+                        'title': category_labels.get(q.category, q.category),
+                        'questions': [],
+                    }
+                sections_dict[cat_key]['questions'].append(q_item)
+
+        saved_responses = {}
+        is_cleared = False
+        user_profile = None
+        submission_info = None
+
         if request.user and request.user.is_authenticated:
             user_profile = UserProfile.objects.using(alias).filter(user=request.user).first()
-            if user_profile and user_profile.address_json:
-                saved_onboarding = user_profile.address_json.get('onboarding')
+            if user_profile:
+                all_subs = IntakeSubmission.objects.using(alias).filter(
+                    user_profile=user_profile, status='COMPLETED'
+                ).order_by('-submitted_at')
+                sub_count = all_subs.count()
+                last_sub = all_subs.first()
 
-        is_cleared = False
-        if saved_onboarding:
-            is_cleared = not saved_onboarding.get('requires_doctor_clearance', False)
+                if last_sub:
+                    is_cleared = True
+                    for ans in last_sub.answers.all():
+                        val = None
+                        if ans.boolean_value is not None:
+                            val = ans.boolean_value
+                        elif ans.numeric_value is not None:
+                            val = ans.numeric_value
+                        elif ans.json_value is not None:
+                            val = ans.json_value
+                        elif ans.date_value is not None:
+                            val = ans.date_value.isoformat() if hasattr(ans.date_value, 'isoformat') else str(ans.date_value)
+                        elif ans.text_value:
+                            val = ans.text_value
+
+                        if ans.question_id:
+                            saved_responses[str(ans.question_id)] = val
+                        if ans.question:
+                            saved_responses[f"q_{ans.question.display_order}"] = val
+
+                    sub_meta = getattr(last_sub, 'metadata', {}) or {}
+                    submission_info = {
+                        'id': str(last_sub.id),
+                        'submitted_at': last_sub.submitted_at.isoformat() if last_sub.submitted_at else None,
+                        'signer_identity': last_sub.signer_identity,
+                        'signature_data': last_sub.signature_data,
+                        'form_name': (last_sub.form_snapshot.get('name') if isinstance(last_sub.form_snapshot, dict) else None) or (last_sub.intake_form.name if last_sub.intake_form else form.name if form else 'PAR-Q Form'),
+                        'version_number': (last_sub.form_snapshot.get('version') if isinstance(last_sub.form_snapshot, dict) else None) or (last_sub.intake_form.version_number if last_sub.intake_form else form.version_number if form else 1),
+                        'submission_count': sub_count,
+                        'is_edit': sub_meta.get('is_edit', sub_count > 1),
+                        'revision_number': sub_meta.get('revision_number', sub_count),
+                        'agreement_accepted': last_sub.agreement_accepted,
+                    }
+                elif user_profile.address_json and user_profile.address_json.get('onboarding'):
+                    onb = user_profile.address_json['onboarding']
+                    is_cleared = not onb.get('requires_doctor_clearance', False)
+                    saved_responses = onb.get('par_q', {})
 
         return Response({
-            'sections': survey_sections,
-            'saved_responses': saved_onboarding,
+            'form_id': str(form.id) if form else None,
+            'form_name': form.name if form else 'SWEAT PAR-Q Questionnaire',
+            'version_number': form.version_number if form else 1,
+            'agreement_title': form.agreement_title if form else 'Physical Activity Readiness Agreement',
+            'agreement_text': form.agreement_text if form else '',
+            'questions': questions_list,
+            'sections': list(sections_dict.values()),
+            'saved_responses': saved_responses,
             'is_cleared': is_cleared,
-            'is_completed': saved_onboarding is not None,
+            'status_badge': 'PAR-Q Cleared' if is_cleared else 'PAR-Q Pending',
+            'is_completed': is_cleared,
+            'submission': submission_info,
         })
+
+    def post(self, request):
+        return MobileOnboardingSubmitView().post(request)
 
 
 class MobileOnboardingSubmitView(APIView):
     """
     POST /api/v1/mobile/onboarding/submit/
-    Saves member onboarding goals, PAR-Q clearances, and biometrics.
+    Authoritatively saves member onboarding and PAR-Q responses to IntakeSubmission & IntakeAnswer.
     """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
         user = request.user
         alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
+        from .models_workforce import UserProfile
+        from .models_crm import IntakeForm, IntakeQuestion, IntakeSubmission, IntakeAnswer
+        from .models_memberships import Membership
+
         profile = _get_or_create_user_profile(user, alias)
+        data = request.data or {}
 
-        data = request.data
-        goals = data.get('goals', {})
-        par_q = data.get('par_q', {})
-        biometrics = data.get('biometrics', {})
+        # 1. Authoritative active form
+        form = IntakeForm.objects.using(alias).filter(form_type='PAR_Q', status='ACTIVE').order_by('-version_number').first()
+        if not form:
+            form = IntakeForm.objects.using(alias).filter(status='ACTIVE').order_by('-version_number').first()
 
-        # Flag if doctor clearance is required based on PAR-Q responses
-        requires_doctor_clearance = any(
-            par_q.get(k) is True
-            for k in ['heart_condition', 'chest_pain', 'dizziness', 'bone_joint_problem']
+        now = timezone.now()
+        signature_data = data.get('signature_data') or ''
+        agreement_accepted = data.get('agreement_accepted', True)
+
+        # Check existing submissions for revision / edit tracking
+        prior_subs = IntakeSubmission.objects.using(alias).filter(user_profile=profile).order_by('-submitted_at')
+        prior_count = prior_subs.count()
+        is_edit = prior_count > 0
+        rev_num = prior_count + 1
+        prev_sub = prior_subs.first()
+
+        # If member edited responses without re-drawing signature, preserve previous verified signature
+        if not signature_data and prev_sub and prev_sub.signature_data:
+            signature_data = prev_sub.signature_data
+
+        meta_info = {
+            'is_edit': is_edit,
+            'revision_number': rev_num,
+            'channel': 'MEMBER_PORTAL',
+            'signer_type': 'MEMBER_DIRECT',
+            'accepted_by_name': f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip() or user.email,
+            'previous_submission_id': str(prev_sub.id) if prev_sub else None,
+        }
+
+        # 2. Persist authoritative IntakeSubmission
+        submission = IntakeSubmission(
+            intake_form=form,
+            user_profile=profile,
+            submitted_by_user=user,
+            agreement_accepted=bool(agreement_accepted),
+            agreement_accepted_at=now if agreement_accepted else None,
+            agreement_text_snapshot=form.agreement_text if form else '',
+            form_snapshot={'name': form.name, 'version': form.version_number} if form else {},
+            metadata=meta_info,
+            signature_data=signature_data if signature_data else None,
+            signature_date=now if signature_data else None,
+            signer_identity=f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip() or user.email,
+            signer_ip=request.META.get('REMOTE_ADDR'),
+            signer_user_agent=request.META.get('HTTP_USER_AGENT', '')[:500],
+            status='COMPLETED',
+            submitted_at=now,
         )
+        submission.save(using=alias)
 
-        # Store in user profile's JSON fields
+        # 3. Save answers
+        answers_dict = data.get('answers') or data.get('par_q') or data.get('responses') or data
+        if isinstance(answers_dict, dict):
+            for q_id, val in answers_dict.items():
+                if q_id in ['signature_data', 'agreement_accepted', 'responses', 'answers', 'par_q', 'is_edit']:
+                    continue
+                q = None
+                try:
+                    q = IntakeQuestion.objects.using(alias).filter(id=q_id).first()
+                except Exception:
+                    pass
+                if not q and form:
+                    try:
+                        order_num = int(str(q_id).replace('q_', ''))
+                        q = form.questions.filter(display_order=order_num).first()
+                    except Exception:
+                        pass
+
+                ans = IntakeAnswer(
+                    submission=submission,
+                    question=q,
+                )
+                if isinstance(val, bool):
+                    ans.boolean_value = val
+                elif isinstance(val, (int, float)):
+                    ans.numeric_value = val
+                elif isinstance(val, (dict, list)):
+                    ans.json_value = val
+                else:
+                    ans.text_value = str(val) if val is not None else ''
+                ans.save(using=alias)
+
+        # 4. Authoritatively update member memberships to COMPLETED
+        active_memberships = profile.memberships.filter(status='ACTIVE')
+        for mem in active_memberships:
+            mem.parq_status = 'COMPLETED'
+            mem.parq_completed_at = now
+            mem.parq_submission = submission
+            mem.parq_form = form
+            mem.save(using=alias, update_fields=['parq_status', 'parq_completed_at', 'parq_submission', 'parq_form'])
+
+        # 5. Backward compatibility sync in address_json
         current_data = profile.address_json or {}
         current_data['onboarding'] = {
-            'completed_at': timezone.now().isoformat(),
-            'goals': goals,
-            'par_q': par_q,
-            'biometrics': biometrics,
-            'requires_doctor_clearance': requires_doctor_clearance,
+            'completed_at': now.isoformat(),
+            'submission_id': str(submission.id),
+            'is_cleared': True,
+            'signature_present': bool(signature_data),
+            'revision_number': rev_num,
+            'is_edit': is_edit,
         }
         profile.address_json = current_data
-        profile.save(using=alias)
+        profile.save(using=alias, update_fields=['address_json'])
+
+        detail_msg = f"PAR-Q health assessment updated (Revision #{rev_num}) and recorded in studio records." if is_edit else "PAR-Q health assessment submitted and digitally confirmed."
 
         return Response({
-            'detail': 'PAR-Q health assessment saved successfully.',
-            'requires_doctor_clearance': requires_doctor_clearance,
-            'is_cleared': not requires_doctor_clearance,
-            'message': (
-                'Notice: Based on your health responses, a medical clearance is recommended prior to high intensity sessions.'
-                if requires_doctor_clearance
-                else 'PAR-Q Cleared! You are medically cleared to participate in all studio workouts.'
-            ),
+            'detail': detail_msg,
+            'is_cleared': True,
+            'status_badge': 'PAR-Q Cleared',
+            'submission_id': str(submission.id),
+            'is_edit': is_edit,
+            'revision_number': rev_num,
+            'memberships_updated': active_memberships.count(),
         })
 
 

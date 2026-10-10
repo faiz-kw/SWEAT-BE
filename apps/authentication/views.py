@@ -948,6 +948,9 @@ class MeView(APIView):
                         m_code = (tm.module.code or '').lower()
                         if m_code and m_code not in enabled_modules_list:
                             enabled_modules_list.append(m_code)
+                            root_path = f"/{m_code}"
+                            if root_path not in enabled_modules_list:
+                                enabled_modules_list.append(root_path)
                         subs = []
                         if tm.configuration and isinstance(tm.configuration, dict):
                             subs = tm.configuration.get('enabled_submodules') or []

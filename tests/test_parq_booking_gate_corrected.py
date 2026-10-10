@@ -1,4 +1,4 @@
-﻿import uuid
+import uuid
 import os
 import django
 from decimal import Decimal
@@ -20,7 +20,10 @@ from apps.tenant_core.models_users import TenantUser
 from apps.tenant_core.models_crm import (
     Lead, UserProfile, IntakeForm, IntakeQuestion, IntakeQuestionOption, IntakeSubmission, IntakeAnswer
 )
-from apps.tenant_core.models_catalog import Program, Package, PackageVersion, PackagePrice, PackageEntitlementDefinition
+from apps.tenant_core.models_catalog import (
+    Program, Package, PackageVersion, PackagePrice, PackageEntitlementDefinition,
+    TermsDocument, TermsDocumentVersion, TermsAcceptance
+)
 from apps.tenant_core.models_classes import ClassCategory, ClassTemplate, ClassOccurrence
 from apps.tenant_core.models_commerce import Order, OrderItem
 from apps.tenant_core.models_memberships import (
@@ -109,6 +112,12 @@ class ParqCorrectedWorkflowTests(TestCase):
             member_status="ACTIVE",
             first_name_snapshot="Jane",
             last_name_snapshot="Doe",
+        )
+        self.other_member_profile = UserProfile.objects.using(DB).create(
+            user=self.other_member_user,
+            member_status="ACTIVE",
+            first_name_snapshot="Other",
+            last_name_snapshot="Member",
         )
 
         # 3. Program & Package
@@ -492,3 +501,165 @@ class ParqCorrectedWorkflowTests(TestCase):
         self.assertIn("already been completed", str(res_dup.data))
 
         print("\nAll 14 Verification Scenarios Passed Successfully!")
+
+    def test_terms_acceptance_resolution_paths_and_isolation(self):
+        """
+        Regression Test for activate_membership_from_order terms acceptance resolution:
+        1. Order-level acceptance exists -> recorded in contract_snapshot.terms_document_version_ids
+        2. Fallback path (no order-level acceptance, but user_profile has prior acceptance) -> recorded
+        3. Isolation: Unrelated users' acceptances are never selected
+        4. Relationships: links correct member, order, accepted terms version, and contract snapshot
+        """
+        set_tenant_db_alias(DB)
+
+        # 1. Setup Terms Document & Versions
+        doc = TermsDocument.objects.using(DB).create(
+            organization=self.org,
+            code=f"TERMS-{uuid.uuid4().hex[:4]}",
+            name="Studio Terms & Rules",
+            document_type="MEMBERSHIP_TERMS",
+            status="ACTIVE"
+        )
+        ver1 = TermsDocumentVersion.objects.using(DB).create(
+            terms_document=doc,
+            version_number=1,
+            content_text="Terms version 1",
+            effective_from=timezone.now(),
+            status="ACTIVE",
+            created_by_user=self.staff_user
+        )
+        ver2 = TermsDocumentVersion.objects.using(DB).create(
+            terms_document=doc,
+            version_number=2,
+            content_text="Terms version 2",
+            effective_from=timezone.now(),
+            status="ACTIVE",
+            created_by_user=self.staff_user
+        )
+
+        # Helper to create an order
+        def create_test_order(profile):
+            ord_obj = Order.objects.using(DB).create(
+                branch=self.branch,
+                user_profile=profile,
+                order_number=f"ORD-{uuid.uuid4().hex[:8]}",
+                order_type="PACKAGE",
+                status="PAID",
+                currency="INR"
+            )
+            item_obj = OrderItem.objects.using(DB).create(
+                order=ord_obj,
+                item_type="PACKAGE",
+                package=self.package,
+                package_version=self.pv,
+                package_price=self.pp,
+                unit_price_snapshot=Decimal("3000.00"),
+                total_amount=Decimal("3000.00")
+            )
+            return ord_obj, item_obj
+
+        # -------------------------------------------------------------
+        # Scenario A: Order-level terms acceptance exists
+        # -------------------------------------------------------------
+        order_a, item_a = create_test_order(self.member_profile)
+        TermsAcceptance.objects.using(DB).create(
+            terms_document_version=ver1,
+            order_id=order_a.id,
+            user_profile=self.member_profile,
+            accepted_via="WEB"
+        )
+
+        mem_a = MembershipLifecycleService.activate_membership_from_order(
+            order=order_a,
+            order_item=item_a,
+            db_alias=DB,
+            created_by_user=self.staff_user
+        )
+        self.assertIsNotNone(mem_a.contract_snapshot)
+        self.assertEqual(mem_a.contract_snapshot.terms_document_version_ids, [str(ver1.id)])
+        self.assertEqual(mem_a.user_profile.id, self.member_profile.id)
+        self.assertEqual(mem_a.source_order.id, order_a.id)
+
+        # -------------------------------------------------------------
+        # Scenario B: Fallback path (no order-level acceptance, profile has acceptance)
+        # Verify isolation: another unrelated member ALSO has a terms acceptance in DB!
+        # -------------------------------------------------------------
+        # Unrelated member accepts ver1
+        TermsAcceptance.objects.using(DB).create(
+            terms_document_version=ver1,
+            order_id=None,
+            user_profile=self.other_member_profile,
+            accepted_via="WEB"
+        )
+
+        member_b_user = TenantUser.objects.using(DB).create(
+            organization=self.org,
+            email=f"member-b-{uuid.uuid4().hex[:6]}@test.com",
+            first_name="Member",
+            last_name="B",
+            status="ACTIVE"
+        )
+        member_b_profile = UserProfile.objects.using(DB).create(
+            user=member_b_user,
+            member_number=f"MEM-B-{uuid.uuid4().hex[:4]}",
+            first_name_snapshot="Member",
+            last_name_snapshot="B",
+            member_status="ACTIVE",
+            preferred_branch=self.branch
+        )
+
+        # Member B accepts ver2 on their profile (e.g. at initial onboarding)
+        TermsAcceptance.objects.using(DB).create(
+            terms_document_version=ver2,
+            order_id=None,
+            user_profile=member_b_profile,
+            accepted_via="WEB"
+        )
+
+        # Member B places order_b with NO order-level acceptance
+        order_b, item_b = create_test_order(member_b_profile)
+
+        mem_b = MembershipLifecycleService.activate_membership_from_order(
+            order=order_b,
+            order_item=item_b,
+            db_alias=DB,
+            created_by_user=self.staff_user
+        )
+        self.assertIsNotNone(mem_b.contract_snapshot)
+        # Must resolve ver2 from member_b_profile, NOT ver1 from other_member_profile or member A!
+        self.assertEqual(mem_b.contract_snapshot.terms_document_version_ids, [str(ver2.id)])
+        self.assertNotIn(str(ver1.id), mem_b.contract_snapshot.terms_document_version_ids)
+        self.assertEqual(mem_b.user_profile.id, member_b_profile.id)
+        self.assertEqual(mem_b.source_order.id, order_b.id)
+
+        # -------------------------------------------------------------
+        # Scenario C: Brand new member with NO acceptances anywhere
+        # -------------------------------------------------------------
+        new_user = TenantUser.objects.using(DB).create(
+            organization=self.org,
+            email=f"brandnew-{uuid.uuid4().hex[:4]}@test.com",
+            first_name="Brand",
+            last_name="New",
+            status="ACTIVE"
+        )
+        new_profile = UserProfile.objects.using(DB).create(
+            user=new_user,
+            member_number=f"MEM-BN-{uuid.uuid4().hex[:4]}",
+            first_name_snapshot="Brand",
+            last_name_snapshot="New",
+            member_status="ACTIVE",
+            preferred_branch=self.branch
+        )
+        order_c, item_c = create_test_order(new_profile)
+
+        mem_c = MembershipLifecycleService.activate_membership_from_order(
+            order=order_c,
+            order_item=item_c,
+            db_alias=DB,
+            created_by_user=self.staff_user
+        )
+        self.assertIsNotNone(mem_c.contract_snapshot)
+        # Must be empty list, and NOT contaminate with any other user's acceptances
+        self.assertEqual(mem_c.contract_snapshot.terms_document_version_ids, [])
+        self.assertEqual(mem_c.user_profile.id, new_profile.id)
+        self.assertEqual(mem_c.source_order.id, order_c.id)

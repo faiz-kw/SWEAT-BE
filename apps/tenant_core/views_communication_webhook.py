@@ -103,6 +103,7 @@ class CommunicationWebhookView(APIView):
                 'TWILIO': 'SMS',
                 'MSG91': 'SMS',
                 'GUPSHUP_SMS': 'SMS',
+                'SARVAM': 'VOICE',
             }
             channel = channel_map.get(provider_upper, 'WHATSAPP')
 
@@ -134,6 +135,12 @@ class CommunicationWebhookView(APIView):
             if not adapter.verify_webhook_signature(request.body, request.META):
                 logger.warning("Invalid webhook signature for tenant %s provider %s", tenant.id, provider)
                 return Response({'error': 'Invalid webhook signature'}, status=status.HTTP_401_UNAUTHORIZED)
+
+            # SARVAM Voice Callback handler
+            if provider_upper == 'SARVAM':
+                from apps.tenant_core.services_voice_calling import VoiceCallingService
+                res = VoiceCallingService.record_call_webhook(org, payload, db_alias=db_alias)
+                return Response(res, status=status.HTTP_200_OK)
 
             # Step 4: Check for Delivery Status Event
             status_event = adapter.parse_status_webhook(payload, request.META)

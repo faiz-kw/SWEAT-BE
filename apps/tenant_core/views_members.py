@@ -311,7 +311,39 @@ def serialize_member(profile: UserProfile, alias: str = 'default') -> dict:
     # Assigned trainer
     assigned_trainer = getattr(profile, 'primary_coach_name', None) or 'Unassigned'
 
+    # PAR-Q Compliance Status & Revision Tracking
+    from .models_crm import IntakeSubmission
+    parq_subs = IntakeSubmission.objects.using(alias).filter(user_profile=profile).order_by('-submitted_at')
+    parq_sub_count = parq_subs.count()
+    latest_parq = parq_subs.first()
+
+    parq_status = 'PENDING'
+    parq_completed_at = None
+    parq_version = 1
+    parq_has_edits = parq_sub_count > 1
+
+    if active_m and getattr(active_m, 'parq_status', None):
+        parq_status = active_m.parq_status
+        parq_completed_at = active_m.parq_completed_at.isoformat() if active_m.parq_completed_at else None
+    elif latest_parq and latest_parq.status == 'COMPLETED':
+        parq_status = 'COMPLETED'
+        parq_completed_at = latest_parq.submitted_at.isoformat() if latest_parq.submitted_at else None
+    elif profile.address_json and profile.address_json.get('onboarding', {}).get('is_cleared'):
+        parq_status = 'COMPLETED'
+        parq_completed_at = profile.address_json.get('onboarding', {}).get('completed_at')
+
+    if latest_parq:
+        if isinstance(getattr(latest_parq, 'form_snapshot', None), dict) and latest_parq.form_snapshot.get('version'):
+            parq_version = latest_parq.form_snapshot.get('version')
+        elif latest_parq.intake_form:
+            parq_version = latest_parq.intake_form.version_number
+
     return {
+        'parq_status': parq_status,
+        'parq_completed_at': parq_completed_at,
+        'parq_sub_count': parq_sub_count,
+        'parq_has_edits': parq_has_edits,
+        'parq_version': parq_version,
         'id': str(profile.id),
         'tenant_id': str(user.organization_id) if user and getattr(user, 'organization_id', None) else None,
         'location': str(branch.id) if branch else None,
@@ -601,6 +633,30 @@ def build_member_timeline(profile: UserProfile, alias: str = 'default', limit: i
             'actor': 'Front Desk' if att.check_in_method == 'FRONT_DESK' else 'QR Scan',
             'badge_color': 'teal' if att.status == 'PRESENT' else 'rose',
             'metadata': {'attendance_id': str(att.id), 'method': att.check_in_method},
+        })
+
+    # 7. Health & PAR-Q Intake Assessments and Revisions
+    from .models_crm import IntakeSubmission
+    for sub in IntakeSubmission.objects.using(alias).filter(user_profile=profile).select_related('intake_form').order_by('-submitted_at'):
+        sub_meta = getattr(sub, 'metadata', {}) or {}
+        is_edit = sub_meta.get('is_edit', False)
+        rev_num = sub_meta.get('revision_number', 1)
+        form_name = (sub.form_snapshot.get('name') if isinstance(sub.form_snapshot, dict) else None) or (sub.intake_form.name if sub.intake_form else 'PAR-Q Questionnaire')
+        form_v = (sub.form_snapshot.get('version') if isinstance(sub.form_snapshot, dict) else None) or (sub.intake_form.version_number if sub.intake_form else 1)
+
+        events.append({
+            'event_type': 'PARQ_REVISION' if is_edit else 'PARQ_CLEARED',
+            'title': f"PAR-Q Assessment Updated (Rev #{rev_num})" if is_edit else f"PAR-Q Assessment Completed (v{form_v})",
+            'description': f"{form_name} {'edited and re-certified' if is_edit else 'completed and digitally signed'} by {sub.signer_identity or 'Member'}.",
+            'occurred_at': sub.submitted_at.isoformat() if sub.submitted_at else sub.created_at.isoformat(),
+            'actor': sub.signer_identity or 'Member',
+            'badge_color': 'blue' if is_edit else 'emerald',
+            'metadata': {
+                'submission_id': str(sub.id),
+                'is_edit': is_edit,
+                'revision_number': rev_num,
+                'status': sub.status,
+            },
         })
 
     # Sort all events chronologically descending
@@ -1029,6 +1085,9 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             'sensitive_data_restricted': not can_view_health,
             'answers': answers,
             'form_snapshot': getattr(sub, 'form_snapshot', None),
+            'metadata': meta,
+            'is_edit': meta.get('is_edit', False),
+            'revision_number': meta.get('revision_number', 1),
         })
 
     # Build purchase-specific PAR-Q requirements per membership

@@ -426,10 +426,23 @@ class BookingWaitlistAttendanceService:
 
         # 6. Capacity Check
         from .models_crm import TrialBooking
-        trial_enrolled = TrialBooking.objects.using(alias).filter(
+        booked_user_emails = set(
+            occurrence.bookings.using(alias).filter(
+                status__in=['CONFIRMED', 'RESERVED', 'COMPLETED']
+            ).values_list('user_profile__user__email', flat=True)
+        )
+        trial_qs = TrialBooking.objects.using(alias).filter(
             class_occurrence_id=occurrence.id,
             status__in=['BOOKED', 'CONFIRMED', 'ATTENDED']
-        ).count()
+        )
+        if booked_user_emails:
+            trial_qs = trial_qs.exclude(lead__email_normalized__in=booked_user_emails)
+        if user_profile and user_profile.user:
+            trial_qs = trial_qs.exclude(
+                models.Q(lead__email_normalized__iexact=user_profile.user.email) |
+                (models.Q(lead__phone_normalized=user_profile.user.phone) if user_profile.user.phone else models.Q(pk=None))
+            )
+        trial_enrolled = trial_qs.count()
         enrolled_count = occurrence.bookings.using(alias).filter(
             status__in=['CONFIRMED', 'RESERVED', 'COMPLETED']
         ).count() + trial_enrolled
@@ -580,10 +593,26 @@ class BookingWaitlistAttendanceService:
                 status__in=['CONFIRMED', 'RESERVED', 'COMPLETED']
             ).count()
             from .models_crm import TrialBooking
-            trial_enrolled = TrialBooking.objects.using(alias).filter(
+            user_email = user_profile.user.email if (user_profile and user_profile.user) else None
+            user_phone = user_profile.user.phone if (user_profile and user_profile.user) else None
+            booked_user_emails = set(
+                Booking.objects.using(alias).filter(
+                    occurrence=occurrence,
+                    status__in=['CONFIRMED', 'RESERVED', 'COMPLETED']
+                ).values_list('user_profile__user__email', flat=True)
+            )
+            trial_qs = TrialBooking.objects.using(alias).filter(
                 class_occurrence_id=occurrence.id,
                 status__in=['BOOKED', 'CONFIRMED', 'ATTENDED']
-            ).count()
+            )
+            if booked_user_emails:
+                trial_qs = trial_qs.exclude(lead__email_normalized__in=booked_user_emails)
+            if user_email or user_phone:
+                trial_qs = trial_qs.exclude(
+                    models.Q(lead__email_normalized__iexact=user_email) |
+                    (models.Q(lead__phone_normalized=user_phone) if user_phone else models.Q(pk=None))
+                )
+            trial_enrolled = trial_qs.count()
             total_enrolled = enrolled_count + trial_enrolled
             is_capacity_available = total_enrolled < occurrence.capacity
 
