@@ -109,8 +109,8 @@ def _get_org(request):
 
 def calculate_member_outstanding(profile: UserProfile, alias: str = 'default') -> Decimal:
     """
-    Computes total outstanding balance across all non-cancelled, non-draft orders for a member.
-    Accounts for payable orders (PENDING_PAYMENT, PARTIALLY_PAID), successful payments, and refunds.
+    Computes total genuine outstanding balance across partially paid orders or active credit agreements for a member.
+    Excludes cancelled, refunded, draft, and abandoned unpaid checkout attempts.
     """
     orders = Order.objects.using(alias).filter(
         user_profile=profile
@@ -118,19 +118,71 @@ def calculate_member_outstanding(profile: UserProfile, alias: str = 'default') -
 
     total_outstanding = Decimal('0.00')
     for order in orders:
-        if order.status in ['PENDING_PAYMENT', 'PARTIALLY_PAID']:
+        if order.status == 'PARTIALLY_PAID':
             paid_sum = PaymentTransaction.objects.using(alias).filter(
-                order=order, status='SUCCESS'
+                order=order, status__in=['SUCCESS', 'success']
             ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
             refund_sum = Refund.objects.using(alias).filter(
-                order=order, status='SUCCESS'
+                order=order, status__in=['SUCCESS', 'success']
             ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
             net_paid = max(Decimal('0.00'), paid_sum - refund_sum)
             diff = order.total_amount - net_paid
             if diff > Decimal('0.00'):
                 total_outstanding += diff
+        elif order.status == 'PENDING_PAYMENT':
+            # Check if any partial payment was committed on this order
+            paid_sum = PaymentTransaction.objects.using(alias).filter(
+                order=order, status__in=['SUCCESS', 'success']
+            ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+            if paid_sum > Decimal('0.00'):
+                diff = order.total_amount - paid_sum
+                if diff > Decimal('0.00'):
+                    total_outstanding += diff
+            # Abandoned/cancelled payment attempts with zero payments are NOT debt
 
     return total_outstanding
+
+
+def get_primary_membership(profile: UserProfile, alias: str = 'default'):
+    """
+    Returns the authoritative operational membership for a member:
+    1. First, an ACTIVE membership whose end_date is >= today (or NULL).
+       If multiple, pick the one with the latest end_date (or latest created_at).
+    2. Next, a currently FROZEN membership.
+    3. If neither, the latest membership by end_date and created_at.
+    """
+    today = timezone.now().date()
+    # 1. Currently active and unexpired
+    m = (
+        Membership.objects.using(alias)
+        .filter(user_profile=profile, status='ACTIVE')
+        .filter(Q(end_date__gte=today) | Q(end_date__isnull=True))
+        .select_related('package', 'package__program', 'package_version', 'package_price', 'home_branch', 'purchase_branch')
+        .order_by('-end_date', '-created_at')
+        .first()
+    )
+    if m:
+        return m
+
+    # 2. Currently frozen
+    m = (
+        Membership.objects.using(alias)
+        .filter(user_profile=profile, status='FROZEN')
+        .select_related('package', 'package__program', 'package_version', 'package_price', 'home_branch', 'purchase_branch')
+        .order_by('-end_date', '-created_at')
+        .first()
+    )
+    if m:
+        return m
+
+    # 3. Latest historical/expired membership
+    return (
+        Membership.objects.using(alias)
+        .filter(user_profile=profile)
+        .select_related('package', 'package__program', 'package_version', 'package_price', 'home_branch', 'purchase_branch')
+        .order_by('-end_date', '-created_at')
+        .first()
+    )
 
 
 def get_member_sessions_summary(profile: UserProfile, active_m: Membership = None, alias: str = 'default'):
@@ -142,12 +194,7 @@ def get_member_sessions_summary(profile: UserProfile, active_m: Membership = Non
     detailed_balances = []
 
     if not active_m:
-        active_m = (
-            Membership.objects.using(alias)
-            .filter(user_profile=profile)
-            .order_by('-created_at')
-            .first()
-        )
+        active_m = get_primary_membership(profile, alias)
 
     if active_m:
         ents = MembershipEntitlement.objects.using(alias).filter(membership=active_m)
@@ -181,20 +228,15 @@ def serialize_member(profile: UserProfile, alias: str = 'default') -> dict:
     full_name = f"{first_name} {last_name}".strip() or getattr(user, 'full_name', '') or getattr(user, 'email', '') or 'Member'
 
     # Age calculation
-    age = 28
+    age = None
     if profile.date_of_birth:
         today = timezone.now().date()
         dob = profile.date_of_birth
         age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
 
-    # Active or latest membership
-    active_m = (
-        Membership.objects.using(alias)
-        .filter(user_profile=profile)
-        .select_related('package', 'package__program', 'package_version', 'home_branch', 'purchase_branch')
-        .order_by('-created_at')
-        .first()
-    )
+    # Authoritative operational membership (prefers unexpired ACTIVE, then FROZEN, then latest)
+    today = timezone.now().date()
+    active_m = get_primary_membership(profile, alias)
 
     membership_name = "Standard Membership"
     active_plan = None
@@ -203,7 +245,6 @@ def serialize_member(profile: UserProfile, alias: str = 'default') -> dict:
     package_name = "None"
     package_id = None
     package_version_name = "v1"
-    membership_status = profile.member_status or 'ACTIVE'
     start_date = None
     expiry_date = None
 
@@ -218,16 +259,24 @@ def serialize_member(profile: UserProfile, alias: str = 'default') -> dict:
             program_id = str(prog.id)
         if active_m.package_version:
             package_version_name = f"v{active_m.package_version.version_number}"
-        membership_status = active_m.status
+
+        # Real membership status: check expiration against today
+        if active_m.status == 'ACTIVE' and active_m.end_date and active_m.end_date < today:
+            membership_status = 'EXPIRED'
+        else:
+            membership_status = active_m.status
+
         start_date = str(active_m.start_date) if active_m.start_date else None
         expiry_date = str(active_m.end_date) if active_m.end_date else None
         active_plan = {
             'id': str(active_m.id),
             'plan_name': membership_name,
-            'status': active_m.status,
+            'status': membership_status,
             'start_date': start_date or '',
             'end_date': expiry_date or '',
         }
+    else:
+        membership_status = 'INACTIVE'
 
     branch = profile.preferred_branch
 
@@ -276,7 +325,8 @@ def serialize_member(profile: UserProfile, alias: str = 'default') -> dict:
         'email': getattr(user, 'email', '') or '',
         'gender': profile.gender or 'M',
         'age': age,
-        'status': profile.member_status or 'ACTIVE',
+        'date_of_birth': str(profile.date_of_birth) if profile.date_of_birth else None,
+        'status': membership_status if (profile.member_status or 'ACTIVE') == 'ACTIVE' else (profile.member_status or membership_status),
         'membership_status': membership_status,
         'membership': membership_name,
         'membership_id': str(active_m.id) if active_m else None,
@@ -540,7 +590,7 @@ def build_member_timeline(profile: UserProfile, alias: str = 'default', limit: i
             'metadata': {'booking_id': str(bk.id), 'status': bk.status},
         })
 
-    for att in AttendanceRecord.objects.using(alias).filter(user_profile=profile).select_related('branch').order_by('-created_at')[:20]:
+    for att in AttendanceRecord.objects.using(alias).filter(user_profile=profile).select_related('branch').order_by('-check_in_at', '-created_at')[:20]:
         events.append({
             'id': f"att-{att.id}",
             'category': 'ATTENDANCE',
@@ -565,14 +615,7 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
     user = profile.user
     base_member = serialize_member(profile, alias)
 
-    active_m = (
-        Membership.objects.using(alias)
-        .filter(user_profile=profile)
-        .select_related('package', 'package__program', 'package_version', 'home_branch', 'purchase_branch')
-        .order_by('-created_at')
-        .first()
-    )
-
+    active_m = get_primary_membership(profile, alias)
     outstanding = Decimal(str(base_member['outstanding_balance']))
 
     # Alerts
@@ -791,7 +834,7 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             'check_in_method': att.check_in_method,
             'marked_by': att.marked_by_user.email if att.marked_by_user else 'Front Desk',
         }
-        for att in AttendanceRecord.objects.using(alias).filter(user_profile=profile).select_related('branch', 'marked_by_user').order_by('-created_at')[:50]
+        for att in AttendanceRecord.objects.using(alias).filter(user_profile=profile).select_related('branch', 'marked_by_user').order_by('-check_in_at', '-created_at')[:50]
     ]
 
     # 6. Finance
@@ -801,11 +844,20 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
 
     for ord_obj in Order.objects.using(alias).filter(user_profile=profile).prefetch_related('items').order_by('-created_at'):
         paid_for_order = PaymentTransaction.objects.using(alias).filter(
-            order=ord_obj, status='SUCCESS'
+            order=ord_obj, status__in=['SUCCESS', 'success']
         ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
 
-        bal = max(Decimal('0.00'), ord_obj.total_amount - paid_for_order)
-        if ord_obj.status not in ['CANCELLED', 'REFUNDED']:
+        if ord_obj.status in ['CANCELLED', 'REFUNDED', 'DRAFT']:
+            bal = Decimal('0.00')
+        elif ord_obj.status == 'PENDING_PAYMENT':
+            if paid_for_order > Decimal('0.00'):
+                bal = max(Decimal('0.00'), ord_obj.total_amount - paid_for_order)
+                total_invoiced += ord_obj.total_amount
+                total_paid += paid_for_order
+            else:
+                bal = Decimal('0.00')
+        else:
+            bal = max(Decimal('0.00'), ord_obj.total_amount - paid_for_order)
             total_invoiced += ord_obj.total_amount
             total_paid += paid_for_order
 
@@ -1014,6 +1066,7 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             'phone': base_member['phone'],
             'gender': base_member['gender'],
             'age': base_member['age'],
+            'date_of_birth': base_member.get('date_of_birth'),
             'joined_at': base_member['joined_at'],
             'emergency_contact': base_member['emergency_contact'],
             'acquisition_source': base_member['source'],
@@ -1164,19 +1217,46 @@ class MemberViewSet(viewsets.ViewSet):
         today = timezone.now().date()
 
         # Branch / Location filter: current / home member branch
+        branch_ids_param = request.query_params.get('branch_ids')
         location = request.query_params.get('location') or request.query_params.get('locationId') or request.query_params.get('branch_id')
-        if location and location not in ['all', 'ALL']:
+        if branch_ids_param:
+            b_ids = [b.strip() for b in branch_ids_param.split(',') if b.strip()]
+            if b_ids:
+                qs = qs.filter(Q(preferred_branch_id__in=b_ids) | Q(memberships__home_branch_id__in=b_ids))
+        elif location and location not in ['all', 'ALL']:
             qs = qs.filter(Q(preferred_branch_id=location) | Q(memberships__home_branch_id=location))
 
         # Program filter
+        program_ids_param = request.query_params.get('program_ids')
         program_id = request.query_params.get('program_id')
-        if program_id and program_id not in ['all', 'ALL']:
+        if program_ids_param:
+            p_ids = [p.strip() for p in program_ids_param.split(',') if p.strip()]
+            if p_ids:
+                qs = qs.filter(memberships__program_id__in=p_ids)
+        elif program_id and program_id not in ['all', 'ALL']:
             qs = qs.filter(memberships__program_id=program_id)
 
         # Package filter
+        package_ids_param = request.query_params.get('package_ids')
         package_id = request.query_params.get('package_id')
-        if package_id and package_id not in ['all', 'ALL']:
+        if package_ids_param:
+            pkg_ids = [p.strip() for p in package_ids_param.split(',') if p.strip()]
+            if pkg_ids:
+                qs = qs.filter(memberships__package_id__in=pkg_ids)
+        elif package_id and package_id not in ['all', 'ALL']:
             qs = qs.filter(memberships__package_id=package_id)
+
+        # Date range filter (joining_date or created_at)
+        date_from = request.query_params.get('date_from') or request.query_params.get('start_date')
+        date_to = request.query_params.get('date_to') or request.query_params.get('end_date')
+        if date_from:
+            qs = qs.filter(
+                Q(joining_date__gte=date_from) | (Q(joining_date__isnull=True) & Q(created_at__date__gte=date_from))
+            )
+        if date_to:
+            qs = qs.filter(
+                Q(joining_date__lte=date_to) | (Q(joining_date__isnull=True) & Q(created_at__date__lte=date_to))
+            )
 
         # Status filter
         status_param = request.query_params.get('status')
@@ -1184,9 +1264,8 @@ class MemberViewSet(viewsets.ViewSet):
             st = status_param.upper()
             if st == 'ACTIVE':
                 qs = qs.filter(
-                    memberships__status='ACTIVE'
-                ).filter(
-                    Q(memberships__end_date__gte=today) | Q(memberships__end_date__isnull=True)
+                    memberships__status='ACTIVE',
+                    memberships__end_date__gte=today
                 ).exclude(
                     memberships__status='FROZEN'
                 )
@@ -1245,9 +1324,8 @@ class MemberViewSet(viewsets.ViewSet):
         if quick_view == 'active':
             # Canonical active membership: currently ACTIVE, not past end_date, not FROZEN
             qs = qs.filter(
-                memberships__status='ACTIVE'
-            ).filter(
-                Q(memberships__end_date__gte=today) | Q(memberships__end_date__isnull=True)
+                memberships__status='ACTIVE',
+                memberships__end_date__gte=today
             ).exclude(
                 memberships__status='FROZEN'
             )
@@ -1302,7 +1380,7 @@ class MemberViewSet(viewsets.ViewSet):
             page = 1
 
         try:
-            page_size = min(100, max(1, int(request.query_params.get('page_size', 20))))
+            page_size = min(1000, max(1, int(request.query_params.get('page_size', 20))))
         except (ValueError, TypeError):
             page_size = 20
 

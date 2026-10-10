@@ -329,8 +329,18 @@ class LeadSourceViewSet(viewsets.ModelViewSet):
         return self.destroy(request, pk=pk)
 
 
+from rest_framework.pagination import PageNumberPagination
+
+
+class ConfigurablePageNumberPagination(PageNumberPagination):
+    page_size = 50
+    page_size_query_param = 'page_size'
+    max_page_size = 1000
+
+
 class LeadViewSet(viewsets.ModelViewSet):
     serializer_class = LeadSerializer
+    pagination_class = ConfigurablePageNumberPagination
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
 
     def get_permissions(self):
@@ -397,8 +407,17 @@ class LeadViewSet(viewsets.ModelViewSet):
         if status_val:
             qs = qs.filter(current_status=status_val)
 
+        branch_ids_param = self.request.query_params.get('branch_ids')
         branch_id = self.request.query_params.get('branch_id') or self.request.query_params.get('branch')
-        if branch_id:
+        if branch_ids_param:
+            b_ids = [b.strip() for b in branch_ids_param.split(',') if b.strip()]
+            if permitted_branches is not None:
+                b_ids = [b for b in b_ids if b in permitted_branches]
+            if b_ids:
+                qs = qs.filter(branch_id__in=b_ids)
+            else:
+                return qs.none()
+        elif branch_id and branch_id not in ('all', 'ALL'):
             if permitted_branches is not None and str(branch_id) not in permitted_branches:
                 return qs.none()
             qs = qs.filter(branch_id=branch_id)
@@ -411,9 +430,23 @@ class LeadViewSet(viewsets.ModelViewSet):
         if unassigned and str(unassigned).lower() in ('true', '1'):
             qs = qs.filter(assigned_sales_user__isnull=True)
 
-        assigned_user = self.request.query_params.get('assigned_sales_user_id')
-        if assigned_user:
+        sales_user_ids_param = self.request.query_params.get('sales_user_ids')
+        assigned_user = self.request.query_params.get('assigned_sales_user_id') or self.request.query_params.get('sales_user_id')
+        if sales_user_ids_param:
+            s_ids = [s.strip() for s in sales_user_ids_param.split(',') if s.strip()]
+            if s_ids:
+                qs = qs.filter(assigned_sales_user_id__in=s_ids)
+        elif assigned_user and assigned_user not in ('all', 'ALL'):
             qs = qs.filter(assigned_sales_user_id=assigned_user)
+
+        trainer_ids_param = self.request.query_params.get('trainer_ids')
+        trainer_user = self.request.query_params.get('trainer_id')
+        if trainer_ids_param:
+            t_ids = [t.strip() for t in trainer_ids_param.split(',') if t.strip()]
+            if t_ids:
+                qs = qs.filter(assigned_trainer_user_id__in=t_ids)
+        elif trainer_user and trainer_user not in ('all', 'ALL'):
+            qs = qs.filter(assigned_trainer_user_id=trainer_user)
 
         lead_source_id = self.request.query_params.get('lead_source_id') or self.request.query_params.get('lead_source')
         if lead_source_id:
@@ -427,9 +460,21 @@ class LeadViewSet(viewsets.ModelViewSet):
         if platform:
             qs = qs.filter(Q(first_touch_source__icontains=platform) | Q(latest_touch_source__icontains=platform) | Q(attributions__platform__iexact=platform)).distinct()
 
+        program_ids_param = self.request.query_params.get('program_ids')
         program_id = self.request.query_params.get('program_id') or self.request.query_params.get('interested_program_id')
-        if program_id:
+        if program_ids_param:
+            p_ids = [p.strip() for p in program_ids_param.split(',') if p.strip()]
+            if p_ids:
+                qs = qs.filter(interested_program_id__in=p_ids)
+        elif program_id and program_id not in ('all', 'ALL'):
             qs = qs.filter(interested_program_id=program_id)
+
+        date_from = self.request.query_params.get('date_from') or self.request.query_params.get('start_date')
+        date_to = self.request.query_params.get('date_to') or self.request.query_params.get('end_date')
+        if date_from:
+            qs = qs.filter(created_at__date__gte=date_from)
+        if date_to:
+            qs = qs.filter(created_at__date__lte=date_to)
 
         sla_param = self.request.query_params.get('sla_status')
         if sla_param:
@@ -2911,7 +2956,7 @@ class CRMAttentionPolicyViewSet(viewsets.ModelViewSet):
     serializer_class = CRMAttentionPolicySerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
     required_module = 'crm'
-    required_submodule = 'settings'
+    required_submodule = 'leads'
     required_permission = 'crm.settings.view'
     permission_action_map = {
         'create': 'crm.settings.edit',
@@ -2966,7 +3011,7 @@ class CRMAgentAssignmentConfigViewSet(viewsets.ViewSet):
     """
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
     required_module = 'crm'
-    required_submodule = 'settings'
+    required_submodule = 'leads'
     required_permission = 'crm.settings.view'
     permission_action_map = {
         'list': 'crm.settings.view',

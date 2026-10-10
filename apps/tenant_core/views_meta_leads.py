@@ -299,7 +299,7 @@ class MetaPagination(PageNumberPagination):
 class MetaAccessMixin:
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
     required_module = 'crm'
-    required_submodule = 'settings'
+    required_submodule = 'leads'
     action_permission_map = {
         'list': 'crm.settings.view',
         'retrieve': 'crm.settings.view',

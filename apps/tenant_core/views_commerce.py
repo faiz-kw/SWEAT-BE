@@ -5,9 +5,16 @@ apps/tenant_core/views_commerce.py — ViewSets for Layer 2 Module G: Commerce, 
 from decimal import Decimal
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 from django.core.exceptions import ValidationError
 from django.utils import timezone
+
+
+class ConfigurablePageNumberPagination(PageNumberPagination):
+    page_size = 50
+    page_size_query_param = 'page_size'
+    max_page_size = 1000
 
 from apps.tenant_core.permissions import RequireActiveTenantAndOrg, TenantRBACPermission
 from apps.tenant_core.context import get_tenant_db_alias
@@ -36,8 +43,28 @@ def _get_db(request):
     return get_tenant_db_alias() or 'default'
 
 
+def _parse_multi_param(request, *param_names):
+    vals = []
+    for name in param_names:
+        if not name:
+            continue
+        if hasattr(request.query_params, 'getlist'):
+            raw_list = request.query_params.getlist(name)
+        else:
+            v = request.query_params.get(name)
+            raw_list = [v] if v else []
+        for item in raw_list:
+            if item:
+                for part in str(item).split(','):
+                    p = part.strip()
+                    if p and p.lower() != 'all':
+                        vals.append(p)
+    return vals
+
+
 class OrderViewSet(viewsets.ModelViewSet):
     serializer_class = OrderSerializer
+    pagination_class = ConfigurablePageNumberPagination
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
     required_module = 'core'
     required_submodule = 'settings'
@@ -54,19 +81,44 @@ class OrderViewSet(viewsets.ModelViewSet):
         from django.db.models import Q
         alias = _get_db(self.request)
         qs = Order.objects.using(alias).all()
-        branch_id = (
-            self.request.query_params.get('branch_id')
-            or self.request.query_params.get('branch')
-            or self.request.query_params.get('location')
-        )
+        branch_ids = _parse_multi_param(self.request, 'branch_ids', 'branch_id', 'branch', 'location')
+        program_ids = _parse_multi_param(self.request, 'program_ids', 'program_id')
+        package_ids = _parse_multi_param(self.request, 'package_ids', 'package_id')
+        sales_user_ids = _parse_multi_param(self.request, 'sales_user_ids', 'sales_user_id')
+        trainer_ids = _parse_multi_param(self.request, 'trainer_ids', 'trainer_id')
+        date_from = (self.request.query_params.get('date_from') or self.request.query_params.get('start_date') or '').strip()
+        date_to = (self.request.query_params.get('date_to') or self.request.query_params.get('end_date') or '').strip()
         user_profile_id = self.request.query_params.get('user_profile_id')
         lead_id = self.request.query_params.get('lead_id')
         status_param = self.request.query_params.get('status')
         search_param = self.request.query_params.get('search')
         exclude_zero = self.request.query_params.get('exclude_zero')
 
-        if branch_id and branch_id != 'all':
-            qs = qs.filter(branch_id=branch_id)
+        if branch_ids:
+            qs = qs.filter(branch_id__in=branch_ids)
+        if date_from:
+            qs = qs.filter(created_at__date__gte=date_from)
+        if date_to:
+            qs = qs.filter(created_at__date__lte=date_to)
+
+        has_join_filter = False
+        if program_ids:
+            qs = qs.filter(items__package__program_id__in=program_ids)
+            has_join_filter = True
+        if package_ids:
+            qs = qs.filter(items__package_id__in=package_ids)
+            has_join_filter = True
+        if sales_user_ids:
+            qs = qs.filter(
+                Q(sold_by_user_id__in=sales_user_ids) | Q(lead__assigned_sales_user_id__in=sales_user_ids)
+            )
+        if trainer_ids:
+            qs = qs.filter(
+                Q(sold_by_user_id__in=trainer_ids)
+                | Q(lead__assigned_trainer_user_id__in=trainer_ids)
+                | Q(lead__referred_by_user_id__in=trainer_ids)
+            )
+
         if user_profile_id:
             qs = qs.filter(user_profile_id=user_profile_id)
         if lead_id:
@@ -87,6 +139,9 @@ class OrderViewSet(viewsets.ModelViewSet):
                 Q(lead__first_name__icontains=term) |
                 Q(lead__last_name__icontains=term)
             )
+
+        if has_join_filter:
+            qs = qs.distinct()
 
         return qs.select_related('branch', 'user_profile', 'lead').prefetch_related('items', 'payments', 'invoices').order_by('-created_at')
 
@@ -603,6 +658,7 @@ class OrderItemViewSet(viewsets.ReadOnlyModelViewSet):
 
 class PaymentTransactionViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = PaymentTransactionSerializer
+    pagination_class = ConfigurablePageNumberPagination
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
     required_module = 'core'
     required_submodule = 'settings'
@@ -615,18 +671,29 @@ class PaymentTransactionViewSet(viewsets.ReadOnlyModelViewSet):
         qs = PaymentTransaction.objects.using(alias).all()
         order_id = self.request.query_params.get('order_id')
         branch_id = self.request.query_params.get('branch_id')
+        branch_ids_param = self.request.query_params.get('branch_ids')
         provider = self.request.query_params.get('provider')
         status_param = self.request.query_params.get('status')
         search_param = self.request.query_params.get('search')
+        date_from = self.request.query_params.get('date_from') or self.request.query_params.get('start_date')
+        date_to = self.request.query_params.get('date_to') or self.request.query_params.get('end_date')
 
         if order_id:
             qs = qs.filter(order_id=order_id)
-        if branch_id:
+        if branch_ids_param:
+            b_ids = [b.strip() for b in branch_ids_param.split(',') if b.strip()]
+            if b_ids:
+                qs = qs.filter(order__branch_id__in=b_ids)
+        elif branch_id:
             qs = qs.filter(order__branch_id=branch_id)
         if provider:
             qs = qs.filter(provider__iexact=provider)
         if status_param:
             qs = qs.filter(status__iexact=status_param)
+        if date_from:
+            qs = qs.filter(created_at__date__gte=date_from)
+        if date_to:
+            qs = qs.filter(created_at__date__lte=date_to)
         if search_param:
             term = search_param.strip()
             qs = qs.filter(
@@ -644,7 +711,10 @@ class PaymentTransactionViewSet(viewsets.ReadOnlyModelViewSet):
         from django.db.models import Sum, Count, Q
         alias = _get_db(request)
         branch_id = request.query_params.get('branch_id')
+        branch_ids_param = request.query_params.get('branch_ids')
         date_param = request.query_params.get('date')
+        date_from = request.query_params.get('date_from') or request.query_params.get('start_date')
+        date_to = request.query_params.get('date_to') or request.query_params.get('end_date')
         status_param = request.query_params.get('status')
         search_param = request.query_params.get('search')
 
@@ -653,7 +723,11 @@ class PaymentTransactionViewSet(viewsets.ReadOnlyModelViewSet):
         )
         base_qs = PaymentTransaction.objects.using(alias).filter(cash_q)
 
-        if branch_id:
+        if branch_ids_param:
+            b_ids = [b.strip() for b in branch_ids_param.split(',') if b.strip()]
+            if b_ids:
+                base_qs = base_qs.filter(order__branch_id__in=b_ids)
+        elif branch_id:
             base_qs = base_qs.filter(order__branch_id=branch_id)
         if status_param:
             base_qs = base_qs.filter(status__iexact=status_param)
@@ -669,14 +743,15 @@ class PaymentTransactionViewSet(viewsets.ReadOnlyModelViewSet):
 
         effective_date_label = 'All Time'
         qs = base_qs
-        if date_param and date_param.lower() != 'all':
-            dated_qs = base_qs.filter(created_at__date=date_param)
-            if dated_qs.exists():
-                qs = dated_qs
-                effective_date_label = date_param
-            elif date_param != timezone.now().date().isoformat():
-                qs = dated_qs
-                effective_date_label = date_param
+        if date_from or date_to:
+            if date_from:
+                qs = qs.filter(created_at__date__gte=date_from)
+            if date_to:
+                qs = qs.filter(created_at__date__lte=date_to)
+            effective_date_label = f"{date_from or 'Start'} to {date_to or 'Now'}"
+        elif date_param and date_param.lower() != 'all':
+            qs = base_qs.filter(created_at__date=date_param)
+            effective_date_label = date_param
 
         total_txns = qs.count()
         physical_cash = qs.aggregate(s=Sum('amount'))['s'] or Decimal('0.00')
