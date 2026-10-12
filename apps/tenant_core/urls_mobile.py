@@ -28,6 +28,11 @@ from .views_mobile import (
     MobileOnboardingSubmitView,
     MobilePTAppointmentsView,
     MobileCancelPTAppointmentView,
+    MobileMembershipActionsView,
+    MobileMembershipRenewView,
+    MobileMembershipUpgradeView,
+    MobileMembershipExtendView,
+    MobileMembershipFreezeView,
 )
 
 app_name = 'mobile_api'
@@ -73,6 +78,11 @@ urlpatterns = [
     path('pt/appointments/<uuid:appointment_id>/cancel/', MobileCancelPTAppointmentView.as_view(), name='mobile-pt-cancel'),
 
     # 5. Memberships, Packs, Credits & Checkout
+    path('memberships/actions/', MobileMembershipActionsView.as_view(), name='mobile-membership-actions'),
+    path('memberships/renew/', MobileMembershipRenewView.as_view(), name='mobile-membership-renew'),
+    path('memberships/upgrade/', MobileMembershipUpgradeView.as_view(), name='mobile-membership-upgrade'),
+    path('memberships/extend/', MobileMembershipExtendView.as_view(), name='mobile-membership-extend'),
+    path('memberships/freeze/', MobileMembershipFreezeView.as_view(), name='mobile-membership-freeze'),
     path('packages/', MobilePackagesView.as_view(), name='mobile-packages'),
     path('my-credits/', MobileMyCreditsView.as_view(), name='mobile-my-credits'),
     path('credits/', MobileMyCreditsView.as_view(), name='mobile-credits-direct'),

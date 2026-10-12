@@ -278,6 +278,7 @@ class BookingWaitlistAttendanceService:
         membership: Membership = None,
         user_profile: UserProfile = None,
         db_alias: str = None,
+        booking_type: str = 'MEMBER',
     ) -> dict:
         """
         Authoritatively evaluates whether an occurrence is bookable for a specific membership and user.
@@ -447,20 +448,63 @@ class BookingWaitlistAttendanceService:
             status__in=['CONFIRMED', 'RESERVED', 'COMPLETED']
         ).count() + trial_enrolled
 
-        if enrolled_count >= occurrence.capacity:
-            if not occurrence.class_template.allow_waitlist or occurrence.waitlist_capacity <= 0:
+        if booking_type == 'TRIAL':
+            effective_trial_cap = (
+                occurrence.trial_capacity
+                if occurrence.trial_capacity is not None
+                else (occurrence.class_template.default_trial_capacity if occurrence.class_template else 0)
+            )
+
+            if effective_trial_cap <= 0:
                 return {
                     'eligible': False,
-                    'reason_code': 'CLASS_FULL',
-                    'reason_message': 'Class session is at full capacity.',
+                    'reason_code': 'TRIAL_NOT_PERMITTED',
+                    'reason_message': 'Trial bookings are not enabled for this session.',
                 }
-            wl_count = occurrence.bookings.using(alias).filter(status='WAITLISTED').count()
-            if wl_count >= occurrence.waitlist_capacity:
+
+            if enrolled_count >= occurrence.capacity:
                 return {
                     'eligible': False,
-                    'reason_code': 'WAITLIST_FULL',
-                    'reason_message': 'Class capacity and waitlist are both full.',
+                    'reason_code': 'TRIAL_CAPACITY_FULL',
+                    'reason_message': 'This class session is fully booked. No trial slots available.',
                 }
+
+            existing_trials = occurrence.bookings.using(alias).filter(
+                booking_type='TRIAL',
+                status__in=['CONFIRMED', 'RESERVED', 'COMPLETED']
+            ).count() + trial_enrolled
+
+            if existing_trials >= effective_trial_cap:
+                return {
+                    'eligible': False,
+                    'reason_code': 'TRIAL_CAPACITY_FULL',
+                    'reason_message': 'Trial capacity reached for this session. This trial session is now full.',
+                }
+        else:
+            if enrolled_count >= occurrence.capacity:
+                allow_waitlist = (
+                    occurrence.class_template.allow_waitlist
+                    if (occurrence.class_template and occurrence.class_template.allow_waitlist is not None)
+                    else True
+                )
+                waitlist_cap = (
+                    occurrence.waitlist_capacity
+                    if occurrence.waitlist_capacity is not None
+                    else (occurrence.class_template.default_waitlist_capacity if occurrence.class_template else 5)
+                )
+                if not allow_waitlist or waitlist_cap <= 0:
+                    return {
+                        'eligible': False,
+                        'reason_code': 'CLASS_FULL',
+                        'reason_message': 'Class session is at full capacity.',
+                    }
+                wl_count = occurrence.bookings.using(alias).filter(status='WAITLISTED').count()
+                if wl_count >= waitlist_cap:
+                    return {
+                        'eligible': False,
+                        'reason_code': 'WAITLIST_FULL',
+                        'reason_message': 'Class capacity and waitlist are both full.',
+                    }
 
         return {
             'eligible': True,
@@ -487,7 +531,11 @@ class BookingWaitlistAttendanceService:
             if user_profile.user and user_profile.user.status != 'ACTIVE':
                 raise ValidationError("User account is not active.")
 
-            organization = occurrence.class_template.category.organization
+            organization = (
+                occurrence.class_template.category.organization
+                if (occurrence.class_template and occurrence.class_template.category and occurrence.class_template.category.organization)
+                else (occurrence.class_template.organization if (occurrence.class_template and occurrence.class_template.organization) else (occurrence.branch.organization if occurrence.branch else None))
+            )
             branch = occurrence.branch
 
             # Lock occurrence to serialize concurrent booking and capacity allocation
@@ -616,14 +664,21 @@ class BookingWaitlistAttendanceService:
             total_enrolled = enrolled_count + trial_enrolled
             is_capacity_available = total_enrolled < occurrence.capacity
 
-            if is_capacity_available and booking_type == 'TRIAL':
-                # Trial quota check
+            effective_trial_cap = (
+                occurrence.trial_capacity
+                if occurrence.trial_capacity is not None
+                else (occurrence.class_template.default_trial_capacity if occurrence.class_template else 0)
+            )
+
+            if booking_type == 'TRIAL':
+                if effective_trial_cap <= 0:
+                    raise ValidationError("Trial bookings are not enabled for this session.")
                 existing_trials = Booking.objects.using(alias).filter(
                     occurrence=occurrence,
                     booking_type='TRIAL',
                     status__in=['CONFIRMED', 'RESERVED', 'COMPLETED']
                 ).count() + trial_enrolled
-                if existing_trials >= occurrence.trial_capacity:
+                if existing_trials >= effective_trial_cap:
                     is_capacity_available = False
 
             if is_capacity_available:
@@ -726,12 +781,27 @@ class BookingWaitlistAttendanceService:
 
             else:
                 # Capacity is full: evaluate waitlist. WAITLIST CONSUMES ZERO ENTITLEMENT.
-                allow_waitlist = booking_policy.allow_waitlist if booking_policy else True
-                waitlist_cap = booking_policy.waitlist_capacity if (booking_policy and booking_policy.waitlist_capacity) else 20
+                if booking_type == 'TRIAL':
+                    raise ValidationError("Trial capacity reached for this session. This trial session is now full. Please select another slot.")
+
+                allow_waitlist = (
+                    occurrence.class_template.allow_waitlist
+                    if (occurrence.class_template and occurrence.class_template.allow_waitlist is not None)
+                    else (booking_policy.allow_waitlist if booking_policy else True)
+                )
+                waitlist_cap = (
+                    occurrence.waitlist_capacity
+                    if occurrence.waitlist_capacity is not None
+                    else (
+                        occurrence.class_template.default_waitlist_capacity
+                        if (occurrence.class_template and occurrence.class_template.default_waitlist_capacity is not None)
+                        else (booking_policy.waitlist_capacity if (booking_policy and booking_policy.waitlist_capacity) else 20)
+                    )
+                )
 
                 current_waitlist_count = Booking.objects.using(alias).filter(occurrence=occurrence, status='WAITLISTED').count()
                 if not allow_waitlist or current_waitlist_count >= waitlist_cap:
-                    raise ValidationError("Class occurrence capacity and waitlist are completely full.")
+                    raise ValidationError("Class occurrence capacity and waitlist are completely full. No further bookings accepted.")
 
                 next_position = current_waitlist_count + 1
 

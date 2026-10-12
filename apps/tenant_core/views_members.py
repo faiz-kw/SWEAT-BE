@@ -1026,30 +1026,93 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             if snapshot_questions:
                 for sq in snapshot_questions:
                     ans_val = sq.get('submitted_answer')
+                    disp = ''
+                    if isinstance(ans_val, bool):
+                        disp = 'Yes' if ans_val else 'No'
+                    elif ans_val is not None:
+                        disp = str(ans_val)
                     answers.append({
                         'question_id': str(sq.get('id', '')),
                         'question_text': sq.get('question_text', ''),
                         'question_type': sq.get('question_type', 'TEXT'),
                         'category': sq.get('category', 'GENERAL'),
-                        'is_sensitive': False,
-                        'answer': str(ans_val) if ans_val is not None else '',
+                        'is_sensitive': sq.get('is_sensitive', False),
+                        'answer': disp,
                         'boolean_value': ans_val if isinstance(ans_val, bool) else None,
                         'text_value': str(ans_val) if ans_val is not None else '',
                     })
             else:
                 for ans in sub.answers.all():
-                    val = ans.text_value or ans.numeric_value or ans.boolean_value or ans.date_value or ans.json_value
+                    val = ''
+                    if ans.boolean_value is not None:
+                        val = 'Yes' if ans.boolean_value else 'No'
+                    elif ans.numeric_value is not None:
+                        val = str(ans.numeric_value)
+                    elif ans.date_value is not None:
+                        val = ans.date_value.isoformat()
+                    elif ans.text_value is not None and ans.text_value != '':
+                        val = ans.text_value
+                    elif ans.json_value:
+                        val = str(ans.json_value)
+
                     answers.append({
                         'question_id': str(ans.question.id) if ans.question else '',
                         'question_text': ans.question.question_text if ans.question else '',
                         'question_type': ans.question.question_type if ans.question else 'TEXT',
                         'category': getattr(ans.question, 'category', 'GENERAL') if ans.question else 'GENERAL',
                         'is_sensitive': getattr(ans.question, 'is_sensitive', False) if ans.question else False,
-                        'answer': str(val) if val is not None else '',
+                        'answer': val,
                         'boolean_value': ans.boolean_value,
                         'numeric_value': float(ans.numeric_value) if ans.numeric_value is not None else None,
                         'text_value': ans.text_value,
                     })
+
+            # Graceful recovery for historical / legacy submissions with 0 answers in current record
+            if not answers:
+                prev_id = (getattr(sub, 'metadata', {}) or {}).get('previous_submission_id')
+                if prev_id:
+                    prev_sub = IntakeSubmission.objects.using(alias).filter(id=prev_id).first()
+                    if prev_sub:
+                        for ans in prev_sub.answers.all():
+                            val = ''
+                            if ans.boolean_value is not None:
+                                val = 'Yes' if ans.boolean_value else 'No'
+                            elif ans.numeric_value is not None:
+                                val = str(ans.numeric_value)
+                            elif ans.date_value is not None:
+                                val = ans.date_value.isoformat()
+                            elif ans.text_value is not None and ans.text_value != '':
+                                val = ans.text_value
+                            elif ans.json_value:
+                                val = str(ans.json_value)
+                            answers.append({
+                                'question_id': str(ans.question.id) if ans.question else '',
+                                'question_text': ans.question.question_text if ans.question else '',
+                                'question_type': ans.question.question_type if ans.question else 'TEXT',
+                                'category': getattr(ans.question, 'category', 'GENERAL') if ans.question else 'GENERAL',
+                                'is_sensitive': getattr(ans.question, 'is_sensitive', False) if ans.question else False,
+                                'answer': val,
+                                'boolean_value': ans.boolean_value,
+                                'numeric_value': float(ans.numeric_value) if ans.numeric_value is not None else None,
+                                'text_value': ans.text_value,
+                            })
+
+                if not answers and profile.address_json and profile.address_json.get('onboarding', {}).get('par_q'):
+                    legacy_parq = profile.address_json['onboarding']['par_q']
+                    if isinstance(legacy_parq, dict):
+                        for k, v in legacy_parq.items():
+                            val_str = 'Yes' if v is True else ('No' if v is False else str(v))
+                            answers.append({
+                                'question_id': k,
+                                'question_text': k.replace('_', ' ').title(),
+                                'question_type': 'BOOLEAN' if isinstance(v, bool) else 'TEXT',
+                                'category': 'MEDICAL' if any(w in k for w in ['condition', 'pain', 'heart', 'bone', 'joint', 'dizzy']) else 'GENERAL',
+                                'is_sensitive': any(w in k for w in ['condition', 'pain', 'heart', 'bone', 'joint', 'dizzy']),
+                                'answer': val_str,
+                                'boolean_value': v if isinstance(v, bool) else None,
+                                'numeric_value': None,
+                                'text_value': val_str,
+                            })
 
         meta = getattr(sub, 'metadata', {}) or {}
         accepted_name = meta.get('accepted_by_name') or (sub.submitted_by_user.display_name if sub.submitted_by_user else (sub.signer_identity or 'Member'))

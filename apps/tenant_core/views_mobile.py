@@ -1206,20 +1206,45 @@ class MobileScheduleView(APIView):
                         'waitlist_position': b.waitlist_position,
                     }
 
+        # Check if caller requested trial slots only
+        is_trial_filter = (
+            'trials/available-slots' in request.path
+            or request.query_params.get('for_trial', '').lower() in ('true', '1', 'yes')
+            or request.query_params.get('trial_only', '').lower() in ('true', '1', 'yes')
+        )
+        hide_full = (
+            request.query_params.get('hide_full', '').lower() in ('true', '1', 'yes')
+            or request.query_params.get('available_only', '').lower() in ('true', '1', 'yes')
+        )
+
         results = []
         for occ in qs:
             template = occ.class_template
             category = template.category if template else None
 
             # Calculate live capacity & booked seats
-            confirmed_count = occ.bookings.using(alias).filter(
-                status__in=['CONFIRMED', 'RESERVED', 'COMPLETED']
-            ).count()
-            trial_count = TrialBooking.objects.using(alias).filter(
+            confirmed_emails = set(
+                occ.bookings.using(alias).filter(
+                    status__in=['CONFIRMED', 'RESERVED', 'COMPLETED']
+                ).values_list('user_profile__user__email', flat=True)
+            )
+            trial_crm_qs = TrialBooking.objects.using(alias).filter(
                 class_occurrence_id=occ.id,
                 status__in=['BOOKED', 'CONFIRMED', 'ATTENDED']
-            ).count()
-            total_booked = confirmed_count + trial_count
+            )
+            if confirmed_emails:
+                trial_crm_qs = trial_crm_qs.exclude(lead__email_normalized__in=confirmed_emails)
+            trial_crm_count = trial_crm_qs.count()
+
+            booking_confirmed = occ.bookings.using(alias).filter(
+                status__in=['CONFIRMED', 'RESERVED', 'COMPLETED']
+            )
+            booking_trial_count = booking_confirmed.filter(booking_type='TRIAL').count()
+            total_trial_booked = trial_crm_count + booking_trial_count
+
+            regular_booked_count = booking_confirmed.exclude(booking_type='TRIAL').count()
+            total_booked = regular_booked_count + total_trial_booked
+
             total_capacity = occ.capacity or (template.default_capacity if template else 10)
             available_seats = max(0, total_capacity - total_booked)
             is_full = (available_seats == 0)
@@ -1227,8 +1252,42 @@ class MobileScheduleView(APIView):
             # Waitlist status
             waitlist_count = occ.bookings.using(alias).filter(status='WAITLISTED').count()
             allow_waitlist = bool(template and getattr(template, 'allow_waitlist', True))
-            max_waitlist = occ.waitlist_capacity or 5
+            max_waitlist = (
+                occ.waitlist_capacity
+                if occ.waitlist_capacity is not None
+                else (template.default_waitlist_capacity if (template and template.default_waitlist_capacity is not None) else 5)
+            )
             is_waitlist_open = allow_waitlist and (waitlist_count < max_waitlist)
+
+            # Trial capacity and availability
+            effective_trial_cap = (
+                occ.trial_capacity
+                if occ.trial_capacity is not None
+                else (template.default_trial_capacity if template else 0)
+            )
+            allow_trial = effective_trial_cap > 0
+            trial_available_seats = max(0, min(available_seats, effective_trial_cap - total_trial_booked)) if allow_trial else 0
+            is_trial_available = allow_trial and (not is_full) and (trial_available_seats > 0)
+
+            # Regular member booking state
+            if not is_full:
+                booking_state = 'AVAILABLE'
+                is_bookable = True
+            elif is_waitlist_open:
+                booking_state = 'WAITLIST'
+                is_bookable = True
+            else:
+                booking_state = 'FULL'
+                is_bookable = False
+
+            # Filters:
+            # 1. If trial slots requested, omit if trial capacity or class is full
+            if is_trial_filter and not is_trial_available:
+                continue
+
+            # 2. If hide_full requested, omit if class AND waitlist are completely full
+            if hide_full and not is_bookable:
+                continue
 
             # Trainer details
             trainer_name = 'SWEAT Trainer'
@@ -1288,8 +1347,21 @@ class MobileScheduleView(APIView):
                     'available_seats': available_seats,
                     'is_full': is_full,
                     'waitlist_count': waitlist_count,
+                    'max_waitlist': max_waitlist,
                     'is_waitlist_open': is_waitlist_open,
+                    'is_waitlist_full': not is_waitlist_open,
+                    'is_completely_full': is_full and not is_waitlist_open,
+                    'trial_capacity': effective_trial_cap,
+                    'trial_booked_count': total_trial_booked,
+                    'available_trial_seats': trial_available_seats,
+                    'is_trial_available': is_trial_available,
                 },
+                'booking_state': booking_state,
+                'is_bookable': is_bookable,
+                'can_book': not is_full,
+                'can_waitlist': is_full and is_waitlist_open,
+                'is_trial_available': is_trial_available,
+                'available_trial_seats': trial_available_seats,
                 'user_booking': user_booking,
                 'is_included_in_plan': is_included,
             })
@@ -1441,6 +1513,45 @@ class MobileClaimFreeTrialView(APIView):
         except ClassOccurrence.DoesNotExist:
             return Response({'detail': 'Class slot not found.'}, status=status.HTTP_404_NOT_FOUND)
 
+        # Pre-check trial capacity availability before booking
+        effective_trial_cap = (
+            occurrence.trial_capacity
+            if occurrence.trial_capacity is not None
+            else (occurrence.class_template.default_trial_capacity if occurrence.class_template else 0)
+        )
+        if effective_trial_cap <= 0:
+            return Response({
+                'detail': 'Trial bookings are not enabled for this session.',
+                'code': 'TRIAL_NOT_PERMITTED',
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check total capacity
+        confirmed_count = occurrence.bookings.using(alias).filter(
+            status__in=['CONFIRMED', 'RESERVED', 'COMPLETED']
+        ).count()
+        trial_crm_count = TrialBooking.objects.using(alias).filter(
+            class_occurrence_id=occurrence.id,
+            status__in=['BOOKED', 'CONFIRMED', 'ATTENDED']
+        ).count()
+        total_booked = confirmed_count + trial_crm_count
+        total_capacity = occurrence.capacity or (occurrence.class_template.default_capacity if occurrence.class_template else 10)
+        if total_booked >= total_capacity:
+            return Response({
+                'detail': 'This class session is fully booked. No trial slots available.',
+                'code': 'TRIAL_CAPACITY_FULL',
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check trial specific capacity
+        booking_trial_count = occurrence.bookings.using(alias).filter(
+            booking_type='TRIAL',
+            status__in=['CONFIRMED', 'RESERVED', 'COMPLETED']
+        ).count()
+        if (booking_trial_count + trial_crm_count) >= effective_trial_cap:
+            return Response({
+                'detail': 'Trial capacity reached for this session. This trial session is now full. Please select another slot.',
+                'code': 'TRIAL_CAPACITY_FULL',
+            }, status=status.HTTP_400_BAD_REQUEST)
+
         # 3. Book slot using atomic booking service
         try:
             booking = BookingWaitlistAttendanceService.create_booking(
@@ -1469,9 +1580,20 @@ class MobileClaimFreeTrialView(APIView):
                     'error': str(e.messages[0] if hasattr(e, 'messages') and e.messages else e),
                 }, status=status.HTTP_400_BAD_REQUEST)
             detail = e.messages[0] if hasattr(e, 'messages') and e.messages else str(e)
-            return Response({'detail': detail}, status=status.HTTP_400_BAD_REQUEST)
+            is_trial_cap = 'trial' in detail.lower() or 'capacity' in detail.lower() or 'full' in detail.lower()
+            return Response({
+                'detail': detail,
+                'code': 'TRIAL_CAPACITY_FULL' if is_trial_cap else 'VALIDATION_ERROR'
+            }, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
             return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        if booking.status == 'WAITLISTED':
+            booking.delete()
+            return Response({
+                'detail': 'Trial capacity reached for this session. This trial session is now full. Please select another slot.',
+                'code': 'TRIAL_CAPACITY_FULL',
+            }, status=status.HTTP_400_BAD_REQUEST)
 
         # Advance CRM Lead status to TRIAL_BOOKED and log TrialBooking record
         try:
@@ -1520,17 +1642,13 @@ class MobileClaimFreeTrialView(APIView):
             'booking_id': str(booking.id),
             'booking_number': booking.booking_number,
             'status': booking.status,
-            'waitlist_position': booking.waitlist_position,
+            'waitlist_position': None,
             'is_free_trial': True,
             'class_name': occurrence.class_template.name,
             'branch_name': occurrence.branch.name if occurrence.branch else 'SWEAT Studio',
             'date': occurrence.occurrence_date.isoformat() if occurrence.occurrence_date else None,
             'start_at': occurrence.start_at.isoformat() if occurrence.start_at else None,
-            'message': (
-                'Free trial booked successfully! See you on the reformer.'
-                if booking.status == 'CONFIRMED'
-                else f'Class is full. You are #{booking.waitlist_position} on the waitlist.'
-            ),
+            'message': 'Free trial booked successfully! See you on the reformer.',
         }
         if auth_tokens:
             resp_data['auth'] = auth_tokens
@@ -1620,7 +1738,11 @@ class MobileBookClassView(APIView):
             )
         except ValidationError as e:
             detail = e.messages[0] if hasattr(e, 'messages') and e.messages else str(e)
-            return Response({'detail': detail}, status=status.HTTP_400_BAD_REQUEST)
+            is_full = 'capacity and waitlist' in detail.lower() or 'completely full' in detail.lower()
+            return Response({
+                'detail': detail,
+                'code': 'CLASS_AND_WAITLIST_FULL' if is_full else 'BOOKING_VALIDATION_ERROR'
+            }, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
             return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -2706,28 +2828,43 @@ class MobileOnboardingSubmitView(APIView):
         )
         submission.save(using=alias)
 
-        # 3. Save answers
+        # 3. Save answers with full question snapshots & revision carryover
         answers_dict = data.get('answers') or data.get('par_q') or data.get('responses') or data
-        if isinstance(answers_dict, dict):
-            for q_id, val in answers_dict.items():
-                if q_id in ['signature_data', 'agreement_accepted', 'responses', 'answers', 'par_q', 'is_edit']:
-                    continue
-                q = None
-                try:
-                    q = IntakeQuestion.objects.using(alias).filter(id=q_id).first()
-                except Exception:
-                    pass
-                if not q and form:
-                    try:
-                        order_num = int(str(q_id).replace('q_', ''))
-                        q = form.questions.filter(display_order=order_num).first()
-                    except Exception:
-                        pass
+        snapshot_questions = []
 
-                ans = IntakeAnswer(
-                    submission=submission,
-                    question=q,
-                )
+        if form:
+            form_questions = list(form.questions.using(alias).filter(status='ACTIVE').order_by('display_order'))
+            processed_q_ids = set()
+
+            for q in form_questions:
+                processed_q_ids.add(str(q.id))
+                val = None
+                if isinstance(answers_dict, dict):
+                    # Check exact UUID match, order keys (e.g. q_1, 1), and slug
+                    if str(q.id) in answers_dict:
+                        val = answers_dict[str(q.id)]
+                    elif f"q_{q.display_order}" in answers_dict:
+                        val = answers_dict[f"q_{q.display_order}"]
+                    elif str(q.display_order) in answers_dict:
+                        val = answers_dict[str(q.display_order)]
+
+                # Carry over previous answer on revision if unchanged/unprovided
+                if val is None and prev_sub:
+                    prev_ans = prev_sub.answers.filter(question=q).first()
+                    if prev_ans:
+                        if prev_ans.boolean_value is not None:
+                            val = prev_ans.boolean_value
+                        elif prev_ans.numeric_value is not None:
+                            val = float(prev_ans.numeric_value)
+                        elif prev_ans.date_value is not None:
+                            val = prev_ans.date_value.isoformat()
+                        elif prev_ans.json_value is not None:
+                            val = prev_ans.json_value
+                        elif prev_ans.text_value:
+                            val = prev_ans.text_value
+
+                # Persist answer record
+                ans = IntakeAnswer(submission=submission, question=q)
                 if isinstance(val, bool):
                     ans.boolean_value = val
                 elif isinstance(val, (int, float)):
@@ -2737,6 +2874,24 @@ class MobileOnboardingSubmitView(APIView):
                 else:
                     ans.text_value = str(val) if val is not None else ''
                 ans.save(using=alias)
+
+                snapshot_questions.append({
+                    'id': str(q.id),
+                    'question_text': q.question_text,
+                    'question_type': q.question_type,
+                    'category': q.category,
+                    'is_sensitive': q.is_sensitive,
+                    'submitted_answer': val,
+                })
+
+        # Update submission with authoritative questions & answers snapshot
+        submission.form_snapshot = {
+            'form_title': form.name if form else 'PAR-Q Form',
+            'version_number': form.version_number if form else 1,
+            'agreement_title': form.agreement_title if form else 'Physical Activity Readiness & Assumption of Risk Agreement',
+            'questions': snapshot_questions,
+        }
+        submission.save(using=alias, update_fields=['form_snapshot'])
 
         # 4. Authoritatively update member memberships to COMPLETED
         active_memberships = profile.memberships.filter(status='ACTIVE')
@@ -3098,3 +3253,594 @@ class MobileClassCategoriesView(APIView):
             for c in categories
         ]
         return Response(results)
+
+
+class MobileMembershipActionsView(APIView):
+    """
+    GET /api/v1/mobile/memberships/actions/
+    Returns member-facing options and policies for:
+    - Renew Membership
+    - Upgrade Package
+    - Extend Validity
+    - Freeze Membership
+    along with any currently pending approval / change requests.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
+        profile = _get_or_create_user_profile(user, alias)
+
+        from django.db.models import Q
+        from .models_memberships import (
+            Membership, MembershipFreeze, MembershipChangeRequest,
+            MembershipRenewalPolicy, Package, PackageVersion, PackagePrice
+        )
+        from .models_approvals import ApprovalRequest
+        from .models_commerce import Order
+
+        active_m = (
+            Membership.objects.using(alias)
+            .filter(user_profile=profile)
+            .select_related('package', 'package_version', 'program', 'home_branch')
+            .order_by('-created_at')
+            .first()
+        )
+
+        if not active_m:
+            return Response({
+                'has_membership': False,
+                'active_membership': None,
+                'renew_options': [],
+                'upgrade_options': [],
+                'extend_options': {'available_days': [7, 14, 21, 30], 'requires_approval': True, 'policy_note': 'No active membership.'},
+                'freeze_options': {'min_days': 7, 'max_days': 60, 'requires_approval': True, 'policy_note': 'No active membership.'},
+                'pending_requests': [],
+            })
+
+        # Calculate session credits
+        entitlements = list(active_m.entitlements.using(alias).filter(status='ACTIVE'))
+        total_sessions = int(sum((e.allocated_units or Decimal('0')) for e in entitlements))
+        used_sessions = int(sum((e.consumed_units or Decimal('0')) for e in entitlements))
+        remaining_sessions = max(0, total_sessions - used_sessions)
+
+        today = timezone.now().date()
+        days_remaining = max(0, (active_m.end_date - today).days) if active_m.end_date else 0
+
+        # Current package price
+        current_price = Decimal('0.00')
+        if active_m.package_version:
+            pr = active_m.package_version.prices.using(alias).filter(status='ACTIVE').first()
+            if pr:
+                tax_pct = pr.tax_percent or Decimal('18.0')
+                current_price = pr.base_price * (1 + (tax_pct / Decimal('100.0')))
+
+        # Renew options: active packages
+        renew_options = []
+        all_active_pkgs = Package.objects.using(alias).filter(status='ACTIVE').prefetch_related('versions', 'versions__prices')
+        for pkg in all_active_pkgs:
+            ver = pkg.versions.filter(status='ACTIVE').order_by('-version_number').first()
+            if not ver:
+                continue
+            pr = ver.prices.filter(status='ACTIVE').first()
+            if not pr:
+                continue
+            tax_pct = pr.tax_percent or Decimal('18.0')
+            final_price = pr.base_price * (1 + (tax_pct / Decimal('100.0')))
+            is_current = (active_m.package_id == pkg.id)
+            renew_options.append({
+                'package_id': str(pkg.id),
+                'package_version_id': str(ver.id),
+                'package_name': pkg.name,
+                'program_name': pkg.program.name if pkg.program else 'SWEAT',
+                'duration_days': getattr(pkg, 'duration_days', None) or getattr(ver, 'total_days', None) or (ver.duration_value * 30 if getattr(ver, 'duration_unit', '') == 'MONTH' else getattr(ver, 'duration_value', 30)),
+                'session_credits': getattr(ver, 'default_credits', None) or getattr(pkg, 'default_credits', None) or 16,
+                'base_price': float(pr.base_price),
+                'tax_percent': float(tax_pct),
+                'total_price': float(round(final_price, 2)),
+                'currency': pr.currency or 'INR',
+                'is_current_package': is_current,
+            })
+
+        renew_options.sort(key=lambda x: (not x['is_current_package'], x['total_price']))
+
+        # Upgrade options
+        upgrade_options = []
+        for opt in renew_options:
+            price_diff = max(0.0, opt['total_price'] - float(current_price))
+            if opt['total_price'] > float(current_price) or opt['session_credits'] > total_sessions:
+                upgrade_options.append({
+                    **opt,
+                    'price_difference': float(round(price_diff, 2)),
+                    'current_price': float(round(current_price, 2)),
+                    'credits_gain': max(0, opt['session_credits'] - total_sessions),
+                })
+
+        # Pending approval requests
+        pending_approvals = ApprovalRequest.objects.using(alias).filter(
+            Q(entity_id=active_m.id) | Q(requested_by_user=user),
+            status='PENDING'
+        ).order_by('-created_at')
+
+        pending_requests = []
+        for req in pending_approvals:
+            pending_requests.append({
+                'id': str(req.id),
+                'request_type': req.request_type,
+                'status': req.status,
+                'created_at': req.created_at.isoformat(),
+                'payload': req.requested_payload or {},
+            })
+
+        # Pending freezes
+        pending_freezes = MembershipFreeze.objects.using(alias).filter(
+            membership=active_m,
+            status__in=['SCHEDULED', 'ACTIVE']
+        ).order_by('-created_at')
+        for pf in pending_freezes:
+            if not any(pr['payload'].get('freeze_id') == str(pf.id) for pr in pending_requests):
+                pending_requests.append({
+                    'id': str(pf.id),
+                    'request_type': 'MEMBERSHIP_FREEZE',
+                    'status': pf.status,
+                    'created_at': pf.created_at.isoformat(),
+                    'payload': {
+                        'freeze_from': str(pf.freeze_from),
+                        'freeze_until': str(pf.freeze_until),
+                        'days': pf.extend_membership_days,
+                        'reason': pf.reason_text,
+                    }
+                })
+
+        return Response({
+            'has_membership': True,
+            'active_membership': {
+                'id': str(active_m.id),
+                'membership_number': active_m.membership_number,
+                'package_name': active_m.package.name if active_m.package else 'Active Package',
+                'status': active_m.status,
+                'start_date': str(active_m.start_date) if active_m.start_date else None,
+                'end_date': str(active_m.end_date) if active_m.end_date else None,
+                'days_remaining': days_remaining,
+                'total_sessions': total_sessions,
+                'remaining_sessions': remaining_sessions,
+                'used_sessions': used_sessions,
+                'is_frozen': active_m.status == 'FROZEN',
+            },
+            'renew_options': renew_options,
+            'upgrade_options': upgrade_options,
+            'extend_options': {
+                'available_days': [7, 14, 21, 30],
+                'requires_approval': True,
+                'policy_note': 'Validity extensions require studio manager approval.',
+            },
+            'freeze_options': {
+                'min_days': 7,
+                'max_days': 60,
+                'requires_approval': True,
+                'policy_note': 'Freeze requests must be at least 7 days in duration and extend total validity upon approval.',
+            },
+            'pending_requests': pending_requests,
+        })
+
+
+class MobileMembershipRenewView(APIView):
+    """
+    POST /api/v1/mobile/memberships/renew/
+    Initiates member-facing renewal checkout. Creates a pending order.
+    Does NOT activate membership without verified payment.
+    Enforces idempotency to avoid duplicate clicks.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
+        profile = _get_or_create_user_profile(user, alias)
+
+        from .models_memberships import Membership, Package, PackageVersion
+        from .models_commerce import Order, OrderItem
+        import uuid
+
+        active_m = (
+            Membership.objects.using(alias)
+            .filter(user_profile=profile)
+            .select_related('package', 'package_version', 'home_branch')
+            .order_by('-created_at')
+            .first()
+        )
+        if not active_m:
+            return Response({'detail': 'No membership found to renew.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        package_id = request.data.get('package_id') or (str(active_m.package.id) if active_m.package else None)
+        package_version_id = request.data.get('package_version_id')
+
+        package = Package.objects.using(alias).filter(id=package_id, status='ACTIVE').first() if package_id else None
+        if not package:
+            return Response({'detail': 'Renewal package not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if package_version_id:
+            ver = PackageVersion.objects.using(alias).filter(id=package_version_id, package=package).first()
+        else:
+            ver = package.versions.using(alias).filter(status='ACTIVE').order_by('-version_number').first()
+
+        if not ver:
+            return Response({'detail': 'Active package version not found for renewal.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        price_obj = ver.prices.using(alias).filter(status='ACTIVE').first()
+        if not price_obj:
+            return Response({'detail': 'Package price not configured.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        base_price = price_obj.base_price
+        tax_pct = price_obj.tax_percent or Decimal('18.0')
+        total_price = base_price * (1 + (tax_pct / Decimal('100.0')))
+
+        # Idempotency check: Reuse existing pending renewal order created in the last 10 minutes
+        ten_mins_ago = timezone.now() - timedelta(minutes=10)
+        existing_order = (
+            Order.objects.using(alias)
+            .filter(
+                user_profile=profile,
+                order_type='RENEWAL',
+                status='PENDING_PAYMENT',
+                created_at__gte=ten_mins_ago
+            )
+            .order_by('-created_at')
+            .first()
+        )
+        if existing_order:
+            return Response({
+                'order_id': str(existing_order.id),
+                'order_number': existing_order.order_number,
+                'status': existing_order.status,
+                'total_amount': float(existing_order.total_amount),
+                'package_name': package.name,
+                'detail': 'Existing pending renewal order retrieved. Please proceed to payment to activate.',
+                'requires_payment': True,
+                'is_active': False,
+            }, status=status.HTTP_200_OK)
+
+        org = active_m.home_branch.organization if active_m.home_branch else (active_m.package.organization if active_m.package else None)
+        branch = active_m.home_branch
+
+        # Create pending renewal order
+        order_num = f"REN-{uuid.uuid4().hex[:8].upper()}"
+        order = Order.objects.using(alias).create(
+            branch=branch,
+            user_profile=profile,
+            order_number=order_num,
+            order_type='RENEWAL',
+            source='MOBILE_APP',
+            status='PENDING_PAYMENT',
+            subtotal=base_price,
+            discount_amount=Decimal('0.00'),
+            tax_amount=total_price - base_price,
+            total_amount=total_price,
+            currency=price_obj.currency or 'INR',
+            notes=f"Renewal for package: {package.name} (membership: {active_m.id})",
+        )
+        OrderItem.objects.using(alias).create(
+            order=order,
+            item_type='PACKAGE',
+            package=package,
+            package_version=ver,
+            package_price=price_obj,
+            item_name_snapshot=f"Membership Renewal: {package.name}",
+            quantity=Decimal('1.00'),
+            unit_price_snapshot=base_price,
+            tax_percent_snapshot=tax_pct,
+            tax_amount=total_price - base_price,
+            total_amount=total_price,
+        )
+
+        return Response({
+            'order_id': str(order.id),
+            'order_number': order.order_number,
+            'status': order.status,
+            'total_amount': float(order.total_amount),
+            'package_name': package.name,
+            'detail': 'Renewal order created. Complete payment to activate your renewed package.',
+            'requires_payment': True,
+            'is_active': False,
+        }, status=status.HTTP_201_CREATED)
+
+
+class MobileMembershipUpgradeView(APIView):
+    """
+    POST /api/v1/mobile/memberships/upgrade/
+    Submits a member self-service upgrade request.
+    Creates ApprovalRequest and registers pending state.
+    Requires staff review/approval.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
+        profile = _get_or_create_user_profile(user, alias)
+
+        from .models_memberships import Membership, Package, PackageVersion
+        from .models_approvals import ApprovalRequest
+
+        active_m = (
+            Membership.objects.using(alias)
+            .filter(user_profile=profile, status='ACTIVE')
+            .select_related('package', 'package_version', 'home_branch')
+            .order_by('-created_at')
+            .first()
+        )
+        if not active_m:
+            return Response({'detail': 'No active membership eligible for upgrade.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check existing pending upgrade request
+        existing_req = ApprovalRequest.objects.using(alias).filter(
+            entity_id=active_m.id,
+            request_type='MEMBERSHIP_UPGRADE',
+            status='PENDING'
+        ).first()
+        if existing_req:
+            return Response({
+                'detail': 'An upgrade request is already pending studio approval.',
+                'code': 'UPGRADE_REQUEST_ALREADY_PENDING',
+                'request_id': str(existing_req.id),
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        target_pkg_id = request.data.get('target_package_id') or request.data.get('package_id')
+        reason = (request.data.get('reason') or 'Member self-service upgrade request').strip()
+
+        if not target_pkg_id:
+            return Response({'detail': 'Target upgrade package is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        target_pkg = Package.objects.using(alias).filter(id=target_pkg_id, status='ACTIVE').first()
+        if not target_pkg:
+            return Response({'detail': 'Target upgrade package not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        target_ver = target_pkg.versions.using(alias).filter(status='ACTIVE').order_by('-version_number').first()
+        if not target_ver:
+            return Response({'detail': 'Active version for target package not found.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Price comparison
+        cur_price = Decimal('0.00')
+        if active_m.package_version:
+            pr = active_m.package_version.prices.using(alias).filter(status='ACTIVE').first()
+            if pr:
+                cur_price = pr.base_price
+        target_price = Decimal('0.00')
+        t_pr = target_ver.prices.using(alias).filter(status='ACTIVE').first()
+        if t_pr:
+            target_price = t_pr.base_price
+
+        price_diff = max(Decimal('0.00'), target_price - cur_price)
+
+        req = ApprovalRequest.objects.using(alias).create(
+            organization=active_m.home_branch.organization if active_m.home_branch else active_m.package.organization,
+            request_type='MEMBERSHIP_UPGRADE',
+            entity_type='Membership',
+            entity_id=active_m.id,
+            requested_by_user=user,
+            requested_payload={
+                'current_membership_id': str(active_m.id),
+                'current_package_name': active_m.package.name if active_m.package else 'Current Package',
+                'target_package_id': str(target_pkg.id),
+                'target_package_name': target_pkg.name,
+                'target_version_id': str(target_ver.id),
+                'price_difference': float(price_diff),
+                'reason': reason,
+                'channel': 'MEMBER_PORTAL',
+            },
+            status='PENDING',
+        )
+
+        return Response({
+            'detail': f"Upgrade request to '{target_pkg.name}' submitted successfully. Pending studio review.",
+            'request_id': str(req.id),
+            'status': 'PENDING',
+            'target_package_name': target_pkg.name,
+            'price_difference': float(price_diff),
+        }, status=status.HTTP_201_CREATED)
+
+
+class MobileMembershipExtendView(APIView):
+    """
+    POST /api/v1/mobile/memberships/extend/
+    Submits a member validity extension request.
+    Creates ApprovalRequest (status PENDING).
+    Does NOT silently extend expiry date or bypass staff approval.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
+        profile = _get_or_create_user_profile(user, alias)
+
+        from .models_memberships import Membership
+        from .models_approvals import ApprovalRequest
+
+        active_m = (
+            Membership.objects.using(alias)
+            .filter(user_profile=profile)
+            .select_related('package', 'home_branch')
+            .order_by('-created_at')
+            .first()
+        )
+        if not active_m:
+            return Response({'detail': 'No membership found to extend.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check existing pending extension request
+        existing_req = ApprovalRequest.objects.using(alias).filter(
+            entity_id=active_m.id,
+            request_type='MEMBERSHIP_EXTENSION',
+            status='PENDING'
+        ).first()
+        if existing_req:
+            return Response({
+                'detail': 'A validity extension request is already pending studio approval.',
+                'code': 'EXTENSION_REQUEST_ALREADY_PENDING',
+                'request_id': str(existing_req.id),
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            days = int(request.data.get('days', 7))
+        except (ValueError, TypeError):
+            days = 7
+
+        if days not in [7, 14, 21, 30]:
+            return Response({'detail': 'Allowed extension durations are 7, 14, 21, or 30 days.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        reason = (request.data.get('reason') or '').strip()
+        if not reason:
+            return Response({'detail': 'A reason for the validity extension is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        req = ApprovalRequest.objects.using(alias).create(
+            organization=active_m.home_branch.organization if active_m.home_branch else active_m.package.organization,
+            request_type='MEMBERSHIP_EXTENSION',
+            entity_type='Membership',
+            entity_id=active_m.id,
+            requested_by_user=user,
+            requested_payload={
+                'membership_id': str(active_m.id),
+                'days': days,
+                'reason': reason,
+                'current_end_date': active_m.end_date.isoformat() if active_m.end_date else None,
+                'channel': 'MEMBER_PORTAL',
+            },
+            status='PENDING',
+        )
+
+        return Response({
+            'detail': f"Validity extension request for {days} days submitted. Pending studio manager approval.",
+            'request_id': str(req.id),
+            'status': 'PENDING',
+            'requested_days': days,
+            'current_end_date': str(active_m.end_date) if active_m.end_date else None,
+        }, status=status.HTTP_201_CREATED)
+
+
+class MobileMembershipFreezeView(APIView):
+    """
+    POST /api/v1/mobile/memberships/freeze/
+    Submits a member freeze request with freeze_from, freeze_until, and reason.
+    Validates duration (7-60 days), dates, and active status.
+    Creates MembershipFreeze (SCHEDULED) and ApprovalRequest (PENDING).
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
+        profile = _get_or_create_user_profile(user, alias)
+
+        from .models_memberships import Membership, MembershipFreeze
+        from .models_approvals import ApprovalRequest
+
+        active_m = (
+            Membership.objects.using(alias)
+            .filter(user_profile=profile, status='ACTIVE')
+            .select_related('home_branch', 'package')
+            .order_by('-created_at')
+            .first()
+        )
+        if not active_m:
+            return Response({'detail': 'Only active memberships can be frozen.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        freeze_from_str = request.data.get('freeze_from')
+        freeze_until_str = request.data.get('freeze_until')
+        reason = (request.data.get('reason') or '').strip()
+
+        if not freeze_from_str or not freeze_until_str:
+            return Response({'detail': 'Freeze start and end dates are required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not reason:
+            return Response({'detail': 'A reason for freezing the membership is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            from_d = datetime.strptime(freeze_from_str[:10], '%Y-%m-%d').date()
+            until_d = datetime.strptime(freeze_until_str[:10], '%Y-%m-%d').date()
+        except Exception:
+            return Response({'detail': 'Invalid date format. Use YYYY-MM-DD.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        today = timezone.now().date()
+        if from_d < today:
+            return Response({'detail': 'Freeze start date cannot be in the past.'}, status=status.HTTP_400_BAD_REQUEST)
+        if until_d <= from_d:
+            return Response({'detail': 'Freeze end date must be after start date.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        freeze_days = (until_d - from_d).days
+        if freeze_days < 7:
+            return Response({'detail': 'Minimum freeze duration is 7 days.'}, status=status.HTTP_400_BAD_REQUEST)
+        if freeze_days > 60:
+            return Response({'detail': 'Maximum freeze duration is 60 days.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check overlapping active / scheduled freeze
+        overlap = MembershipFreeze.objects.using(alias).filter(
+            membership=active_m,
+            status__in=['SCHEDULED', 'ACTIVE'],
+            freeze_from__lte=until_d,
+            freeze_until__gte=from_d,
+        ).exists()
+        if overlap:
+            return Response({'detail': 'A freeze window already overlaps with these dates.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check pending approval request
+        existing_req = ApprovalRequest.objects.using(alias).filter(
+            entity_id=active_m.id,
+            request_type='MEMBERSHIP_FREEZE',
+            status='PENDING'
+        ).first()
+        if existing_req:
+            return Response({
+                'detail': 'A freeze request is already pending studio approval.',
+                'code': 'FREEZE_REQUEST_ALREADY_PENDING',
+                'request_id': str(existing_req.id),
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Create scheduled MembershipFreeze record
+        frz = MembershipFreeze.objects.using(alias).create(
+            membership=active_m,
+            freeze_from=from_d,
+            freeze_until=until_d,
+            reason_code='MEMBER_SELF_SERVICE',
+            reason_text=reason,
+            extend_membership_days=freeze_days,
+            status='SCHEDULED',
+        )
+
+        # Create ApprovalRequest for studio staff
+        req = ApprovalRequest.objects.using(alias).create(
+            organization=active_m.home_branch.organization if active_m.home_branch else active_m.package.organization,
+            request_type='MEMBERSHIP_FREEZE',
+            entity_type='Membership',
+            entity_id=active_m.id,
+            requested_by_user=user,
+            requested_payload={
+                'freeze_id': str(frz.id),
+                'membership_id': str(active_m.id),
+                'freeze_from': str(from_d),
+                'freeze_until': str(until_d),
+                'days': freeze_days,
+                'reason': reason,
+                'channel': 'MEMBER_PORTAL',
+            },
+            status='PENDING',
+        )
+
+        return Response({
+            'detail': f"Freeze request from {from_d} to {until_d} ({freeze_days} days) submitted for studio approval.",
+            'freeze_id': str(frz.id),
+            'request_id': str(req.id),
+            'status': 'PENDING',
+            'freeze_from': str(from_d),
+            'freeze_until': str(until_d),
+            'days': freeze_days,
+        }, status=status.HTTP_201_CREATED)
