@@ -216,29 +216,66 @@ class SarvamVoiceAdapter(BaseCommunicationAdapter):
 
     def verify_webhook_signature(self, payload_bytes: bytes, headers: Dict[str, Any]) -> bool:
         """
-        Verifies incoming webhook authentication.
-        If a shared webhook token is configured in integration configuration,
-        verifies that 'x-webhook-token' or 'authorization' matches.
+        Verifies incoming webhook authentication using constant-time comparison.
+        Fails closed: strictly requires a non-empty configured shared-secret token.
+
+        Authentication mechanism:
+        Sarvam Voice Agents dispatches outbound call completion and status callbacks
+        to the configured webhook URL. Because Sarvam does not provide a proprietary
+        HMAC-SHA256 signature algorithm, authentication is enforced via a tenant-scoped
+        shared-secret token transmitted through:
+        1. HTTP Header: 'X-Webhook-Token' (HTTP_X_WEBHOOK_TOKEN)
+        2. HTTP Header: 'Authorization: Bearer <token>' (HTTP_AUTHORIZATION)
+        3. URL Query Parameter: '?token=<token>' or '?verify_token=<token>' (QUERY_STRING)
         """
+        import hmac
+
+        # 1. Resolve expected token (fail-closed if missing, empty, or whitespace)
         expected_token = (
             self.config.get('webhook_token')
             or self.config.get('verify_token')
             or self.credentials.get('webhook_token')
+            or ''
         )
-        if not expected_token:
-            return True
+        if not isinstance(expected_token, str) or not expected_token.strip():
+            logger.warning("Sarvam webhook authentication failed: No webhook secret token configured.")
+            return False
 
+        expected_token = expected_token.strip()
+
+        # 2. Extract provided token from headers or query string
         provided_token = (
             headers.get('HTTP_X_WEBHOOK_TOKEN')
             or headers.get('X-Webhook-Token')
-            or headers.get('HTTP_AUTHORIZATION', '').replace('Bearer ', '').strip()
+            or headers.get('x-webhook-token')
+            or ''
         )
+
+        if not provided_token:
+            auth_header = (
+                headers.get('HTTP_AUTHORIZATION')
+                or headers.get('Authorization')
+                or headers.get('authorization')
+                or ''
+            )
+            if isinstance(auth_header, str) and auth_header.lower().startswith('bearer '):
+                provided_token = auth_header[7:].strip()
+            elif isinstance(auth_header, str) and auth_header:
+                provided_token = auth_header.strip()
+
         if not provided_token and 'QUERY_STRING' in headers:
             import urllib.parse
-            qp = urllib.parse.parse_qs(headers.get('QUERY_STRING', ''))
-            provided_token = (qp.get('token') or qp.get('verify_token') or [''])[0]
+            qp = urllib.parse.parse_qs(headers.get('QUERY_STRING') or '')
+            token_candidates = qp.get('token') or qp.get('verify_token') or []
+            if token_candidates:
+                provided_token = token_candidates[0].strip()
 
-        return provided_token == expected_token
+        if not isinstance(provided_token, str) or not provided_token.strip():
+            logger.warning("Sarvam webhook authentication failed: No authentication token provided in request.")
+            return False
+
+        # 3. Constant-time comparison to prevent timing attacks
+        return hmac.compare_digest(provided_token.strip(), expected_token)
 
     def parse_status_webhook(
         self,

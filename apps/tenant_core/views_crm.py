@@ -63,6 +63,7 @@ from .models_crm import (
     CRMAgentAssignmentConfig,
     LeadAttribution,
     CRMStageAutomationRule,
+    CallSession,
 )
 from .serializers_crm import (
     LeadSourceSerializer,
@@ -360,6 +361,7 @@ class LeadViewSet(viewsets.ModelViewSet):
         'transition_status': 'crm.leads.edit',
         'assign': 'crm.leads.edit',
         'book_trial': 'crm.leads.edit',
+        'call': 'crm.leads.edit',
         'metadata': 'crm.leads.view',
         'eligible_agents': 'crm.leads.view',
         'eligible_assignees': 'crm.leads.view',
@@ -1001,6 +1003,225 @@ class LeadViewSet(viewsets.ModelViewSet):
         else:
             trials_sorted = all_trials
         return Response(TrialBookingSerializer(trials_sorted, many=True).data)
+
+    @action(detail=True, methods=['post'], url_path='call')
+    def call(self, request, pk=None):
+        """
+        SWEAT x Sarvam AI Phase 3B: Authenticated Outbound Call API.
+        POST /api/v1/tenant/leads/{id}/call/
+        Initiates a single, manually authorized outbound call to a lead via Sarvam AI Voice.
+        """
+        lead = self.get_object()
+        alias = _get_db(request)
+
+        # 1. Strict RBAC branch & permission verification
+        from .rbac_engine import RBACAuthorizationEngine
+        allowed, reason, check_code = RBACAuthorizationEngine.evaluate(
+            user=request.user,
+            required_module='crm',
+            required_submodule='leads',
+            required_permission='crm.leads.edit',
+            branch_id=str(lead.branch_id) if lead.branch_id else None,
+            request=request,
+        )
+        if not allowed:
+            raise PermissionDenied(f"Permission denied: crm.leads.edit required ({reason})")
+
+        # 2. Database prerequisite check: migration 0055 (crm_call_sessions table)
+        from django.db import connections
+        from django.db.utils import ProgrammingError, OperationalError
+        try:
+            with connections[alias].cursor() as cursor:
+                table_names = connections[alias].introspection.table_names(cursor)
+            if 'crm_call_sessions' not in table_names:
+                return Response(
+                    {
+                        'error': 'Voice calling service is unavailable: database migration is pending.',
+                        'code': 'MIGRATION_PENDING',
+                    },
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+        except Exception as db_check_err:
+            logger.error("Error verifying call session table in db %s: %s", alias, db_check_err)
+            return Response(
+                {
+                    'error': 'Voice calling database service is temporarily unavailable.',
+                    'code': 'DATABASE_UNAVAILABLE',
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        # 3. Idempotency Key validation
+        idempotency_key = (
+            request.headers.get('X-Idempotency-Key')
+            or request.META.get('HTTP_X_IDEMPOTENCY_KEY')
+            or (request.data.get('idempotency_key') if isinstance(request.data, dict) else None)
+        )
+        if not idempotency_key or not str(idempotency_key).strip():
+            return Response(
+                {
+                    'error': 'Idempotency key is required. Provide X-Idempotency-Key header or idempotency_key in request body.',
+                    'code': 'MISSING_IDEMPOTENCY_KEY',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        idempotency_key = str(idempotency_key).strip()
+        if len(idempotency_key) > 128:
+            return Response(
+                {
+                    'error': 'Idempotency key must not exceed 128 characters.',
+                    'code': 'INVALID_IDEMPOTENCY_KEY',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 4. Check for existing session with this idempotency key prior to dispatch
+        try:
+            existing_session = CallSession.objects.using(alias).filter(
+                organization=lead.organization,
+                idempotency_key=idempotency_key,
+            ).first()
+        except (ProgrammingError, OperationalError) as db_err:
+            logger.error("CallSession database error in db %s: %s", alias, db_err)
+            return Response(
+                {
+                    'error': 'Voice calling service is unavailable: database migration is pending.',
+                    'code': 'MIGRATION_PENDING',
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        if existing_session:
+            if existing_session.error_code == 'TIMEOUT_UNCONFIRMED':
+                return Response(
+                    {
+                        'error': 'Call attempt timed out and is awaiting provider reconciliation. Re-dispatch is blocked.',
+                        'code': 'TIMEOUT_PENDING_RECONCILIATION',
+                        'call_session_id': str(existing_session.id),
+                        'status': existing_session.status,
+                        'is_duplicate': True,
+                    },
+                    status=status.HTTP_504_GATEWAY_TIMEOUT,
+                )
+            safe_existing_data = {
+                'call_session_id': str(existing_session.id),
+                'status': existing_session.status,
+                'provider': existing_session.provider,
+                'direction': existing_session.direction,
+                'recipient_phone': existing_session.user_phone_number,
+                'provider_attempt_id': existing_session.provider_attempt_id,
+                'started_at': existing_session.started_at.isoformat() if existing_session.started_at else None,
+                'is_duplicate': True,
+            }
+            return Response(safe_existing_data, status=status.HTTP_200_OK)
+
+        # 5. Initiate Call via VoiceCallingService
+        from .services_voice_calling import VoiceCallingService
+        custom_metadata = {
+            'initiated_by_user_id': str(request.user.id) if hasattr(request.user, 'id') else None,
+            'source': 'CRM_MANUAL_API',
+        }
+        if isinstance(request.data, dict) and isinstance(request.data.get('custom_metadata'), dict):
+            caller_tags = request.data['custom_metadata']
+            for k, v in caller_tags.items():
+                if k not in ('initiated_by_user_id', 'source', 'lead_id', 'call_session_id') and isinstance(v, (str, int, float, bool)):
+                    custom_metadata[str(k)[:64]] = v
+
+        try:
+            session = VoiceCallingService.initiate_outbound_call(
+                lead=lead,
+                actor_user=request.user,
+                idempotency_key=idempotency_key,
+                custom_metadata=custom_metadata,
+                db_alias=alias,
+            )
+        except ValueError as val_err:
+            return Response(
+                {
+                    'error': str(val_err),
+                    'code': 'INVALID_RECIPIENT_OR_CONSENT',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except (ProgrammingError, OperationalError) as db_err:
+            logger.error("CallSession database error in db %s: %s", alias, db_err)
+            return Response(
+                {
+                    'error': 'Voice calling service is unavailable: database migration is pending.',
+                    'code': 'MIGRATION_PENDING',
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except Exception as unhandled_err:
+            logger.error("Unhandled error initiating outbound call for lead %s: %s", lead.id, unhandled_err, exc_info=True)
+            return Response(
+                {
+                    'error': 'Failed to initiate outbound call due to internal error.',
+                    'code': 'INTERNAL_ERROR',
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        # 6. Check for concurrent active call collision (different idempotency key)
+        if session.idempotency_key != idempotency_key and session.status in ['QUEUED', 'INITIATED', 'RINGING', 'CONNECTED']:
+            return Response(
+                {
+                    'error': 'A call is already in progress for this lead.',
+                    'code': 'CALL_ALREADY_IN_PROGRESS',
+                    'call_session_id': str(session.id),
+                    'status': session.status,
+                    'provider': session.provider,
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        # 7. Handle Provider Failures / Unconfigured / Timeouts
+        if session.error_code in ('TIMEOUT', 'TIMEOUT_UNCONFIRMED'):
+            return Response(
+                {
+                    'error': 'Voice provider timed out while initiating call. Call may be in progress; awaiting provider webhook reconciliation.',
+                    'code': 'TIMEOUT_PENDING_RECONCILIATION',
+                    'call_session_id': str(session.id),
+                    'status': session.status,
+                    'is_duplicate': False,
+                },
+                status=status.HTTP_504_GATEWAY_TIMEOUT,
+            )
+
+        if session.status == 'FAILED':
+            if session.error_code == 'UNCONFIGURED':
+                return Response(
+                    {
+                        'error': 'Voice calling provider is not configured for this tenant.',
+                        'code': 'UNCONFIGURED',
+                        'call_session_id': str(session.id),
+                        'status': 'FAILED',
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            else:
+                return Response(
+                    {
+                        'error': 'Voice provider failed to initiate call.',
+                        'code': session.error_code or 'PROVIDER_FAILURE',
+                        'call_session_id': str(session.id),
+                        'status': 'FAILED',
+                    },
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
+
+        # 8. Successful dispatch response
+        safe_data = {
+            'call_session_id': str(session.id),
+            'status': session.status,
+            'provider': session.provider,
+            'direction': session.direction,
+            'recipient_phone': session.user_phone_number,
+            'provider_attempt_id': session.provider_attempt_id,
+            'started_at': session.started_at.isoformat() if session.started_at else None,
+            'is_duplicate': False,
+        }
+        return Response(safe_data, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['get'], url_path='offers')
     def offers(self, request, pk=None):

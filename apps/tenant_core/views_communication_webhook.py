@@ -79,15 +79,6 @@ class CommunicationWebhookView(APIView):
             logger.warning("Webhook received for unknown tenant public_id=%s provider=%s", public_integration_id, provider)
             return Response({'error': 'Unknown integration endpoint'}, status=status.HTTP_404_NOT_FOUND)
 
-        # Parse request body
-        try:
-            if request.content_type == 'application/json' or request.body.startswith(b'{'):
-                payload = json.loads(request.body.decode('utf-8'))
-            else:
-                payload = request.POST.dict()
-        except Exception:
-            payload = request.POST.dict() or {}
-
         # Step 2: Switch into Tenant's Dedicated Database Context
         with tenant_database_context(tenant.id) as db_alias:
             org = Organization.objects.first()
@@ -107,7 +98,7 @@ class CommunicationWebhookView(APIView):
             }
             channel = channel_map.get(provider_upper, 'WHATSAPP')
 
-            # Step 3: Resolve Adapter & Verify Security Token / Signature
+            # Step 3: Resolve Adapter & Verify Security Token / Signature (Fail-Closed)
             adapter_cls = CommunicationProviderRegistry.get_adapter_class(channel, provider_upper)
             if not adapter_cls:
                 logger.error("No adapter registered for provider %s", provider_upper)
@@ -116,7 +107,11 @@ class CommunicationWebhookView(APIView):
             from apps.tenant_core.models_infra import Integration
             from config.secrets import SecretResolver
 
-            integration = Integration.objects.filter(provider__iexact=provider).first()
+            if provider_upper == 'SARVAM':
+                integration = Integration.objects.filter(provider__iexact='SARVAM', status='ACTIVE').first()
+            else:
+                integration = Integration.objects.filter(provider__iexact=provider).first()
+
             credentials = {}
             configuration = {}
             if integration:
@@ -126,15 +121,38 @@ class CommunicationWebhookView(APIView):
                         credentials = SecretResolver.resolve(integration.secret_reference) or {}
                         if not isinstance(credentials, dict):
                             credentials = {'api_token': credentials}
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.error("Failed to resolve secret for integration %s: %s", integration.id, type(e).__name__)
+                        credentials = {}
 
             adapter = adapter_cls(configuration=configuration, secret_credentials=credentials)
 
-            # Validate signature if configured
+            # Validate signature / token fail-closed BEFORE payload processing
             if not adapter.verify_webhook_signature(request.body, request.META):
                 logger.warning("Invalid webhook signature for tenant %s provider %s", tenant.id, provider)
                 return Response({'error': 'Invalid webhook signature'}, status=status.HTTP_401_UNAUTHORIZED)
+
+            # Step 4: Safely parse validated request payload
+            payload = {}
+            raw_body = request.body
+            if raw_body:
+                try:
+                    if request.content_type == 'application/json' or raw_body.startswith((b'{', b'[')):
+                        payload = json.loads(raw_body.decode('utf-8'))
+                    else:
+                        payload = request.POST.dict()
+                except (json.JSONDecodeError, UnicodeDecodeError) as parse_err:
+                    logger.warning("Malformed JSON in webhook request for tenant %s provider %s: %s", tenant.id, provider, type(parse_err).__name__)
+                    return Response({'error': 'Malformed JSON payload'}, status=status.HTTP_400_BAD_REQUEST)
+                except Exception as parse_err:
+                    logger.warning("Failed to parse webhook payload for tenant %s provider %s: %s", tenant.id, provider, type(parse_err).__name__)
+                    return Response({'error': 'Invalid payload format'}, status=status.HTTP_400_BAD_REQUEST)
+            else:
+                payload = request.POST.dict() or {}
+
+            if not isinstance(payload, dict):
+                logger.warning("Webhook payload for tenant %s provider %s is not a JSON object", tenant.id, provider)
+                return Response({'error': 'Webhook payload must be a JSON object'}, status=status.HTTP_400_BAD_REQUEST)
 
             # SARVAM Voice Callback handler
             if provider_upper == 'SARVAM':

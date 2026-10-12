@@ -195,6 +195,10 @@ class Lead(models.Model):
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
+    @property
+    def is_opted_out(self) -> bool:
+        return bool(self.do_not_contact or (not self.consent_sms and not self.consent_whatsapp))
+
     class Meta:
         app_label = 'tenant_core'
         db_table = 'leads'

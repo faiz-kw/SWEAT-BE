@@ -839,32 +839,38 @@ class CRMLeadService:
                 },
             })
 
-        # 10. Voice Call Sessions
+        # 10. Voice Call Sessions (tolerantly skipped if migration 0055 is pending)
         from .models_crm import CallSession
-        for cs in CallSession.objects.using(alias).filter(lead=lead):
-            status_label = cs.status.replace('_', ' ').title()
-            events.append({
-                'id': f"call-{cs.id}",
-                'event_type': 'VOICE_CALL',
-                'occurred_at': (cs.started_at or cs.created_at).isoformat(),
-                'title': f"AI Call: {status_label}",
-                'description': f"Duration: {int(cs.duration_seconds)}s • Provider: {cs.provider}" + (
-                    f" • Turns: {len(cs.transcript)}" if cs.transcript else ""
-                ),
-                'actor': f"{cs.provider.title()} Voice Agent",
-                'channel': 'VOICE',
-                'metadata': {
-                    'call_session_id': str(cs.id),
-                    'provider_attempt_id': cs.provider_attempt_id,
-                    'status': cs.status,
-                    'direction': cs.direction,
-                    'duration_seconds': cs.duration_seconds,
-                    'transcript': cs.transcript,
-                    'final_agent_variables': cs.final_agent_variables,
-                    'started_at': cs.started_at.isoformat() if cs.started_at else None,
-                    'ended_at': cs.ended_at.isoformat() if cs.ended_at else None,
-                },
-            })
+        from django.db.utils import ProgrammingError, OperationalError
+        try:
+            with transaction.atomic(using=alias):
+                call_sessions = list(CallSession.objects.using(alias).filter(lead=lead))
+            for cs in call_sessions:
+                status_label = cs.status.replace('_', ' ').title()
+                events.append({
+                    'id': f"call-{cs.id}",
+                    'event_type': 'VOICE_CALL',
+                    'occurred_at': (cs.started_at or cs.created_at).isoformat(),
+                    'title': f"AI Call: {status_label}",
+                    'description': f"Duration: {int(cs.duration_seconds)}s • Provider: {cs.provider}" + (
+                        f" • Turns: {len(cs.transcript)}" if cs.transcript else ""
+                    ),
+                    'actor': f"{cs.provider.title()} Voice Agent",
+                    'channel': 'VOICE',
+                    'metadata': {
+                        'call_session_id': str(cs.id),
+                        'provider_attempt_id': cs.provider_attempt_id,
+                        'status': cs.status,
+                        'direction': cs.direction,
+                        'duration_seconds': cs.duration_seconds,
+                        'transcript': cs.transcript,
+                        'final_agent_variables': cs.final_agent_variables,
+                        'started_at': cs.started_at.isoformat() if cs.started_at else None,
+                        'ended_at': cs.ended_at.isoformat() if cs.ended_at else None,
+                    },
+                })
+        except (ProgrammingError, OperationalError) as db_err:
+            logger.debug("CallSession table unavailable in db %s (migration 0055 pending): %s", alias, db_err)
 
         # Sort descending by occurred_at, with deterministic secondary sort on ID
         events.sort(key=lambda e: (e['occurred_at'], e['id']), reverse=True)
