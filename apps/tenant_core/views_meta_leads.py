@@ -309,6 +309,7 @@ class MetaAccessMixin:
         'pages': 'crm.settings.view',
         'forms': 'crm.settings.view',
         'form_fields': 'crm.settings.view',
+        'form_fields_alias': 'crm.settings.view',
         'create': 'crm.settings.edit',
         'partial_update': 'crm.settings.edit',
         'simulate': 'crm.settings.edit',
@@ -426,6 +427,31 @@ def is_synthetic_token(raw_or_encrypted_token: str) -> bool:
         or 'mock' in token_str.lower()
         or len(token_str) < 30
     )
+
+
+
+def _is_valid_uuid(val) -> bool:
+    try:
+        uuid.UUID(str(val))
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+def _format_page_connection_payload(p: dict) -> dict:
+    page_id_str = str(p.get('page_id') or '')
+    page_name_str = str(p.get('page_name') or '')
+    sub_at = p.get('subscribed_at')
+    sub_at_str = sub_at.isoformat() if sub_at and hasattr(sub_at, 'isoformat') else (str(sub_at) if sub_at else None)
+    return {
+        'id': page_id_str,
+        'page_id': page_id_str,
+        'connection_id': str(p.get('id') or ''),
+        'name': page_name_str,
+        'page_name': page_name_str,
+        'is_subscribed_to_webhooks': bool(p.get('is_subscribed_to_webhooks', False)),
+        'subscribed_at': sub_at_str,
+    }
 
 
 class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):
@@ -822,9 +848,10 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
         if not conn:
             return Response({'status': 'NOT_CONNECTED', 'pages': []})
 
-        pages = list(MetaPageConnection.objects.using(self.alias).filter(
+        raw_conn_pages = list(MetaPageConnection.objects.using(self.alias).filter(
             organization=self.organization, is_active=True
         ).values('id', 'page_id', 'page_name', 'is_subscribed_to_webhooks', 'subscribed_at'))
+        pages = [_format_page_connection_payload(p) for p in raw_conn_pages]
 
         token_is_synthetic = is_synthetic_token(conn.encrypted_user_access_token)
         sim_active = simulator_enabled()
@@ -887,10 +914,11 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
 
     @action(detail=False, methods=['get'], url_path='pages')
     def pages(self, request):
-        pages = list(MetaPageConnection.objects.using(self.alias).filter(
+        raw_pages = list(MetaPageConnection.objects.using(self.alias).filter(
             organization=self.organization, is_active=True
-        ).values('id', 'page_id', 'page_name', 'is_subscribed_to_webhooks'))
-        return Response({'results': pages})
+        ).values('id', 'page_id', 'page_name', 'is_subscribed_to_webhooks', 'subscribed_at'))
+        pages = [_format_page_connection_payload(p) for p in raw_pages]
+        return Response({'results': pages, 'pages': pages})
 
     @action(detail=False, methods=['get'], url_path='forms')
     def forms(self, request):
@@ -898,20 +926,23 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
         if not page_id:
             raise ValidationError({'page_id': 'Query parameter page_id is required.'})
 
+        # Dual lookup: search by Facebook page_id or internal row UUID
         page_conn = MetaPageConnection.objects.using(self.alias).filter(
-            organization=self.organization, page_id=page_id, is_active=True
+            organization=self.organization, is_active=True
+        ).filter(
+            Q(page_id=page_id) | Q(id=page_id) if _is_valid_uuid(page_id) else Q(page_id=page_id)
         ).first()
 
         if not page_conn:
-            return Response({'results': [], 'notice': 'Page is not connected. Enter form ID manually.'})
+            return Response({'results': [], 'forms': [], 'notice': 'Page is not connected. Enter form ID manually.'})
 
         token = decrypt_token(page_conn.encrypted_page_access_token)
         if not token:
-            return Response({'results': [], 'notice': 'Page token not available. Re-authorize connection.'})
+            return Response({'results': [], 'forms': [], 'notice': 'Page token not available. Re-authorize connection.'})
 
         client = MetaGraphClient()
         try:
-            forms_data = client.fetch_page_forms(page_id, token)
+            forms_data = client.fetch_page_forms(page_conn.page_id, token)
             results = []
             for f in forms_data:
                 results.append({
@@ -920,30 +951,45 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
                     'status': f.get('status', 'ACTIVE'),
                     'questions_count': len(f.get('questions', [])),
                 })
-            return Response({'results': results})
+            return Response({'results': results, 'forms': results})
         except MetaTokenExpiredError:
-            return Response({'results': [], 'error': 'TOKEN_EXPIRED', 'message': 'Page token expired. Please reconnect.'}, status=401)
+            return Response({'results': [], 'forms': [], 'error': 'TOKEN_EXPIRED', 'message': 'Page token expired. Please reconnect.'}, status=401)
         except Exception as exc:
             logger.warning("Could not fetch forms for page %s: %s", page_id, exc)
-            return Response({'results': [], 'error': str(exc)})
+            return Response({'results': [], 'forms': [], 'error': str(exc)})
+
+    @action(detail=False, methods=['get'], url_path='form_fields')
+    def form_fields_alias(self, request):
+        """Snake-case alias for form-fields endpoint."""
+        return self.form_fields(request)
 
     @action(detail=False, methods=['get'], url_path='form-fields')
     def form_fields(self, request):
         page_id = request.query_params.get('page_id')
         form_id = request.query_params.get('form_id')
-        if not page_id or not form_id:
-            raise ValidationError('Both page_id and form_id are required.')
+        if not form_id:
+            raise ValidationError('Query parameter form_id is required.')
 
-        page_conn = MetaPageConnection.objects.using(self.alias).filter(
-            organization=self.organization, page_id=page_id, is_active=True
-        ).first()
+        page_conn = None
+        if page_id:
+            page_conn = MetaPageConnection.objects.using(self.alias).filter(
+                organization=self.organization, is_active=True
+            ).filter(
+                Q(page_id=page_id) | Q(id=page_id) if _is_valid_uuid(page_id) else Q(page_id=page_id)
+            ).first()
 
         if not page_conn:
-            return Response({'questions': []})
+            # Fallback to any active page connection with available token
+            page_conn = MetaPageConnection.objects.using(self.alias).filter(
+                organization=self.organization, is_active=True
+            ).exclude(encrypted_page_access_token='').first()
+
+        if not page_conn:
+            return Response({'questions': [], 'form': {'id': form_id, 'name': '', 'questions': []}})
 
         token = decrypt_token(page_conn.encrypted_page_access_token)
         if not token:
-            return Response({'questions': []})
+            return Response({'questions': [], 'form': {'id': form_id, 'name': '', 'questions': []}})
 
         client = MetaGraphClient()
         try:
@@ -957,10 +1003,11 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
                     'type': q.get('type', 'CUSTOM'),
                     'options': [opt.get('value') or opt.get('key') for opt in q.get('options', [])] if q.get('options') else [],
                 })
-            return Response({'questions': mapped_questions, 'form_name': form_data.get('name', '')})
+            form_dict = {'id': form_id, 'name': form_data.get('name', ''), 'questions': mapped_questions}
+            return Response({'questions': mapped_questions, 'form_name': form_data.get('name', ''), 'form': form_dict})
         except Exception as exc:
             logger.warning("Could not fetch form fields for %s: %s", form_id, exc)
-            return Response({'questions': [], 'error': str(exc)})
+            return Response({'questions': [], 'form': {'id': form_id, 'name': '', 'questions': []}, 'error': str(exc)})
 
     @action(detail=False, methods=['get'])
     def metadata(self, request):
@@ -1002,9 +1049,10 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
                 'updated_at': conn.updated_at.isoformat(),
             }
 
-        pages_list = list(MetaPageConnection.objects.using(self.alias).filter(
+        raw_meta_pages = list(MetaPageConnection.objects.using(self.alias).filter(
             organization=self.organization, is_active=True
         ).values('id', 'page_id', 'page_name', 'is_subscribed_to_webhooks', 'subscribed_at')) if (conn and is_live_conn) else []
+        pages_list = [_format_page_connection_payload(p) for p in raw_meta_pages]
 
         return Response({
             'connection_status': conn_status,
