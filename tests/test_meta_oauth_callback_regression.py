@@ -64,10 +64,24 @@ class MetaOAuthCallbackRegressionTests(unittest.TestCase):
         )
         with tenant_database_context(str(self.tenant.id)) as alias:
             self.alias = alias
-            self.org = Organization.objects.using(alias).filter(status='ACTIVE').first()
-            if not self.org:
-                self.org = Organization.objects.using(alias).create(
-                    name='SWEAT UAT Organization', status='ACTIVE'
+            existing_admin = TenantUser.objects.using(alias).filter(email='admin@sweat.com').first()
+            if existing_admin:
+                self.user = existing_admin
+                self.org = existing_admin.organization
+            else:
+                self.org = Organization.objects.using(alias).filter(status='ACTIVE').first()
+                if not self.org:
+                    self.org = Organization.objects.using(alias).create(
+                        name='SWEAT UAT Organization', status='ACTIVE'
+                    )
+                self.user = TenantUser.objects.using(alias).create(
+                    organization=self.org,
+                    email='admin@sweat.com',
+                    user_type='STAFF',
+                    status='ACTIVE',
+                    is_login_allowed=True,
+                    first_name='Admin',
+                    last_name='User',
                 )
 
             mod_crm, _ = ModuleCatalog.objects.using(alias).get_or_create(
@@ -115,11 +129,6 @@ class MetaOAuthCallbackRegressionTests(unittest.TestCase):
             RolePermissionSetItem.objects.using(alias).get_or_create(permission_set=ps, permission=perm_edit, defaults={'granted': True})
             RolePermissionSetItem.objects.using(alias).get_or_create(permission_set=ps, permission=perm_view, defaults={'granted': True})
 
-            self.user, _ = TenantUser.objects.using(alias).get_or_create(
-                organization=self.org,
-                email='admin@sweat.com',
-                defaults={'user_type': 'STAFF', 'status': 'ACTIVE', 'is_login_allowed': True, 'first_name': 'Admin', 'last_name': 'User'},
-            )
             RoleAssignment.objects.using(alias).get_or_create(
                 user=self.user, role=role_admin, defaults={'is_active': True, 'status': 'ACTIVE'}
             )

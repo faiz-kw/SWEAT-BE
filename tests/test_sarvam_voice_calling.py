@@ -21,7 +21,7 @@ import io
 import urllib.error
 from unittest.mock import patch, MagicMock
 from datetime import timedelta
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -146,6 +146,25 @@ class SarvamVoiceCallingTests(TestCase):
 
         self._setup_rbac_and_users()
 
+        # Voice Calling Purpose and Explicit ConsentRecord for lead_a
+        from apps.tenant_core.models_privacy import ProcessingPurpose, ConsentRecord
+        self.voice_purpose, _ = ProcessingPurpose.objects.using('tenant_test').get_or_create(
+            code='VOICE_CALL',
+            defaults={
+                'name': 'AI Voice Calling',
+                'description': 'Explicit consent for automated and AI voice calls',
+            },
+        )
+        self.consent_record_a = ConsentRecord.objects.using('tenant_test').create(
+            user=self.user_editor,
+            purpose=self.voice_purpose,
+            subject_type='lead',
+            subject_id=self.lead_a.id,
+            status='GRANTED',
+            capture_source='WEB_FORM',
+            notice_version='1.0',
+        )
+
     def _setup_rbac_and_users(self):
         # 1. Master DB SaaS Modules
         self.prod_mod_crm, _ = ProductModule.objects.using('default').get_or_create(
@@ -214,6 +233,20 @@ class SarvamVoiceCallingTests(TestCase):
         ps_ed = RolePermissionSet.objects.using('tenant_test').create(role=self.role_editor, name='editor_perms')
         RolePermissionSetItem.objects.using('tenant_test').create(permission_set=ps_ed, permission=self.perm_edit)
         RolePermissionSetItem.objects.using('tenant_test').create(permission_set=ps_ed, permission=self.perm_view)
+
+        self.perm_comm_view, _ = Permission.objects.using('tenant_test').get_or_create(
+            permission_code='crm.communications.view',
+            defaults={
+                'code': 'crm.communications.view',
+                'label': 'crm.communications.view',
+                'action': 'view',
+                'module': self.mod_crm,
+                'submodule': self.submod_leads,
+                'source_permission_id': uuid.uuid4(),
+                'is_active': True,
+            },
+        )
+        RolePermissionSetItem.objects.using('tenant_test').create(permission_set=ps_ed, permission=self.perm_comm_view)
 
         ps_ro = RolePermissionSet.objects.using('tenant_test').create(role=self.role_readonly, name='readonly_perms')
         RolePermissionSetItem.objects.using('tenant_test').create(permission_set=ps_ro, permission=self.perm_view)
@@ -1237,7 +1270,254 @@ class SarvamVoiceCallingTests(TestCase):
         reloaded = CallSession.objects.using('tenant_test').get(id=session.id)
         self.assertEqual(reloaded.status, 'COMPLETED')
 
-    def test_lead_with_withdrawn_consent_record_rejected(self):
+    def test_webhook_with_malformed_session_id_falls_back_to_attempt_id(self):
+        """Malformed or non-UUID call_session_id in metadata does not crash and safely falls back to attempt_id."""
+        session = CallSession.objects.using('tenant_test').create(
+            organization=self.org_a,
+            lead=self.lead_a,
+            provider='SARVAM',
+            status='INITIATED',
+            provider_attempt_id='attempt_malformed_test_123',
+            direction='OUTBOUND',
+            user_phone_number='+919876543210',
+        )
+
+        malformed_payload = {
+            'attempt_id': 'attempt_malformed_test_123',
+            'status': 'connected',
+            'duration': 25.0,
+            'metadata': {'call_session_id': 'not-a-valid-uuid-string-12345'},
+        }
+
+        result = VoiceCallingService.record_call_webhook(self.org_a, malformed_payload, db_alias='tenant_test')
+        self.assertEqual(result['status'], 'recorded')
+        self.assertEqual(result['call_status'], 'COMPLETED')
+
+        session.refresh_from_db()
+        self.assertEqual(session.status, 'COMPLETED')
+        self.assertEqual(session.duration_seconds, 25.0)
+
+    # -------------------------------------------------------------------------
+    # Comprehensive Voice Consent & Suppression Enforcement Tests
+    # -------------------------------------------------------------------------
+    def test_explicit_grant_via_consent_record_allows_call(self):
+        """Lead with an active GRANTED ConsentRecord allows call dispatch and populates provenance."""
+        with patch.dict('os.environ', {'SARVAM_API_KEY': 'test_sarvam_key_secret'}):
+            provenance = VoiceCallingService.verify_lead_calling_eligibility(
+                lead=self.lead_a,
+                db_alias='tenant_test',
+            )
+        self.assertTrue(provenance['voice_consent_verified'])
+        self.assertEqual(provenance['voice_consent_method'], 'DATABASE_CONSENT_RECORD')
+        self.assertEqual(provenance['voice_consent_source'], 'WEB_FORM')
+        self.assertIsNotNone(provenance['voice_consent_recorded_at'])
+
+    def test_caller_supplied_metadata_cannot_authorize_call(self):
+        """
+        Caller-supplied custom_metadata (e.g. has_voice_consent=True) or request payload flags
+        MUST NEVER authorize a call when trusted DB consent is absent.
+        Fails closed with ValueError and creates no provider dispatch.
+        """
+        from apps.tenant_core.communication.adapters.voice_sarvam import SarvamVoiceAdapter
+        lead_no_cr = Lead.objects.using('tenant_test').create(
+            organization=self.org_a,
+            branch=self.branch_a,
+            first_name='Karan',
+            last_name='Mehta',
+            phone_normalized='+919876543222',
+            current_status='NEW_LEAD',
+            do_not_contact=False,
+        )
+        custom_metadata = {
+            'has_voice_consent': True,
+            'voice_consent_source': 'VERBAL_PHONE_INTAKE',
+            'voice_consent_recorded_at': '2026-10-12T10:00:00Z',
+        }
+        with self.assertRaises(ValueError) as ctx:
+            VoiceCallingService.verify_lead_calling_eligibility(
+                lead=lead_no_cr,
+                db_alias='tenant_test',
+                custom_metadata=custom_metadata,
+            )
+        self.assertIn('does not have an explicit, verified voice-calling consent grant', str(ctx.exception))
+
+        # Also verify initiate_outbound_call fails closed with zero provider dispatch
+        with patch.object(SarvamVoiceAdapter, 'create_instant_outbound_call') as mock_provider:
+            with patch.dict('os.environ', {'SARVAM_API_KEY': 'test_sarvam_key_secret'}):
+                with self.assertRaises(ValueError):
+                    VoiceCallingService.initiate_outbound_call(
+                        lead=lead_no_cr,
+                        idempotency_key='test-spoof-attempt',
+                        custom_metadata=custom_metadata,
+                        db_alias='tenant_test',
+                    )
+            mock_provider.assert_not_called()
+
+    def test_caller_supplied_provenance_spoofing_is_stripped_and_overridden(self):
+        """
+        When a lead has a valid DB ConsentRecord, any caller-supplied spoofed consent keys
+        (e.g. voice_consent_source='SPOOFED', consent_voice=True) are stripped and replaced
+        with authoritative database provenance.
+        """
+        from apps.tenant_core.communication.adapters.voice_sarvam import SarvamVoiceAdapter, ProviderSendResult
+        spoofed_metadata = {
+            'voice_consent_source': 'MALICIOUS_SPOOFED_SOURCE',
+            'voice_consent_method': 'MANUFACTURED_METHOD',
+            'consent_voice': True,
+            'has_voice_consent': True,
+            'legitimate_campaign_id': 'promo_2026',
+        }
+        with patch.object(
+            SarvamVoiceAdapter,
+            'create_instant_outbound_call',
+            return_value=ProviderSendResult(
+                success=True,
+                status='INITIATED',
+                provider_message_id='attempt_anti_spoof_1',
+            ),
+        ) as mock_provider:
+            with patch.dict('os.environ', {'SARVAM_API_KEY': 'test_sarvam_key_secret'}):
+                session = VoiceCallingService.initiate_outbound_call(
+                    lead=self.lead_a,
+                    idempotency_key='test-key-anti-spoof-1',
+                    custom_metadata=spoofed_metadata,
+                    db_alias='tenant_test',
+                )
+
+        mock_provider.assert_called_once()
+        self.assertEqual(session.metadata['voice_consent_source'], 'WEB_FORM')
+        self.assertEqual(session.metadata['voice_consent_method'], 'DATABASE_CONSENT_RECORD')
+        self.assertEqual(session.metadata['legitimate_campaign_id'], 'promo_2026')
+        self.assertNotIn('MALICIOUS_SPOOFED_SOURCE', str(session.metadata))
+        self.assertNotIn('MANUFACTURED_METHOD', str(session.metadata))
+
+    def test_api_perimeter_rejects_unconsented_lead_even_with_metadata_consent(self):
+        """
+        POST /api/v1/tenant/leads/{id}/call/ must return 400 when caller passes has_voice_consent=True
+        for an unconsented lead. No CallSession is created, no provider dispatch.
+        """
+        from apps.tenant_core.communication.adapters.voice_sarvam import SarvamVoiceAdapter
+        lead_no_consent = Lead.objects.using('tenant_test').create(
+            organization=self.org_a,
+            branch=self.branch_a,
+            first_name='Unconsented',
+            last_name='Lead',
+            phone_normalized='+919876543299',
+            current_status='NEW_LEAD',
+            do_not_contact=False,
+        )
+        url = f"/api/v1/tenant/leads/{lead_no_consent.id}/call/"
+        with patch.object(SarvamVoiceAdapter, 'create_instant_outbound_call') as mock_provider:
+            response = self.client.post(
+                url,
+                data=json.dumps({
+                    'custom_metadata': {
+                        'has_voice_consent': True,
+                        'voice_consent_source': 'MANUFACTURED',
+                    }
+                }),
+                content_type='application/json',
+                HTTP_AUTHORIZATION=f'Bearer {self.token_editor}',
+                HTTP_X_TENANT_ID=str(self.tenant_a.id),
+                HTTP_X_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            )
+            mock_provider.assert_not_called()
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json().get('code'), 'INVALID_RECIPIENT_OR_CONSENT')
+        self.assertIn('explicit, verified voice-calling consent grant', response.json().get('error', ''))
+
+    def test_explicit_grant_via_model_attribute_allows_call(self):
+        """Lead model instance with consent_voice=True is recognized as an explicit grant."""
+        lead_model_consent = Lead.objects.using('tenant_test').create(
+            organization=self.org_a,
+            branch=self.branch_a,
+            first_name='Ananya',
+            last_name='Deshmukh',
+            phone_normalized='+919876543233',
+            current_status='NEW_LEAD',
+            do_not_contact=False,
+        )
+        lead_model_consent.consent_voice = True
+        lead_model_consent.consent_voice_source = 'IN_PERSON_KIOSK'
+        lead_model_consent.consent_voice_recorded_at = timezone.now()
+
+        provenance = VoiceCallingService.verify_lead_calling_eligibility(
+            lead=lead_model_consent,
+            db_alias='tenant_test',
+        )
+        self.assertTrue(provenance['voice_consent_verified'])
+        self.assertEqual(provenance['voice_consent_method'], 'LEAD_MODEL_FIELD')
+        self.assertEqual(provenance['voice_consent_source'], 'IN_PERSON_KIOSK')
+
+    def test_missing_consent_fails_closed(self):
+        """A lead with no ConsentRecord, no model flag, and no metadata MUST fail closed."""
+        lead_unconsented = Lead.objects.using('tenant_test').create(
+            organization=self.org_a,
+            branch=self.branch_a,
+            first_name='Pooja',
+            last_name='Verma',
+            phone_normalized='+919876543244',
+            current_status='NEW_LEAD',
+            do_not_contact=False,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            VoiceCallingService.verify_lead_calling_eligibility(
+                lead=lead_unconsented,
+                db_alias='tenant_test',
+            )
+        self.assertIn('does not have an explicit, verified voice-calling consent grant', str(ctx.exception))
+
+    def test_null_consent_fails_closed(self):
+        """Lead with null/None consent attributes and null metadata fails closed."""
+        lead_null = Lead.objects.using('tenant_test').create(
+            organization=self.org_a,
+            branch=self.branch_a,
+            first_name='Naveen',
+            last_name='Reddy',
+            phone_normalized='+919876543255',
+            current_status='NEW_LEAD',
+            do_not_contact=False,
+        )
+        lead_null.consent_voice = None
+        with self.assertRaises(ValueError) as ctx:
+            VoiceCallingService.verify_lead_calling_eligibility(
+                lead=lead_null,
+                db_alias='tenant_test',
+                custom_metadata={'has_voice_consent': None},
+            )
+        self.assertIn('does not have an explicit, verified voice-calling consent grant', str(ctx.exception))
+
+    def test_explicit_denial_fails_closed(self):
+        """Lead with consent_voice=False or invocation metadata has_voice_consent=False is rejected."""
+        # 1. Via metadata
+        with self.assertRaises(ValueError) as ctx:
+            VoiceCallingService.verify_lead_calling_eligibility(
+                lead=self.lead_a,
+                db_alias='tenant_test',
+                custom_metadata={'has_voice_consent': False},
+            )
+        self.assertIn('Explicit voice calling consent was denied', str(ctx.exception))
+
+        # 2. Via model attribute
+        lead_denied = Lead.objects.using('tenant_test').create(
+            organization=self.org_a,
+            branch=self.branch_a,
+            first_name='Suresh',
+            last_name='Raina',
+            phone_normalized='+919876543266',
+            current_status='NEW_LEAD',
+            do_not_contact=False,
+        )
+        lead_denied.consent_voice = False
+        with self.assertRaises(ValueError) as ctx2:
+            VoiceCallingService.verify_lead_calling_eligibility(
+                lead=lead_denied,
+                db_alias='tenant_test',
+            )
+        self.assertIn('opted out of voice communications', str(ctx2.exception))
+
+    def test_withdrawal_fails_closed(self):
         """Lead with an explicit WITHDRAWN ConsentRecord for voice calling is rejected."""
         from apps.tenant_core.models_privacy import ProcessingPurpose, ConsentRecord
         purpose, _ = ProcessingPurpose.objects.using('tenant_test').get_or_create(
@@ -1247,34 +1527,63 @@ class SarvamVoiceCallingTests(TestCase):
                 'description': 'Automated outbound calling',
             },
         )
+        lead_withdrawn = Lead.objects.using('tenant_test').create(
+            organization=self.org_a,
+            branch=self.branch_a,
+            first_name='Vikas',
+            last_name='Kohli',
+            phone_normalized='+919876543277',
+            current_status='NEW_LEAD',
+            do_not_contact=False,
+        )
         ConsentRecord.objects.using('tenant_test').create(
             user=self.user_editor,
             purpose=purpose,
             subject_type='lead',
-            subject_id=self.lead_a.id,
+            subject_id=lead_withdrawn.id,
             status='WITHDRAWN',
         )
 
         with patch.dict('os.environ', {'SARVAM_API_KEY': 'test_sarvam_key_secret'}):
             with self.assertRaises(ValueError) as ctx:
                 VoiceCallingService.initiate_outbound_call(
-                    lead=self.lead_a,
+                    lead=lead_withdrawn,
                     idempotency_key='test-key-withdrawn-consent',
                     db_alias='tenant_test',
                 )
             self.assertIn('withdrawn voice calling consent', str(ctx.exception))
 
-    def test_lead_with_explicit_opt_out_flag_rejected(self):
-        """Lead with consent_voice=False or invocation metadata has_voice_consent=False is rejected."""
-        with patch.dict('os.environ', {'SARVAM_API_KEY': 'test_sarvam_key_secret'}):
-            with self.assertRaises(ValueError) as ctx:
-                VoiceCallingService.initiate_outbound_call(
-                    lead=self.lead_a,
-                    idempotency_key='test-key-no-consent-meta',
-                    custom_metadata={'has_voice_consent': False},
-                    db_alias='tenant_test',
-                )
-            self.assertIn('Explicit voice calling consent was not verified', str(ctx.exception))
+    def test_dnc_blocks_dispatch_even_with_explicit_grant(self):
+        """Do Not Contact flag strictly blocks dispatch even if lead has active voice consent."""
+        self.lead_a.do_not_contact = True
+        with self.assertRaises(ValueError) as ctx:
+            VoiceCallingService.verify_lead_calling_eligibility(
+                lead=self.lead_a,
+                db_alias='tenant_test',
+            )
+        self.assertIn('marked Do Not Contact', str(ctx.exception))
+        self.lead_a.do_not_contact = False
+
+    def test_unrelated_channel_consent_sms_whatsapp_fails_closed(self):
+        """Consent for SMS or WhatsApp is NEVER treated as consent for automated AI voice calls."""
+        lead_sms_wa = Lead.objects.using('tenant_test').create(
+            organization=self.org_a,
+            branch=self.branch_a,
+            first_name='Amit',
+            last_name='Bansal',
+            phone_normalized='+919876543288',
+            current_status='NEW_LEAD',
+            do_not_contact=False,
+            consent_sms=True,
+            consent_whatsapp=True,
+            consent_email=True,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            VoiceCallingService.verify_lead_calling_eligibility(
+                lead=lead_sms_wa,
+                db_alias='tenant_test',
+            )
+        self.assertIn('does not have an explicit, verified voice-calling consent grant', str(ctx.exception))
 
     def test_unauthenticated_webhook_cannot_mutate_call_session(self):
         """An unauthenticated webhook request (bad token) is rejected 401 and does not alter the call session."""
@@ -1330,3 +1639,380 @@ class SarvamVoiceCallingTests(TestCase):
             self.assertEqual(res2.data.get('code'), 'CALL_ALREADY_IN_PROGRESS')
             # Critical: Sarvam HTTP client MUST NOT be called a second time
             self.assertEqual(mock_urlopen.call_count, 1)
+
+    # -------------------------------------------------------------------------
+    # 13. Voice Consent Status and Trust Boundary Regression Tests
+    # -------------------------------------------------------------------------
+    def test_voice_consent_status_missing_when_unspecified(self):
+        """Lead with no voice consent record must return status='MISSING' and is_eligible=False."""
+        lead = Lead.objects.using('tenant_test').create(
+            organization=self.org_a,
+            first_name='NoConsent',
+            last_name='Lead',
+            phone_normalized='+919876543210',
+        )
+        status_info = VoiceCallingService.get_lead_voice_consent_status(lead, db_alias='tenant_test')
+        self.assertEqual(status_info['status'], 'MISSING')
+        self.assertFalse(status_info['is_eligible'])
+        self.assertIn('explicit, verified voice-calling consent grant', status_info['reason'])
+
+    def test_voice_consent_status_granted_on_lead_model(self):
+        """Lead with consent_voice=True attribute must return status='GRANTED' and is_eligible=True."""
+        lead = Lead.objects.using('tenant_test').create(
+            organization=self.org_a,
+            first_name='Granted',
+            last_name='Lead',
+            phone_normalized='+919876543211',
+        )
+        lead.consent_voice = True
+        lead.consent_voice_source = 'LANDING_PAGE'
+        lead.consent_voice_recorded_at = timezone.now()
+
+        status_info = VoiceCallingService.get_lead_voice_consent_status(lead, db_alias='tenant_test')
+        self.assertEqual(status_info['status'], 'GRANTED')
+        self.assertTrue(status_info['is_eligible'])
+        self.assertEqual(status_info['source'], 'LANDING_PAGE')
+        self.assertEqual(status_info['method'], 'LEAD_MODEL_FIELD')
+
+    def test_voice_consent_status_withdrawn_on_lead_model(self):
+        """Lead with consent_voice=False attribute must return status='WITHDRAWN' and is_eligible=False."""
+        lead = Lead.objects.using('tenant_test').create(
+            organization=self.org_a,
+            first_name='Withdrawn',
+            last_name='Lead',
+            phone_normalized='+919876543212',
+        )
+        lead.consent_voice = False
+        lead.consent_voice_source = 'SMS_OPT_OUT'
+        lead.consent_voice_recorded_at = timezone.now()
+
+        status_info = VoiceCallingService.get_lead_voice_consent_status(lead, db_alias='tenant_test')
+        self.assertEqual(status_info['status'], 'WITHDRAWN')
+        self.assertFalse(status_info['is_eligible'])
+        self.assertIn('opted out of voice communications', status_info['reason'])
+
+    def test_voice_consent_never_inferred_from_sms_or_whatsapp(self):
+        """SMS, WhatsApp, and Email consent must NEVER authorize voice calls."""
+        lead = Lead.objects.using('tenant_test').create(
+            organization=self.org_a,
+            first_name='MultiChannel',
+            last_name='Lead',
+            phone_normalized='+919876543213',
+            consent_sms=True,
+            consent_whatsapp=True,
+            consent_email=True,
+        )
+        status_info = VoiceCallingService.get_lead_voice_consent_status(lead, db_alias='tenant_test')
+        self.assertEqual(status_info['status'], 'MISSING')
+        self.assertFalse(status_info['is_eligible'])
+
+    def test_dnc_suppresses_granted_voice_consent(self):
+        """Do Not Contact flag must take precedence over active voice consent."""
+        lead = Lead.objects.using('tenant_test').create(
+            organization=self.org_a,
+            first_name='Dnc',
+            last_name='Lead',
+            phone_normalized='+919876543214',
+            do_not_contact=True,
+        )
+        lead.consent_voice = True
+
+        status_info = VoiceCallingService.get_lead_voice_consent_status(lead, db_alias='tenant_test')
+        self.assertFalse(status_info['is_eligible'])
+        self.assertIn('Do Not Contact', status_info['reason'])
+
+        with self.assertRaises(ValueError) as ctx:
+            VoiceCallingService.verify_lead_calling_eligibility(lead, db_alias='tenant_test')
+        self.assertIn('Do Not Contact', str(ctx.exception))
+
+    def test_consent_record_model_withdrawal_takes_precedence(self):
+        """ConsentRecord table entry with status='WITHDRAWN' takes precedence."""
+        from apps.tenant_core.models_privacy import ConsentRecord
+        lead = Lead.objects.using('tenant_test').create(
+            organization=self.org_a,
+            first_name='TableWithdrawn',
+            last_name='Lead',
+            phone_normalized='+919876543215',
+        )
+        lead.consent_voice = True
+        ConsentRecord.objects.using('tenant_test').create(
+            user=self.user_editor,
+            purpose=self.voice_purpose,
+            subject_type='lead',
+            subject_id=lead.id,
+            status='WITHDRAWN',
+            capture_source='PHONE_VERBAL',
+            recorded_at=timezone.now(),
+        )
+        status_info = VoiceCallingService.get_lead_voice_consent_status(lead, db_alias='tenant_test')
+        self.assertEqual(status_info['status'], 'WITHDRAWN')
+        self.assertFalse(status_info['is_eligible'])
+
+    # -------------------------------------------------------------------------
+    # 14. Dynamic CRM Communication Channels Endpoint Tests
+    # -------------------------------------------------------------------------
+    def test_channels_endpoint_requires_permission(self):
+        """GET /api/v1/tenant/crm/channels/ without crm.communications.view must return 403."""
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.token_readonly}')
+        res = self.client.get('/api/v1/tenant/crm/channels/')
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_channels_endpoint_not_configured_when_no_integration(self):
+        """When no Sarvam integration exists, voice channel status must be NOT_CONFIGURED."""
+        self.integration_a.status = 'INACTIVE'
+        self.integration_a.save(using='tenant_test')
+
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.token_editor}')
+        res = self.client.get('/api/v1/tenant/crm/channels/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        channels = {c['id']: c for c in res.data}
+        self.assertIn('ai_calling', channels)
+        voice = channels['ai_calling']
+        self.assertEqual(voice['status'], 'NOT_CONFIGURED')
+        self.assertFalse(voice['is_configured'])
+
+    def test_channels_endpoint_configured_when_partial_integration(self):
+        """When active Sarvam integration exists but missing credentials, status is CONFIGURED."""
+        self.integration_a.status = 'ACTIVE'
+        self.integration_a.save(using='tenant_test')
+
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.token_editor}')
+        with patch.dict('os.environ', {}, clear=True):
+            res = self.client.get('/api/v1/tenant/crm/channels/')
+            self.assertEqual(res.status_code, status.HTTP_200_OK)
+            channels = {c['id']: c for c in res.data}
+            self.assertIn('ai_calling', channels)
+            voice = channels['ai_calling']
+            self.assertEqual(voice['status'], 'CONFIGURED')
+            self.assertFalse(voice['is_configured'])
+
+    def test_channels_endpoint_connected_and_masks_phone(self):
+        """When integration is fully configured with credentials, status is CONNECTED and sender phone is masked."""
+        self.integration_a.status = 'ACTIVE'
+        self.integration_a.save(using='tenant_test')
+
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.token_editor}')
+        with patch.dict('os.environ', {'SARVAM_API_KEY': 'sk_test_api_key_123'}):
+            res = self.client.get('/api/v1/tenant/crm/channels/')
+            self.assertEqual(res.status_code, status.HTTP_200_OK)
+            channels = {c['id']: c for c in res.data}
+            self.assertIn('ai_calling', channels)
+            voice = channels['ai_calling']
+            self.assertEqual(voice['status'], 'CONNECTED')
+            self.assertTrue(voice['is_configured'])
+            self.assertEqual(voice['sender_identity'], '+91******0704')
+
+    def test_channels_endpoint_zero_secret_leakage(self):
+        """Ensure response never contains api_key, tokens, or secret references."""
+        self.integration_a.status = 'ACTIVE'
+        self.integration_a.configuration['webhook_token'] = 'webhook_secret_token'
+        self.integration_a.save(using='tenant_test')
+
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.token_editor}')
+        with patch.dict('os.environ', {'SARVAM_API_KEY': 'sk_live_secret_leak_check'}):
+            res = self.client.get('/api/v1/tenant/crm/channels/')
+            self.assertEqual(res.status_code, status.HTTP_200_OK)
+            raw_json = json.dumps(res.data)
+            self.assertNotIn('sk_live_secret_leak_check', raw_json)
+            self.assertNotIn('webhook_secret_token', raw_json)
+            self.assertNotIn('env://SARVAM_API_KEY', raw_json)
+
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.token_editor}')
+        with patch.dict('os.environ', {'SARVAM_API_KEY': 'sk_live_secret_leak_check'}):
+            res = self.client.get('/api/v1/tenant/crm/channels/')
+            self.assertEqual(res.status_code, status.HTTP_200_OK)
+            raw_json = json.dumps(res.data)
+            self.assertNotIn('sk_live_secret_leak_check', raw_json)
+            self.assertNotIn('telephony_super_secret_token', raw_json)
+            self.assertNotIn('webhook_secret_token', raw_json)
+            self.assertNotIn('env://SARVAM_API_KEY', raw_json)
+
+
+# =============================================================================
+# Task 2 — Safe PostgreSQL Concurrency Verification Suite
+# =============================================================================
+class SarvamPostgresConcurrencyTests(TransactionTestCase):
+    """
+    Dedicated transaction-capable concurrency test suite.
+    Runs on PostgreSQL test database using real transaction boundaries and row-level locks.
+    Asserts:
+    1. Independent concurrent worker connections serialize via select_for_update().
+    2. Concurrent dispatches with different idempotency keys cannot create duplicate active sessions.
+    3. External Sarvam adapter is NEVER called more than once and is mocked safely.
+    4. Database lock is released BEFORE external provider I/O.
+    """
+    databases = '__all__'
+
+    def setUp(self):
+        super().setUp()
+        set_tenant_db_alias('tenant_test')
+        from django.db import connections
+        self.is_postgres = connections['tenant_test'].vendor == 'postgresql'
+
+        # Isolated test tenant & organization
+        self.tenant = Tenant.objects.using('default').create(
+            code=f'CRM-PG-{uuid.uuid4().hex[:6]}',
+            name='PG Test Tenant',
+            slug=f'pg-test-{uuid.uuid4().hex[:6]}',
+            status='ACTIVE',
+        )
+        self.org = Organization.objects.using('tenant_test').create(
+            code=f'ORG-PG-{uuid.uuid4().hex[:6]}',
+            name='PG Test Org',
+            status='ACTIVE',
+        )
+        self.loc = Location.objects.using('tenant_test').create(
+            organization=self.org,
+            code=f'LOC-PG-{uuid.uuid4().hex[:6]}',
+            name='PG Location',
+            status='ACTIVE',
+        )
+        self.branch = Branch.objects.using('tenant_test').create(
+            organization=self.org,
+            location=self.loc,
+            code=f'BR-PG-{uuid.uuid4().hex[:6]}',
+            name='PG Branch',
+            status='ACTIVE',
+        )
+        self.lead = Lead.objects.using('tenant_test').create(
+            organization=self.org,
+            branch=self.branch,
+            first_name='Aarav',
+            last_name='Patel',
+            phone_normalized='+919876543299',
+            current_status='NEW_LEAD',
+            do_not_contact=False,
+        )
+        # Explicit Voice Calling Consent via ConsentRecord
+        from apps.tenant_core.models_privacy import ProcessingPurpose, ConsentRecord
+        self.purpose, _ = ProcessingPurpose.objects.using('tenant_test').get_or_create(
+            code='VOICE_CALL',
+            defaults={'name': 'Voice Purpose', 'description': 'Voice calling'},
+        )
+        self.user = TenantUser.objects.using('tenant_test').create(
+            organization=self.org,
+            email=f'user_{uuid.uuid4().hex[:6]}@fitness.test',
+            first_name='Admin',
+            last_name='User',
+        )
+        ConsentRecord.objects.using('tenant_test').create(
+            user=self.user,
+            purpose=self.purpose,
+            subject_type='lead',
+            subject_id=self.lead.id,
+            status='GRANTED',
+            capture_source='WEB_FORM',
+        )
+        # Integration configuration
+        self.integration = Integration.objects.using('tenant_test').create(
+            integration_type='CALLING',
+            provider='SARVAM',
+            secret_reference='env://SARVAM_API_KEY',
+            configuration={
+                'org_id': 'org_pg_1',
+                'workspace_id': 'ws_pg_1',
+                'app_id': 'app_pg_1',
+                'app_version': 1,
+                'connection_id': 'conn_pg_1',
+                'agent_phone_number': '+918044620704',
+                'webhook_token': 'pg_test_token',
+                'public_integration_id': str(self.tenant.id),
+                'webhook_base_url': 'https://api.fitness.vibecopilot.ai',
+            },
+            status='ACTIVE',
+        )
+
+    def tearDown(self):
+        # Safe cleanup of isolated test records
+        CallSession.objects.using('tenant_test').filter(organization=self.org).delete()
+        from apps.tenant_core.models_privacy import ConsentRecord
+        ConsentRecord.objects.using('tenant_test').filter(subject_id=self.lead.id).delete()
+        self.lead.delete(using='tenant_test')
+        self.user.delete(using='tenant_test')
+        self.branch.delete(using='tenant_test')
+        self.loc.delete(using='tenant_test')
+        self.integration.delete(using='tenant_test')
+        self.org.delete(using='tenant_test')
+        self.tenant.delete(using='default')
+        super().tearDown()
+
+    def test_postgres_concurrent_duplicate_dispatch_prevented(self):
+        """
+        Validates real PostgreSQL row locking and transaction serialization:
+        1. Two concurrent workers attempt to dispatch outbound calls for the same lead with different idempotency keys.
+        2. Mocks the Sarvam adapter and asserts Sarvam is NEVER called more than once.
+        3. Asserts the database row lock is released BEFORE external provider I/O.
+        4. Asserts exactly one active session is created in the database.
+        """
+        import concurrent.futures
+        from django.db import connections, transaction
+        from apps.tenant_core.communication.adapters.voice_sarvam import SarvamVoiceAdapter, ProviderSendResult
+
+        if not self.is_postgres:
+            self.skipTest("Skipping test: requires PostgreSQL database engine.")
+
+        # Thread-safe tracking of lock state during external I/O
+        lock_released_during_io = []
+
+        def mock_create_call(*args, **kwargs):
+            # Assert that database transaction/row lock is NOT held during provider HTTP call
+            is_in_atomic = transaction.get_connection('tenant_test').in_atomic_block
+            lock_released_during_io.append(not is_in_atomic)
+            return ProviderSendResult(
+                success=True,
+                provider_message_id=f"attempt_pg_{uuid.uuid4().hex[:8]}",
+                status='INITIATED',
+            )
+
+        with patch.object(SarvamVoiceAdapter, 'create_instant_outbound_call', side_effect=mock_create_call) as mock_provider:
+            with patch.dict('os.environ', {'SARVAM_API_KEY': 'test_sarvam_key_secret'}):
+                def worker_task(worker_id):
+                    # Each thread gets its own database connection in Django and requires tenant DB routing context
+                    set_tenant_db_alias('tenant_test')
+                    connections['tenant_test'].close()  # Ensure clean thread connection
+                    key = f"pg-key-worker-{worker_id}"
+                    try:
+                        session = VoiceCallingService.initiate_outbound_call(
+                            lead=self.lead,
+                            idempotency_key=key,
+                            db_alias='tenant_test',
+                        )
+                        # Verify if this worker actually created the new session vs received active call collision
+                        is_creator = (session.idempotency_key == key)
+                        return {
+                            'worker': worker_id,
+                            'success': True,
+                            'is_creator': is_creator,
+                            'session_id': str(session.id),
+                            'error': None,
+                        }
+                    except Exception as e:
+                        return {'worker': worker_id, 'success': False, 'is_creator': False, 'session_id': None, 'error': str(e)}
+                    finally:
+                        connections['tenant_test'].close()
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                    fut1 = executor.submit(worker_task, 1)
+                    fut2 = executor.submit(worker_task, 2)
+                    res1 = fut1.result()
+                    res2 = fut2.result()
+
+                results = [res1, res2]
+                creators = [r for r in results if r['is_creator']]
+
+                # Exactly one worker must succeed in creating the call session
+                self.assertEqual(len(creators), 1, f"Expected exactly 1 creator, got {len(creators)}: {results}")
+
+                # The Sarvam provider mock must be called EXACTLY once
+                self.assertEqual(mock_provider.call_count, 1, "Sarvam provider MUST NOT be called more than once!")
+
+                # Both workers returned the same single session ID
+                self.assertEqual(res1['session_id'], res2['session_id'])
+
+                # Confirm that the database lock was released BEFORE the external provider I/O
+                self.assertTrue(len(lock_released_during_io) > 0)
+                self.assertTrue(all(lock_released_during_io), "Database lock was improperly held during provider HTTP call!")
+
+                # Confirm that only ONE CallSession was created in the database for this lead
+                sessions = CallSession.objects.using('tenant_test').filter(organization=self.org, lead=self.lead)
+                self.assertEqual(sessions.count(), 1)

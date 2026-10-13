@@ -344,6 +344,107 @@ class LeadViewSet(viewsets.ModelViewSet):
     pagination_class = ConfigurablePageNumberPagination
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
 
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        headers = self.get_success_headers(serializer.data)
+        lead = serializer.instance
+        alias = _get_db(request)
+
+        response_data = dict(serializer.data)
+
+        # Auto-provision TenantUser & UserProfile for this lead and return JWT tokens for seamless checkout
+        try:
+            from django.db import models
+            from apps.tenant_core.models_users import TenantUser
+            from apps.tenant_core.models_workforce import UserProfile
+            from apps.tenant_core.models_rbac import Role, RoleAssignment
+            from apps.master.models_tenant import Tenant
+            from apps.authentication.views import _build_tenant_token
+            import uuid
+
+            email = lead.email_normalized
+            phone = lead.phone_normalized
+            user = None
+            if email or phone:
+                user = TenantUser.objects.using(alias).filter(
+                    (models.Q(email__iexact=email) if email else models.Q(pk=None)) |
+                    (models.Q(phone=phone) if phone else models.Q(pk=None))
+                ).first()
+
+            if not user and (email or phone):
+                base_username = email.split('@')[0] if email else f"lead_{uuid.uuid4().hex[:6]}"
+                username = base_username
+                idx = 1
+                while TenantUser.objects.using(alias).filter(username__iexact=username).exists():
+                    username = f"{base_username}_{idx}"
+                    idx += 1
+
+                user = TenantUser(
+                    organization=lead.organization,
+                    username=username,
+                    email=email or f"lead_{phone}@sweat.internal",
+                    phone=phone or '',
+                    first_name=lead.first_name,
+                    last_name=lead.last_name or '',
+                    display_name=f"{lead.first_name} {lead.last_name}".strip(),
+                    home_branch=lead.branch,
+                    user_type='LEAD',
+                    status='ACTIVE',
+                    is_login_allowed=True,
+                )
+                user.set_password(f"Sweat@{uuid.uuid4().hex[:8]}")
+                user.save(using=alias)
+
+                member_role = Role.objects.using(alias).filter(code='MEMBER').first()
+                if member_role:
+                    RoleAssignment.objects.using(alias).get_or_create(
+                        user=user,
+                        role=member_role,
+                        defaults={'branch': lead.branch, 'is_active': True}
+                    )
+
+            if user:
+                profile = UserProfile.objects.using(alias).filter(user=user).first()
+                if not profile:
+                    profile = UserProfile.objects.using(alias).create(
+                        user=user,
+                        member_number=None,
+                        preferred_branch=user.home_branch or lead.branch,
+                        first_name_snapshot=user.first_name,
+                        last_name_snapshot=user.last_name,
+                        member_type='TRIAL',
+                        member_status='ACTIVE',
+                        acquisition_source='CRM_LEAD',
+                    )
+                lead.converted_user_profile = profile
+                lead.save(using=alias, update_fields=['converted_user_profile'])
+
+                # Generate JWT tokens
+                tenant = Tenant.objects.using('default').filter(slug=getattr(request, 'tenant_slug', 'sweat')).first()
+                if not tenant:
+                    tenant = Tenant.objects.using('default').first()
+
+                if tenant:
+                    tokens = _build_tenant_token(user, tenant, alias)
+                    auth_dict = {
+                        'access': str(tokens.access_token),
+                        'refresh': str(tokens),
+                    }
+                    response_data['auth'] = auth_dict
+                    response_data['tokens'] = auth_dict
+                    response_data['user'] = {
+                        'id': str(user.id),
+                        'email': user.email,
+                        'user_type': user.user_type,
+                        'role_code': user.user_type,
+                    }
+        except Exception as e:
+            logger.warning("Could not auto-provision JWT for lead %s: %s", getattr(lead, 'id', None), e)
+
+        return Response(response_data, status=status.HTTP_201_CREATED, headers=headers)
+
     def get_permissions(self):
         if self.action == 'create':
             # Keep lead creation open so normal users who sign up / submit forms from the app or website can register as leads
@@ -1123,9 +1224,28 @@ class LeadViewSet(viewsets.ModelViewSet):
         }
         if isinstance(request.data, dict) and isinstance(request.data.get('custom_metadata'), dict):
             caller_tags = request.data['custom_metadata']
+            disallowed_prefixes = ('voice_consent_', 'consent_')
+            disallowed_exact = {
+                'initiated_by_user_id',
+                'source',
+                'lead_id',
+                'call_session_id',
+                'has_voice_consent',
+                'voice_consent_verified',
+                'voice_consent_source',
+                'voice_consent_recorded_at',
+                'voice_consent_method',
+                'consent_voice',
+            }
             for k, v in caller_tags.items():
-                if k not in ('initiated_by_user_id', 'source', 'lead_id', 'call_session_id') and isinstance(v, (str, int, float, bool)):
-                    custom_metadata[str(k)[:64]] = v
+                k_clean = str(k).strip()
+                k_lower = k_clean.lower()
+                if (
+                    k_lower not in disallowed_exact
+                    and not any(k_lower.startswith(pfx) for pfx in disallowed_prefixes)
+                    and isinstance(v, (str, int, float, bool))
+                ):
+                    custom_metadata[k_clean[:64]] = v
 
         try:
             session = VoiceCallingService.initiate_outbound_call(
@@ -3001,6 +3121,29 @@ class CRMCommunicationChannelsViewSet(viewsets.ViewSet):
         if sms_integ and sms_integ.configuration:
             sms_sender = sms_integ.configuration.get('sender_id') or 'SWTFIT'
 
+        # Resolve Voice (Sarvam) status
+        voice_adapter, voice_integ = CommunicationProviderRegistry.resolve_for_tenant('VOICE', provider_preference='SARVAM')
+        voice_is_fully_configured = bool(voice_adapter and voice_adapter.is_configured())
+
+        voice_sender = 'Not configured'
+        if voice_integ and voice_integ.configuration:
+            raw_phone = voice_integ.configuration.get('agent_phone_number') or ''
+            if len(raw_phone) >= 4:
+                voice_sender = f"+91******{raw_phone[-4:]}"
+            elif raw_phone:
+                voice_sender = raw_phone
+
+        # Determine accurate status:
+        # - CONNECTED: Integration is ACTIVE, and all telephony + credentials are valid (is_configured == True)
+        # - CONFIGURED: Integration record exists and is ACTIVE, but missing required parameters/credentials
+        # - NOT_CONFIGURED: No active Integration record found for Sarvam
+        if voice_integ and voice_integ.status == 'ACTIVE' and voice_is_fully_configured:
+            voice_status = 'CONNECTED'
+        elif voice_integ and voice_integ.status == 'ACTIVE':
+            voice_status = 'CONFIGURED'
+        else:
+            voice_status = 'NOT_CONFIGURED'
+
         channels = [
             {
                 'id': 'whatsapp',
@@ -3045,14 +3188,14 @@ class CRMCommunicationChannelsViewSet(viewsets.ViewSet):
                 'id': 'ai_calling',
                 'name': 'Sarvam AI Voice Agent',
                 'channel_type': 'VOICE_AI',
-                'provider': 'Sarvam',
-                'status': 'COMING_SOON',
-                'is_configured': False,
-                'sender_identity': 'Virtual Receptionist',
-                'description': 'Autonomous conversational AI agent for lead qualification and trial reminders.',
-                'capabilities': ['OUTBOUND', 'INBOUND_WEBHOOK'],
-                'implemented_adapters': [],
-                'last_sync_at': None,
+                'provider': 'SARVAM',
+                'status': voice_status,
+                'is_configured': voice_is_fully_configured,
+                'sender_identity': voice_sender,
+                'description': 'Autonomous conversational AI voice agent for manual Lead 360 outbound qualification calls.',
+                'capabilities': voice_adapter.capabilities if voice_adapter else ['OUTBOUND_CALL', 'WEBHOOK_STATUS', 'TRANSCRIPT', 'AGENT_VARIABLES'],
+                'implemented_adapters': ['SarvamVoiceAdapter'],
+                'last_sync_at': voice_integ.last_sync_at if voice_integ else None,
             },
         ]
         return Response(channels)

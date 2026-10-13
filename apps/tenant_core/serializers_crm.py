@@ -231,6 +231,32 @@ class LeadSerializer(serializers.ModelSerializer):
                 'terminal_reason': instance.current_status if is_lost else None,
             }
 
+        # Authoritative Voice Calling Consent & Pre-flight Action Eligibility
+        try:
+            from .services_voice_calling import VoiceCallingService
+            voice_status_info = VoiceCallingService.get_lead_voice_consent_status(instance, db_alias=alias)
+            data['voice_consent'] = voice_status_info
+        except Exception:
+            data['voice_consent'] = {
+                'status': 'UNKNOWN',
+                'is_eligible': False,
+                'reason': 'Consent status could not be verified.',
+                'source': None,
+                'recorded_at': None,
+                'method': None,
+            }
+
+        is_terminal = data.get('action_eligibility', {}).get('is_terminal', False)
+        can_call_with_ai = (
+            data.get('voice_consent', {}).get('is_eligible', False)
+            and not is_terminal
+            and not getattr(instance, 'do_not_contact', False)
+            and not getattr(instance, 'is_opted_out', False)
+        )
+        if 'action_eligibility' in data and isinstance(data['action_eligibility'], dict):
+            data['action_eligibility']['can_call_with_ai'] = can_call_with_ai
+            data['action_eligibility']['can_call_with_ai_reason'] = data.get('voice_consent', {}).get('reason')
+
         return data
 
     def get_full_name(self, obj):

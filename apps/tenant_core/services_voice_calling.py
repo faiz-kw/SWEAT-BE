@@ -62,51 +62,173 @@ class VoiceCallingService:
         return clean
 
     @classmethod
+    def get_lead_voice_consent_status(
+        cls,
+        lead: Lead,
+        db_alias: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Determines the authoritative voice consent state for a lead for UI visibility and pre-flight checks.
+        Never infers voice consent from SMS, WhatsApp, or Email.
+        Returns:
+            {
+                'status': 'GRANTED' | 'WITHDRAWN' | 'MISSING' | 'UNKNOWN',
+                'is_eligible': bool,
+                'reason': str,
+                'source': Optional[str],
+                'recorded_at': Optional[str],
+                'method': Optional[str],
+            }
+        """
+        if hasattr(lead, '_cached_voice_consent'):
+            return lead._cached_voice_consent
+
+        alias = db_alias or getattr(getattr(lead, '_state', None), 'db', None) or 'default'
+
+        # 1. Do Not Contact suppression check
+        if getattr(lead, 'do_not_contact', False):
+            res = {
+                'status': 'WITHDRAWN' if getattr(lead, 'consent_voice', None) is False else 'MISSING',
+                'is_eligible': False,
+                'reason': f"Lead {lead.id} is marked Do Not Contact.",
+                'source': None,
+                'recorded_at': None,
+                'method': None,
+            }
+            lead._cached_voice_consent = res
+            return res
+
+        # 2. General CRM communication opt-out check
+        if getattr(lead, 'is_opted_out', False):
+            res = {
+                'status': 'WITHDRAWN',
+                'is_eligible': False,
+                'reason': f"Lead {lead.id} has opted out of communications.",
+                'source': None,
+                'recorded_at': None,
+                'method': None,
+            }
+            lead._cached_voice_consent = res
+            return res
+
+        # 3. Check for explicit voice consent withdrawal in compliance ConsentRecord table
+        try:
+            from .models_privacy import ConsentRecord
+            latest_record = ConsentRecord.objects.using(alias).filter(
+                subject_type='lead',
+                subject_id=lead.id,
+                purpose__code__in=['VOICE_CALL', 'COMMUNICATION_VOICE', 'MARKETING_VOICE', 'AI_VOICE'],
+            ).order_by('-recorded_at', '-created_at').first()
+
+            if latest_record:
+                if latest_record.status == 'WITHDRAWN':
+                    rec_time = latest_record.recorded_at or latest_record.withdrawn_at or latest_record.created_at
+                    res = {
+                        'status': 'WITHDRAWN',
+                        'is_eligible': False,
+                        'reason': f"Lead {lead.id} has explicitly withdrawn voice calling consent.",
+                        'source': latest_record.capture_source or latest_record.consent_method or 'CONSENT_RECORD',
+                        'recorded_at': rec_time.isoformat() if rec_time else None,
+                        'method': 'DATABASE_CONSENT_RECORD',
+                    }
+                    lead._cached_voice_consent = res
+                    return res
+                elif latest_record.status == 'GRANTED':
+                    rec_time = latest_record.recorded_at or latest_record.granted_at or latest_record.created_at
+                    res = {
+                        'status': 'GRANTED',
+                        'is_eligible': True,
+                        'reason': 'Explicit voice calling consent grant verified.',
+                        'source': latest_record.capture_source or latest_record.consent_method or 'CONSENT_RECORD',
+                        'recorded_at': rec_time.isoformat() if rec_time else None,
+                        'method': 'DATABASE_CONSENT_RECORD',
+                    }
+                    lead._cached_voice_consent = res
+                    return res
+        except Exception as priv_err:
+            logger.debug("ConsentRecord check error in get_lead_voice_consent_status: %s", priv_err)
+            res = {
+                'status': 'UNKNOWN',
+                'is_eligible': False,
+                'reason': 'Voice consent record could not be verified due to an internal query error.',
+                'source': None,
+                'recorded_at': None,
+                'method': None,
+            }
+            lead._cached_voice_consent = res
+            return res
+
+        # 4. Explicit voice denial check on lead
+        if getattr(lead, 'consent_voice', None) is False:
+            res = {
+                'status': 'WITHDRAWN',
+                'is_eligible': False,
+                'reason': f"Lead {lead.id} has opted out of voice communications.",
+                'source': getattr(lead, 'consent_voice_source', None),
+                'recorded_at': (
+                    getattr(lead, 'consent_voice_recorded_at', None).isoformat()
+                    if getattr(lead, 'consent_voice_recorded_at', None)
+                    else None
+                ),
+                'method': 'LEAD_MODEL_FIELD',
+            }
+            lead._cached_voice_consent = res
+            return res
+
+        # 5. Persisted lead model boolean
+        if getattr(lead, 'consent_voice', None) is True:
+            rec_at = getattr(lead, 'consent_voice_recorded_at', None)
+            res = {
+                'status': 'GRANTED',
+                'is_eligible': True,
+                'reason': 'Explicit voice calling consent verified on lead record.',
+                'source': getattr(lead, 'consent_voice_source', None) or 'LEAD_MODEL',
+                'recorded_at': rec_at.isoformat() if rec_at else timezone.now().isoformat(),
+                'method': 'LEAD_MODEL_FIELD',
+            }
+            lead._cached_voice_consent = res
+            return res
+
+        # 6. Fallback: Missing consent (SMS, WhatsApp, Email consent never authorize voice calls)
+        res = {
+            'status': 'MISSING',
+            'is_eligible': False,
+            'reason': f"Lead {lead.id} does not have an explicit, verified voice-calling consent grant.",
+            'source': None,
+            'recorded_at': None,
+            'method': None,
+        }
+        lead._cached_voice_consent = res
+        return res
+
+    @classmethod
     def verify_lead_calling_eligibility(
         cls,
         lead: Lead,
         db_alias: Optional[str] = None,
         custom_metadata: Optional[Dict[str, Any]] = None,
-    ) -> None:
+    ) -> Dict[str, Any]:
         """
-        Validates lead suppression, Do Not Contact, and explicit voice consent.
-        Fails closed: Checks Do Not Contact, ConsentRecord withdrawals, and explicit voice flags.
-        Does not treat SMS or WhatsApp consent as proof of voice-call consent.
+        Validates lead suppression, Do Not Contact, and trusted voice consent.
+        Fails closed. Uses authoritative get_lead_voice_consent_status logic.
         """
         alias = db_alias or 'default'
 
-        # 1. Do Not Contact suppression check
-        if getattr(lead, 'do_not_contact', False):
-            raise ValueError(f"Outbound call rejected: Lead {lead.id} is marked Do Not Contact.")
-
-        # 2. General CRM communication opt-out check (preserves is_opted_out model property)
-        if getattr(lead, 'is_opted_out', False):
-            raise ValueError(f"Outbound call rejected: Lead {lead.id} has opted out of communications.")
-
-        # 3. Check for explicit voice consent withdrawal in compliance ConsentRecord table
-        try:
-            from .models_privacy import ConsentRecord
-            has_withdrawn = ConsentRecord.objects.using(alias).filter(
-                subject_type='lead',
-                subject_id=lead.id,
-                purpose__code__in=['VOICE_CALL', 'COMMUNICATION_VOICE', 'MARKETING_VOICE', 'AI_VOICE'],
-                status='WITHDRAWN',
-            ).exists()
-            if has_withdrawn:
-                raise ValueError(f"Outbound call rejected: Lead {lead.id} has explicitly withdrawn voice calling consent.")
-        except ValueError:
-            raise
-        except Exception as priv_err:
-            # If table is unavailable in test environment, continue to model checks
-            logger.debug("ConsentRecord check skipped or unavailable: %s", priv_err)
-
-        # 4. Explicit voice consent flag on lead (fail-closed if explicitly set to False)
-        if getattr(lead, 'consent_voice', None) is False:
-            raise ValueError(f"Outbound call rejected: Lead {lead.id} has opted out of voice communications.")
-
-        # 5. Explicit voice consent flag passed in invocation metadata
+        # Check explicit invocation metadata denial
         if custom_metadata and custom_metadata.get('has_voice_consent') is False:
-            raise ValueError(f"Outbound call rejected: Explicit voice calling consent was not verified for Lead {lead.id}.")
+            raise ValueError(f"Outbound call rejected: Explicit voice calling consent was denied for lead {lead.id}.")
+
+        consent_info = cls.get_lead_voice_consent_status(lead, db_alias=alias)
+
+        if not consent_info['is_eligible'] or consent_info['status'] != 'GRANTED':
+            raise ValueError(f"Outbound call rejected: {consent_info['reason']}")
+
+        return {
+            'voice_consent_verified': True,
+            'voice_consent_source': consent_info['source'] or '',
+            'voice_consent_recorded_at': consent_info['recorded_at'],
+            'voice_consent_method': consent_info['method'] or '',
+        }
 
     @classmethod
     def initiate_outbound_call(
@@ -119,7 +241,7 @@ class VoiceCallingService:
         timeout: int = 15,
     ) -> CallSession:
         """
-        Validates lead, enforces consent, prevents duplicate calls using row-level locking,
+        Validates lead, enforces trusted consent, prevents duplicate calls using row-level locking,
         and submits the verified call to Sarvam Instant Outbound API.
         
         Concurrency Safety:
@@ -139,8 +261,35 @@ class VoiceCallingService:
             if not recipient_phone or not PHONE_REGEX.match(recipient_phone):
                 raise ValueError(f"Lead {locked_lead.id} has invalid recipient phone number: '{recipient_phone}'")
 
-            # Consent & Suppression Check
-            cls.verify_lead_calling_eligibility(locked_lead, db_alias=alias, custom_metadata=custom_metadata)
+            # Consent & Suppression Check (Fail-closed; extracts verifiable provenance from trusted storage)
+            consent_provenance = cls.verify_lead_calling_eligibility(
+                locked_lead,
+                db_alias=alias,
+                custom_metadata=custom_metadata,
+            )
+
+            # Sanitize caller-supplied custom_metadata to prevent spoofing or tampering with consent provenance
+            safe_metadata = {}
+            if custom_metadata:
+                disallowed_prefixes = ('voice_consent_', 'consent_')
+                disallowed_exact = {
+                    'has_voice_consent',
+                    'voice_consent_verified',
+                    'voice_consent_source',
+                    'voice_consent_recorded_at',
+                    'voice_consent_method',
+                    'consent_voice',
+                }
+                for k, v in custom_metadata.items():
+                    k_clean = str(k).strip()
+                    k_lower = k_clean.lower()
+                    if (
+                        k_lower not in disallowed_exact
+                        and not any(k_lower.startswith(pfx) for pfx in disallowed_prefixes)
+                    ):
+                        safe_metadata[k] = v
+            safe_metadata.update(consent_provenance)
+            custom_metadata = safe_metadata
 
             # Idempotency Check inside lock
             if idempotency_key:
@@ -264,10 +413,15 @@ class VoiceCallingService:
         # 1. Match session by session ID or attempt ID
         session = None
         if call_session_id:
-            session = CallSession.objects.using(alias).filter(
-                organization=organization,
-                id=call_session_id,
-            ).first()
+            try:
+                import uuid
+                valid_session_id = uuid.UUID(str(call_session_id).strip())
+                session = CallSession.objects.using(alias).filter(
+                    organization=organization,
+                    id=valid_session_id,
+                ).first()
+            except (ValueError, TypeError, Exception):
+                session = None
 
         if not session and attempt_id:
             session = CallSession.objects.using(alias).filter(
