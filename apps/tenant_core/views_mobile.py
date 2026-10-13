@@ -934,10 +934,19 @@ def _serialize_branch_dict(b, user_lat=None, user_lng=None):
     if hasattr(b, 'closing_time') and b.closing_time:
         close_time = b.closing_time.strftime('%H:%M')
 
+    loc_name = ''
+    loc_code = ''
+    if hasattr(b, 'location') and b.location:
+        raw_loc = getattr(b.location, 'name', '') or ''
+        loc_name = raw_loc.title() if raw_loc else ''
+        loc_code = getattr(b.location, 'code', '') or ''
+
     return {
         'id': str(b.id),
         'name': b.name,
         'code': b.code,
+        'location_name': loc_name,
+        'location_code': loc_code,
         'address': full_address,
         'address_line1': addr_l1,
         'address_line2': addr_l2,
@@ -988,7 +997,7 @@ def _get_active_bookable_branches(request, alias):
     else:
         branches_qs = branches_qs.filter(organization=active_org)
 
-    return branches_qs.order_by('name')
+    return branches_qs.select_related('location').order_by('name')
 
 
 class MobileBranchesView(APIView):
