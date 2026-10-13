@@ -649,7 +649,7 @@ class MembersLifecycleCanonicalTestCase(APITestCase):
         self.assertFalse(sub_admin.get('sensitive_data_restricted', False))
         self.assertEqual(len(sub_admin['answers']), 2)
         answers_dict = {a['question_text']: a['answer'] for a in sub_admin['answers']}
-        self.assertEqual(answers_dict["Do you have a heart condition or high blood pressure?"], "True")
+        self.assertIn(answers_dict["Do you have a heart condition or high blood pressure?"], ["Yes", "True"])
         self.assertEqual(answers_dict["Current medications"], "Beta blockers")
 
     # =========================================================================

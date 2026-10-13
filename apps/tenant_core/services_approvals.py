@@ -139,6 +139,8 @@ class AdminApprovalService:
             approval_request.save(using=alias, update_fields=['status', 'resolved_at', 'updated_at'])
             if approval_request.request_type == 'CASH_PAYMENT_APPROVAL':
                 cls._materialize_cash_payment_rejection(approval_request, action_record, alias=alias)
+            elif approval_request.request_type == 'MEMBERSHIP_FREEZE':
+                cls._materialize_membership_freeze_rejection(approval_request, action_record, alias=alias)
         else:
             # Count approvals
             approval_count = ApprovalAction.objects.using(alias).filter(
@@ -156,6 +158,12 @@ class AdminApprovalService:
                     cls._materialize_schedule_exception(approval_request, alias=alias)
                 elif approval_request.request_type == 'CASH_PAYMENT_APPROVAL':
                     cls._materialize_cash_payment_approval(approval_request, action_record, alias=alias)
+                elif approval_request.request_type == 'MEMBERSHIP_EXTENSION':
+                    cls._materialize_membership_extension(approval_request, action_record, alias=alias)
+                elif approval_request.request_type == 'MEMBERSHIP_FREEZE':
+                    cls._materialize_membership_freeze(approval_request, action_record, alias=alias)
+                elif approval_request.request_type == 'MEMBERSHIP_UPGRADE':
+                    cls._materialize_membership_upgrade(approval_request, action_record, alias=alias)
 
         record_business_audit(
             organization=approval_request.organization,
@@ -401,3 +409,192 @@ class AdminApprovalService:
                 reason_text=f"Cash payment rejected: {action_record.comment or 'Payment rejected'}",
                 changed_by_user=action_record.approver_user,
             )
+
+    @classmethod
+    def _materialize_membership_extension(cls, approval_request: ApprovalRequest, action_record: ApprovalAction, alias: str = 'default'):
+        """
+        Extends the active membership's validity upon manager approval of MEMBERSHIP_EXTENSION.
+        """
+        from .models_memberships import Membership
+        from .services_memberships import MembershipLifecycleService
+
+        payload = approval_request.requested_payload or {}
+        mem_id = payload.get('membership_id') or approval_request.entity_id
+        days = int(payload.get('days', 7))
+        reason = payload.get('reason') or f"Extension approved by {getattr(action_record.approver_user, 'display_name', 'Manager')}"
+
+        membership = Membership.objects.using(alias).filter(id=mem_id).first()
+        if not membership:
+            logger.error("Membership %s not found for extension approval.", mem_id)
+            return
+
+        MembershipLifecycleService.extend_membership(
+            membership=membership,
+            days=days,
+            reason_text=reason,
+            approved_by_user=action_record.approver_user,
+            db_alias=alias,
+        )
+
+    @classmethod
+    def _materialize_membership_freeze(cls, approval_request: ApprovalRequest, action_record: ApprovalAction, alias: str = 'default'):
+        """
+        Confirms and activates membership freeze upon manager approval of MEMBERSHIP_FREEZE.
+        Extends membership end_date and updates status.
+        """
+        from datetime import date, timedelta
+        from .models_memberships import Membership, MembershipFreeze, MembershipStatusHistory
+
+        payload = approval_request.requested_payload or {}
+        freeze_id = payload.get('freeze_id')
+        freeze = None
+        if freeze_id:
+            freeze = MembershipFreeze.objects.using(alias).filter(id=freeze_id).first()
+        if not freeze:
+            freeze = MembershipFreeze.objects.using(alias).filter(
+                membership_id=approval_request.entity_id,
+                status='SCHEDULED',
+            ).order_by('-created_at').first()
+
+        if not freeze:
+            logger.error("MembershipFreeze not found for freeze approval %s", approval_request.id)
+            return
+
+        today = timezone.now().date()
+        membership = freeze.membership
+        freeze_days = (freeze.freeze_until - freeze.freeze_from).days
+
+        # Extend membership end_date if not already extended
+        if freeze_days > 0 and freeze.extend_membership_days:
+            membership.end_date = membership.end_date + timedelta(days=freeze_days)
+
+        is_active_now = freeze.freeze_from <= today <= freeze.freeze_until
+        old_status = membership.status
+        if is_active_now:
+            freeze.status = 'ACTIVE'
+            membership.status = 'FROZEN'
+            if membership.user_profile:
+                membership.user_profile.member_status = 'FROZEN'
+                membership.user_profile.save(using=alias, update_fields=['member_status', 'updated_at'])
+        else:
+            freeze.status = 'SCHEDULED'
+
+        freeze.approved_by_user = action_record.approver_user
+        freeze.save(using=alias, update_fields=['status', 'approved_by_user', 'updated_at'])
+        membership.save(using=alias, update_fields=['end_date', 'status', 'updated_at'])
+
+        if is_active_now and old_status != 'FROZEN':
+            MembershipStatusHistory.objects.using(alias).create(
+                membership=membership,
+                from_status=old_status,
+                to_status='FROZEN',
+                reason_code='FREEZE_APPROVED_AND_ACTIVATED',
+                reason_text=f"Freeze approved from {freeze.freeze_from} to {freeze.freeze_until}. End date extended by {freeze_days} days.",
+                changed_by_user=action_record.approver_user,
+            )
+
+        # Cancel any bookings within freeze window
+        if membership.user_profile:
+            try:
+                from .models_bookings import Booking
+                from .services_bookings import BookingWaitlistAttendanceService
+                freeze_bookings = Booking.objects.using(alias).filter(
+                    user_profile=membership.user_profile,
+                    occurrence__start_at__date__gte=freeze.freeze_from,
+                    occurrence__start_at__date__lte=freeze.freeze_until,
+                    status__in=['CONFIRMED', 'RESERVED', 'WAITLISTED']
+                )
+                for b in freeze_bookings:
+                    BookingWaitlistAttendanceService.cancel_booking(
+                        booking=b,
+                        cancelled_by_user=action_record.approver_user,
+                        reason_code="MEMBERSHIP_FREEZE",
+                        reason_text="Booking automatically cancelled due to approved membership freeze window.",
+                        db_alias=alias,
+                    )
+            except Exception as e:
+                logger.warning("Error cancelling bookings during freeze approval: %s", e)
+
+    @classmethod
+    def _materialize_membership_freeze_rejection(cls, approval_request: ApprovalRequest, action_record: ApprovalAction, alias: str = 'default'):
+        """
+        Cancels the scheduled MembershipFreeze record upon manager rejection of MEMBERSHIP_FREEZE.
+        """
+        from .models_memberships import MembershipFreeze
+
+        payload = approval_request.requested_payload or {}
+        freeze_id = payload.get('freeze_id')
+        freeze = None
+        if freeze_id:
+            freeze = MembershipFreeze.objects.using(alias).filter(id=freeze_id).first()
+        if not freeze:
+            freeze = MembershipFreeze.objects.using(alias).filter(
+                membership_id=approval_request.entity_id,
+                status='SCHEDULED',
+            ).order_by('-created_at').first()
+
+        if freeze:
+            freeze.status = 'CANCELLED'
+            freeze.save(using=alias, update_fields=['status', 'updated_at'])
+
+    @classmethod
+    def _materialize_membership_upgrade(cls, approval_request: ApprovalRequest, action_record: ApprovalAction, alias: str = 'default'):
+        """
+        Applies package upgrade upon manager approval of MEMBERSHIP_UPGRADE.
+        """
+        from .models_memberships import (
+            Membership, MembershipChangePolicy, MembershipChangePolicyRule
+        )
+        from .models_catalog import Package, PackageVersion
+        from .services_memberships import MembershipLifecycleService
+
+        payload = approval_request.requested_payload or {}
+        mem_id = payload.get('current_membership_id') or approval_request.entity_id
+        target_pkg_id = payload.get('target_package_id')
+        target_ver_id = payload.get('target_version_id')
+        reason = payload.get('reason') or f"Upgrade approved by {getattr(action_record.approver_user, 'display_name', 'Manager')}"
+
+        membership = Membership.objects.using(alias).filter(id=mem_id).first()
+        target_pkg = Package.objects.using(alias).filter(id=target_pkg_id).first() if target_pkg_id else None
+        target_ver = PackageVersion.objects.using(alias).filter(id=target_ver_id).first() if target_ver_id else None
+
+        if not membership or not target_pkg or not target_ver:
+            logger.error("Missing records for upgrade approval %s", approval_request.id)
+            return
+
+        policy_rule = MembershipChangePolicyRule.objects.using(alias).filter(
+            membership_change_policy__status='ACTIVE',
+            change_type='UPGRADE',
+        ).first()
+
+        if not policy_rule:
+            policy = MembershipChangePolicy.objects.using(alias).filter(status='ACTIVE').first()
+            if not policy:
+                policy = MembershipChangePolicy.objects.using(alias).create(
+                    organization=membership.package.organization,
+                    policy_name="Standard Membership Change Policy",
+                    status='ACTIVE',
+                    version_number=1,
+                    effective_from=timezone.now(),
+                    created_by_user=action_record.approver_user,
+                )
+            policy_rule, _ = MembershipChangePolicyRule.objects.using(alias).get_or_create(
+                membership_change_policy=policy,
+                change_type='UPGRADE',
+                defaults={
+                    'rule_name': 'Standard Upgrade Rule',
+                    'effective_mode': 'IMMEDIATE',
+                    'pricing_mode': 'DIFFERENCE_ONLY',
+                    'unused_session_handling': 'CARRY_FORWARD',
+                }
+            )
+
+        MembershipLifecycleService.quote_and_apply_change(
+            membership=membership,
+            policy_rule=policy_rule,
+            target_package=target_pkg,
+            target_package_version=target_ver,
+            reason=reason,
+            actor_user=action_record.approver_user,
+            db_alias=alias,
+        )

@@ -1319,7 +1319,7 @@ class MemberViewSet(viewsets.ViewSet):
 
     def get_member_profile(self, alias: str, org, pk):
         """
-        Authoritative lookup for a genuine customer member by UUID pk or member_number.
+        Authoritative lookup for a genuine customer member by UUID pk, user_id, or member_number.
         Returns None if pk belongs to a staff-only user without member identity.
         """
         qs = self.get_member_queryset(alias, org)
@@ -1328,6 +1328,11 @@ class MemberViewSet(viewsets.ViewSet):
             profile = qs.filter(id=pk).first()
         except Exception:
             profile = None
+        if not profile:
+            try:
+                profile = qs.filter(user_id=pk).first()
+            except Exception:
+                profile = None
         if not profile:
             profile = qs.filter(member_number=pk).first()
         return profile
@@ -1692,12 +1697,29 @@ class MemberViewSet(viewsets.ViewSet):
                 if updated_fields:
                     profile.save(using=alias, update_fields=updated_fields)
 
-            # Auto-convert linked Lead if present
+            # Auto-convert and link CRM Lead if present
             if from_lead_id:
                 lead = Lead.objects.using(alias).filter(id=from_lead_id).first()
-                if lead and lead.current_status != 'CONVERTED':
-                    lead.current_status = 'CONVERTED'
-                    lead.save(using=alias)
+                if lead:
+                    save_fields = []
+                    if lead.current_status != 'CONVERTED':
+                        lead.current_status = 'CONVERTED'
+                        save_fields.append('current_status')
+                    if lead.converted_user_profile_id != profile.id:
+                        lead.converted_user_profile = profile
+                        save_fields.append('converted_user_profile')
+                    if save_fields:
+                        save_fields.append('updated_at')
+                        lead.save(using=alias, update_fields=save_fields)
+                    from .models_crm import LeadConversion
+                    LeadConversion.objects.using(alias).get_or_create(
+                        lead=lead,
+                        user_profile=profile,
+                        defaults={
+                            'converted_by_user': request.user if getattr(request.user, 'is_authenticated', False) else None,
+                            'converted_at': timezone.now(),
+                        }
+                    )
 
         return Response(serialize_member(profile, alias), status=status.HTTP_201_CREATED)
 
