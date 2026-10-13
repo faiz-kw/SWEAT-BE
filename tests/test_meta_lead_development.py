@@ -1,4 +1,4 @@
-import hashlib
+﻿import hashlib
 import hmac
 import uuid
 from unittest.mock import patch
@@ -24,7 +24,7 @@ class MetaSignatureTests(SimpleTestCase):
         self.assertFalse(verify_signature(raw + b' ', signature, 'test-only-secret'))
         self.assertFalse(verify_signature(raw, signature, ''))
         self.assertFalse(verify_signature(raw, '', 'test-only-secret'))
-        self.assertFalse(verify_signature(raw, 'sha256=' + 'é' * 64, 'test-only-secret'))
+        self.assertFalse(verify_signature(raw, 'sha256=' + 'Ã©' * 64, 'test-only-secret'))
 
     def test_mapping_rejects_duplicate_questions_and_multi_value_contact(self):
         with self.assertRaises(ValueError):
@@ -52,10 +52,21 @@ class MetaDevelopmentTests(TestCase):
         self.user._auth_type = 'tenant'
         self.client = APIClient()
         self.client.force_authenticate(self.user)
-        self.mapping = MetaLeadMapping.objects.create(organization=self.org, name='Test mapping', page_id='test-page', form_id='test-form',
+        # --- FIXTURE FIX START ---
+        # WHY:    MetaLeadMapping.clean() (added in model commit 61d5329) requires page_id and
+        #         form_id to be digits-only strings. The test fixture predates this validator
+        #         (test last updated at e107ce0) and used human-readable slugs.
+        # FIXES:  'test-page' -> '1234567890', 'test-form' -> '9876543210'
+        # IMPACT: No logic change; only stored string values change. All lookups in
+        #         receive_simulation() match on exact string equality, so self.payload
+        #         values are updated in sync below.
+        # OLD:    page_id='test-page', form_id='test-form'
+        self.mapping = MetaLeadMapping.objects.create(organization=self.org, name='Test mapping', page_id='1234567890', form_id='9876543210',
             branch=self.branch, lead_source=self.source, field_mappings={'full_name': 'full_name', 'email': 'email'}, is_active=True)
-        self.payload = {'page_id': 'test-page', 'form_id': 'test-form', 'external_lead_id': 'submission-1',
+        # OLD:    'page_id': 'test-page', 'form_id': 'test-form'
+        self.payload = {'page_id': '1234567890', 'form_id': '9876543210', 'external_lead_id': 'submission-1',
                         'field_data': [{'name': 'full_name', 'values': ['Test Person']}, {'name': 'email', 'values': ['person@example.test']}]}
+        # --- FIXTURE FIX END ---
 
     def tearDown(self):
         set_tenant_db_alias(None)
@@ -78,7 +89,13 @@ class MetaDevelopmentTests(TestCase):
     def test_changed_payload_same_external_id_rejected(self):
         receive_simulation(self.org, self.payload)
         with self.assertRaises(ValidationError):
-            receive_simulation(self.org, {**self.payload, 'form_id': 'another-form'})
+            # --- FIXTURE FIX START ---
+            # WHY:    'another-form' is non-numeric; MetaLeadMapping.clean() rejects it.
+            # FIXES:  'another-form' -> '1111111111' (distinct from self.payload form_id '9876543210')
+            # IMPACT: Test still asserts a DIFFERENT form_id is rejected. Value is arbitrary.
+            # OLD:    'form_id': 'another-form'
+            receive_simulation(self.org, {**self.payload, 'form_id': '1111111111'})
+            # --- FIXTURE FIX END ---
         self.assertEqual(Lead.objects.count(), 1)
 
     def test_unmapped_receipt_is_durable_and_recovers(self):
@@ -164,7 +181,15 @@ class MetaDevelopmentTests(TestCase):
                 resolve.assert_not_called()
 
     def test_create_mapping_through_api(self):
-        payload = {'name': 'Second form', 'page_id': 'another-page', 'form_id': 'another-form',
+        # --- FIXTURE FIX START ---
+        # WHY:    'another-page'/'another-form' are non-numeric; API serializer calls
+        #         MetaLeadMapping.full_clean() which triggers the digits-only validator.
+        # FIXES:  'another-page' -> '2222222222', 'another-form' -> '1111111111'
+        # IMPACT: Values differ from self.mapping (page='1234567890', form='9876543210')
+        #         to satisfy the unique-together constraint (org+page_id+form_id).
+        # OLD:    'page_id': 'another-page', 'form_id': 'another-form'
+        payload = {'name': 'Second form', 'page_id': '2222222222', 'form_id': '1111111111',
+        # --- FIXTURE FIX END ---
                    'branch_mode': 'FIXED', 'branch': str(self.branch.id), 'lead_source': str(self.source.id),
                    'field_mappings': {'full_name': 'customer', 'email': 'contact'}, 'is_active': True}
         response = self.client.post('/meta-lead-mappings/', payload, format='json')
@@ -209,7 +234,15 @@ class MetaDevelopmentTests(TestCase):
         res = self.client.post('/meta-lead-imports/simulate/', self.payload, format='json')
         self.assertEqual(res.status_code, 201, res.data)
         res = self.client.post(f"/meta-lead-imports/{res.data['id']}/retry/", {}, format='json')
-        self.assertEqual(res.status_code, 200)
+        # --- FIXTURE FIX START ---
+        # WHY:    Commit a128beb changed retry() to explicitly reject IMPORTED/RESOLVED
+        #         records with HTTP 400 CANNOT_RETRY_SUCCESS. Previously a 200 no-op.
+        # FIXES:  200 -> 400; assert error code CANNOT_RETRY_SUCCESS.
+        # IMPACT: Tests the correct new contract: retrying a succeeded import is rejected.
+        # OLD:    self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.data.get('error'), 'CANNOT_RETRY_SUCCESS')
+        # --- FIXTURE FIX END ---
         self.assertEqual(Lead.objects.count(), 1)
 
     def test_stale_mapping_update_rejected_and_edit_audited(self):
@@ -255,7 +288,13 @@ class MetaDevelopmentTests(TestCase):
         self.mapping.field_defaults = {'country': 'India', 'fitness_goal': 'Weight Loss'}
         self.mapping.save()
         payload = {
-            'page_id': 'test-page', 'form_id': 'test-form', 'external_lead_id': 'expanded-fields-1',
+            # --- FIXTURE FIX START ---
+            # WHY:    Local payload must match self.mapping page_id/form_id for
+            #         receive_simulation() to locate the mapping. Updated to match setUp.
+            # FIXES:  'test-page' -> '1234567890', 'test-form' -> '9876543210'
+            # OLD:    'page_id': 'test-page', 'form_id': 'test-form'
+            'page_id': '1234567890', 'form_id': '9876543210', 'external_lead_id': 'expanded-fields-1',
+            # --- FIXTURE FIX END ---
             'field_data': [
                 {'name': 'fname', 'values': ['Aarav']},
                 {'name': 'lname', 'values': ['Patel']},
@@ -429,10 +468,18 @@ class MetaDevelopmentTests(TestCase):
         self.assertEqual(Lead.objects.count(), 1)
         self.assertEqual(SalesFollowupTask.objects.count(), initial_tasks)
 
-        # 6. Verify retrying a resolved import is safe and does not create duplicates
+        # 6. Verify retrying a resolved import is explicitly rejected (CANNOT_RETRY_SUCCESS)
         retry_res = self.client.post(f'/meta-lead-imports/{event2.id}/retry/')
-        self.assertEqual(retry_res.status_code, 200)
-        self.assertEqual(retry_res.data['status'], 'RESOLVED')
+        # --- FIXTURE FIX START ---
+        # WHY:    Commit a128beb changed retry() to return 400 CANNOT_RETRY_SUCCESS for
+        #         IMPORTED/RESOLVED records. Previously asserted 200 + status=RESOLVED.
+        # FIXES:  200 -> 400; check CANNOT_RETRY_SUCCESS error code.
+        # IMPACT: Correct new contract: retrying a resolved import is rejected.
+        # OLD:    self.assertEqual(retry_res.status_code, 200)
+        # OLD:    self.assertEqual(retry_res.data['status'], 'RESOLVED')
+        self.assertEqual(retry_res.status_code, 400)
+        self.assertEqual(retry_res.data.get('error'), 'CANNOT_RETRY_SUCCESS')
+        # --- FIXTURE FIX END ---
         self.assertEqual(Lead.objects.count(), 1)
         self.assertEqual(SalesFollowupTask.objects.count(), initial_tasks)
 
