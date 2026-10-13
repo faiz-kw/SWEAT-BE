@@ -705,3 +705,34 @@ class MetaOAuthCallbackRegressionTests(unittest.TestCase):
             self.assertEqual(res.data.get('forms'), [])
             self.assertEqual(res.data.get('results'), [])
             self.assertNotIn('error', res.data)
+
+    def test_18_fetch_page_forms_does_not_request_deprecated_csv_field(self):
+        """18. Regression: fetch_page_forms does not request deprecated export_csv_url field."""
+        from unittest.mock import MagicMock, patch
+        from apps.tenant_core.services_meta_graph import MetaGraphClient
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.ok = True
+        mock_resp.headers = {'content-type': 'application/json'}
+        mock_resp.text = '{"data": []}'
+        mock_resp.json.return_value = {"data": []}
+
+        with patch('apps.tenant_core.services_meta_graph.requests.get') as mock_get:
+            mock_get.return_value = mock_resp
+            client = MetaGraphClient()
+            result = client.fetch_page_forms("1234567890", "dummy-token")
+
+            self.assertEqual(result, [])
+            self.assertTrue(mock_get.called)
+
+            _, kwargs = mock_get.call_args
+            params = kwargs.get('params', {})
+            fields_str = params.get('fields', '')
+
+            self.assertNotIn('export_csv_url', fields_str)
+            self.assertIn('id', fields_str)
+            self.assertIn('name', fields_str)
+            self.assertIn('status', fields_str)
+            self.assertIn('questions', fields_str)
+

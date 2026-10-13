@@ -467,7 +467,13 @@ class MetaGraphClient:
 
             'access_token': page_access_token,
 
-            'fields': 'id,name,status,questions,leadgen_export_csv_url',
+            # --- FIX: REMOVE DEPRECATED META LEADGEN FIELD START ---
+            # WHY: Meta rejects leadgen_export_csv_url on lead form nodes with error (#12).
+            # FIXES: /{page_id}/leadgen_forms failed, so no lead forms loaded in CRM Setup.
+            # IMPACT: Form discovery works. This field was never read by any CRM code.
+            # OLD: 'fields': 'id,name,status,questions,leadgen_export_csv_url',
+            'fields': 'id,name,status,questions',
+            # --- FIX: REMOVE DEPRECATED META LEADGEN FIELD END ---
 
             'limit': 100,
 
