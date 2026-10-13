@@ -315,6 +315,27 @@ class MembershipViewSet(viewsets.ModelViewSet):
                     .order_by('-version_number')
                     .first()
                 )
+            if not form and membership.program:
+                form = (
+                    IntakeForm.objects.using(alias)
+                    .filter(status='ACTIVE', form_type__in=['PAR_Q', 'PARQ'], assigned_programs=membership.program)
+                    .order_by('-version_number')
+                    .first()
+                )
+            if not form:
+                form = (
+                    IntakeForm.objects.using(alias)
+                    .filter(status='ACTIVE', form_type__in=['PAR_Q', 'PARQ'], is_default_for_all_programs=True)
+                    .order_by('-version_number')
+                    .first()
+                )
+            if not form:
+                form = (
+                    IntakeForm.objects.using(alias)
+                    .filter(status='ACTIVE', form_type__in=['PAR_Q', 'PARQ'])
+                    .order_by('-version_number')
+                    .first()
+                )
             if form and not membership.parq_form:
                 membership.parq_form = form
                 membership.save(using=alias, update_fields=['parq_form'])
@@ -403,6 +424,27 @@ class MembershipViewSet(viewsets.ModelViewSet):
                 form = (
                     IntakeForm.objects.using(alias)
                     .filter(organization=org, status='ACTIVE', form_type__in=['PAR_Q', 'PARQ'], is_default_for_all_programs=True)
+                    .order_by('-version_number')
+                    .first()
+                )
+            if not form and membership.program:
+                form = (
+                    IntakeForm.objects.using(alias)
+                    .filter(status='ACTIVE', form_type__in=['PAR_Q', 'PARQ'], assigned_programs=membership.program)
+                    .order_by('-version_number')
+                    .first()
+                )
+            if not form:
+                form = (
+                    IntakeForm.objects.using(alias)
+                    .filter(status='ACTIVE', form_type__in=['PAR_Q', 'PARQ'], is_default_for_all_programs=True)
+                    .order_by('-version_number')
+                    .first()
+                )
+            if not form:
+                form = (
+                    IntakeForm.objects.using(alias)
+                    .filter(status='ACTIVE', form_type__in=['PAR_Q', 'PARQ'])
                     .order_by('-version_number')
                     .first()
                 )

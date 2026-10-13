@@ -361,6 +361,24 @@ class BookingWaitlistAttendanceService:
                     'reason_code': 'MEMBERSHIP_EXPIRED',
                     'reason_message': 'Selected membership has expired.',
                 }
+            if membership.end_date and occurrence.start_at and membership.end_date < occurrence.start_at.date():
+                return {
+                    'eligible': False,
+                    'reason_code': 'MEMBERSHIP_EXPIRED_ON_DATE',
+                    'reason_message': f"Membership will be expired on the class date ({occurrence.start_at.date()}).",
+                }
+            from .models_memberships import MembershipFreeze
+            if occurrence.start_at and MembershipFreeze.objects.using(alias).filter(
+                membership=membership,
+                status__in=['ACTIVE', 'SCHEDULED'],
+                freeze_from__lte=occurrence.start_at.date(),
+                freeze_until__gte=occurrence.start_at.date()
+            ).exists():
+                return {
+                    'eligible': False,
+                    'reason_code': 'MEMBERSHIP_FROZEN_ON_DATE',
+                    'reason_message': 'Class occurs during an active or scheduled membership freeze window.',
+                }
 
             # Package Branch Availability
             from .models_catalog import PackageBranchAvailability
@@ -608,15 +626,56 @@ class BookingWaitlistAttendanceService:
                 if membership.end_date < timezone.now().date():
                     raise ValidationError("Membership has expired.")
 
+                if occurrence.start_at and membership.end_date < occurrence.start_at.date():
+                    raise ValidationError(f"Membership expires on {membership.end_date}, before the class date {occurrence.start_at.date()}.")
+
+                from .models_memberships import MembershipFreeze
+                if occurrence.start_at and MembershipFreeze.objects.using(alias).filter(
+                    membership=membership,
+                    status__in=['ACTIVE', 'SCHEDULED'],
+                    freeze_from__lte=occurrence.start_at.date(),
+                    freeze_until__gte=occurrence.start_at.date()
+                ).exists():
+                    raise ValidationError("Cannot book class occurring during an active or scheduled membership freeze window.")
+
                 # Gate: Verify PAR-Q completed and digitally signed for this specific membership
                 if getattr(membership, 'parq_status', 'PENDING') != 'COMPLETED':
                     if not membership.parq_form:
-                        raise ParqRequiredValidationError(
-                            "No active PAR-Q form is configured for this program or organization. Please contact gym administration before booking.",
-                            code='PARQ_CONFIG_ERROR',
-                            membership=membership,
-                            form=None
+                        from .models_crm import IntakeForm
+                        org = (
+                            getattr(membership.purchase_branch, 'organization', None)
+                            or getattr(membership.home_branch, 'organization', None)
+                            or getattr(membership.package, 'organization', None)
                         )
+                        dyn_form = None
+                        if org:
+                            if membership.program:
+                                dyn_form = IntakeForm.objects.using(alias).filter(
+                                    organization=org, assigned_programs=membership.program, form_type='PAR_Q', status='ACTIVE'
+                                ).first()
+                            if not dyn_form:
+                                dyn_form = IntakeForm.objects.using(alias).filter(
+                                    organization=org, is_default_for_all_programs=True, form_type='PAR_Q', status='ACTIVE'
+                                ).first()
+                        if not dyn_form:
+                            dyn_form = IntakeForm.objects.using(alias).filter(
+                                form_type='PAR_Q', status='ACTIVE', is_default_for_all_programs=True
+                            ).first() or IntakeForm.objects.using(alias).filter(
+                                form_type='PAR_Q', status='ACTIVE'
+                            ).first()
+                        if dyn_form:
+                            membership.parq_form = dyn_form
+                            try:
+                                membership.save(update_fields=['parq_form'], using=alias)
+                            except Exception:
+                                pass
+                        else:
+                            raise ParqRequiredValidationError(
+                                "No active PAR-Q form is configured for this program or organization. Please contact gym administration before booking.",
+                                code='PARQ_CONFIG_ERROR',
+                                membership=membership,
+                                form=None
+                            )
                     raise ParqRequiredValidationError(
                         f"A completed and digitally signed PAR-Q is required before booking classes under membership {membership.membership_number}.",
                         code='PARQ_REQUIRED',
@@ -1087,6 +1146,40 @@ class BookingWaitlistAttendanceService:
                         )
                         continue
 
+                    if occurrence.start_at and membership.end_date < occurrence.start_at.date():
+                        candidate.status = 'CANCELLED'
+                        candidate.waitlist_position = None
+                        candidate.save(using=alias, update_fields=['status', 'waitlist_position', 'updated_at'])
+                        BookingWaitlistEvent.objects.using(alias).create(
+                            booking=candidate,
+                            occurrence=occurrence,
+                            event_type='AUTO_CANCELLED',
+                            reason=f"Membership expired before class occurrence date ({occurrence.start_at.date()})",
+                            triggered_by_type='SYSTEM',
+                            created_at=timezone.now()
+                        )
+                        continue
+
+                    from .models_memberships import MembershipFreeze
+                    if occurrence.start_at and MembershipFreeze.objects.using(alias).filter(
+                        membership=membership,
+                        status__in=['ACTIVE', 'SCHEDULED'],
+                        freeze_from__lte=occurrence.start_at.date(),
+                        freeze_until__gte=occurrence.start_at.date()
+                    ).exists():
+                        candidate.status = 'CANCELLED'
+                        candidate.waitlist_position = None
+                        candidate.save(using=alias, update_fields=['status', 'waitlist_position', 'updated_at'])
+                        BookingWaitlistEvent.objects.using(alias).create(
+                            booking=candidate,
+                            occurrence=occurrence,
+                            event_type='AUTO_CANCELLED',
+                            reason='Promotion blocked: class occurs during membership freeze window',
+                            triggered_by_type='SYSTEM',
+                            created_at=timezone.now()
+                        )
+                        continue
+
                     # Revalidate PAR-Q requirement at promotion time
                     if getattr(membership, 'parq_status', 'PENDING') != 'COMPLETED':
                         candidate.status = 'CANCELLED'
@@ -1337,6 +1430,30 @@ class BookingWaitlistAttendanceService:
             booking.occurrence = to_occ_locked
             booking.branch = to_occ_locked.branch
             booking.save(using=alias, update_fields=['occurrence', 'branch', 'updated_at'])
+
+            # 7B. Sync CRM TrialBooking if this is a trial session
+            if booking.booking_type == 'TRIAL':
+                from .models_crm import TrialBooking
+                tb = TrialBooking.objects.using(alias).filter(
+                    class_occurrence_id=from_occ_locked.id
+                ).filter(
+                    models.Q(user_profile=booking.user_profile) |
+                    models.Q(lead__email_normalized__iexact=rescheduled_by_user.email if rescheduled_by_user else '') |
+                    (models.Q(lead__phone_normalized=rescheduled_by_user.phone) if rescheduled_by_user and rescheduled_by_user.phone else models.Q(pk=None))
+                ).first()
+                if not tb:
+                    tb = TrialBooking.objects.using(alias).filter(
+                        models.Q(user_profile=booking.user_profile) |
+                        models.Q(lead__email_normalized__iexact=rescheduled_by_user.email if rescheduled_by_user else '')
+                    ).order_by('-created_at').first()
+                if tb:
+                    tb.class_occurrence_id = to_occ_locked.id
+                    tb.scheduled_start = to_occ_locked.start_at
+                    tb.scheduled_end = to_occ_locked.end_at
+                    tb.branch = to_occ_locked.branch
+                    tb.status = 'CONFIRMED'
+                    tb.confirmation_status = 'CONFIRMED'
+                    tb.save(using=alias, update_fields=['class_occurrence_id', 'scheduled_start', 'scheduled_end', 'branch', 'status', 'confirmation_status', 'updated_at'])
 
             # 8. Record Status History
             BookingStatusHistory.objects.using(alias).create(

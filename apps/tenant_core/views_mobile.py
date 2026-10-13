@@ -568,6 +568,18 @@ def _process_social_login(request, email, first_name, last_name, avatar_url, pro
             'name': user.home_branch.name,
         } if user.home_branch else None
 
+        # Check if user has an active membership and whether trial is already used
+        has_active_membership = Membership.objects.using(alias).filter(
+            user_profile=profile, status='ACTIVE', end_date__gte=timezone.now().date()
+        ).exists()
+        has_trial = (
+            Booking.objects.using(alias).filter(user_profile=profile, booking_type='TRIAL').exists()
+            or TrialBooking.objects.using(alias).filter(
+                models.Q(lead__email_normalized__iexact=email) |
+                (models.Q(lead__phone_normalized=user.phone) if user.phone else models.Q(pk=None))
+            ).exists()
+        )
+
         return Response({
             'access': str(tokens.access_token),
             'refresh': str(tokens),
@@ -577,13 +589,18 @@ def _process_social_login(request, email, first_name, last_name, avatar_url, pro
                 'first_name': user.first_name,
                 'last_name': user.last_name,
                 'phone': user.phone or '',
-                'role': 'member',
-                'role_code': 'MEMBER',
+                'role': 'member' if has_active_membership else 'lead',
+                'role_code': 'MEMBER' if has_active_membership else 'LEAD',
+                'user_type': 'MEMBER' if has_active_membership else 'LEAD',
+                'is_member': has_active_membership,
                 'member_number': profile.member_number or '',
                 'avatar_url': user.avatar_url or '',
                 'home_branch': home_branch_info,
             },
             'is_new_user': is_new_user,
+            'is_member': has_active_membership,
+            'can_book_trial': not has_active_membership and not has_trial,
+            'redirect_destination': 'MEMBER_PORTAL' if has_active_membership else 'TRIAL_ONBOARDING',
             'message': f'Logged in successfully via {provider.title()}.',
         }, status=status.HTTP_200_OK if not is_new_user else status.HTTP_201_CREATED)
 
@@ -776,6 +793,7 @@ class MobileMeView(APIView):
             ).exists()
         )
 
+        total_remaining_credits = float(membership_data.get('remaining_sessions', 0.0)) if membership_data else 0.0
         return Response({
             'user': {
                 'id': str(user.id),
@@ -783,6 +801,9 @@ class MobileMeView(APIView):
                 'first_name': user.first_name,
                 'last_name': user.last_name,
                 'phone': user.phone,
+                'role': getattr(user, 'user_type', 'MEMBER').lower(),
+                'role_code': getattr(user, 'user_type', 'MEMBER').upper(),
+                'user_type': getattr(user, 'user_type', 'MEMBER').upper(),
                 'avatar_url': user.avatar_url or '',
                 'date_of_birth': user.date_of_birth.isoformat() if user.date_of_birth else None,
                 'gender': user.gender or '',
@@ -794,12 +815,15 @@ class MobileMeView(APIView):
             'profile': {
                 'member_number': profile.member_number,
                 'member_status': profile.member_status,
+                'member_type': profile.member_type,
                 'joining_date': profile.joining_date.isoformat() if profile.joining_date else None,
                 'preferred_branch': {
                     'id': str(profile.preferred_branch.id) if profile.preferred_branch else None,
                     'name': profile.preferred_branch.name if profile.preferred_branch else 'SWEAT Studio',
                 } if profile.preferred_branch else None,
             },
+            'credits': total_remaining_credits,
+            'credits_available': total_remaining_credits,
             'active_membership': membership_data,
             'free_trial_redeemed': has_trial,
         })
@@ -934,6 +958,39 @@ def _serialize_branch_dict(b, user_lat=None, user_lng=None):
     }
 
 
+def _get_active_bookable_branches(request, alias):
+    """
+    Returns active, bookable studio branches scoped to the active organization.
+    Filters out dormant/seed branches belonging to inactive or unrelated organizations.
+    """
+    branches_qs = Branch.objects.using(alias).filter(status='ACTIVE')
+    active_org = None
+    if request.user and request.user.is_authenticated:
+        active_org = getattr(request.user, 'organization', None)
+        if not active_org:
+            from .models_workforce import UserProfile
+            prof = UserProfile.objects.using(alias).filter(user=request.user).first()
+            if prof and prof.organization:
+                active_org = prof.organization
+            elif prof and prof.preferred_branch and prof.preferred_branch.organization:
+                active_org = prof.preferred_branch.organization
+
+    if not active_org:
+        from .models_classes import ClassOccurrence
+        active_org_ids = list(
+            ClassOccurrence.objects.using(alias)
+            .values_list('branch__organization_id', flat=True)
+            .distinct()
+        )
+        active_org_ids = [oid for oid in active_org_ids if oid]
+        if active_org_ids:
+            branches_qs = branches_qs.filter(organization_id__in=active_org_ids)
+    else:
+        branches_qs = branches_qs.filter(organization=active_org)
+
+    return branches_qs.order_by('name')
+
+
 class MobileBranchesView(APIView):
     """
     GET /api/v1/mobile/branches/
@@ -961,7 +1018,7 @@ class MobileBranchesView(APIView):
                 user_lat = None
                 user_lng = None
 
-        branches = Branch.objects.using(alias).filter(status='ACTIVE').order_by('name')
+        branches = _get_active_bookable_branches(request, alias)
         results = [
             _serialize_branch_dict(b, user_lat=user_lat, user_lng=user_lng)
             for b in branches
@@ -1007,7 +1064,7 @@ class MobileNearestBranchView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        branches = Branch.objects.using(alias).filter(status='ACTIVE')
+        branches = _get_active_bookable_branches(request, alias)
         results = [
             _serialize_branch_dict(b, user_lat=user_lat, user_lng=user_lng)
             for b in branches
@@ -1168,12 +1225,15 @@ class MobileScheduleView(APIView):
             except (ValueError, AttributeError):
                 qs = qs.filter(
                     models.Q(class_template__category__name__iexact=category_param)
+                    | models.Q(class_template__category__name__icontains=category_param)
                     | models.Q(class_template__category__code__iexact=category_param)
+                    | models.Q(class_template__category__code__icontains=category_param)
                 )
 
         # Authenticated user bookings for this day to show 'CONFIRMED' / 'WAITLISTED' badges
         user_booking_map = {}
         included_class_ids = None
+        active_mem = None
         if request.user and request.user.is_authenticated:
             user_profile = _get_or_create_user_profile(request.user, alias)
             if not user_profile and getattr(request.user, 'email', None):
@@ -1316,6 +1376,11 @@ class MobileScheduleView(APIView):
 
             user_booking = user_booking_map.get(str(occ.id))
             is_included = (str(template.id) in included_class_ids) if (included_class_ids is not None and template) else True
+            ineligible_reason = None
+            allowed_pkg_name = active_mem.package.name if (active_mem and active_mem.package) else None
+            if not is_included and template:
+                ineligible_reason = f"Class '{template.name}' is not included in package version {active_mem.package_version.version_number if (active_mem and active_mem.package_version) else 1}."
+
 
             results.append({
                 'id': str(occ.id),
@@ -1364,6 +1429,8 @@ class MobileScheduleView(APIView):
                 'available_trial_seats': trial_available_seats,
                 'user_booking': user_booking,
                 'is_included_in_plan': is_included,
+                'ineligible_reason': ineligible_reason,
+                'allowed_package_name': allowed_pkg_name,
             })
 
         all_categories = [
@@ -1739,9 +1806,11 @@ class MobileBookClassView(APIView):
         except ValidationError as e:
             detail = e.messages[0] if hasattr(e, 'messages') and e.messages else str(e)
             is_full = 'capacity and waitlist' in detail.lower() or 'completely full' in detail.lower()
+            is_pkg_mismatch = 'not included in package' in detail.lower()
+            err_code = 'CLASS_AND_WAITLIST_FULL' if is_full else ('PACKAGE_CLASS_NOT_INCLUDED' if is_pkg_mismatch else 'BOOKING_VALIDATION_ERROR')
             return Response({
                 'detail': detail,
-                'code': 'CLASS_AND_WAITLIST_FULL' if is_full else 'BOOKING_VALIDATION_ERROR'
+                'code': err_code,
             }, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
             return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)

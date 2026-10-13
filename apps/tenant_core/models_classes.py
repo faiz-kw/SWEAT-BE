@@ -327,6 +327,50 @@ class ClassOccurrenceTrainer(models.Model):
             models.Index(fields=['trainer_profile', 'status'], name='idx_clstrn_prof_status'),
         ]
 
+    def clean(self):
+        super().clean()
+        if not self.occurrence_id or not self.trainer_profile_id:
+            return
+        if self.status in ['CANCELLED', 'REPLACED']:
+            return
+
+        db_alias = getattr(self._state, 'db', None) or 'default'
+        occ = self.occurrence
+        trainer = self.trainer_profile
+
+        buffer_min = getattr(trainer, 'minimum_schedule_buffer_minutes', 0) or 0
+        from datetime import timedelta
+        buffer_delta = timedelta(minutes=buffer_min)
+
+        target_start = occ.start_at - buffer_delta
+        target_end = occ.end_at + buffer_delta
+
+        conflicts = ClassOccurrenceTrainer.objects.using(db_alias).filter(
+            trainer_profile=trainer,
+            status__in=['ASSIGNED', 'CONFIRMED'],
+            occurrence__start_at__lt=target_end,
+            occurrence__end_at__gt=target_start,
+        )
+        if self.pk:
+            conflicts = conflicts.exclude(pk=self.pk)
+        conflicts = conflicts.exclude(occurrence=occ)
+
+        if conflicts.exists():
+            c = conflicts.select_related('occurrence__branch', 'occurrence__class_template').first()
+            c_occ = c.occurrence
+            c_branch = c_occ.branch.name if c_occ.branch else 'Unknown branch'
+            c_tpl = c_occ.class_template.name if c_occ.class_template else 'Unknown class'
+            same_loc = (c_occ.branch_id == occ.branch_id)
+            loc_msg = "at the same branch" if same_loc else f"at a different branch ({c_branch})"
+            from django.core.exceptions import ValidationError
+            raise ValidationError(
+                f"Trainer {trainer.trainer_code} has an overlapping class assignment ({c_tpl} {loc_msg} from {c_occ.start_at.strftime('%H:%M')} to {c_occ.end_at.strftime('%H:%M')})."
+            )
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return f"{self.trainer_profile} -> {self.occurrence} ({self.trainer_role})"
 

@@ -381,7 +381,7 @@ class ClassSchedulingService:
         alias = db_alias or 'default'
         with transaction.atomic(using=alias):
             occ = ClassOccurrence.objects.using(alias).select_for_update().get(id=occurrence_id)
-            trainer = TrainerProfile.objects.using(alias).select_related('employee_profile').get(id=trainer_profile_id)
+            trainer = TrainerProfile.objects.using(alias).select_for_update().select_related('employee_profile').get(id=trainer_profile_id)
 
             # 1. Active status check
             if trainer.trainer_status != 'ACTIVE' or trainer.employee_profile.employment_status != 'ACTIVE':
@@ -420,12 +420,18 @@ class ClassSchedulingService:
             if not is_avail:
                 raise ValidationError(f"Trainer availability check failed: {reason}")
 
-            # 4. Conflict check with other class occurrences
+            # 4. Conflict check with other class occurrences including buffer
+            buffer_min = getattr(trainer, 'minimum_schedule_buffer_minutes', 0) or 0
+            from datetime import timedelta
+            buffer_delta = timedelta(minutes=buffer_min)
+            target_start = occ.start_at - buffer_delta
+            target_end = occ.end_at + buffer_delta
+
             conflict = ClassOccurrenceTrainer.objects.using(alias).filter(
                 trainer_profile=trainer,
                 status__in=['ASSIGNED', 'CONFIRMED'],
-                occurrence__start_at__lt=occ.end_at,
-                occurrence__end_at__gt=occ.start_at,
+                occurrence__start_at__lt=target_end,
+                occurrence__end_at__gt=target_start,
             ).exclude(occurrence=occ).exists()
 
             if conflict:

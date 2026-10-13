@@ -284,6 +284,50 @@ class ClassOccurrenceTrainerSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'assigned_at', 'created_at']
 
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        occ = attrs.get('occurrence') or getattr(self.instance, 'occurrence', None)
+        trainer = attrs.get('trainer_profile') or getattr(self.instance, 'trainer_profile', None)
+        status_val = attrs.get('status') or getattr(self.instance, 'status', 'ASSIGNED')
+
+        if occ and trainer and status_val in ['ASSIGNED', 'CONFIRMED']:
+            from datetime import timedelta
+            db_alias = getattr(occ._state, 'db', None) or 'default'
+            if 'request' in self.context:
+                from .views_classes import _get_db
+                try:
+                    db_alias = _get_db(self.context['request'])
+                except Exception:
+                    pass
+            buffer_min = getattr(trainer, 'minimum_schedule_buffer_minutes', 0) or 0
+            buffer_delta = timedelta(minutes=buffer_min)
+
+            target_start = occ.start_at - buffer_delta
+            target_end = occ.end_at + buffer_delta
+
+            conflicts = ClassOccurrenceTrainer.objects.using(db_alias).filter(
+                trainer_profile=trainer,
+                status__in=['ASSIGNED', 'CONFIRMED'],
+                occurrence__start_at__lt=target_end,
+                occurrence__end_at__gt=target_start,
+            )
+            if self.instance and self.instance.pk:
+                conflicts = conflicts.exclude(pk=self.instance.pk)
+            conflicts = conflicts.exclude(occurrence=occ)
+
+            if conflicts.exists():
+                c = conflicts.select_related('occurrence__branch', 'occurrence__class_template').first()
+                c_occ = c.occurrence
+                c_branch = c_occ.branch.name if c_occ.branch else 'Unknown'
+                raise serializers.ValidationError({
+                    'trainer_profile': (
+                        f"Trainer {trainer.trainer_code} already has an overlapping class assignment "
+                        f"({c_occ.class_template.name if c_occ.class_template else 'Class'} at {c_branch} "
+                        f"from {c_occ.start_at.strftime('%H:%M')} to {c_occ.end_at.strftime('%H:%M')})."
+                    )
+                })
+        return attrs
+
 
 class ClassOccurrenceSerializer(serializers.ModelSerializer):
     class_name = serializers.CharField(source='class_template.name', read_only=True)
