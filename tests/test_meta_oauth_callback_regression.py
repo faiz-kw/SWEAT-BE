@@ -594,3 +594,114 @@ class MetaOAuthCallbackRegressionTests(unittest.TestCase):
             res_snake = auth_client.get('/api/v1/tenant/meta-lead-mappings/form_fields/?form_id=1755557852149138')
             self.assertEqual(res_snake.status_code, 200)
             self.assertIn('form', res_snake.data)
+
+    def test_14_forms_endpoint_permission_error_returns_403_and_envelope(self):
+        """14. Regression: forms endpoint returns HTTP 403 Forbidden with PERMISSION_DENIED
+        when Meta Graph API raises MetaPermissionError (e.g. missing leads_retrieval)."""
+        from rest_framework.test import APIClient
+        from apps.authentication.views import _build_tenant_token
+        from apps.tenant_core.services_meta_graph import MetaPermissionError
+
+        fb_page_id = '1265728509951597'
+
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            user = TenantUser.objects.using(alias).filter(email='admin@sweat.com', status='ACTIVE').first()
+            token = _build_tenant_token(user, self.tenant, alias)
+            access_token = str(token.access_token)
+
+        auth_client = APIClient()
+        auth_client.credentials(HTTP_AUTHORIZATION=f'Bearer {access_token}')
+
+        with patch('apps.tenant_core.services_meta_graph.MetaGraphClient.fetch_page_forms') as mock_fetch:
+            mock_fetch.side_effect = MetaPermissionError("Requires leads_retrieval permission to read lead generation forms.")
+            res = auth_client.get(f'/api/v1/tenant/meta-lead-mappings/forms/?page_id={fb_page_id}')
+            self.assertEqual(res.status_code, 403)
+            self.assertEqual(res.data.get('error'), 'PERMISSION_DENIED')
+            self.assertIn('Requires leads_retrieval', res.data.get('message', ''))
+            self.assertEqual(res.data.get('forms'), [])
+            self.assertEqual(res.data.get('results'), [])
+
+    def test_15_forms_endpoint_upstream_meta_error_returns_502(self):
+        """15. Regression: forms endpoint returns HTTP 502 Bad Gateway when Meta Graph API
+        raises MetaGraphAPIError or server error."""
+        from rest_framework.test import APIClient
+        from apps.authentication.views import _build_tenant_token
+        from apps.tenant_core.services_meta_graph import MetaGraphAPIError
+
+        fb_page_id = '1265728509951597'
+
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            user = TenantUser.objects.using(alias).filter(email='admin@sweat.com', status='ACTIVE').first()
+            token = _build_tenant_token(user, self.tenant, alias)
+            access_token = str(token.access_token)
+
+        auth_client = APIClient()
+        auth_client.credentials(HTTP_AUTHORIZATION=f'Bearer {access_token}')
+
+        with patch('apps.tenant_core.services_meta_graph.MetaGraphClient.fetch_page_forms') as mock_fetch:
+            mock_fetch.side_effect = MetaGraphAPIError("Meta Graph API returned an upstream error.")
+            res = auth_client.get(f'/api/v1/tenant/meta-lead-mappings/forms/?page_id={fb_page_id}')
+            self.assertEqual(res.status_code, 502)
+            self.assertEqual(res.data.get('error'), 'META_GRAPH_ERROR')
+            self.assertEqual(res.data.get('forms'), [])
+            self.assertEqual(res.data.get('results'), [])
+
+    def test_16_forms_endpoint_missing_page_and_token_returns_4xx(self):
+        """16. Regression: forms endpoint returns HTTP 404 for unknown page connection and
+        HTTP 400 when page connection has no usable access token."""
+        from rest_framework.test import APIClient
+        from apps.authentication.views import _build_tenant_token
+        from apps.tenant_core.models_meta_leads import MetaPageConnection
+
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            user = TenantUser.objects.using(alias).filter(email='admin@sweat.com', status='ACTIVE').first()
+            token = _build_tenant_token(user, self.tenant, alias)
+            access_token = str(token.access_token)
+
+        auth_client = APIClient()
+        auth_client.credentials(HTTP_AUTHORIZATION=f'Bearer {access_token}')
+
+        # Unknown page ID -> 404
+        res_404 = auth_client.get('/api/v1/tenant/meta-lead-mappings/forms/?page_id=999000111222')
+        self.assertEqual(res_404.status_code, 404)
+        self.assertEqual(res_404.data.get('error'), 'PAGE_NOT_CONNECTED')
+        self.assertEqual(res_404.data.get('forms'), [])
+
+        # Page exists but token missing -> 400
+        fb_page_id = '1265728509951597'
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            MetaPageConnection.objects.using(alias).filter(page_id=fb_page_id).update(encrypted_page_access_token='')
+
+        res_400 = auth_client.get(f'/api/v1/tenant/meta-lead-mappings/forms/?page_id={fb_page_id}')
+        self.assertEqual(res_400.status_code, 400)
+        self.assertEqual(res_400.data.get('error'), 'TOKEN_MISSING')
+        self.assertEqual(res_400.data.get('forms'), [])
+
+    def test_17_forms_endpoint_successful_empty_response(self):
+        """17. Regression: forms endpoint returns HTTP 200 with empty lists and no error field
+        when Meta genuinely returns zero lead forms."""
+        from rest_framework.test import APIClient
+        from apps.authentication.views import _build_tenant_token
+        from apps.tenant_core.models_meta_leads import MetaPageConnection
+        from apps.tenant_core.meta_crypto import encrypt_token
+
+        fb_page_id = '1265728509951597'
+
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            user = TenantUser.objects.using(alias).filter(email='admin@sweat.com', status='ACTIVE').first()
+            MetaPageConnection.objects.using(alias).filter(page_id=fb_page_id).update(
+                encrypted_page_access_token=encrypt_token('EAA_valid_token_1234567890')
+            )
+            token = _build_tenant_token(user, self.tenant, alias)
+            access_token = str(token.access_token)
+
+        auth_client = APIClient()
+        auth_client.credentials(HTTP_AUTHORIZATION=f'Bearer {access_token}')
+
+        with patch('apps.tenant_core.services_meta_graph.MetaGraphClient.fetch_page_forms') as mock_fetch:
+            mock_fetch.return_value = []
+            res = auth_client.get(f'/api/v1/tenant/meta-lead-mappings/forms/?page_id={fb_page_id}')
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(res.data.get('forms'), [])
+            self.assertEqual(res.data.get('results'), [])
+            self.assertNotIn('error', res.data)

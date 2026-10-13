@@ -43,6 +43,8 @@ from .services_meta_graph import (
     MetaTokenExpiredError,
     MetaPermissionError,
     MetaGraphAPIError,
+    MetaGraphServerError,
+    MetaRateLimitError,
 )
 from apps.master.models_tenant import MetaPageRegistry
 
@@ -436,6 +438,16 @@ def _is_valid_uuid(val) -> bool:
         return True
     except (ValueError, AttributeError, TypeError):
         return False
+
+
+def _sanitize_meta_error(msg: str) -> str:
+    if not msg:
+        return ''
+    import re
+    cleaned = re.sub(r'EAA[A-Za-z0-9]+', '[REDACTED_TOKEN]', str(msg))
+    cleaned = re.sub(r'access_token=[^\s&]+', 'access_token=[REDACTED]', cleaned)
+    cleaned = re.sub(r'client_secret=[^\s&]+', 'client_secret=[REDACTED]', cleaned)
+    return cleaned[:300].strip()
 
 
 def _format_page_connection_payload(p: dict) -> dict:
@@ -934,11 +946,29 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
         ).first()
 
         if not page_conn:
-            return Response({'results': [], 'forms': [], 'notice': 'Page is not connected. Enter form ID manually.'})
+            return Response(
+                {
+                    'results': [],
+                    'forms': [],
+                    'error': 'PAGE_NOT_CONNECTED',
+                    'message': 'Page is not connected. Enter Facebook Form ID manually.',
+                    'notice': 'Page is not connected. Enter form ID manually.',
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
 
         token = decrypt_token(page_conn.encrypted_page_access_token)
         if not token:
-            return Response({'results': [], 'forms': [], 'notice': 'Page token not available. Re-authorize connection.'})
+            return Response(
+                {
+                    'results': [],
+                    'forms': [],
+                    'error': 'TOKEN_MISSING',
+                    'message': 'Page access token is missing or unavailable. Please re-authorize the connection in Facebook Settings.',
+                    'notice': 'Page token not available. Re-authorize connection.',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         client = MetaGraphClient()
         try:
@@ -952,11 +982,40 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
                     'questions_count': len(f.get('questions', [])),
                 })
             return Response({'results': results, 'forms': results})
-        except MetaTokenExpiredError:
-            return Response({'results': [], 'forms': [], 'error': 'TOKEN_EXPIRED', 'message': 'Page token expired. Please reconnect.'}, status=401)
+        except MetaTokenExpiredError as exc:
+            logger.warning("Meta token expired fetching forms for page %s: %s", page_id, exc)
+            clean_msg = _sanitize_meta_error(str(exc)) or 'Page access token has expired. Please reconnect Facebook in Settings.'
+            return Response(
+                {'results': [], 'forms': [], 'error': 'TOKEN_EXPIRED', 'message': clean_msg},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        except MetaPermissionError as exc:
+            logger.warning("Meta permission error fetching forms for page %s: %s", page_id, exc)
+            clean_msg = _sanitize_meta_error(str(exc))
+            return Response(
+                {'results': [], 'forms': [], 'error': 'PERMISSION_DENIED', 'message': clean_msg},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        except (MetaGraphServerError, MetaRateLimitError) as exc:
+            logger.warning("Meta upstream server/rate-limit error fetching forms for page %s: %s", page_id, exc)
+            clean_msg = _sanitize_meta_error(str(exc))
+            return Response(
+                {'results': [], 'forms': [], 'error': 'META_UPSTREAM_ERROR', 'message': clean_msg},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        except MetaGraphAPIError as exc:
+            logger.warning("Meta Graph API error fetching forms for page %s: %s", page_id, exc)
+            clean_msg = _sanitize_meta_error(str(exc))
+            return Response(
+                {'results': [], 'forms': [], 'error': 'META_GRAPH_ERROR', 'message': clean_msg},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
         except Exception as exc:
-            logger.warning("Could not fetch forms for page %s: %s", page_id, exc)
-            return Response({'results': [], 'forms': [], 'error': str(exc)})
+            logger.exception("Unexpected error fetching forms for page %s: %s", page_id, exc)
+            return Response(
+                {'results': [], 'forms': [], 'error': 'SERVER_ERROR', 'message': 'An unexpected error occurred while fetching forms from Meta.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
     @action(detail=False, methods=['get'], url_path='form_fields')
     def form_fields_alias(self, request):
