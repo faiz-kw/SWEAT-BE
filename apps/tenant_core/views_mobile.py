@@ -1192,24 +1192,51 @@ class MobileScheduleView(APIView):
         if not alias:
             return Response([], status=status.HTTP_200_OK)
 
+        branch_id = request.query_params.get('branch_id')
+        category_id = request.query_params.get('category_id')
+
+        # Resolve authoritative studio timezone (default 'Asia/Kolkata')
+        tz_name = 'Asia/Kolkata'
+        if branch_id and str(branch_id).lower() != 'all':
+            try:
+                branch_obj = Branch.objects.using(alias).filter(id=branch_id).first()
+                if branch_obj and branch_obj.timezone:
+                    tz_name = branch_obj.timezone
+            except Exception:
+                pass
+
+        try:
+            import zoneinfo
+            local_tz = zoneinfo.ZoneInfo(tz_name)
+        except Exception:
+            import pytz
+            local_tz = pytz.timezone(tz_name)
+
+        now = timezone.now()
+        local_now = now.astimezone(local_tz)
+
         date_str = request.query_params.get('date')
         if date_str:
             try:
                 target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
             except ValueError:
-                target_date = timezone.now().date()
+                target_date = local_now.date()
         else:
-            target_date = timezone.now().date()
+            target_date = local_now.date()
 
-        branch_id = request.query_params.get('branch_id')
-        category_id = request.query_params.get('category_id')
+        # Compute authoritative studio-local calendar day window converted to UTC
+        from datetime import time as dt_time, timezone as dt_timezone
+        day_start_local = datetime.combine(target_date, dt_time.min).replace(tzinfo=local_tz)
+        day_end_local = datetime.combine(target_date, dt_time.max).replace(tzinfo=local_tz)
+        day_start_utc = day_start_local.astimezone(dt_timezone.utc)
+        day_end_utc = day_end_local.astimezone(dt_timezone.utc)
 
-        # Query occurrences for the target date
+        # Query occurrences whose authoritative start_at falls within the studio-local calendar date
         qs = (
             ClassOccurrence.objects.using(alias)
             .filter(
-                models.Q(occurrence_date=target_date)
-                | (models.Q(occurrence_date__isnull=True) & models.Q(start_at__date=target_date)),
+                models.Q(start_at__gte=day_start_utc, start_at__lte=day_end_utc)
+                | (models.Q(start_at__isnull=True) & models.Q(occurrence_date=target_date)),
                 status__in=['OPEN', 'SCHEDULED', 'IN_PROGRESS', 'CONFIRMED', 'PUBLISHED', 'ACTIVE']
             )
             .select_related('class_template__category', 'branch')
@@ -1338,8 +1365,24 @@ class MobileScheduleView(APIView):
             trial_available_seats = max(0, min(available_seats, effective_trial_cap - total_trial_booked)) if allow_trial else 0
             is_trial_available = allow_trial and (not is_full) and (trial_available_seats > 0)
 
+            # Time boundary checks against authoritative current timestamp
+            effective_end_at = occ.end_at
+            if not effective_end_at and occ.start_at:
+                dur = template.default_duration_minutes if template else 50
+                effective_end_at = occ.start_at + timedelta(minutes=dur)
+
+            has_ended = bool(effective_end_at and effective_end_at <= now) or (occ.status == 'COMPLETED')
+            has_started = bool(occ.start_at and occ.start_at <= now) or has_ended
+            is_in_progress = bool(has_started and not has_ended)
+
             # Regular member booking state
-            if not is_full:
+            if has_ended:
+                booking_state = 'ENDED'
+                is_bookable = False
+            elif is_in_progress:
+                booking_state = 'IN_PROGRESS'
+                is_bookable = False
+            elif not is_full:
                 booking_state = 'AVAILABLE'
                 is_bookable = True
             elif is_waitlist_open:
@@ -1402,7 +1445,7 @@ class MobileScheduleView(APIView):
                     'id': str(occ.branch.id) if occ.branch else None,
                     'name': occ.branch.name if occ.branch else 'SWEAT Studio',
                 } if occ.branch else None,
-                'date': target_date.isoformat(),
+                'date': (occ.start_at.astimezone(local_tz).date().isoformat() if occ.start_at else target_date.isoformat()),
                 'start_at': occ.start_at.isoformat() if occ.start_at else None,
                 'end_at': occ.end_at.isoformat() if occ.end_at else None,
                 'duration_minutes': template.default_duration_minutes if template else 50,
@@ -1432,8 +1475,11 @@ class MobileScheduleView(APIView):
                 },
                 'booking_state': booking_state,
                 'is_bookable': is_bookable,
-                'can_book': not is_full,
-                'can_waitlist': is_full and is_waitlist_open,
+                'can_book': is_bookable and not is_full and not has_started and not has_ended,
+                'can_waitlist': is_bookable and is_full and is_waitlist_open and not has_started and not has_ended,
+                'has_started': has_started,
+                'has_ended': has_ended,
+                'is_in_progress': is_in_progress,
                 'is_trial_available': is_trial_available,
                 'available_trial_seats': trial_available_seats,
                 'user_booking': user_booking,
@@ -1588,6 +1634,31 @@ class MobileClaimFreeTrialView(APIView):
             )
         except ClassOccurrence.DoesNotExist:
             return Response({'detail': 'Class slot not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Check occurrence lifecycle and start/end time boundaries
+        now = timezone.now()
+        effective_end_at = occurrence.end_at
+        if not effective_end_at and occurrence.start_at:
+            duration = occurrence.class_template.default_duration_minutes if occurrence.class_template else 50
+            effective_end_at = occurrence.start_at + timedelta(minutes=duration)
+
+        if occurrence.status in ('CANCELLED', 'COMPLETED'):
+            return Response({
+                'detail': f'This class session is {occurrence.status.lower()}.',
+                'code': f'CLASS_{occurrence.status}',
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        if effective_end_at and effective_end_at <= now:
+            return Response({
+                'detail': 'Cannot book a trial for a class occurrence that has already ended.',
+                'code': 'CLASS_ALREADY_ENDED',
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        if occurrence.start_at and occurrence.start_at <= now:
+            return Response({
+                'detail': 'Cannot book a trial for a class occurrence that has already started.',
+                'code': 'CLASS_ALREADY_STARTED',
+            }, status=status.HTTP_400_BAD_REQUEST)
 
         # Pre-check trial capacity availability before booking
         effective_trial_cap = (
@@ -1760,6 +1831,31 @@ class MobileBookClassView(APIView):
             )
         except ClassOccurrence.DoesNotExist:
             return Response({'detail': 'Class slot not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Check occurrence lifecycle and start/end time boundaries
+        now = timezone.now()
+        effective_end_at = occurrence.end_at
+        if not effective_end_at and occurrence.start_at:
+            duration = occurrence.class_template.default_duration_minutes if occurrence.class_template else 50
+            effective_end_at = occurrence.start_at + timedelta(minutes=duration)
+
+        if occurrence.status in ('CANCELLED', 'COMPLETED'):
+            return Response({
+                'detail': f'This class session is {occurrence.status.lower()}.',
+                'code': f'CLASS_{occurrence.status}',
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        if effective_end_at and effective_end_at <= now:
+            return Response({
+                'detail': 'Cannot book a class occurrence that has already ended.',
+                'code': 'CLASS_ALREADY_ENDED',
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        if occurrence.start_at and occurrence.start_at <= now:
+            return Response({
+                'detail': 'Cannot book a class occurrence that has already started.',
+                'code': 'CLASS_ALREADY_STARTED',
+            }, status=status.HTTP_400_BAD_REQUEST)
 
         # 2. Resolve active membership with remaining session units
         active_membership = (
@@ -3922,3 +4018,54 @@ class MobileMembershipFreezeView(APIView):
             'freeze_until': str(until_d),
             'days': freeze_days,
         }, status=status.HTTP_201_CREATED)
+
+
+class MobileMembershipUnfreezeView(APIView):
+    """
+    POST /api/v1/mobile/memberships/unfreeze/
+    Unfreezes a member's active frozen membership and restores it to ACTIVE status.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
+        profile = _get_or_create_user_profile(user, alias)
+
+        from .models_memberships import Membership
+        from .services_memberships import MembershipLifecycleService
+
+        frozen_m = (
+            Membership.objects.using(alias)
+            .filter(user_profile=profile, status='FROZEN')
+            .order_by('-created_at')
+            .first()
+        )
+        if not frozen_m:
+            frozen_m = (
+                Membership.objects.using(alias)
+                .filter(user_profile=profile)
+                .order_by('-created_at')
+                .first()
+            )
+
+        if not frozen_m:
+            return Response({'detail': 'No membership found to unfreeze.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        reason = (request.data.get('reason') or 'Unfreeze requested by member via mobile app').strip()
+        MembershipLifecycleService.unfreeze_membership(
+            membership=frozen_m,
+            reason_text=reason,
+            approved_by_user=user,
+            db_alias=alias,
+        )
+        profile.member_status = 'ACTIVE'
+        profile.save(using=alias, update_fields=['member_status'])
+
+        return Response({
+            'detail': 'Membership unfreezed successfully and restored to Active status.',
+            'status': 'ACTIVE',
+            'membership_id': str(frozen_m.id),
+        }, status=status.HTTP_200_OK)

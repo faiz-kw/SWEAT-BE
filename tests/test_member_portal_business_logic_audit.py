@@ -511,3 +511,232 @@ class MemberPortalBusinessLogicAuditTests(TestCase):
         # Verify entitlement consumed
         self.entitlement.refresh_from_db(using=DB)
         self.assertEqual(self.entitlement.consumed_units, Decimal("1.00"))
+
+    # -------------------------------------------------------------------------
+    # ISSUE 5: PAST & IN-PROGRESS OCCURRENCES BOOKING DISALLOWANCE
+    # -------------------------------------------------------------------------
+    def test_past_and_in_progress_classes_cannot_be_booked(self):
+        """Past and in-progress occurrences must be unbookable on schedule and rejected on booking."""
+        from apps.tenant_core.services_bookings import BookingWaitlistAttendanceService
+
+        now = timezone.now()
+        today = now.date()
+
+        # 1. Past occurrence (Ended 1 hour ago)
+        occ_past = ClassOccurrence.objects.using(DB).create(
+            branch=self.branch_andheri,
+            class_template=self.tpl_stretch,
+            occurrence_date=today,
+            start_at=now - timedelta(hours=2),
+            end_at=now - timedelta(hours=1, minutes=10),
+            status="OPEN",
+            capacity=10,
+        )
+
+        # 2. In-progress occurrence (Started 20 min ago, ends in 30 min)
+        occ_in_progress = ClassOccurrence.objects.using(DB).create(
+            branch=self.branch_andheri,
+            class_template=self.tpl_stretch,
+            occurrence_date=today,
+            start_at=now - timedelta(minutes=20),
+            end_at=now + timedelta(minutes=30),
+            status="OPEN",
+            capacity=10,
+        )
+
+        # 3. Upcoming occurrence (Starts in 2 hours)
+        occ_upcoming = ClassOccurrence.objects.using(DB).create(
+            branch=self.branch_andheri,
+            class_template=self.tpl_stretch,
+            occurrence_date=today,
+            start_at=now + timedelta(hours=2),
+            end_at=now + timedelta(hours=2, minutes=50),
+            status="OPEN",
+            capacity=10,
+        )
+
+        # A. Verify MobileScheduleView flags
+        req_sched = self.factory.get(f'/api/v1/mobile/schedule/?date={today.isoformat()}', HTTP_X_TENANT_SLUG='sweat')
+        force_authenticate(req_sched, user=self.member_user)
+        res_sched = MobileScheduleView.as_view()(req_sched)
+        self.assertEqual(res_sched.status_code, status.HTTP_200_OK)
+
+        slot_map = {s['id']: s for s in res_sched.data['slots']}
+
+        # Past slot checks
+        s_past = slot_map[str(occ_past.id)]
+        self.assertTrue(s_past['has_ended'])
+        self.assertTrue(s_past['has_started'])
+        self.assertFalse(s_past['is_in_progress'])
+        self.assertFalse(s_past['is_bookable'])
+        self.assertFalse(s_past['can_book'])
+        self.assertFalse(s_past['can_waitlist'])
+        self.assertEqual(s_past['booking_state'], 'ENDED')
+
+        # In-progress slot checks
+        s_prog = slot_map[str(occ_in_progress.id)]
+        self.assertFalse(s_prog['has_ended'])
+        self.assertTrue(s_prog['has_started'])
+        self.assertTrue(s_prog['is_in_progress'])
+        self.assertFalse(s_prog['is_bookable'])
+        self.assertFalse(s_prog['can_book'])
+        self.assertFalse(s_prog['can_waitlist'])
+        self.assertEqual(s_prog['booking_state'], 'IN_PROGRESS')
+
+        # Upcoming slot checks
+        s_up = slot_map[str(occ_upcoming.id)]
+        self.assertFalse(s_up['has_ended'])
+        self.assertFalse(s_up['has_started'])
+        self.assertFalse(s_up['is_in_progress'])
+        self.assertTrue(s_up['is_bookable'])
+        self.assertTrue(s_up['can_book'])
+        self.assertEqual(s_up['booking_state'], 'AVAILABLE')
+
+        # B. Direct API booking attempt on Past Occurrence -> 400 CLASS_ALREADY_ENDED
+        self.membership.parq_status = "COMPLETED"
+        self.membership.save(using=DB, update_fields=['parq_status'])
+        self.entitlement.allocated_units = Decimal("5.00")
+        self.entitlement.consumed_units = Decimal("0.00")
+        self.entitlement.save(using=DB, update_fields=['allocated_units', 'consumed_units'])
+
+        req_book_past = self.factory.post(
+            f'/api/v1/mobile/schedule/{occ_past.id}/book/',
+            data={'occurrence_id': str(occ_past.id)},
+            format='json',
+            HTTP_X_TENANT_SLUG='sweat',
+        )
+        force_authenticate(req_book_past, user=self.member_user)
+        res_book_past = MobileBookClassView.as_view()(req_book_past, occurrence_id=str(occ_past.id))
+        self.assertEqual(res_book_past.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(res_book_past.data.get('code'), 'CLASS_ALREADY_ENDED')
+
+        # C. Direct API booking attempt on In-Progress Occurrence -> 400 CLASS_ALREADY_STARTED
+        req_book_prog = self.factory.post(
+            f'/api/v1/mobile/schedule/{occ_in_progress.id}/book/',
+            data={'occurrence_id': str(occ_in_progress.id)},
+            format='json',
+            HTTP_X_TENANT_SLUG='sweat',
+        )
+        force_authenticate(req_book_prog, user=self.member_user)
+        res_book_prog = MobileBookClassView.as_view()(req_book_prog, occurrence_id=str(occ_in_progress.id))
+        self.assertEqual(res_book_prog.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(res_book_prog.data.get('code'), 'CLASS_ALREADY_STARTED')
+
+        # D. Backend service validation enforcement directly in BookingWaitlistAttendanceService
+        with self.assertRaises(ValidationError) as cm_past:
+            BookingWaitlistAttendanceService.create_booking(
+                user_profile=self.member_profile,
+                occurrence=occ_past,
+                membership=self.membership,
+                db_alias=DB,
+            )
+        self.assertIn("already ended", str(cm_past.exception))
+
+        with self.assertRaises(ValidationError) as cm_prog:
+            BookingWaitlistAttendanceService.create_booking(
+                user_profile=self.member_profile,
+                occurrence=occ_in_progress,
+                membership=self.membership,
+                db_alias=DB,
+            )
+        self.assertIn("already started", str(cm_prog.exception))
+
+        # E. Upcoming slot booking succeeds
+        req_book_up = self.factory.post(
+            f'/api/v1/mobile/schedule/{occ_upcoming.id}/book/',
+            data={'occurrence_id': str(occ_upcoming.id)},
+            format='json',
+            HTTP_X_TENANT_SLUG='sweat',
+        )
+        force_authenticate(req_book_up, user=self.member_user)
+        res_book_up = MobileBookClassView.as_view()(req_book_up, occurrence_id=str(occ_upcoming.id))
+        self.assertEqual(res_book_up.status_code, status.HTTP_201_CREATED)
+
+    # -------------------------------------------------------------------------
+    # ISSUE 6: CROSS-DAY MIDNIGHT TIMEZONE BOUNDARY SCHEDULE SCOPING
+    # -------------------------------------------------------------------------
+    def test_cross_day_timezone_boundary_schedule_scoping(self):
+        """Schedule query must use studio-local calendar day window, correctly assigning midnight/1AM classes to their true local date."""
+        import zoneinfo
+        kolkata = zoneinfo.ZoneInfo('Asia/Kolkata')
+        utc = zoneinfo.ZoneInfo('UTC')
+
+        # Oct 13 11:00 PM IST = Oct 13 17:30 UTC
+        start_13_night = datetime(2026, 10, 13, 17, 30, tzinfo=utc)
+        occ_13_evening = ClassOccurrence.objects.using(DB).create(
+            branch=self.branch_andheri,
+            class_template=self.tpl_stretch,
+            occurrence_date=date(2026, 10, 13),
+            start_at=start_13_night,
+            end_at=start_13_night + timedelta(minutes=50),
+            status="OPEN",
+            capacity=10,
+        )
+
+        # Oct 14 12:00 AM IST (Midnight) = Oct 13 18:30 UTC. Note DB occurrence_date stored as 2026-10-13 (UTC date)
+        start_14_mid = datetime(2026, 10, 13, 18, 30, tzinfo=utc)
+        occ_14_midnight = ClassOccurrence.objects.using(DB).create(
+            branch=self.branch_andheri,
+            class_template=self.tpl_stretch,
+            occurrence_date=date(2026, 10, 13),  # Legacy/UTC date in DB
+            start_at=start_14_mid,
+            end_at=start_14_mid + timedelta(minutes=50),
+            status="OPEN",
+            capacity=10,
+        )
+
+        # Oct 14 01:00 AM IST = Oct 13 19:30 UTC
+        start_14_1am = datetime(2026, 10, 13, 19, 30, tzinfo=utc)
+        occ_14_1am = ClassOccurrence.objects.using(DB).create(
+            branch=self.branch_andheri,
+            class_template=self.tpl_stretch,
+            occurrence_date=date(2026, 10, 13),  # Legacy/UTC date in DB
+            start_at=start_14_1am,
+            end_at=start_14_1am + timedelta(minutes=50),
+            status="OPEN",
+            capacity=10,
+        )
+
+        # Oct 14 12:30 PM IST = Oct 14 07:00 UTC
+        start_14_noon = datetime(2026, 10, 14, 7, 0, tzinfo=utc)
+        occ_14_noon = ClassOccurrence.objects.using(DB).create(
+            branch=self.branch_andheri,
+            class_template=self.tpl_stretch,
+            occurrence_date=date(2026, 10, 14),
+            start_at=start_14_noon,
+            end_at=start_14_noon + timedelta(minutes=50),
+            status="OPEN",
+            capacity=10,
+        )
+
+        # 1. Fetch Schedule for 2026-10-13:
+        # Must include 11:00 PM IST, and EXCLUDE 12:00 AM and 01:00 AM IST (which belong to Oct 14)
+        req_13 = self.factory.get('/api/v1/mobile/schedule/?date=2026-10-13', HTTP_X_TENANT_SLUG='sweat')
+        force_authenticate(req_13, user=self.member_user)
+        res_13 = MobileScheduleView.as_view()(req_13)
+        self.assertEqual(res_13.status_code, status.HTTP_200_OK)
+
+        slot_ids_13 = {s['id'] for s in res_13.data['slots']}
+        self.assertIn(str(occ_13_evening.id), slot_ids_13)
+        self.assertNotIn(str(occ_14_midnight.id), slot_ids_13, "Midnight class on Oct 14 IST must NOT appear on Oct 13")
+        self.assertNotIn(str(occ_14_1am.id), slot_ids_13, "1:00 AM class on Oct 14 IST must NOT appear on Oct 13")
+        self.assertNotIn(str(occ_14_noon.id), slot_ids_13)
+
+        # 2. Fetch Schedule for 2026-10-14:
+        # Must INCLUDE 12:00 AM, 01:00 AM, and 12:30 PM IST, and EXCLUDE 11:00 PM on Oct 13
+        req_14 = self.factory.get('/api/v1/mobile/schedule/?date=2026-10-14', HTTP_X_TENANT_SLUG='sweat')
+        force_authenticate(req_14, user=self.member_user)
+        res_14 = MobileScheduleView.as_view()(req_14)
+        self.assertEqual(res_14.status_code, status.HTTP_200_OK)
+
+        slot_ids_14 = {s['id'] for s in res_14.data['slots']}
+        self.assertIn(str(occ_14_midnight.id), slot_ids_14, "Midnight class on Oct 14 IST must appear under Oct 14")
+        self.assertIn(str(occ_14_1am.id), slot_ids_14, "1:00 AM class on Oct 14 IST must appear under Oct 14")
+        self.assertIn(str(occ_14_noon.id), slot_ids_14)
+        self.assertNotIn(str(occ_13_evening.id), slot_ids_14)
+
+        # Verify serialized date matches the studio-local calendar date
+        midnight_slot = next(s for s in res_14.data['slots'] if s['id'] == str(occ_14_midnight.id))
+        self.assertEqual(midnight_slot['date'], '2026-10-14')
+        self.assertTrue(midnight_slot['can_book'])
+        self.assertEqual(midnight_slot['booking_state'], 'AVAILABLE')

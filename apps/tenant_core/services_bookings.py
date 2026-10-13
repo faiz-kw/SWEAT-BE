@@ -559,6 +559,21 @@ class BookingWaitlistAttendanceService:
             # Lock occurrence to serialize concurrent booking and capacity allocation
             occurrence = ClassOccurrence.objects.using(alias).select_for_update().get(id=occurrence.id)
 
+            # Validate occurrence lifecycle and class start/end boundaries
+            if occurrence.status in ('CANCELLED', 'COMPLETED'):
+                raise ValidationError(f"Cannot book a class occurrence that is {occurrence.status.lower()}.")
+
+            now = timezone.now()
+            effective_end_at = occurrence.end_at
+            if not effective_end_at and occurrence.start_at:
+                duration = occurrence.class_template.default_duration_minutes if occurrence.class_template else 50
+                effective_end_at = occurrence.start_at + timedelta(minutes=duration)
+
+            if effective_end_at and effective_end_at <= now:
+                raise ValidationError("Cannot book a class occurrence that has already ended.")
+            if occurrence.start_at and occurrence.start_at <= now:
+                raise ValidationError("Cannot book a class occurrence that has already started.")
+
             # 2. Prevent duplicate active booking
             existing = Booking.objects.using(alias).filter(
                 user_profile=user_profile,

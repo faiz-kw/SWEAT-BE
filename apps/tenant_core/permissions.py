@@ -163,6 +163,10 @@ class TenantRBACPermission(permissions.BasePermission):
             if 'lead' in view_name:
                 if act in ['convert', 'book_trial', 'partial_update', 'update', 'retrieve', 'patch', 'put']:
                     return True
+            # E. Member self-service on their own member profile (e.g. unfreeze, freeze, extend, renew, member_360)
+            if 'member' in view_name:
+                if act in ['unfreeze', 'freeze', 'extend', 'renew', 'member_360', 'retrieve', 'actions']:
+                    return True
 
         allowed, reason, check_code = RBACAuthorizationEngine.evaluate(
             user=user,
@@ -212,6 +216,8 @@ class TenantRBACPermission(permissions.BasePermission):
                 if (getattr(obj, 'email_normalized', '').lower() == (user.email or '').lower() or
                     (user.phone and getattr(obj, 'phone_normalized', '') == user.phone)):
                     return True
+            if obj.__class__.__name__ == 'UserProfile' and getattr(obj, 'user_id', None) == user.id:
+                return True
             if hasattr(obj, 'user_profile') and getattr(obj.user_profile, 'user_id', None) == user.id:
                 return True
             if hasattr(obj, 'lead') and (getattr(obj.lead, 'email_normalized', None) == user.email.lower() or (user.phone and getattr(obj.lead, 'phone_normalized', None) == user.phone)):

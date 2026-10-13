@@ -33,6 +33,7 @@ from .views_mobile import (
     MobileMembershipUpgradeView,
     MobileMembershipExtendView,
     MobileMembershipFreezeView,
+    MobileMembershipUnfreezeView,
 )
 
 app_name = 'mobile_api'
@@ -83,6 +84,7 @@ urlpatterns = [
     path('memberships/upgrade/', MobileMembershipUpgradeView.as_view(), name='mobile-membership-upgrade'),
     path('memberships/extend/', MobileMembershipExtendView.as_view(), name='mobile-membership-extend'),
     path('memberships/freeze/', MobileMembershipFreezeView.as_view(), name='mobile-membership-freeze'),
+    path('memberships/unfreeze/', MobileMembershipUnfreezeView.as_view(), name='mobile-membership-unfreeze'),
     path('packages/', MobilePackagesView.as_view(), name='mobile-packages'),
     path('my-credits/', MobileMyCreditsView.as_view(), name='mobile-my-credits'),
     path('credits/', MobileMyCreditsView.as_view(), name='mobile-credits-direct'),

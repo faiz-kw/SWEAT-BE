@@ -75,12 +75,17 @@ class TermsDocumentViewSet(viewsets.ModelViewSet):
         'partial_update': 'core.settings.edit',
         'destroy': 'core.settings.edit',
         'publish_version': 'core.settings.edit',
+        'publish': 'core.settings.edit',
     }
 
     def get_queryset(self):
         alias = _get_db(self.request)
         org = _get_org(self.request)
-        qs = TermsDocument.objects.using(alias).filter(organization=org)
+        qs = TermsDocument.objects.using(alias).all()
+        if org:
+            org_qs = qs.filter(organization=org)
+            if org_qs.exists():
+                qs = org_qs
         status_param = self.request.query_params.get('status')
         if status_param:
             qs = qs.filter(status=status_param)
@@ -91,15 +96,34 @@ class TermsDocumentViewSet(viewsets.ModelViewSet):
         org = _get_org(self.request)
         serializer.save(organization=org)
 
+    @action(detail=True, methods=['post'], url_path='publish')
+    def publish(self, request, pk=None):
+        return self._do_publish(request)
+
     @action(detail=True, methods=['post'], url_path='publish-version')
     def publish_version(self, request, pk=None):
+        return self._do_publish(request)
+
+    def _do_publish(self, request):
         alias = _get_db(request)
         doc = self.get_object()
         version_id = request.data.get('terms_document_version_id')
-        if not version_id:
-            return Response({'error': 'terms_document_version_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+        content_text = request.data.get('content_text')
 
         try:
+            if content_text is not None and not version_id:
+                new_ver = TermsLegalService.create_terms_version(
+                    terms_document=doc,
+                    content_text=content_text,
+                    created_by_user=request.user,
+                    status='DRAFT',
+                    db_alias=alias,
+                )
+                version_id = str(new_ver.id)
+
+            if not version_id:
+                return Response({'error': 'terms_document_version_id or content_text is required'}, status=status.HTTP_400_BAD_REQUEST)
+
             published = TermsLegalService.publish_terms_version(
                 terms_document_version_id=version_id,
                 actor=request.user,

@@ -2055,7 +2055,9 @@ class IntakeFormViewSet(viewsets.ModelViewSet):
         org = _get_org(self.request)
         qs = IntakeForm.objects.using(alias).prefetch_related('questions', 'questions__options')
         if org:
-            qs = qs.filter(organization=org)
+            org_qs = qs.filter(organization=org)
+            if org_qs.exists():
+                qs = org_qs
         status_val = self.request.query_params.get('status')
         if status_val:
             qs = qs.filter(status=status_val)

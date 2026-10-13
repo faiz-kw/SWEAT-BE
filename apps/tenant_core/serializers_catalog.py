@@ -65,13 +65,14 @@ class TermsDocumentVersionSerializer(serializers.ModelSerializer):
 class TermsDocumentSerializer(serializers.ModelSerializer):
     code = serializers.CharField(required=False, allow_blank=True, max_length=100)
     active_version = serializers.SerializerMethodField()
+    versions = TermsDocumentVersionSerializer(many=True, read_only=True)
     versions_count = serializers.SerializerMethodField()
 
     class Meta:
         model = TermsDocument
         fields = [
             'id', 'organization', 'code', 'name', 'document_type',
-            'status', 'active_version', 'versions_count', 'created_at', 'updated_at',
+            'status', 'active_version', 'versions', 'versions_count', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
         extra_kwargs = {
@@ -94,11 +95,7 @@ class TermsDocumentSerializer(serializers.ModelSerializer):
     def get_active_version(self, obj):
         active_ver = obj.versions.filter(status='ACTIVE').order_by('-version_number').first()
         if active_ver:
-            return {
-                'id': str(active_ver.id),
-                'version_number': active_ver.version_number,
-                'effective_from': active_ver.effective_from.isoformat() if active_ver.effective_from else None,
-            }
+            return TermsDocumentVersionSerializer(active_ver).data
         return None
 
     def get_versions_count(self, obj):
