@@ -1029,26 +1029,56 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
         if not form_id:
             raise ValidationError('Query parameter form_id is required.')
 
-        page_conn = None
-        if page_id:
-            page_conn = MetaPageConnection.objects.using(self.alias).filter(
-                organization=self.organization, is_active=True
-            ).filter(
-                Q(page_id=page_id) | Q(id=page_id) if _is_valid_uuid(page_id) else Q(page_id=page_id)
-            ).first()
+        # --- FIX: REQUIRE PAGE_ID AND REMOVE ARBITRARY FALLBACK START ---
+        # WHY: form_fields previously allowed page_id to be omitted and fell back to an arbitrary Page connection in DB.
+        # FIXES: Calling form_fields without page_id returns 400 PAGE_ID_REQUIRED; missing connection returns 404 PAGE_NOT_FOUND; empty token returns 400 TOKEN_MISSING.
+        # IMPACT: Form field discovery uses the specific Page's access token, preventing Meta (#10) privilege errors.
+        # OLD:
+        # page_conn = None
+        # if page_id:
+        #     page_conn = MetaPageConnection.objects.using(self.alias).filter(
+        #         organization=self.organization, is_active=True
+        #     ).filter(
+        #         Q(page_id=page_id) | Q(id=page_id) if _is_valid_uuid(page_id) else Q(page_id=page_id)
+        #     ).first()
+        #
+        # if not page_conn:
+        #     # Fallback to any active page connection with available token
+        #     page_conn = MetaPageConnection.objects.using(self.alias).filter(
+        #         organization=self.organization, is_active=True
+        #     ).exclude(encrypted_page_access_token='').first()
+        #
+        # if not page_conn:
+        #     return Response({'questions': [], 'form': {'id': form_id, 'name': '', 'questions': []}})
+        #
+        # token = decrypt_token(page_conn.encrypted_page_access_token)
+        # if not token:
+        #     return Response({'questions': [], 'form': {'id': form_id, 'name': '', 'questions': []}})
+        if not page_id:
+            return Response(
+                {'questions': [], 'form': {'id': form_id, 'name': '', 'questions': []}, 'error': 'PAGE_ID_REQUIRED', 'message': 'Query parameter page_id is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        page_conn = MetaPageConnection.objects.using(self.alias).filter(
+            organization=self.organization, is_active=True
+        ).filter(
+            Q(page_id=page_id) | Q(id=page_id) if _is_valid_uuid(page_id) else Q(page_id=page_id)
+        ).first()
 
         if not page_conn:
-            # Fallback to any active page connection with available token
-            page_conn = MetaPageConnection.objects.using(self.alias).filter(
-                organization=self.organization, is_active=True
-            ).exclude(encrypted_page_access_token='').first()
-
-        if not page_conn:
-            return Response({'questions': [], 'form': {'id': form_id, 'name': '', 'questions': []}})
+            return Response(
+                {'questions': [], 'form': {'id': form_id, 'name': '', 'questions': []}, 'error': 'PAGE_NOT_FOUND', 'message': f'Page {page_id} not connected.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
 
         token = decrypt_token(page_conn.encrypted_page_access_token)
         if not token:
-            return Response({'questions': [], 'form': {'id': form_id, 'name': '', 'questions': []}})
+            return Response(
+                {'questions': [], 'form': {'id': form_id, 'name': '', 'questions': []}, 'error': 'TOKEN_MISSING', 'message': f'Page {page_id} has no valid access token. Please reconnect.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # --- FIX: REQUIRE PAGE_ID AND REMOVE ARBITRARY FALLBACK END ---
 
         client = MetaGraphClient()
         try:
@@ -1064,9 +1094,49 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
                 })
             form_dict = {'id': form_id, 'name': form_data.get('name', ''), 'questions': mapped_questions}
             return Response({'questions': mapped_questions, 'form_name': form_data.get('name', ''), 'form': form_dict})
+        # --- FIX: EXCEPTION MAPPING WITH REAL HTTP STATUS CODES START ---
+        # WHY: form_fields previously caught all exceptions and returned HTTP 200 with an empty questions shell.
+        # FIXES: Map MetaTokenExpiredError, MetaPermissionError, MetaGraphServerError, MetaRateLimitError, MetaGraphAPIError, and Exception to standard HTTP statuses matching forms().
+        # IMPACT: Real error codes and sanitized messages are returned to callers.
+        # OLD:
+        # except Exception as exc:
+        #     logger.warning("Could not fetch form fields for %s: %s", form_id, exc)
+        #     return Response({'questions': [], 'form': {'id': form_id, 'name': '', 'questions': []}, 'error': str(exc)})
+        except MetaTokenExpiredError as exc:
+            logger.warning("Meta token expired fetching form fields for %s: %s", form_id, exc)
+            clean_msg = _sanitize_meta_error(str(exc)) or 'Page access token has expired. Please reconnect Facebook in Settings.'
+            return Response(
+                {'questions': [], 'form': {'id': form_id, 'name': '', 'questions': []}, 'error': 'TOKEN_EXPIRED', 'message': clean_msg},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        except MetaPermissionError as exc:
+            logger.warning("Meta permission error fetching form fields for %s: %s", form_id, exc)
+            clean_msg = _sanitize_meta_error(str(exc))
+            return Response(
+                {'questions': [], 'form': {'id': form_id, 'name': '', 'questions': []}, 'error': 'PERMISSION_DENIED', 'message': clean_msg},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        except (MetaGraphServerError, MetaRateLimitError) as exc:
+            logger.warning("Meta upstream server/rate-limit error fetching form fields for %s: %s", form_id, exc)
+            clean_msg = _sanitize_meta_error(str(exc))
+            return Response(
+                {'questions': [], 'form': {'id': form_id, 'name': '', 'questions': []}, 'error': 'META_UPSTREAM_ERROR', 'message': clean_msg},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        except MetaGraphAPIError as exc:
+            logger.warning("Meta Graph API error fetching form fields for %s: %s", form_id, exc)
+            clean_msg = _sanitize_meta_error(str(exc))
+            return Response(
+                {'questions': [], 'form': {'id': form_id, 'name': '', 'questions': []}, 'error': 'META_GRAPH_ERROR', 'message': clean_msg},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
         except Exception as exc:
-            logger.warning("Could not fetch form fields for %s: %s", form_id, exc)
-            return Response({'questions': [], 'form': {'id': form_id, 'name': '', 'questions': []}, 'error': str(exc)})
+            logger.exception("Unexpected error fetching form fields for %s: %s", form_id, exc)
+            return Response(
+                {'questions': [], 'form': {'id': form_id, 'name': '', 'questions': []}, 'error': 'SERVER_ERROR', 'message': 'An unexpected error occurred while fetching form fields from Meta.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        # --- FIX: EXCEPTION MAPPING WITH REAL HTTP STATUS CODES END ---
 
     @action(detail=False, methods=['get'])
     def metadata(self, request):

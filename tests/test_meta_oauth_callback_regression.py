@@ -584,14 +584,28 @@ class MetaOAuthCallbackRegressionTests(unittest.TestCase):
             mock_fetch.return_value = mock_details
 
             # Kebab-case route
-            res_kebab = auth_client.get('/api/v1/tenant/meta-lead-mappings/form-fields/?form_id=1755557852149138')
+            # --- FIX: PASS PAGE_ID TO FORM_FIELDS REQUEST START ---
+            # WHY: form_fields endpoint now requires page_id to target the correct Page connection.
+            # FIXES: Test received 400 PAGE_ID_REQUIRED because page_id was previously omitted.
+            # IMPACT: Matches new contract where page_id is mandatory.
+            # OLD:
+            # res_kebab = auth_client.get('/api/v1/tenant/meta-lead-mappings/form-fields/?form_id=1755557852149138')
+            res_kebab = auth_client.get(f'/api/v1/tenant/meta-lead-mappings/form-fields/?page_id={fb_page_id}&form_id=1755557852149138')
+            # --- FIX: PASS PAGE_ID TO FORM_FIELDS REQUEST END ---
             self.assertEqual(res_kebab.status_code, 200)
             self.assertIn('form', res_kebab.data)
             self.assertIn('questions', res_kebab.data)
             self.assertEqual(len(res_kebab.data['form']['questions']), 2)
 
             # Snake-case route
-            res_snake = auth_client.get('/api/v1/tenant/meta-lead-mappings/form_fields/?form_id=1755557852149138')
+            # --- FIX: PASS PAGE_ID TO FORM_FIELDS REQUEST START ---
+            # WHY: form_fields endpoint now requires page_id to target the correct Page connection.
+            # FIXES: Test received 400 PAGE_ID_REQUIRED because page_id was previously omitted.
+            # IMPACT: Matches new contract where page_id is mandatory.
+            # OLD:
+            # res_snake = auth_client.get('/api/v1/tenant/meta-lead-mappings/form_fields/?form_id=1755557852149138')
+            res_snake = auth_client.get(f'/api/v1/tenant/meta-lead-mappings/form_fields/?page_id={fb_page_id}&form_id=1755557852149138')
+            # --- FIX: PASS PAGE_ID TO FORM_FIELDS REQUEST END ---
             self.assertEqual(res_snake.status_code, 200)
             self.assertIn('form', res_snake.data)
 
@@ -735,4 +749,146 @@ class MetaOAuthCallbackRegressionTests(unittest.TestCase):
             self.assertIn('name', fields_str)
             self.assertIn('status', fields_str)
             self.assertIn('questions', fields_str)
+
+    def test_19_form_fields_requires_page_id(self):
+        """19. Regression: form_fields endpoint returns HTTP 400 when page_id is missing."""
+        from rest_framework.test import APIClient
+        from apps.authentication.views import _build_tenant_token
+
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            user = TenantUser.objects.using(alias).filter(email='admin@sweat.com', status='ACTIVE').first()
+            token = _build_tenant_token(user, self.tenant, alias)
+            access_token = str(token.access_token)
+
+        auth_client = APIClient()
+        auth_client.credentials(HTTP_AUTHORIZATION=f'Bearer {access_token}')
+
+        res = auth_client.get('/api/v1/tenant/meta-lead-mappings/form-fields/?form_id=1234567890')
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.data.get('error'), 'PAGE_ID_REQUIRED')
+        self.assertEqual(res.data.get('questions'), [])
+        self.assertIn('form', res.data)
+
+    def test_20_form_fields_unknown_page_id_returns_404(self):
+        """20. Regression: form_fields endpoint returns HTTP 404 when page_id is unknown."""
+        from rest_framework.test import APIClient
+        from apps.authentication.views import _build_tenant_token
+
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            user = TenantUser.objects.using(alias).filter(email='admin@sweat.com', status='ACTIVE').first()
+            token = _build_tenant_token(user, self.tenant, alias)
+            access_token = str(token.access_token)
+
+        auth_client = APIClient()
+        auth_client.credentials(HTTP_AUTHORIZATION=f'Bearer {access_token}')
+
+        res = auth_client.get('/api/v1/tenant/meta-lead-mappings/form-fields/?page_id=999000111222&form_id=1234567890')
+        self.assertEqual(res.status_code, 404)
+        self.assertEqual(res.data.get('error'), 'PAGE_NOT_FOUND')
+        self.assertEqual(res.data.get('questions'), [])
+        self.assertIn('form', res.data)
+
+    def test_21_form_fields_empty_token_returns_400(self):
+        """21. Regression: form_fields endpoint returns HTTP 400 when page connection has empty token."""
+        from rest_framework.test import APIClient
+        from apps.authentication.views import _build_tenant_token
+        from apps.tenant_core.models_meta_leads import MetaPageConnection
+
+        fb_page_id = '1265728509951597'
+
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            user = TenantUser.objects.using(alias).filter(email='admin@sweat.com', status='ACTIVE').first()
+            MetaPageConnection.objects.using(alias).filter(page_id=fb_page_id).update(encrypted_page_access_token='')
+            token = _build_tenant_token(user, self.tenant, alias)
+            access_token = str(token.access_token)
+
+        auth_client = APIClient()
+        auth_client.credentials(HTTP_AUTHORIZATION=f'Bearer {access_token}')
+
+        res = auth_client.get(f'/api/v1/tenant/meta-lead-mappings/form-fields/?page_id={fb_page_id}&form_id=1234567890')
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.data.get('error'), 'TOKEN_MISSING')
+        self.assertEqual(res.data.get('questions'), [])
+        self.assertIn('form', res.data)
+
+    def test_22_form_fields_permission_error_returns_403(self):
+        """22. Regression: form_fields endpoint returns HTTP 403 when Meta raises MetaPermissionError."""
+        from unittest.mock import patch
+        from rest_framework.test import APIClient
+        from apps.authentication.views import _build_tenant_token
+        from apps.tenant_core.models_meta_leads import MetaPageConnection
+        from apps.tenant_core.meta_crypto import encrypt_token
+        from apps.tenant_core.services_meta_graph import MetaPermissionError
+
+        fb_page_id = '1265728509951597'
+
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            user = TenantUser.objects.using(alias).filter(email='admin@sweat.com', status='ACTIVE').first()
+            MetaPageConnection.objects.using(alias).filter(page_id=fb_page_id).update(
+                encrypted_page_access_token=encrypt_token('dummy_page_token_abc')
+            )
+            token = _build_tenant_token(user, self.tenant, alias)
+            access_token = str(token.access_token)
+
+        auth_client = APIClient()
+        auth_client.credentials(HTTP_AUTHORIZATION=f'Bearer {access_token}')
+
+        with patch('apps.tenant_core.services_meta_graph.MetaGraphClient.fetch_form_details') as mock_fetch:
+            mock_fetch.side_effect = MetaPermissionError("Denied: User has insufficient privileges on the page (#10)")
+            res = auth_client.get(f'/api/v1/tenant/meta-lead-mappings/form-fields/?page_id={fb_page_id}&form_id=1234567890')
+            self.assertEqual(res.status_code, 403)
+            self.assertEqual(res.data.get('error'), 'PERMISSION_DENIED')
+            self.assertEqual(res.data.get('questions'), [])
+            self.assertIn('form', res.data)
+
+    def test_23_form_fields_uses_exact_page_token_with_multiple_connections(self):
+        """23. Regression: with two active page connections, assert fetch_form_details uses the requested page's token."""
+        from unittest.mock import patch
+        from rest_framework.test import APIClient
+        from apps.authentication.views import _build_tenant_token
+        from apps.tenant_core.models_meta_leads import MetaPageConnection, MetaConnection
+        from apps.tenant_core.meta_crypto import encrypt_token
+
+        page_1_id = '111111111111'
+        page_2_id = '222222222222'
+        token_1 = 'dummy_token_for_page_1'
+        token_2 = 'dummy_token_for_page_2'
+        target_form_id = '999988887777'
+
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            user = TenantUser.objects.using(alias).filter(email='admin@sweat.com', status='ACTIVE').first()
+            target_org = user.organization
+            conn, _ = MetaConnection.objects.using(alias).get_or_create(
+                organization=target_org,
+                defaults={'status': 'CONNECTED', 'encrypted_user_access_token': encrypt_token('user_tok')}
+            )
+            MetaPageConnection.objects.using(alias).update_or_create(
+                organization=target_org,
+                page_id=page_1_id,
+                defaults={'connection': conn, 'page_name': 'Page One', 'is_active': True, 'encrypted_page_access_token': encrypt_token(token_1)}
+            )
+            MetaPageConnection.objects.using(alias).update_or_create(
+                organization=target_org,
+                page_id=page_2_id,
+                defaults={'connection': conn, 'page_name': 'Page Two', 'is_active': True, 'encrypted_page_access_token': encrypt_token(token_2)}
+            )
+            token = _build_tenant_token(user, self.tenant, alias)
+            access_token = str(token.access_token)
+
+        auth_client = APIClient()
+        auth_client.credentials(HTTP_AUTHORIZATION=f'Bearer {access_token}')
+
+        with patch('apps.tenant_core.services_meta_graph.MetaGraphClient.fetch_form_details') as mock_fetch:
+            mock_fetch.return_value = {
+                'id': target_form_id,
+                'name': 'Sample Form Page 2',
+                'questions': [{'key': 'email', 'label': 'Email Address', 'type': 'EMAIL'}]
+            }
+            res = auth_client.get(f'/api/v1/tenant/meta-lead-mappings/form-fields/?page_id={page_2_id}&form_id={target_form_id}')
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(len(res.data.get('questions', [])), 1)
+
+            # Assert fetch_form_details was called with token_2 (not token_1)
+            mock_fetch.assert_called_once_with(target_form_id, token_2)
+            self.assertNotEqual(mock_fetch.call_args[0][1], token_1)
 
