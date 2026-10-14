@@ -32,6 +32,8 @@ from .models_memberships import (
     MembershipChangePolicyRule,
     MembershipChangeRequest,
     MembershipPackageHistory,
+    MembershipExtension,
+    MembershipPolicyConfig,
 )
 from .models_org import Branch
 from .models_users import TenantUser
@@ -413,6 +415,197 @@ class MembershipLifecycleService:
     restore_entitlement = reverse_entitlement
 
     @classmethod
+    def get_policy_config(
+        cls,
+        organization=None,
+        db_alias: Optional[str] = None,
+    ) -> MembershipPolicyConfig:
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        from .models_org import Organization
+        org = organization
+        if not org:
+            org = Organization.objects.using(alias).filter(status='ACTIVE').order_by('-created_at').first()
+        if not org:
+            org = Organization.objects.using(alias).first()
+
+        config, _ = MembershipPolicyConfig.objects.using(alias).get_or_create(
+            organization=org,
+            defaults={
+                'extension_per_day_fee': Decimal('50.00'),
+                'extension_activation_fee': Decimal('200.00'),
+                'extension_min_days': 1,
+                'extension_max_days': 90,
+                'extension_requires_remaining_sessions': True,
+                'freeze_per_day_fee': Decimal('25.00'),
+                'freeze_min_days': 3,
+                'freeze_max_days': 60,
+                'freeze_max_count_per_cycle': 3,
+            }
+        )
+        return config
+
+    @classmethod
+    def check_remaining_sessions(
+        cls,
+        membership: Membership,
+        db_alias: Optional[str] = None,
+    ) -> Tuple[bool, Decimal]:
+        """
+        Calculates remaining session units across active entitlements.
+        Returns (has_remaining: bool, remaining_sessions: Decimal).
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        ents = membership.entitlements.using(alias).all()
+        if not ents.exists():
+            return False, Decimal('0.00')
+        total = Decimal('0.00')
+        has_unlimited = False
+        for e in ents:
+            if getattr(e, 'is_unlimited', False):
+                has_unlimited = True
+                break
+            rem = e.remaining_units
+            if rem and rem > Decimal('0.00'):
+                total += rem
+        if has_unlimited:
+            return True, Decimal('999999')
+        return (total > Decimal('0.00')), total
+
+    @classmethod
+    def calculate_freeze(
+        cls,
+        membership: Membership,
+        freeze_from: date,
+        freeze_until: date,
+        db_alias: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Quotes and validates a prospective membership freeze window against tenant policy.
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        config = cls.get_policy_config(membership.organization, db_alias=alias)
+
+        if freeze_until < freeze_from:
+            return {
+                'membership_id': str(membership.id),
+                'can_freeze': False,
+                'error': "Freeze end date must be on or after freeze start date.",
+            }
+
+        freeze_days = (freeze_until - freeze_from).days + 1
+
+        if freeze_days < config.freeze_min_days:
+            return {
+                'membership_id': str(membership.id),
+                'can_freeze': False,
+                'error': f"Minimum freeze duration is {config.freeze_min_days} day(s). Selected: {freeze_days} day(s).",
+            }
+
+        if freeze_days > config.freeze_max_days:
+            return {
+                'membership_id': str(membership.id),
+                'can_freeze': False,
+                'error': f"Maximum freeze duration is {config.freeze_max_days} day(s). Selected: {freeze_days} day(s).",
+            }
+
+        past_freezes_count = MembershipFreeze.objects.using(alias).filter(
+            membership=membership,
+            status__in=['ACTIVE', 'COMPLETED', 'SCHEDULED']
+        ).count()
+        if past_freezes_count >= config.freeze_max_count_per_cycle:
+            return {
+                'membership_id': str(membership.id),
+                'can_freeze': False,
+                'error': f"Maximum allowed freezes ({config.freeze_max_count_per_cycle}) reached for this package.",
+            }
+
+        fee_per_day = config.freeze_per_day_fee
+        total_fee = fee_per_day * Decimal(freeze_days)
+        new_end_date = membership.end_date + timedelta(days=freeze_days)
+
+        return {
+            'membership_id': str(membership.id),
+            'membership_number': membership.membership_number,
+            'current_end_date': membership.end_date.isoformat(),
+            'freeze_from': freeze_from.isoformat(),
+            'freeze_until': freeze_until.isoformat(),
+            'freeze_days': freeze_days,
+            'fee_per_day': str(fee_per_day),
+            'total_fee': str(total_fee),
+            'new_end_date': new_end_date.isoformat(),
+            'can_freeze': True,
+            'error': None,
+        }
+
+    @classmethod
+    def auto_sync_freeze_status(
+        cls,
+        membership: Membership,
+        db_alias: Optional[str] = None,
+    ) -> Membership:
+        """
+        Auto-reconciles freeze status:
+        - If today > freeze_until for any ACTIVE freeze, marks it COMPLETED.
+        - If today >= freeze_from and <= freeze_until for a SCHEDULED freeze, marks it ACTIVE and membership FROZEN.
+        - If membership is FROZEN but has no active freezes today, restores status to ACTIVE.
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        today = timezone.now().date()
+
+        # Mark past active freezes as COMPLETED
+        past_freezes = MembershipFreeze.objects.using(alias).filter(
+            membership=membership,
+            status='ACTIVE',
+            freeze_until__lt=today,
+        )
+        if past_freezes.exists():
+            past_freezes.update(status='COMPLETED')
+
+        # Activate scheduled freezes whose start date has arrived
+        due_scheduled = MembershipFreeze.objects.using(alias).filter(
+            membership=membership,
+            status='SCHEDULED',
+            freeze_from__lte=today,
+            freeze_until__gte=today,
+        )
+        if due_scheduled.exists():
+            due_scheduled.update(status='ACTIVE')
+            if membership.status != 'FROZEN':
+                old_status = membership.status
+                membership.status = 'FROZEN'
+                membership.save(using=alias, update_fields=['status', 'updated_at'])
+                MembershipStatusHistory.objects.using(alias).create(
+                    membership=membership,
+                    from_status=old_status,
+                    to_status='FROZEN',
+                    reason_code='FREEZE_AUTO_ACTIVATED',
+                    reason_text=f"Scheduled freeze became active on {today}.",
+                )
+            return membership
+
+        # If membership is FROZEN but no freeze is active today, restore ACTIVE status
+        if membership.status == 'FROZEN':
+            active_freeze_today = MembershipFreeze.objects.using(alias).filter(
+                membership=membership,
+                status='ACTIVE',
+                freeze_from__lte=today,
+                freeze_until__gte=today,
+            ).exists()
+            if not active_freeze_today:
+                old_status = membership.status
+                membership.status = 'ACTIVE'
+                membership.save(using=alias, update_fields=['status', 'updated_at'])
+                MembershipStatusHistory.objects.using(alias).create(
+                    membership=membership,
+                    from_status=old_status,
+                    to_status='ACTIVE',
+                    reason_code='FREEZE_AUTO_RESUMED',
+                    reason_text=f"Freeze window concluded on {today}. Booking and attendance access automatically resumed.",
+                )
+
+        return membership
+
+    @classmethod
     @transaction.atomic
     def apply_freeze(
         cls,
@@ -424,18 +617,21 @@ class MembershipLifecycleService:
         db_alias: Optional[str] = None,
     ) -> MembershipFreeze:
         """
-        Applies a membership freeze, calculates extended days, and extends the membership end date.
+        Applies a membership freeze, calculates freeze fee, extends membership end date,
+        and enforces strict class booking lockout during the freeze window.
         """
         alias = db_alias or get_current_tenant_db_alias() or 'default'
+        calc = cls.calculate_freeze(membership, freeze_from, freeze_until, db_alias=alias)
+        if not calc.get('can_freeze'):
+            raise ValidationError(calc.get('error') or "Cannot freeze membership.")
 
-        if freeze_until <= freeze_from:
-            raise ValidationError("Freeze end date must be after freeze start date.")
-
-        freeze_days = (freeze_until - freeze_from).days
+        freeze_days = calc['freeze_days']
+        fee_per_day = Decimal(calc['fee_per_day'])
+        total_fee = Decimal(calc['total_fee'])
+        new_end = date.fromisoformat(calc['new_end_date'])
 
         # Extend membership end_date
         old_end = membership.end_date
-        new_end = old_end + timedelta(days=freeze_days)
         membership.end_date = new_end
 
         today = timezone.now().date()
@@ -447,6 +643,12 @@ class MembershipLifecycleService:
 
         membership.save(using=alias, update_fields=['end_date', 'status', 'updated_at'])
 
+        # Extend active and expired entitlements valid_until by freeze_days
+        end_dt = timezone.make_aware(datetime.combine(new_end, datetime.max.time()))
+        membership.entitlements.using(alias).filter(status__in=['ACTIVE', 'EXPIRED']).update(
+            valid_until=end_dt
+        )
+
         freeze = MembershipFreeze.objects.using(alias).create(
             membership=membership,
             freeze_from=freeze_from,
@@ -454,6 +656,9 @@ class MembershipLifecycleService:
             reason_code='MEMBER_REQUEST',
             reason_text=reason_text,
             extend_membership_days=freeze_days,
+            fee_per_day=fee_per_day,
+            total_fee=total_fee,
+            payment_status='PAID',
             status='ACTIVE' if is_active_now else 'SCHEDULED',
             approved_by_user=approved_by_user,
         )
@@ -464,7 +669,11 @@ class MembershipLifecycleService:
                 from_status=old_status,
                 to_status='FROZEN',
                 reason_code='FREEZE_APPLIED',
-                reason_text=f"Frozen from {freeze_from} to {freeze_until}. Extended end date by {freeze_days} days to {new_end}.",
+                reason_text=(
+                    f"Frozen from {freeze_from} to {freeze_until}. "
+                    f"Extended end date by {freeze_days} days from {old_end} to {new_end}. "
+                    f"Freeze fee: ₹{total_fee} (₹{fee_per_day}/day x {freeze_days} days)."
+                ),
                 changed_by_user=approved_by_user,
             )
 
@@ -725,6 +934,84 @@ class MembershipLifecycleService:
         return membership
 
     @classmethod
+    def calculate_extension(
+        cls,
+        membership: Membership,
+        days: int,
+        db_alias: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Quotes and validates a prospective package validity extension against tenant policy.
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        config = cls.get_policy_config(membership.organization, db_alias=alias)
+
+        if days <= 0:
+            return {
+                'membership_id': str(membership.id),
+                'can_extend': False,
+                'error': "Extension days must be greater than zero.",
+            }
+
+        if days < config.extension_min_days:
+            return {
+                'membership_id': str(membership.id),
+                'can_extend': False,
+                'error': f"Minimum extension duration is {config.extension_min_days} day(s).",
+            }
+
+        if days > config.extension_max_days:
+            return {
+                'membership_id': str(membership.id),
+                'can_extend': False,
+                'error': f"Maximum extension duration is {config.extension_max_days} day(s).",
+            }
+
+        # Check remaining sessions
+        has_remaining, remaining_sessions = cls.check_remaining_sessions(membership, db_alias=alias)
+        if config.extension_requires_remaining_sessions and not has_remaining:
+            return {
+                'membership_id': str(membership.id),
+                'membership_number': membership.membership_number,
+                'status': membership.status,
+                'is_expired': (membership.status == 'EXPIRED' or membership.end_date < timezone.now().date()),
+                'current_end_date': membership.end_date.isoformat(),
+                'new_end_date': None,
+                'days': days,
+                'fee_per_day': str(config.extension_per_day_fee),
+                'activation_fee': str(config.extension_activation_fee),
+                'total_fee': '0.00',
+                'remaining_sessions': str(remaining_sessions),
+                'can_extend': False,
+                'error': "Cannot extend package: no remaining sessions left for consumption. Members can only extend if they have unused sessions.",
+            }
+
+        today = timezone.now().date()
+        is_expired = (membership.status == 'EXPIRED' or membership.end_date < today)
+        fee_per_day = config.extension_per_day_fee
+        activation_fee = config.extension_activation_fee if is_expired else Decimal('0.00')
+        total_fee = activation_fee + (fee_per_day * Decimal(days))
+
+        base_date = max(membership.end_date, today)
+        new_end_date = base_date + timedelta(days=days)
+
+        return {
+            'membership_id': str(membership.id),
+            'membership_number': membership.membership_number,
+            'status': membership.status,
+            'is_expired': is_expired,
+            'current_end_date': membership.end_date.isoformat(),
+            'new_end_date': new_end_date.isoformat(),
+            'days': days,
+            'fee_per_day': str(fee_per_day),
+            'activation_fee': str(activation_fee),
+            'total_fee': str(total_fee),
+            'remaining_sessions': 'Unlimited' if remaining_sessions == Decimal('999999') else str(remaining_sessions),
+            'can_extend': True,
+            'error': None,
+        }
+
+    @classmethod
     @transaction.atomic
     def extend_membership(
         cls,
@@ -733,34 +1020,83 @@ class MembershipLifecycleService:
         reason_text: Optional[str] = None,
         approved_by_user: Optional[TenantUser] = None,
         db_alias: Optional[str] = None,
-    ) -> Membership:
+    ) -> Tuple[Membership, MembershipExtension]:
         """
         Extends the validity end date of a membership by N days.
+        Enforces:
+        - Prerequisite: Only works when there are sessions left for consumption.
+        - If active: charges per-day fee * days.
+        - If already expired: charges activation fee + (per-day fee * days), reactivates membership and entitlements.
+        - Records MembershipExtension and full audit history.
         """
         alias = db_alias or get_current_tenant_db_alias() or 'default'
-        if days <= 0:
-            raise ValidationError("Extension days must be greater than zero.")
+        calc = cls.calculate_extension(membership, days, db_alias=alias)
+        if not calc.get('can_extend'):
+            raise ValidationError(calc.get('error') or "Cannot extend membership.")
 
         old_end = membership.end_date
-        new_end = old_end + timedelta(days=days)
+        old_status = membership.status
+        was_expired = calc['is_expired']
+        new_end = date.fromisoformat(calc['new_end_date'])
+        fee_per_day = Decimal(calc['fee_per_day'])
+        activation_fee = Decimal(calc['activation_fee'])
+        total_fee = Decimal(calc['total_fee'])
+        rem_sessions = Decimal(calc['remaining_sessions']) if calc['remaining_sessions'] != 'Unlimited' else Decimal('999999')
+
         membership.end_date = new_end
-        old_st = membership.status
-        if membership.status == 'EXPIRED' and new_end >= timezone.now().date():
+        if membership.status == 'EXPIRED' or was_expired:
             membership.status = 'ACTIVE'
         membership.save(using=alias, update_fields=['end_date', 'status', 'updated_at'])
 
+        # Update valid_until on active and expired entitlements
         end_dt = timezone.make_aware(datetime.combine(new_end, datetime.max.time()))
-        membership.entitlements.filter(status__in=['ACTIVE', 'EXPIRED']).update(valid_until=end_dt, status='ACTIVE')
+        membership.entitlements.using(alias).filter(status__in=['ACTIVE', 'EXPIRED']).update(
+            valid_until=end_dt,
+            status='ACTIVE'
+        )
 
+        # Record append-only extension audit and fee entry
+        extension = MembershipExtension.objects.using(alias).create(
+            membership=membership,
+            days=days,
+            fee_per_day=fee_per_day,
+            activation_fee=activation_fee,
+            total_fee=total_fee,
+            was_expired=was_expired,
+            sessions_remaining_at_extension=rem_sessions,
+            previous_end_date=old_end,
+            new_end_date=new_end,
+            reason_text=reason_text or f"Extended by {days} days from {old_end} to {new_end}.",
+            created_by_user=approved_by_user,
+        )
+
+        # Status History
         MembershipStatusHistory.objects.using(alias).create(
             membership=membership,
-            from_status=old_st,
+            from_status=old_status,
             to_status=membership.status,
             reason_code='EXTENSION_APPLIED',
-            reason_text=reason_text or f"Extended by {days} days from {old_end} to {new_end}.",
+            reason_text=(
+                f"Extended by {days} days from {old_end} to {new_end}. "
+                f"Fee: ₹{total_fee} (Activation: ₹{activation_fee}, Per-day: ₹{fee_per_day} x {days}). "
+                f"{reason_text or ''}".strip()
+            ),
             changed_by_user=approved_by_user,
         )
-        return membership
+
+        # Package History
+        MembershipPackageHistory.objects.using(alias).create(
+            membership=membership,
+            from_package=membership.package,
+            from_package_version=membership.package_version,
+            to_package=membership.package,
+            to_package_version=membership.package_version,
+            change_type='EXTENSION',
+            changed_by_user=approved_by_user,
+            reason=f"Validity extended by {days} days to {new_end}. Total fee: ₹{total_fee}.",
+        )
+
+        return membership, extension
 
     @classmethod
     @transaction.atomic

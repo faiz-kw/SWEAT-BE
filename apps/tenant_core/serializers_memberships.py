@@ -16,6 +16,8 @@ from .models_memberships import (
     MembershipChangePolicyRule,
     MembershipChangeRequest,
     MembershipPackageHistory,
+    MembershipExtension,
+    MembershipPolicyConfig,
 )
 
 
@@ -164,6 +166,8 @@ class MembershipStatusHistorySerializer(serializers.ModelSerializer):
 
 
 class MembershipFreezeSerializer(serializers.ModelSerializer):
+    approved_by_name = serializers.SerializerMethodField()
+
     class Meta:
         model = MembershipFreeze
         fields = [
@@ -174,12 +178,21 @@ class MembershipFreezeSerializer(serializers.ModelSerializer):
             'reason_code',
             'reason_text',
             'extend_membership_days',
+            'fee_per_day',
+            'total_fee',
+            'payment_status',
             'status',
             'approved_by_user',
+            'approved_by_name',
             'created_at',
             'updated_at',
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def get_approved_by_name(self, obj) -> str:
+        if obj.approved_by_user:
+            return f"{obj.approved_by_user.first_name or ''} {obj.approved_by_user.last_name or ''}".strip() or obj.approved_by_user.email
+        return ''
 
 
 class MembershipRenewalPolicySerializer(serializers.ModelSerializer):
@@ -425,3 +438,77 @@ class FreezeRequestSerializer(serializers.Serializer):
     freeze_from = serializers.DateField()
     freeze_until = serializers.DateField()
     reason_text = serializers.CharField(required=False, allow_blank=True, default='')
+
+
+class MembershipExtensionSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MembershipExtension
+        fields = [
+            'id',
+            'membership',
+            'days',
+            'fee_per_day',
+            'activation_fee',
+            'total_fee',
+            'was_expired',
+            'sessions_remaining_at_extension',
+            'previous_end_date',
+            'new_end_date',
+            'reason_text',
+            'created_by_user',
+            'created_by_name',
+            'created_at',
+        ]
+        read_only_fields = ['id', 'created_at']
+
+    def get_created_by_name(self, obj) -> str:
+        if obj.created_by_user:
+            return f"{obj.created_by_user.first_name or ''} {obj.created_by_user.last_name or ''}".strip() or obj.created_by_user.email
+        return ''
+
+
+class MembershipPolicyConfigSerializer(serializers.ModelSerializer):
+    updated_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MembershipPolicyConfig
+        fields = [
+            'id',
+            'organization',
+            'extension_per_day_fee',
+            'extension_activation_fee',
+            'extension_min_days',
+            'extension_max_days',
+            'extension_requires_remaining_sessions',
+            'freeze_per_day_fee',
+            'freeze_min_days',
+            'freeze_max_days',
+            'freeze_max_count_per_cycle',
+            'updated_by_user',
+            'updated_by_name',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
+
+    def get_updated_by_name(self, obj) -> str:
+        if obj.updated_by_user:
+            return f"{obj.updated_by_user.first_name or ''} {obj.updated_by_user.last_name or ''}".strip() or obj.updated_by_user.email
+        return ''
+
+
+class ExtendMembershipRequestSerializer(serializers.Serializer):
+    days = serializers.IntegerField(min_value=1)
+    reason_text = serializers.CharField(required=False, allow_blank=True, default='')
+
+
+class CalculateExtensionRequestSerializer(serializers.Serializer):
+    days = serializers.IntegerField(min_value=1)
+
+
+class CalculateFreezeRequestSerializer(serializers.Serializer):
+    freeze_from = serializers.DateField()
+    freeze_until = serializers.DateField()
+

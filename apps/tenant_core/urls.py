@@ -133,6 +133,8 @@ from .views_memberships import (
     MembershipChangePolicyViewSet,
     MembershipChangeRequestViewSet,
     MembershipBranchHistoryViewSet,
+    MembershipExtensionViewSet,
+    MembershipPolicyConfigViewSet,
 )
 from .views_members import MemberViewSet
 from .views_bookings import (
@@ -193,6 +195,8 @@ router.register(r'membership-renewal-policies', MembershipRenewalPolicyViewSet, 
 router.register(r'membership-change-policies', MembershipChangePolicyViewSet, basename='membership-change-policy')
 router.register(r'membership-change-requests', MembershipChangeRequestViewSet, basename='membership-change-request')
 router.register(r'membership-branch-histories', MembershipBranchHistoryViewSet, basename='membership-branch-history')
+router.register(r'membership-extensions', MembershipExtensionViewSet, basename='membership-extension')
+router.register(r'membership-policy-configs', MembershipPolicyConfigViewSet, basename='membership-policy-config')
 
 router.register(r'discount-campaigns', DiscountCampaignViewSet, basename='discount-campaign')
 router.register(r'discount-codes', DiscountCodeViewSet, basename='discount-code')

@@ -334,7 +334,7 @@ from rest_framework.pagination import PageNumberPagination
 
 
 class ConfigurablePageNumberPagination(PageNumberPagination):
-    page_size = 50
+    page_size = 20
     page_size_query_param = 'page_size'
     max_page_size = 1000
 
@@ -464,6 +464,9 @@ class LeadViewSet(viewsets.ModelViewSet):
         'book_trial': 'crm.leads.edit',
         'call': 'crm.leads.edit',
         'metadata': 'crm.leads.view',
+        'summary_metrics': 'crm.leads.view',
+        'summary_metrics_underscore': 'crm.leads.view',
+        'offers': 'crm.leads.view',
         'eligible_agents': 'crm.leads.view',
         'eligible_assignees': 'crm.leads.view',
         'search_referrers': 'crm.leads.view',
@@ -507,8 +510,17 @@ class LeadViewSet(viewsets.ModelViewSet):
             qs = qs.filter(Q(branch_id__in=permitted_branches) | Q(assigned_sales_user=self.request.user))
 
         status_val = self.request.query_params.get('current_status')
-        if status_val:
-            qs = qs.filter(current_status=status_val)
+        if status_val and status_val not in ('all', 'ALL'):
+            if status_val == 'TRIAL_BOOKED':
+                qs = qs.filter(Q(current_status__in=['TRIAL_BOOKED', 'TRIAL_CONFIRMED', 'TRIAL_ATTENDED']) | Q(trial_bookings__isnull=False)).distinct()
+            elif status_val == 'CONVERTED':
+                qs = qs.filter(current_status__in=['CONVERTED', 'DEAL_DONE', 'SUBSCRIBED'])
+            elif status_val == 'INTERESTED':
+                qs = qs.filter(current_status__in=['INTERESTED', 'NEW_DEAL', 'CONVERSATION'])
+            elif status_val in ('LOST', 'NOT_INTERESTED'):
+                qs = qs.filter(current_status__in=['LOST', 'NOT_INTERESTED', 'DEAL_FAILED', 'ARCHIVED'])
+            else:
+                qs = qs.filter(current_status=status_val)
 
         branch_ids_param = self.request.query_params.get('branch_ids')
         branch_id = self.request.query_params.get('branch_id') or self.request.query_params.get('branch')
@@ -680,6 +692,75 @@ class LeadViewSet(viewsets.ModelViewSet):
             {'error': 'Permanent deletion of leads is not permitted. Transition status to LOST or NOT_INTERESTED instead.'},
             status=status.HTTP_400_BAD_REQUEST,
         )
+
+    @action(detail=False, methods=['get'], url_path='summary-metrics')
+    def summary_metrics(self, request):
+        """
+        Lightweight aggregate SQL counts for CRM summary tiles (Total Leads, Active Inquiries, Trial, Converted).
+        Executes dynamically based on active filters (branch, date range, search, sales user, source, etc.).
+        """
+        from django.db.models import Count, Q
+        alias = _get_db(request)
+        base_qs = self.filter_queryset(self.get_queryset())
+
+        inquiries_q = Q(current_status__in=['NEW_LEAD', 'INTERESTED', 'HOT_LEAD', 'FOLLOW_UP_PENDING', 'NEW_DEAL', 'CONVERSATION'])
+        trials_q = Q(current_status__in=['TRIAL_BOOKED', 'TRIAL_CONFIRMED', 'TRIAL_ATTENDED'])
+        converted_q = Q(current_status__in=['CONVERTED', 'DEAL_DONE', 'SUBSCRIBED'])
+
+        status_val = request.query_params.get('current_status')
+        if status_val and status_val not in ('all', 'ALL'):
+            total_count = base_qs.count()
+            if status_val == 'CONVERTED':
+                converted_count = total_count
+                inquiries_count = 0
+                trials_count = 0
+            elif status_val in ('TRIAL_BOOKED', 'TRIAL_CONFIRMED', 'TRIAL_ATTENDED'):
+                trials_count = total_count
+                inquiries_count = 0
+                converted_count = 0
+            elif status_val in ('NEW_LEAD', 'INTERESTED', 'HOT_LEAD', 'FOLLOW_UP_PENDING', 'NEW_DEAL', 'CONVERSATION'):
+                inquiries_count = total_count
+                trials_count = 0
+                converted_count = 0
+            else:
+                inquiries_count = base_qs.filter(inquiries_q).count()
+                trials_count = base_qs.filter(trials_q).count()
+                converted_count = base_qs.filter(converted_q).count()
+        else:
+            agg = base_qs.aggregate(
+                total=Count('id'),
+                inquiries=Count('id', filter=inquiries_q),
+                trials_status=Count('id', filter=trials_q),
+                converted=Count('id', filter=converted_q),
+            )
+            total_count = agg['total'] or 0
+            inquiries_count = agg['inquiries'] or 0
+            converted_count = agg['converted'] or 0
+
+            org = _get_org(request)
+            branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
+            tb_qs = TrialBooking.objects.using(alias)
+            if org:
+                tb_qs = tb_qs.filter(lead__organization=org)
+            permitted_branches = get_user_effective_branch_ids(request.user, alias)
+            if permitted_branches is not None:
+                tb_qs = tb_qs.filter(branch_id__in=permitted_branches)
+            if branch_id and branch_id not in ('all', 'ALL'):
+                tb_qs = tb_qs.filter(branch_id=branch_id)
+
+            trials_count = max(agg['trials_status'] or 0, tb_qs.count())
+
+        return Response({
+            'total': total_count,
+            'inquiries': inquiries_count,
+            'trials': trials_count,
+            'converted': converted_count,
+            'sla_breaches': 0,
+        })
+
+    @action(detail=False, methods=['get'], url_path='summary_metrics')
+    def summary_metrics_underscore(self, request):
+        return self.summary_metrics(request)
 
     @action(detail=False, methods=['get'], url_path='metadata')
     def metadata(self, request):
@@ -2252,6 +2333,7 @@ class IntakeSubmissionViewSet(viewsets.ReadOnlyModelViewSet):
 
 class TrialBookingViewSet(viewsets.ModelViewSet):
     serializer_class = TrialBookingSerializer
+    pagination_class = ConfigurablePageNumberPagination
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
     required_module = 'crm'
     required_submodule = 'leads'
@@ -3806,7 +3888,15 @@ class CRMDashboardViewSet(viewsets.ViewSet):
         if not org:
             return Response({'error': 'Organization not found'}, status=400)
 
+        from django.core.cache import cache
         from .services_crm_dashboard import CRMDashboardService
+
+        # 60-second Redis cache key based on org, user, and active query filters
+        query_sig = '&'.join(f"{k}={v}" for k, v in sorted(request.query_params.items()))
+        cache_key = f"crm_dash:{alias}:{org.id}:{getattr(request.user, 'id', 'anon')}:{query_sig}"
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return Response(cached_data)
 
         try:
             data = CRMDashboardService.get_dashboard_data(
@@ -3815,6 +3905,8 @@ class CRMDashboardViewSet(viewsets.ViewSet):
                 filters=request.query_params,
                 db_alias=alias,
             )
+            # Cache for 60 seconds
+            cache.set(cache_key, data, timeout=60)
             return Response(data)
         except PermissionDenied as e:
             return Response({'error': str(e)}, status=403)
@@ -3823,7 +3915,6 @@ class CRMDashboardViewSet(viewsets.ViewSet):
         except Exception as e:
             logger.exception("CRM Dashboard aggregation failed")
             return Response({'error': 'Failed to load CRM dashboard metrics'}, status=500)
-
 
 class InAppNotificationViewSet(viewsets.ModelViewSet):
     serializer_class = InAppNotificationSerializer

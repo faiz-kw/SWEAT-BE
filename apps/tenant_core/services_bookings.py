@@ -349,17 +349,35 @@ class BookingWaitlistAttendanceService:
                     'reason_code': 'PAYMENT_APPROVAL_PENDING_LIMIT_REACHED',
                     'reason_message': 'Cash payment approval is still pending and provisional session limit has been reached.',
                 }
-            if membership.status != 'ACTIVE':
+            from .services_memberships import MembershipLifecycleService
+            MembershipLifecycleService.auto_sync_freeze_status(membership, db_alias=alias)
+
+            occ_date = occurrence.start_at.date() if occurrence.start_at else now.date()
+            from .models_memberships import MembershipFreeze
+            matching_freeze = MembershipFreeze.objects.using(alias).filter(
+                membership=membership,
+                status__in=['ACTIVE', 'SCHEDULED'],
+                freeze_from__lte=occ_date,
+                freeze_until__gte=occ_date,
+            ).first()
+            if matching_freeze:
+                return {
+                    'eligible': False,
+                    'reason_code': 'MEMBERSHIP_FROZEN',
+                    'reason_message': f"Membership is frozen from {matching_freeze.freeze_from} to {matching_freeze.freeze_until}. No class bookings allowed during the freeze window.",
+                }
+
+            if membership.status not in ('ACTIVE', 'FROZEN'):
                 return {
                     'eligible': False,
                     'reason_code': 'MEMBERSHIP_INACTIVE',
-                    'reason_message': 'Selected membership is not active.',
+                    'reason_message': f"Selected membership is {membership.status}.",
                 }
-            if membership.end_date and membership.end_date < now.date():
+            if membership.end_date and membership.end_date < occ_date:
                 return {
                     'eligible': False,
                     'reason_code': 'MEMBERSHIP_EXPIRED',
-                    'reason_message': 'Selected membership has expired.',
+                    'reason_message': f"Selected membership expires on {membership.end_date}, before class date {occ_date}.",
                 }
             if membership.end_date and occurrence.start_at and membership.end_date < occurrence.start_at.date():
                 return {
@@ -625,21 +643,38 @@ class BookingWaitlistAttendanceService:
             units_to_consume = Decimal('1.00')
             ent_type_filter = None
             if booking_type == 'MEMBER':
+                occ_date = occurrence.start_at.date() if occurrence.start_at else timezone.now().date()
                 if not membership:
                     membership = Membership.objects.using(alias).filter(
                         user_profile=user_profile,
-                        status='ACTIVE',
-                        end_date__gte=timezone.now().date()
+                        status__in=['ACTIVE', 'FROZEN'],
+                        end_date__gte=occ_date
                     ).first()
 
                 if not membership:
                     raise ValidationError("Active membership required for member class booking.")
 
-                if membership.status != 'ACTIVE':
+                from .services_memberships import MembershipLifecycleService
+                MembershipLifecycleService.auto_sync_freeze_status(membership, db_alias=alias)
+
+                from .models_memberships import MembershipFreeze
+                matching_freeze = MembershipFreeze.objects.using(alias).filter(
+                    membership=membership,
+                    status__in=['ACTIVE', 'SCHEDULED'],
+                    freeze_from__lte=occ_date,
+                    freeze_until__gte=occ_date,
+                ).first()
+                if matching_freeze:
+                    raise ValidationError(
+                        f"Membership is frozen from {matching_freeze.freeze_from} to {matching_freeze.freeze_until}. "
+                        "No class bookings allowed during the freeze window."
+                    )
+
+                if membership.status not in ('ACTIVE', 'FROZEN'):
                     raise ValidationError(f"Membership is in '{membership.status}' status (must be ACTIVE).")
 
-                if membership.end_date < timezone.now().date():
-                    raise ValidationError("Membership has expired.")
+                if membership.end_date < occ_date:
+                    raise ValidationError(f"Membership expires on {membership.end_date}, before class date {occ_date}.")
 
                 if occurrence.start_at and membership.end_date < occurrence.start_at.date():
                     raise ValidationError(f"Membership expires on {membership.end_date}, before the class date {occurrence.start_at.date()}.")

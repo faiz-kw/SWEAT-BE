@@ -1749,6 +1749,12 @@ class MemberViewSet(viewsets.ViewSet):
             profile.user.save(using=alias)
         if 'gender' in data:
             profile.gender = data['gender']
+            if profile.user:
+                profile.user.gender = data['gender']
+                profile.user.save(using=alias)
+        if 'date_of_birth' in data and profile.user:
+            profile.user.date_of_birth = data['date_of_birth']
+            profile.user.save(using=alias)
         if 'status' in data:
             st = str(data['status']).upper()
             profile.member_status = 'ACTIVE' if 'ACT' in st else ('FROZEN' if 'FROZ' in st else 'INACTIVE')
@@ -1757,6 +1763,9 @@ class MemberViewSet(viewsets.ViewSet):
             branch = Branch.objects.using(alias).filter(id=loc_id).first()
             if branch:
                 profile.preferred_branch = branch
+                if profile.user:
+                    profile.user.home_branch = branch
+                    profile.user.save(using=alias)
         if 'emergencyContact' in data or 'emergency_contact' in data:
             c = data.get('emergencyContact') or data.get('emergency_contact')
             profile.emergency_contact_json = {'contact': c}
@@ -1856,11 +1865,45 @@ class MemberViewSet(viewsets.ViewSet):
             )
 
             payment_provider = request.data.get('payment_provider', 'CARD')
-            payment_method = request.data.get('payment_method', 'CARD')
             is_cash = str(payment_provider).upper() == 'CASH' or str(payment_method).upper() == 'CASH'
+            is_link = str(payment_provider).upper() in ('PAYMENT_LINK', 'LINK') or str(payment_method).upper() in ('PAYMENT_LINK', 'LINK')
             payment_amount = request.data.get('payment_amount')
             pay_amt = Decimal(str(payment_amount)) if payment_amount is not None else order.total_amount
             carry_forward = request.data.get('carry_forward', True)
+
+            if is_link:
+                link = CommerceService.create_payment_link(
+                    order_id=str(order.id),
+                    expiry_hours=48,
+                    actor=request.user,
+                    db_alias=alias,
+                )
+                order_item = order.items.first()
+                new_membership = MembershipLifecycleService.activate_membership_from_order(
+                    order=order,
+                    order_item=order_item,
+                    start_date=renewal_start,
+                    db_alias=alias,
+                    created_by_user=request.user,
+                )
+                new_membership.status = 'PENDING_PAYMENT'
+                new_membership.legacy_reference = f"PAYMENT_LINK:{link.id}"
+                new_membership.save(using=alias, update_fields=['status', 'legacy_reference', 'updated_at'])
+                new_membership.entitlements.using(alias).update(status='INACTIVE')
+
+                return Response({
+                    'success': True,
+                    'status': 'PAYMENT_LINK_GENERATED',
+                    'message': f"Renewal order {order.order_number} created. Payment link generated.",
+                    'payment_url': link.payment_url,
+                    'payment_link_id': str(link.id),
+                    'order_id': str(order.id),
+                    'order_number': order.order_number,
+                    'amount': str(order.total_amount),
+                    'old_membership_id': str(active_m.id),
+                    'new_membership_id': str(new_membership.id),
+                    'member': serialize_member(profile, alias),
+                }, status=status.HTTP_201_CREATED)
 
             if is_cash and pay_amt > Decimal('0.00'):
                 txn = PaymentTransaction.objects.using(alias).create(
@@ -2520,8 +2563,43 @@ class MemberViewSet(viewsets.ViewSet):
                 db_alias=alias,
             )
 
-            # Record payment if provided
+            is_link = str(payment_provider).upper() in ('PAYMENT_LINK', 'LINK') or str(payment_method).upper() in ('PAYMENT_LINK', 'LINK')
             pay_amt = Decimal(str(payment_amount)) if payment_amount is not None else order.total_amount
+
+            if is_link:
+                link = CommerceService.create_payment_link(
+                    order_id=str(order.id),
+                    expiry_hours=48,
+                    actor=request.user,
+                    db_alias=alias,
+                )
+                order_item = order.items.first()
+                membership = MembershipLifecycleService.activate_membership_from_order(
+                    order=order,
+                    order_item=order_item,
+                    start_date=timezone.now().date(),
+                    db_alias=alias,
+                    created_by_user=request.user,
+                )
+                membership.status = 'PENDING_PAYMENT'
+                membership.legacy_reference = f"PAYMENT_LINK:{link.id}"
+                membership.save(using=alias, update_fields=['status', 'legacy_reference', 'updated_at'])
+                membership.entitlements.using(alias).update(status='INACTIVE')
+
+                return Response({
+                    'success': True,
+                    'status': 'PAYMENT_LINK_GENERATED',
+                    'message': f"Order {order.order_number} created for {package.name}. Payment link generated.",
+                    'payment_url': link.payment_url,
+                    'payment_link_id': str(link.id),
+                    'order_id': str(order.id),
+                    'order_number': order.order_number,
+                    'amount': str(order.total_amount),
+                    'membership_id': str(membership.id),
+                    'member': serialize_member(profile, alias),
+                }, status=status.HTTP_201_CREATED)
+
+            # Record payment if provided
             if pay_amt > Decimal('0.00'):
                 CommerceService.record_payment(
                     order_id=str(order.id),

@@ -138,7 +138,7 @@ class LeadSerializer(serializers.ModelSerializer):
         # Converted member linking and canonical action eligibility
         alias = getattr(getattr(instance, '_state', None), 'db', None) or 'default'
         is_converted = (
-            instance.current_status == 'CONVERTED'
+            instance.current_status in ('CONVERTED', 'DEAL_DONE', 'SUBSCRIBED')
             or getattr(instance, 'converted_user_profile_id', None) is not None
         )
         if not is_converted and instance.current_status not in ('LOST', 'NOT_INTERESTED'):
@@ -172,6 +172,16 @@ class LeadSerializer(serializers.ModelSerializer):
                         'full_name': f"{fname} {lname}".strip() or getattr(p, 'member_number', 'Member'),
                         'conversion_id': None,
                         'membership_id': None,
+                    }
+                elif instance.current_status == 'SUBSCRIBED':
+                    sub_num = instance.last_name.replace('#', '').strip() if instance.last_name else ''
+                    data['converted_member'] = {
+                        'member_id': None,
+                        'member_number': f"SUB-{sub_num}" if sub_num else None,
+                        'full_name': f"Subscriber {instance.last_name}".strip(),
+                        'conversion_id': None,
+                        'membership_id': None,
+                        'is_subscriber': True,
                     }
                 else:
                     data['converted_member'] = None

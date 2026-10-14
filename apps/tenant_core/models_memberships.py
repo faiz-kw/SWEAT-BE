@@ -99,6 +99,36 @@ class Membership(models.Model):
                 raise ValidationError("purchase_branch is immutable and cannot be modified.")
         super().save(*args, **kwargs)
 
+    @property
+    def organization(self):
+        if self.home_branch and self.home_branch.organization:
+            return self.home_branch.organization
+        if self.purchase_branch and self.purchase_branch.organization:
+            return self.purchase_branch.organization
+        if self.program and self.program.organization:
+            return self.program.organization
+        return None
+
+    @property
+    def total_remaining_sessions(self) -> Decimal:
+        """
+        Calculates remaining session units across active entitlements.
+        Returns Decimal('999999') if any active entitlement is unlimited.
+        """
+        ents = self.entitlements.all()
+        has_unlimited = False
+        total = Decimal('0.00')
+        for e in ents:
+            if getattr(e, 'is_unlimited', False):
+                has_unlimited = True
+                break
+            rem = e.remaining_units
+            if rem and rem > Decimal('0.00'):
+                total += rem
+        if has_unlimited:
+            return Decimal('999999')
+        return total
+
     class Meta:
         db_table = 'memberships'
         ordering = ['-created_at']
@@ -293,6 +323,9 @@ class MembershipFreeze(models.Model):
     reason_code = models.CharField(max_length=100, null=True, blank=True)
     reason_text = models.TextField(null=True, blank=True)
     extend_membership_days = models.IntegerField(null=True, blank=True)
+    fee_per_day = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    total_fee = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    payment_status = models.CharField(max_length=20, default='PAID')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='SCHEDULED')
     approved_by_user = models.ForeignKey(TenantUser, on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
     created_at = models.DateTimeField(auto_now_add=True)
@@ -561,3 +594,90 @@ class MembershipPackageHistory(models.Model):
 
     def __str__(self):
         return f"{self.membership.membership_number}: {self.from_package} -> {self.to_package} ({self.change_type})"
+
+
+class MembershipExtension(models.Model):
+    """
+    Append-only audit record and financial ledger entry for package validity extensions.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    membership = models.ForeignKey(Membership, on_delete=models.PROTECT, related_name='extensions')
+    days = models.IntegerField()
+    fee_per_day = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    activation_fee = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    total_fee = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    was_expired = models.BooleanField(default=False)
+    sessions_remaining_at_extension = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
+    previous_end_date = models.DateField()
+    new_end_date = models.DateField()
+    reason_text = models.TextField(null=True, blank=True)
+    created_by_user = models.ForeignKey(TenantUser, on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'membership_extensions'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.membership.membership_number}: +{self.days} days (Total: ₹{self.total_fee})"
+
+
+class MembershipPolicyConfig(models.Model):
+    """
+    Tenant Admin configurable operational settings governing package extensions and freezes.
+    Enforces role-based administration (ORG_ADMIN authority).
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.OneToOneField(Organization, on_delete=models.CASCADE, related_name='membership_policy_config')
+
+    # Validity Extension Settings
+    extension_per_day_fee = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal('50.00'),
+        help_text="Standard per-day validity extension fee"
+    )
+    extension_activation_fee = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal('200.00'),
+        help_text="Activation surcharge mandatory when extending an already expired package"
+    )
+    extension_min_days = models.IntegerField(
+        default=1,
+        help_text="Minimum allowed validity extension days"
+    )
+    extension_max_days = models.IntegerField(
+        default=90,
+        help_text="Maximum allowed validity extension days in a single extension"
+    )
+    extension_requires_remaining_sessions = models.BooleanField(
+        default=True,
+        help_text="Strictly require at least 1 remaining unconsumed session to allow extension"
+    )
+
+    # Freeze Settings
+    freeze_per_day_fee = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal('25.00'),
+        help_text="Per-day freeze fee charged during membership lockout"
+    )
+    freeze_min_days = models.IntegerField(
+        default=3,
+        help_text="Minimum consecutive days for a freeze request"
+    )
+    freeze_max_days = models.IntegerField(
+        default=60,
+        help_text="Maximum consecutive days for a single freeze request"
+    )
+    freeze_max_count_per_cycle = models.IntegerField(
+        default=3,
+        help_text="Maximum number of freezes permitted across package lifetime"
+    )
+
+    updated_by_user = models.ForeignKey(TenantUser, on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'membership_policy_configs'
+        verbose_name = 'Membership Policy Config'
+
+    def __str__(self):
+        return f"MembershipPolicyConfig ({self.organization.name})"
+
