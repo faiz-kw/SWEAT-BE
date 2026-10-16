@@ -56,6 +56,7 @@ from .models_catalog import (
     Package,
     PackageVersion,
     PackagePrice,
+    PackageEntitlementDefinition,
     Program,
     ProgramBranchAvailability,
     PackageBranchAvailability,
@@ -885,12 +886,37 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         {
             'id': str(att.id),
             'date_time': (att.check_in_at or att.created_at).isoformat(),
+            'check_in_at': att.check_in_at.isoformat() if att.check_in_at else None,
+            'check_out_at': att.check_out_at.isoformat() if att.check_out_at else None,
             'branch_name': att.branch.name if att.branch else 'Branch',
+            'branch_id': str(att.branch.id) if att.branch else None,
+            'class_name': (
+                att.occurrence.class_template.name
+                if (att.occurrence and att.occurrence.class_template)
+                else (
+                    att.booking.occurrence.class_template.name
+                    if (att.booking and att.booking.occurrence and att.booking.occurrence.class_template)
+                    else 'General Session'
+                )
+            ),
             'status': att.status,
             'check_in_method': att.check_in_method,
             'marked_by': att.marked_by_user.email if att.marked_by_user else 'Front Desk',
         }
-        for att in AttendanceRecord.objects.using(alias).filter(user_profile=profile).select_related('branch', 'marked_by_user').order_by('-check_in_at', '-created_at')[:50]
+        for att in (
+            AttendanceRecord.objects.using(alias)
+            .filter(user_profile=profile)
+            .select_related(
+                'branch',
+                'marked_by_user',
+                'occurrence',
+                'occurrence__class_template',
+                'booking',
+                'booking__occurrence',
+                'booking__occurrence__class_template',
+            )
+            .order_by('-check_in_at', '-created_at')[:200]
+        )
     ]
 
     # 6. Finance
@@ -917,13 +943,17 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             total_invoiced += ord_obj.total_amount
             total_paid += paid_for_order
 
+        is_ext = ('extension' in (ord_obj.notes or '').lower() or any('extension' in (it.item_name_snapshot or '').lower() for it in ord_obj.items.all()))
         orders_data.append({
             'id': str(ord_obj.id),
             'order_number': ord_obj.order_number,
-            'order_type': ord_obj.order_type,
+            'order_type': 'EXTENSION' if is_ext else ord_obj.order_type,
+            'is_extension': is_ext,
+            'notes': ord_obj.notes or '',
             'status': ord_obj.status,
             'subtotal': float(ord_obj.subtotal),
             'discount_amount': float(ord_obj.discount_amount),
+            'reward_amount': float(ord_obj.reward_amount or Decimal('0.00')),
             'tax_amount': float(ord_obj.tax_amount),
             'total_amount': float(ord_obj.total_amount),
             'paid_amount': float(paid_for_order),
@@ -953,6 +983,8 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             'currency': pt.currency,
             'status': pt.status,
             'paid_at': pt.paid_at.isoformat() if pt.paid_at else pt.created_at.isoformat(),
+            'provider_transaction_id': pt.provider_transaction_id or '',
+            'metadata': pt.metadata or {},
         }
         for pt in PaymentTransaction.objects.using(alias).filter(user_profile=profile).select_related('order').order_by('-created_at')
     ]
@@ -1181,6 +1213,85 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
     # Next booking for Overview
     next_bk = upcoming_bookings[0] if upcoming_bookings else None
 
+    # Reward Points / Coins
+    from .models_rewards import RewardAccount
+    from .models_govern import OrganizationSettings
+    reward_acc = RewardAccount.objects.using(alias).filter(user_profile=profile).first()
+    
+    earn_rate = 100
+    current_org = _get_org(request) if request else (getattr(profile, 'organization', None) or Organization.objects.using(alias).filter(status='ACTIVE').first())
+    org_settings = None
+    if current_org:
+        org_settings = OrganizationSettings.objects.using(alias).filter(organization=current_org).first()
+    if not org_settings:
+        org_settings = OrganizationSettings.objects.using(alias).first()
+
+    if org_settings and isinstance(org_settings.membership_config, dict):
+        earn_rate = int(org_settings.membership_config.get('reward_points', {}).get('earn_rate_rupees', 100) or 100)
+
+    pts_balance = float(reward_acc.points_balance) if (reward_acc and reward_acc.points_balance > 0) else 0.0
+    lifetime_earned = float(reward_acc.lifetime_earned) if (reward_acc and reward_acc.lifetime_earned > 0) else 0.0
+    lifetime_redeemed = float(reward_acc.lifetime_redeemed) if reward_acc else 0.0
+    credit_balance = float(reward_acc.credit_balance) if reward_acc else 0.0
+
+    if pts_balance == 0.0:
+        total_spent = sum(float(p['amount']) for p in payments_data if p['status'] == 'SUCCESS')
+        pts_balance = float(int(total_spent // earn_rate))
+        lifetime_earned = pts_balance
+        credit_balance = pts_balance * 1.0  # 1 point = 1 rupee standard
+
+    rewards_data = {
+        'points_balance': pts_balance,
+        'credit_balance': credit_balance,
+        'lifetime_earned': lifetime_earned,
+        'lifetime_redeemed': lifetime_redeemed,
+        'status': reward_acc.status if reward_acc else 'ACTIVE',
+        'earn_rate_rupees': earn_rate,
+    }
+
+    # Passport / Cross-Branch Sessions
+    passport_allowed = 0
+    if active_m and active_m.package_version:
+        pdef = PackageEntitlementDefinition.objects.using(alias).filter(
+            package_version=active_m.package_version
+        ).first()
+        if pdef and isinstance(pdef.configuration, dict):
+            passport_allowed = int(pdef.configuration.get('max_passport_sessions') or 0)
+    
+    if passport_allowed == 0:
+        passport_allowed = int(base_member.get('cross_branch_sessions_remaining') or 0)
+
+    cross_bookings = []
+    if active_m and active_m.home_branch_id:
+        cross_bks = (
+            Booking.objects.using(alias)
+            .filter(user_profile=profile)
+            .exclude(branch_id=active_m.home_branch_id)
+            .select_related('branch', 'occurrence', 'occurrence__class_template')
+            .order_by('-booked_at')[:50]
+        )
+        for cb in cross_bks:
+            occ = cb.occurrence
+            tpl = occ.class_template if occ else None
+            dt_str = occ.start_at.isoformat() if (occ and occ.start_at) else (cb.booked_at.isoformat() if cb.booked_at else cb.created_at.isoformat())
+            cross_bookings.append({
+                'id': str(cb.id),
+                'branch_name': cb.branch.name if cb.branch else 'Cross Branch',
+                'class_name': tpl.name if tpl else 'Class Session',
+                'date_time': dt_str,
+                'status': cb.status,
+            })
+
+    passport_consumed = len(cross_bookings)
+    passport_remaining = max(0, passport_allowed - passport_consumed) if passport_allowed > 0 else 0
+
+    passport_data = {
+        'passport_allowed': passport_allowed,
+        'passport_consumed': passport_consumed,
+        'passport_remaining': passport_remaining,
+        'cross_branch_visits': cross_bookings,
+    }
+
     overview = {
         'contact': {
             'full_name': base_member['name'],
@@ -1204,6 +1315,8 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         'assigned_trainer': base_member['assigned_trainer'],
         'alerts': alerts,
         'recent_activities': timeline_events[:5],
+        'rewards': rewards_data,
+        'passport': passport_data,
     }
 
     return {
@@ -1245,6 +1358,8 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             'invoices': invoices_data,
             'refunds': refunds_data,
         },
+        'rewards': rewards_data,
+        'passport': passport_data,
         'health_and_forms': {
             'submissions': submissions_data,
         },

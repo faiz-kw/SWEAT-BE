@@ -22,7 +22,7 @@ MYSQL_CONFIG = {
     "port": 3307,
     "user": "root",
     "password": "M@$#eera11",
-    "database": "import_db",
+    "database": "sweat_latest_db",
     "charset": "utf8mb4",
 }
 
@@ -255,9 +255,17 @@ def run_migration():
         print(f"Fetched {len(lcomment_rows)} follow-up records from lcomments.")
 
         now_dt = datetime.now(IST)
+        pg_cur.execute("SELECT external_reference FROM sales_followup_tasks WHERE external_reference IS NOT NULL;")
+        existing_task_refs = set(r[0] for r in pg_cur.fetchall())
+        seen_task_refs = set()
+
         tasks_batch = []
         for row in lcomment_rows:
             lc_uid, lc_leadid, lc_agentid, lc_followup, lc_followuptime, lc_resp, lc_subj, lc_comment, lc_createdon = row
+            ext_ref = f"lcomment:{lc_uid}"
+            if ext_ref in existing_task_refs or ext_ref in seen_task_refs:
+                continue
+
             email = leadid_to_email.get(lc_leadid)
             if not email or email not in email_to_lead_data:
                 continue
@@ -288,6 +296,7 @@ def run_migration():
             priority = "HIGH" if "urgent" in str(lc_comment).lower() or "high" in str(lc_comment).lower() else "NORMAL"
             outcome = (lc_comment or lc_resp or "")[:500] or None
 
+            seen_task_refs.add(ext_ref)
             tasks_batch.append((
                 str(uuid.uuid4()),
                 "CALL",
@@ -296,7 +305,7 @@ def run_migration():
                 status,
                 outcome,
                 due_dt,
-                f"lcomment:{lc_uid}",
+                ext_ref,
                 assigned_user_id,
                 assigned_user_id,
                 lead_id,
@@ -405,10 +414,29 @@ def run_migration():
         call_rows = my_cur.fetchall()
         print(f"Fetched {len(call_rows)} records from call_logs.")
 
+        pg_cur.execute("SELECT idempotency_key FROM crm_call_sessions WHERE idempotency_key IS NOT NULL;")
+        existing_call_keys = set(r[0] for r in pg_cur.fetchall())
+        pg_cur.execute("SELECT provider_attempt_id FROM crm_call_sessions WHERE provider_attempt_id IS NOT NULL;")
+        existing_attempts = set(r[0] for r in pg_cur.fetchall())
+
+        seen_call_keys = set()
+        seen_attempts = set()
+
         calls_batch = []
         for row in call_rows:
             (cl_uid, cl_uid_user, cl_aid, cl_lid, cl_cid, cl_createdon, cl_client_no, cl_agent_no, cl_phone_no,
              cl_status, cl_start, cl_end, cl_dur, cl_rec) = row
+
+            prov_attempt = f"{cl_cid}_{cl_uid}" if cl_cid else f"legacy_call_{cl_uid}"
+            idemp_key = f"call_log_{cl_uid}"
+
+            if idemp_key in existing_call_keys or idemp_key in seen_call_keys:
+                continue
+            if prov_attempt in existing_attempts or prov_attempt in seen_attempts:
+                continue
+
+            seen_call_keys.add(idemp_key)
+            seen_attempts.add(prov_attempt)
 
             c_dt = parse_dt(cl_createdon) or parse_dt(cl_start) or now_dt
             st_dt = parse_dt(cl_start) or c_dt
@@ -430,8 +458,6 @@ def run_migration():
             if status_str not in ("QUEUED", "INITIATED", "RINGING", "IN_PROGRESS", "COMPLETED", "BUSY", "NO_ANSWER", "FAILED", "CANCELLED"):
                 status_str = "COMPLETED"
 
-            prov_attempt = f"{cl_cid}_{cl_uid}" if cl_cid else f"legacy_call_{cl_uid}"
-
             calls_batch.append((
                 str(uuid.uuid4()),
                 "EXOTEL",
@@ -448,7 +474,7 @@ def run_migration():
                 f'{{"recording_url": "{cl_rec or ""}", "legacy_uid": {cl_uid}, "call_id": "{cl_cid or ""}"}}',
                 "",
                 "",
-                f"call_log_{cl_uid}",
+                idemp_key,
                 lead_id,
                 org_id,
                 c_dt,

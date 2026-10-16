@@ -8,10 +8,14 @@ from .views import (
     PublicBrandingView, ChangePasswordView,
     AcceptInviteView,
 )
+from .views_otp import SendOTPView, VerifyOTPView
 
 app_name = 'authentication'
 
 urlpatterns = [
+    # Passwordless OTP Login (Web Portal & Mobile App)
+    path('otp/send/', SendOTPView.as_view(), name='auth-otp-send'),
+    path('otp/verify/', VerifyOTPView.as_view(), name='auth-otp-verify'),
     # Universal login (frontend default)
     path('login/', UniversalLoginView.as_view(), name='universal-login'),
     # Specific logins
