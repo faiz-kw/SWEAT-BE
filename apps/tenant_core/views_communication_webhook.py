@@ -178,7 +178,7 @@ class CommunicationWebhookView(APIView):
                         tenant.id, type(payload).__name__,
                     )
                     return Response(
-                        {'error': 'Sarvam webhook payload must be a JSON object.'},
+                        {'error': 'Webhook payload must be a JSON object'},
                         status=status.HTTP_400_BAD_REQUEST,
                     )
                 from apps.tenant_core.services_voice_calling import VoiceCallingService
