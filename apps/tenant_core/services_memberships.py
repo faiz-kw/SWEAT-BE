@@ -90,14 +90,15 @@ class MembershipLifecycleService:
             start = start_date or timezone.now().date()
             duration_value = package_version.duration_value or 1
             duration_unit = package_version.duration_unit or 'MONTH'
+            dur_unit_norm = str(duration_unit).upper().rstrip('S')
 
-            if duration_unit == 'DAY':
+            if dur_unit_norm == 'DAY':
                 end = start + timedelta(days=duration_value)
-            elif duration_unit == 'WEEK':
+            elif dur_unit_norm == 'WEEK':
                 end = start + timedelta(weeks=duration_value)
-            elif duration_unit == 'MONTH':
+            elif dur_unit_norm == 'MONTH':
                 end = start + timedelta(days=duration_value * 30)
-            elif duration_unit == 'YEAR':
+            elif dur_unit_norm == 'YEAR':
                 end = start + timedelta(days=duration_value * 365)
             else:
                 end = start + timedelta(days=30)
@@ -897,6 +898,129 @@ class MembershipLifecycleService:
             )
 
         return req
+
+    @classmethod
+    @transaction.atomic
+    def execute_upgrade(
+        cls,
+        membership: 'Membership',
+        target_package: 'Package',
+        target_package_version: 'PackageVersion',
+        target_branch: Optional['Branch'] = None,
+        order: Optional['Order'] = None,
+        actor_user: Optional['TenantUser'] = None,
+        reason: Optional[str] = None,
+        db_alias: Optional[str] = None,
+    ) -> 'Membership':
+        """
+        Executes an immediate authoritative membership package upgrade:
+        - Updates package, package_version, and home_branch on membership
+        - Extends validity if target package has longer duration
+        - Allocates/adjusts entitlements according to target package definition
+        - Records immutable MembershipPackageHistory and MembershipStatusHistory
+        - Restores/maintains ACTIVE status
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+
+        from_pkg = membership.package
+        from_pkg_v = membership.package_version
+
+        membership.package = target_package
+        membership.package_version = target_package_version
+        if target_package.program:
+            membership.program = target_package.program
+        if target_branch:
+            membership.home_branch = target_branch
+
+        old_status = membership.status
+        membership.status = 'ACTIVE'
+
+        today = timezone.now().date()
+        target_duration = getattr(target_package_version, 'duration_value', None) or 1
+        target_unit = getattr(target_package_version, 'duration_unit', 'MONTH')
+
+        if not membership.end_date or membership.end_date < today:
+            start = today
+            if target_unit == 'DAY':
+                membership.end_date = start + timedelta(days=target_duration)
+            elif target_unit == 'WEEK':
+                membership.end_date = start + timedelta(weeks=target_duration)
+            elif target_unit == 'MONTH':
+                membership.end_date = start + timedelta(days=target_duration * 30)
+            elif target_unit == 'YEAR':
+                membership.end_date = start + timedelta(days=target_duration * 365)
+            else:
+                membership.end_date = start + timedelta(days=30)
+
+        membership.save(using=alias, update_fields=['package', 'package_version', 'program', 'home_branch', 'status', 'end_date', 'updated_at'])
+
+        # Record Package History
+        from .models_memberships import (
+            MembershipPackageHistory, MembershipStatusHistory,
+            MembershipEntitlement, MembershipEntitlementLedger
+        )
+        MembershipPackageHistory.objects.using(alias).create(
+            membership=membership,
+            from_package=from_pkg,
+            from_package_version=from_pkg_v,
+            to_package=target_package,
+            to_package_version=target_package_version,
+            change_type='UPGRADE',
+            order=order,
+            changed_by_user=actor_user,
+            reason=reason or f"Self-service upgrade to {target_package.name}",
+        )
+
+        valid_until_dt = timezone.make_aware(datetime.combine(membership.end_date, datetime.max.time())) if membership.end_date else timezone.now() + timedelta(days=90)
+
+        for ped in target_package_version.entitlement_definitions.using(alias).all():
+            existing_ent = membership.entitlements.using(alias).filter(entitlement_type=ped.entitlement_type, status='ACTIVE').first()
+            if existing_ent:
+                add_units = ped.allocated_units or Decimal('0.00')
+                if add_units > Decimal('0.00'):
+                    cls.adjust_entitlement(
+                        membership=membership,
+                        entitlement_type=ped.entitlement_type,
+                        units_delta=add_units,
+                        reason_code='UPGRADE_ALLOCATION',
+                        reason_text=f"Package upgrade to {target_package.name} (v{target_package_version.version_number})",
+                        actor_user=actor_user,
+                        db_alias=alias,
+                    )
+            else:
+                new_ent = MembershipEntitlement.objects.using(alias).create(
+                    membership=membership,
+                    source_definition=ped,
+                    entitlement_type=ped.entitlement_type,
+                    allocated_units=ped.allocated_units,
+                    consumed_units=Decimal('0.00'),
+                    is_unlimited=ped.is_unlimited,
+                    valid_from=timezone.now(),
+                    valid_until=valid_until_dt,
+                    status='ACTIVE',
+                )
+                MembershipEntitlementLedger.objects.using(alias).create(
+                    membership_entitlement=new_ent,
+                    transaction_type='ALLOCATION',
+                    units=ped.allocated_units or Decimal('0.00'),
+                    reason_code='UPGRADE_NEW_ALLOCATION',
+                    reason_text=f"Initial allocation on upgrade to {target_package.name}",
+                    balance_after=ped.allocated_units or Decimal('0.00'),
+                    created_by_user=actor_user,
+                )
+
+        MembershipStatusHistory.objects.using(alias).create(
+            membership=membership,
+            from_status=old_status,
+            to_status='ACTIVE',
+            reason_code='UPGRADE_APPLIED',
+            reason_text=reason or f"Upgraded package to {target_package.name}.",
+            changed_by_user=actor_user,
+        )
+
+        return membership
+
+
 
     @classmethod
     @transaction.atomic

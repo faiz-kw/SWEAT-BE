@@ -356,19 +356,40 @@ class TenantDatabaseMiddleware:
             tenant_id = _extract_tenant_id_from_jwt(request)
 
             # Allow open public lead capture: resolve tenant DB via header or default to 'sweat'
-            if not tenant_id and (path.startswith('/api/v1/tenant/leads/') or request.headers.get('X-Tenant-Slug') or request.META.get('HTTP_X_TENANT_SLUG')):
+            explicit_slug = (
+                request.headers.get('X-Tenant-Slug')
+                or request.META.get('HTTP_X_TENANT_SLUG')
+                or request.GET.get('tenant')
+            )
+            if not tenant_id and explicit_slug:
                 from apps.master.models_tenant import Tenant
-                slug = (
-                    request.headers.get('X-Tenant-Slug')
-                    or request.META.get('HTTP_X_TENANT_SLUG')
-                    or request.GET.get('tenant')
-                    or 'sweat'
-                )
-                t_obj = Tenant.objects.using('default').filter(slug=slug, status='ACTIVE').first()
+                clean_slug = str(explicit_slug).strip().lower()
+                t_obj = Tenant.objects.using('default').filter(slug=clean_slug, status='ACTIVE').first()
                 if not t_obj:
+                    logger.warning(
+                        'TenantDatabaseMiddleware: Explicit tenant slug "%s" not found or inactive. correlation_id=%s',
+                        clean_slug, getattr(request, 'correlation_id', '-'),
+                    )
+                    set_tenant_db_alias(None)
+                    return JsonResponse(
+                        {'error': 'TENANT_NOT_FOUND', 'detail': f"Organization '{clean_slug}' was not found or is inactive."},
+                        status=404,
+                    )
+                tenant_id = str(t_obj.id)
+            elif not tenant_id and path.startswith('/api/v1/tenant/leads/'):
+                from apps.master.models_tenant import Tenant
+                t_obj = Tenant.objects.using('default').filter(slug='sweat', status='ACTIVE').first()
+                if not t_obj and 'test' in sys.argv:
                     t_obj = Tenant.objects.using('default').filter(status='ACTIVE').first()
                 if t_obj:
                     tenant_id = str(t_obj.id)
+                else:
+                    logger.warning('TenantDatabaseMiddleware: Default tenant "sweat" not found or inactive')
+                    set_tenant_db_alias(None)
+                    return JsonResponse(
+                        {'error': 'TENANT_NOT_FOUND', 'detail': 'Default organization was not found.'},
+                        status=404,
+                    )
 
             if tenant_id:
                 try:
@@ -420,7 +441,10 @@ class TenantDatabaseMiddleware:
 
                     effective_db_name = data_source.database_name or data_source.db_name
                     # In test runner environment, map test tenant database aliases cleanly
-                    if 'test' in sys.argv and 'tenant_test' in settings.DATABASES and effective_db_name in ('fitness_tenant', 'test_fitness_tenant', 'test'):
+                    if 'test' in sys.argv and 'tenant_test' in settings.DATABASES and (
+                        effective_db_name in ('fitness_tenant', 'test_fitness_tenant', 'test')
+                        or str(effective_db_name).startswith('test_')
+                    ):
                         alias = 'tenant_test'
                     else:
                         alias = build_tenant_db_alias(tenant_id)

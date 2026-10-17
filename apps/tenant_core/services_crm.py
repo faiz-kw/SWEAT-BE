@@ -989,7 +989,7 @@ class CRMLeadService:
                 return lead
 
             from .models_crm import LeadConversion
-            if old_status == 'CONVERTED' or (new_status != 'CONVERTED' and (getattr(lead, 'converted_user_profile_id', None) or LeadConversion.objects.using(alias).filter(lead=lead).exists())):
+            if old_status == 'CONVERTED' or (new_status != 'CONVERTED' and LeadConversion.objects.using(alias).filter(lead=lead).exists()):
                 raise ValidationError("This lead has already been converted to a member. The CRM sales journey is terminal.")
 
             if new_status == 'CONVERTED':
@@ -1474,7 +1474,7 @@ class CRMLeadService:
                 raise ValidationError("Lead and Branch belong to different organizations.")
 
             from .models_crm import LeadConversion
-            if lead.current_status == 'CONVERTED' or getattr(lead, 'converted_user_profile_id', None) or LeadConversion.objects.using(alias).filter(lead=lead).exists():
+            if lead.current_status == 'CONVERTED' or LeadConversion.objects.using(alias).filter(lead=lead).exists():
                 raise ValidationError("This lead has already been converted to a member. The CRM sales journey is terminal. Bookings must be made via the Member schedule.")
 
             try:
@@ -3357,7 +3357,7 @@ class LeadConversionService:
         alias = db_alias or get_tenant_db_alias() or 'default'
 
         from .models_crm import LeadConversion
-        if lead.current_status == 'CONVERTED' or getattr(lead, 'converted_user_profile_id', None) or LeadConversion.objects.using(alias).filter(lead=lead).exists():
+        if lead.current_status == 'CONVERTED' or LeadConversion.objects.using(alias).filter(lead=lead).exists():
             return {
                 'eligible': False,
                 'reason': 'already_converted',
@@ -3865,7 +3865,7 @@ class LeadConversionService:
                 # ── Guard: lock and check lead inside tenant atomic transaction ──
                 lead_locked = Lead.objects.using(alias).select_for_update().get(id=lead.id)
                 from .models_crm import LeadConversion
-                if lead_locked.current_status == 'CONVERTED' or getattr(lead_locked, 'converted_user_profile_id', None) or LeadConversion.objects.using(alias).filter(lead=lead_locked).exists():
+                if lead_locked.current_status == 'CONVERTED' or LeadConversion.objects.using(alias).filter(lead=lead_locked).exists():
                     existing_conv = LeadConversion.objects.using(alias).filter(lead=lead_locked).first()
                     if existing_conv and (payment_provider == 'RAZORPAY' or existing_conv.order_id):
                         from .models_memberships import Membership

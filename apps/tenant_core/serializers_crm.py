@@ -363,9 +363,11 @@ class LeadSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         # Converted lead terminal state validation
-        if self.instance and (self.instance.current_status == 'CONVERTED' or getattr(self.instance, 'converted_user_profile_id', None)):
+        alias = getattr(getattr(self.instance, '_state', None), 'db', None) or 'default'
+        from .models_crm import LeadConversion
+        if self.instance and (self.instance.current_status in ('CONVERTED', 'DEAL_DONE', 'SUBSCRIBED') or getattr(self.instance, 'converted_user_profile_id', None) or LeadConversion.objects.using(alias).filter(lead=self.instance).exists()):
             new_status = attrs.get('current_status')
-            if new_status and new_status != 'CONVERTED':
+            if new_status and new_status not in ('CONVERTED', 'DEAL_DONE', 'SUBSCRIBED'):
                 raise serializers.ValidationError({
                     "current_status": "This lead has already been converted to a member. The CRM sales journey is terminal."
                 })
@@ -858,13 +860,21 @@ class TrialBookingSerializer(serializers.ModelSerializer):
             branch=obj.branch,
             db_alias=alias,
         )
-        if obj.lead and (obj.lead.current_status == 'CONVERTED' or getattr(obj.lead, 'converted_user_profile', None)):
+        from .models_crm import LeadConversion
+        lead_is_converted = bool(
+            obj.lead and (
+                obj.lead.current_status in ('CONVERTED', 'DEAL_DONE', 'SUBSCRIBED') or
+                getattr(obj.lead, 'converted_user_profile', None) or
+                LeadConversion.objects.using(alias).filter(lead=obj.lead).exists()
+            )
+        )
+        if lead_is_converted:
             can_book_new_trial = False
 
         can_convert_member = bool(
             obj.lead and
-            obj.lead.current_status not in ['LOST', 'NOT_INTERESTED', 'CONVERTED'] and
-            not getattr(obj.lead, 'converted_user_profile', None)
+            obj.lead.current_status not in ['LOST', 'NOT_INTERESTED', 'CONVERTED', 'DEAL_DONE', 'SUBSCRIBED'] and
+            not lead_is_converted
         )
 
         return {

@@ -19,6 +19,7 @@ import logging
 from datetime import datetime, date, time, timedelta
 from typing import Optional, List, Dict, Tuple, Any
 from django.db.models import Q
+from django.utils import timezone
 from config.routers import get_tenant_db_alias
 from .models_org import Branch, Organization
 from .models_workforce import (
@@ -64,9 +65,21 @@ class TrainerAvailabilityService:
         Returns: (is_available, reason_message, details_dict)
         """
         alias = db_alias or get_tenant_db_alias() or 'default'
-        target_date = start_datetime.date()
-        target_start_time = start_datetime.time()
-        end_datetime = start_datetime + timedelta(minutes=duration_minutes)
+        if timezone.is_aware(start_datetime):
+            tz_name = getattr(branch, 'timezone', None) or 'Asia/Kolkata'
+            try:
+                from zoneinfo import ZoneInfo
+                branch_tz = ZoneInfo(tz_name)
+            except Exception:
+                from zoneinfo import ZoneInfo
+                branch_tz = ZoneInfo('Asia/Kolkata')
+            local_dt = start_datetime.astimezone(branch_tz)
+        else:
+            local_dt = start_datetime
+
+        target_date = local_dt.date()
+        target_start_time = local_dt.time()
+        end_datetime = local_dt + timedelta(minutes=duration_minutes)
         target_end_time = end_datetime.time()
         iso_day = target_date.isoweekday()  # 1=Monday ... 7=Sunday
 

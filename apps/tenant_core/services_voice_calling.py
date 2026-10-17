@@ -251,6 +251,13 @@ class VoiceCallingService:
         alias = db_alias or 'default'
         org = lead.organization
 
+        # 0. Global Outbound Safety Gates (Fail-closed)
+        from django.conf import settings
+        if not getattr(settings, 'COMMUNICATIONS_OUTBOUND_ENABLED', False):
+            raise ValueError('Outbound communications are disabled in this deployment.')
+        if not getattr(settings, 'VOICE_CALLING_ENABLED', False):
+            raise ValueError('Outbound voice calling is disabled in this deployment.')
+
         # 1. Acquire row lock on Lead within atomic block to serialize concurrent call requests
         with transaction.atomic(using=alias):
             locked_lead = Lead.objects.using(alias).select_for_update().get(id=lead.id)
@@ -407,7 +414,13 @@ class VoiceCallingService:
         alias = db_alias or 'default'
         attempt_id = payload.get('attempt_id')
         raw_status = str(payload.get('status') or '').strip().lower()
-        meta = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
+        # Per official Sarvam webhook schema, metadata is echoed inside webhook_config.metadata,
+        # NOT at the top-level payload.metadata key (which does not exist in the Sarvam spec).
+        # See: https://docs.sarvam.ai/voice-agents/api/instant-outbound/webhook-payload.md
+        _wc = payload.get('webhook_config')
+        meta = (_wc.get('metadata') or {}) if isinstance(_wc, dict) else {}
+        if not isinstance(meta, dict):
+            meta = {}
         call_session_id = meta.get('call_session_id')
 
         # 1. Match session by session ID or attempt ID

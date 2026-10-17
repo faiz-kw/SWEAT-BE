@@ -184,7 +184,10 @@ def _register_and_resolve_tenant(tenant):
     from django.conf import settings
     from config.routers import build_tenant_db_alias
 
-    if 'test' in sys.argv and 'tenant_test' in settings.DATABASES and effective_db_name in ('fitness_tenant', 'test_fitness_tenant', 'test'):
+    if 'test' in sys.argv and 'tenant_test' in settings.DATABASES and (
+        effective_db_name in ('fitness_tenant', 'test_fitness_tenant', 'test')
+        or str(effective_db_name).startswith('test_')
+    ):
         db_alias = 'tenant_test'
     else:
         db_alias = build_tenant_db_alias(tenant.id)

@@ -367,6 +367,7 @@ class LeadViewSet(viewsets.ModelViewSet):
             email = lead.email_normalized
             phone = lead.phone_normalized
             user = None
+            user_created = False
             if email or phone:
                 user = TenantUser.objects.using(alias).filter(
                     (models.Q(email__iexact=email) if email else models.Q(pk=None)) |
@@ -396,6 +397,7 @@ class LeadViewSet(viewsets.ModelViewSet):
                 )
                 user.set_password(f"Sweat@{uuid.uuid4().hex[:8]}")
                 user.save(using=alias)
+                user_created = True
 
                 member_role = Role.objects.using(alias).filter(code='MEMBER').first()
                 if member_role:
@@ -421,25 +423,33 @@ class LeadViewSet(viewsets.ModelViewSet):
                 lead.converted_user_profile = profile
                 lead.save(using=alias, update_fields=['converted_user_profile'])
 
-                # Generate JWT tokens
-                tenant = Tenant.objects.using('default').filter(slug=getattr(request, 'tenant_slug', 'sweat')).first()
-                if not tenant:
-                    tenant = Tenant.objects.using('default').first()
+                # START [SEC-LEAD-TOKEN]
+                # WHY: LeadViewSet.create() is AllowAny; returning tokens for pre-existing TenantUsers allows unauthenticated token harvesting for staff/member accounts.
+                # FIXES: Restricts token issuance strictly to newly created TenantUsers provisioned in this request.
+                # IMPACT: Pre-existing users matched during intake do not receive auth tokens in the 201 response.
+                if user and user_created:
+                    req_slug = getattr(request, 'tenant_slug', None) or 'sweat'
+                    tenant = Tenant.objects.using('default').filter(slug=req_slug, status='ACTIVE').first()
+                    if not tenant and 'test' in sys.argv:
+                        tenant = Tenant.objects.using('default').filter(status='ACTIVE').first()
 
-                if tenant:
-                    tokens = _build_tenant_token(user, tenant, alias)
-                    auth_dict = {
-                        'access': str(tokens.access_token),
-                        'refresh': str(tokens),
-                    }
-                    response_data['auth'] = auth_dict
-                    response_data['tokens'] = auth_dict
-                    response_data['user'] = {
-                        'id': str(user.id),
-                        'email': user.email,
-                        'user_type': user.user_type,
-                        'role_code': user.user_type,
-                    }
+                    if tenant:
+                        tokens = _build_tenant_token(user, tenant, alias)
+                        auth_dict = {
+                            'access': str(tokens.access_token),
+                            'refresh': str(tokens),
+                        }
+                        response_data['auth'] = auth_dict
+                        response_data['tokens'] = auth_dict
+                        response_data['user'] = {
+                            'id': str(user.id),
+                            'email': user.email,
+                            'user_type': user.user_type,
+                            'role_code': user.user_type,
+                        }
+                elif user:
+                    logger.info("Matched existing TenantUser for lead %s; withholding tokens on intake.", getattr(lead, 'id', None))
+                # END [SEC-LEAD-TOKEN]
         except Exception as e:
             logger.warning("Could not auto-provision JWT for lead %s: %s", getattr(lead, 'id', None), e)
 
@@ -1209,7 +1219,20 @@ class LeadViewSet(viewsets.ModelViewSet):
         if not allowed:
             raise PermissionDenied(f"Permission denied: crm.leads.edit required ({reason})")
 
-        # 2. Database prerequisite check: migration 0055 (crm_call_sessions table)
+        # 2. Global outbound safety gates (Fail-closed)
+        from django.conf import settings
+        outbound_enabled = getattr(settings, 'COMMUNICATIONS_OUTBOUND_ENABLED', False)
+        voice_enabled = getattr(settings, 'VOICE_CALLING_ENABLED', False)
+        if not outbound_enabled or not voice_enabled:
+            return Response(
+                {
+                    'error': 'Outbound voice calling is disabled in this deployment.',
+                    'code': 'VOICE_CALLING_DISABLED',
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # 3. Database prerequisite check: migration 0055 (crm_call_sessions table)
         from django.db import connections
         from django.db.utils import ProgrammingError, OperationalError
         try:
