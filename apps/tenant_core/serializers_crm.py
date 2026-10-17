@@ -108,7 +108,38 @@ class LeadSerializer(serializers.ModelSerializer):
     class Meta:
         model = Lead
         fields = '__all__'
-        read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
+        # SEC-05 FIX: Expanded read_only_fields to protect all staff-managed and
+        # system-managed fields. Previously only audit fields were protected, leaving
+        # pipeline fields writable by LEAD/MEMBER users via partial_update.
+        # These fields MUST only be set by staff actions or internal service calls.
+        read_only_fields = [
+            'id',
+            'organization',
+            'created_at',
+            'updated_at',
+            # Pipeline / CRM state — staff-only
+            'crm_stage',
+            'current_status',
+            'assigned_sales_user',
+            'assigned_branch',
+            # Conversion & member linkage — system-managed
+            'converted_user_profile',
+            'converted_at',
+            'conversion_locked',
+            # Suppression flags — staff/compliance-only
+            'do_not_call',
+            'do_not_contact',
+            'is_opted_out',
+            # Computed / provenance fields
+            'email_normalized',
+            'phone_normalized',
+            'lead_score',
+            'priority_score',
+            'last_contacted_at',
+            'last_activity_at',
+            'response_sla_breached_at',
+            'stage_sla_breached_at',
+        ]
 
     def to_representation(self, instance):
         data = super().to_representation(instance)

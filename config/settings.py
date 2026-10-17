@@ -246,10 +246,20 @@ REST_FRAMEWORK = {
     # Applied by apps/authentication/throttles.py on login, MFA, and refresh views.
     # These values can be overridden via environment variables; see settings below.
     # ---------------------------------------------------------------------------
+    # SEC-10 FIX: Apply global throttle classes so every API endpoint has a rate
+    # limit fallback. Auth endpoints use custom throttle classes declared in their
+    # view; these catch everything else.
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.UserRateThrottle',
+        'rest_framework.throttling.AnonRateThrottle',
+    ],
     'DEFAULT_THROTTLE_RATES': {
         'auth_login':   os.getenv('THROTTLE_RATE_LOGIN',   '10/minute'),
         'auth_mfa':     os.getenv('THROTTLE_RATE_MFA',     '5/minute'),
         'auth_refresh': os.getenv('THROTTLE_RATE_REFRESH', '20/minute'),
+        # General API throttles (authenticated vs anonymous)
+        'user': os.getenv('THROTTLE_RATE_API_USER', '1000/minute'),
+        'anon': os.getenv('THROTTLE_RATE_API_ANON', '60/minute'),
     },
 }
 
@@ -506,6 +516,9 @@ if 'test' in sys.argv:
         'auth_login':   '10000/minute',
         'auth_mfa':     '10000/minute',
         'auth_refresh': '10000/minute',
+        # Disable global API throttles in tests: all test requests share the same loopback IP.
+        'user': '10000/minute',
+        'anon': '10000/minute',
     }
 else:
     CELERY_TASK_ALWAYS_EAGER = False

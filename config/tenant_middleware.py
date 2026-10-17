@@ -377,19 +377,23 @@ class TenantDatabaseMiddleware:
                     )
                 tenant_id = str(t_obj.id)
             elif not tenant_id and path.startswith('/api/v1/tenant/leads/'):
-                from apps.master.models_tenant import Tenant
-                t_obj = Tenant.objects.using('default').filter(slug='sweat', status='ACTIVE').first()
-                if not t_obj and 'test' in sys.argv:
-                    t_obj = Tenant.objects.using('default').filter(status='ACTIVE').first()
-                if t_obj:
-                    tenant_id = str(t_obj.id)
-                else:
-                    logger.warning('TenantDatabaseMiddleware: Default tenant "sweat" not found or inactive')
-                    set_tenant_db_alias(None)
-                    return JsonResponse(
-                        {'error': 'TENANT_NOT_FOUND', 'detail': 'Default organization was not found.'},
-                        status=404,
-                    )
+                # SEC-06 FIX: The previous hardcoded fallback to tenant 'sweat' allowed unauthenticated
+                # requests to be silently routed into a specific tenant database without any credential.
+                # This constitutes a tenant isolation leak and must be rejected.
+                # Public lead capture requires an explicit X-Tenant-Slug header.
+                logger.warning(
+                    'TenantDatabaseMiddleware: Unauthenticated tenant/leads request missing X-Tenant-Slug header. '
+                    'Refusing. path=%s correlation_id=%s',
+                    path, getattr(request, 'correlation_id', '-'),
+                )
+                set_tenant_db_alias(None)
+                return JsonResponse(
+                    {
+                        'error': 'TENANT_SLUG_REQUIRED',
+                        'detail': 'An X-Tenant-Slug header is required for public lead submission.',
+                    },
+                    status=401,
+                )
 
             if tenant_id:
                 try:
