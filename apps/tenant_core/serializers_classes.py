@@ -186,6 +186,32 @@ class ClassScheduleRuleSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
 
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        raw_days = ret.get('days_of_week')
+        if not raw_days:
+            ret['days_of_week'] = []
+        elif isinstance(raw_days, list):
+            ret['days_of_week'] = [int(d) for d in raw_days if str(d).isdigit()]
+        elif isinstance(raw_days, dict):
+            if 'days' in raw_days and isinstance(raw_days['days'], list):
+                ret['days_of_week'] = [int(d) for d in raw_days['days'] if str(d).isdigit()]
+            else:
+                ret['days_of_week'] = [int(k) for k in raw_days.keys() if str(k).isdigit()]
+        elif isinstance(raw_days, str):
+            import json
+            try:
+                parsed = json.loads(raw_days)
+                if isinstance(parsed, list):
+                    ret['days_of_week'] = [int(d) for d in parsed if str(d).isdigit()]
+                else:
+                    ret['days_of_week'] = []
+            except Exception:
+                ret['days_of_week'] = [int(s.strip()) for s in raw_days.split(',') if s.strip().isdigit()]
+        else:
+            ret['days_of_week'] = []
+        return ret
+
     def validate(self, attrs):
         start_time = attrs.get('start_time') or (self.instance.start_time if self.instance else None)
         end_time = attrs.get('end_time') or (self.instance.end_time if self.instance else None)

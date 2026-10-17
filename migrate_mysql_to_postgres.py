@@ -419,6 +419,46 @@ def main():
   pg_cur.execute("SET session_replication_role = 'origin';")
   pg_conn.commit()
 
+  # 3b. Sync CRM Trial Bookings from Bookings (type = 'TRIAL')
+  print(" Syncing CRM trial bookings from bookings...")
+  try:
+      pg_cur.execute("""
+          INSERT INTO trial_bookings (
+              id, lead_id, user_profile_id, branch_id, class_occurrence_id,
+              trial_type, scheduled_start, scheduled_end, status,
+              booking_source, confirmation_status, created_at, updated_at
+          )
+          SELECT 
+              b.id,
+              l.id as lead_id,
+              b.user_profile_id,
+              b.branch_id,
+              b.occurrence_id,
+              'CLASS' as trial_type,
+              COALESCE(co.start_at, b.booked_at) as scheduled_start,
+              COALESCE(co.end_at, b.booked_at + interval '1 hour') as scheduled_end,
+              CASE 
+                  WHEN b.status = 'COMPLETED' THEN 'ATTENDED'
+                  WHEN b.status = 'CANCELLED' THEN 'CANCELLED'
+                  WHEN b.status = 'CONFIRMED' THEN 'CONFIRMED'
+                  ELSE 'BOOKED'
+              END as status,
+              COALESCE(b.booking_source, 'MOBILE_APP') as booking_source,
+              'CONFIRMED' as confirmation_status,
+              b.created_at,
+              b.updated_at
+          FROM bookings b
+          JOIN leads l ON b.user_profile_id = l.converted_user_profile_id
+          LEFT JOIN class_occurrences co ON b.occurrence_id = co.id
+          WHERE b.booking_type = 'TRIAL'
+          ON CONFLICT (id) DO NOTHING;
+      """)
+      pg_conn.commit()
+      print(f"✓ trial_bookings synchronized: {pg_cur.rowcount} rows")
+  except Exception as e:
+      print(f"⚠️ trial_bookings sync notice: {e}")
+      pg_conn.rollback()
+
   pg_cur.close()
   pg_conn.close()
   my_cur.close()

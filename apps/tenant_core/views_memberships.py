@@ -30,7 +30,10 @@ from .models_memberships import (
     MembershipChangePolicyRule,
     MembershipChangeRequest,
     MembershipPackageHistory,
+    MembershipExtension,
+    MembershipPolicyConfig,
 )
+from .models_org import Organization
 from .models_commerce import Order, OrderItem
 from .serializers_memberships import (
     MembershipSerializer,
@@ -48,6 +51,11 @@ from .serializers_memberships import (
     ActivateMembershipRequestSerializer,
     ConsumeEntitlementRequestSerializer,
     FreezeRequestSerializer,
+    MembershipExtensionSerializer,
+    MembershipPolicyConfigSerializer,
+    ExtendMembershipRequestSerializer,
+    CalculateExtensionRequestSerializer,
+    CalculateFreezeRequestSerializer,
 )
 from .services_memberships import MembershipLifecycleService
 
@@ -62,6 +70,20 @@ def _get_db(request):
     if alias and alias != 'default':
         set_tenant_db_alias(alias)
     return alias
+
+
+def _get_org(request):
+    org = getattr(request, 'organization', None)
+    if not org:
+        user = getattr(request, 'user', None)
+        if user and hasattr(user, 'organization') and user.organization:
+            return user.organization
+        alias = _get_db(request)
+        if user and getattr(user, 'organization_id', None):
+            return Organization.objects.using(alias).filter(id=user.organization_id).first()
+        return Organization.objects.using(alias).filter(status='ACTIVE').order_by('-created_at').first()
+    return org
+
 
 class MembershipPagination(PageNumberPagination):
     """Standard cursor-based page pagination for the Membership list endpoint."""
@@ -94,6 +116,9 @@ class MembershipViewSet(viewsets.ModelViewSet):
         'consume_entitlement': 'core.users.edit',
         'reverse_entitlement': 'core.users.edit',
         'freeze': 'core.users.edit',
+        'extend': 'core.users.edit',
+        'calculate_extension': 'core.users.view',
+        'calculate_freeze': 'core.users.view',
     }
     pagination_class = MembershipPagination
     filter_backends = [filters.OrderingFilter]
@@ -232,6 +257,67 @@ class MembershipViewSet(viewsets.ModelViewSet):
                 db_alias=db,
             )
             return Response(MembershipFreezeSerializer(freeze).data, status=status.HTTP_201_CREATED)
+        except ValidationError as exc:
+            return Response({'error': str(exc.message if hasattr(exc, 'message') else exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'], url_path='calculate-freeze')
+    def calculate_freeze(self, request, pk=None):
+        membership = self.get_object()
+        serializer = CalculateFreezeRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        db = _get_db(request)
+
+        try:
+            res = MembershipLifecycleService.calculate_freeze(
+                membership=membership,
+                freeze_from=data['freeze_from'],
+                freeze_until=data['freeze_until'],
+                db_alias=db,
+            )
+            return Response(res, status=status.HTTP_200_OK)
+        except ValidationError as exc:
+            return Response({'error': str(exc.message if hasattr(exc, 'message') else exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'], url_path='calculate-extension')
+    def calculate_extension(self, request, pk=None):
+        membership = self.get_object()
+        serializer = CalculateExtensionRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        days = serializer.validated_data['days']
+        db = _get_db(request)
+
+        try:
+            res = MembershipLifecycleService.calculate_extension(
+                membership=membership,
+                days=days,
+                db_alias=db,
+            )
+            return Response(res, status=status.HTTP_200_OK)
+        except ValidationError as exc:
+            return Response({'error': str(exc.message if hasattr(exc, 'message') else exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'], url_path='extend')
+    def extend(self, request, pk=None):
+        membership = self.get_object()
+        serializer = ExtendMembershipRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        db = _get_db(request)
+
+        try:
+            updated_membership, extension = MembershipLifecycleService.extend_membership(
+                membership=membership,
+                days=data['days'],
+                reason_text=data.get('reason_text'),
+                approved_by_user=request.user,
+                db_alias=db,
+            )
+            return Response({
+                'membership': MembershipSerializer(updated_membership).data,
+                'extension': MembershipExtensionSerializer(extension).data,
+                'message': f"Membership validity successfully extended by {data['days']} days.",
+            }, status=status.HTTP_200_OK)
         except ValidationError as exc:
             return Response({'error': str(exc.message if hasattr(exc, 'message') else exc)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -794,3 +880,92 @@ class MembershipBranchHistoryViewSet(viewsets.ReadOnlyModelViewSet):
                 | Q(reason__icontains=s)
             )
         return qs.order_by('-effective_at', '-created_at')
+
+
+class MembershipExtensionViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Append-only audit ledger of package validity extensions with fee breakdowns.
+    """
+    serializer_class = MembershipExtensionSerializer
+    permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
+    required_module = 'core'
+    required_submodule = 'users'
+    required_permission = 'core.users.view'
+
+    def get_queryset(self):
+        db = _get_db(self.request)
+        qs = MembershipExtension.objects.using(db).select_related(
+            'membership', 'membership__user_profile', 'membership__package', 'created_by_user'
+        )
+        membership_id = self.request.query_params.get('membership_id')
+        if membership_id:
+            qs = qs.filter(membership_id=membership_id)
+        return qs.order_by('-created_at')
+
+
+class MembershipPolicyConfigViewSet(viewsets.ViewSet):
+    """
+    Tenant Admin Configurable Settings for Membership Package Extend and Freeze.
+    Enforces role-based authority: Strictly restricted to ORG_ADMIN.
+    """
+    permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
+    required_module = 'members'
+    required_submodule = 'memberships'
+    required_permission = 'membership.policy.manage'
+    permission_action_map = {
+        'list': 'membership.policy.manage',
+        'retrieve': 'membership.policy.manage',
+        'current': 'membership.policy.manage',
+        'update': 'membership.policy.manage',
+        'partial_update': 'membership.policy.manage',
+        'create': 'membership.policy.manage',
+    }
+
+    def _ensure_org_admin(self, request):
+        user = request.user
+        is_admin = (
+            getattr(user, 'is_superuser', False)
+            or getattr(user, 'is_org_wide', False)
+            or (getattr(user, '_auth_type', None) == 'platform')
+            or any(r.code in ('ORG_ADMIN', 'TENANT_ADMIN', 'SUPER_ADMIN') for r in getattr(user, 'roles', []).all() if hasattr(user, 'roles'))
+            or getattr(user, 'role', '') in ('ORG_ADMIN', 'TENANT_ADMIN', 'SUPER_ADMIN')
+        )
+        user_role = getattr(user, 'role', None)
+        if user_role and user_role in ('ORG_ADMIN', 'TENANT_ADMIN', 'SUPER_ADMIN'):
+            is_admin = True
+        return is_admin
+
+    def list(self, request):
+        db = _get_db(request)
+        org = _get_org(request)
+        config = MembershipLifecycleService.get_policy_config(org, db_alias=db)
+        return Response(MembershipPolicyConfigSerializer(config).data)
+
+    def retrieve(self, request, pk=None):
+        return self.list(request)
+
+    @action(detail=False, methods=['get', 'patch', 'post'], url_path='current')
+    def current(self, request):
+        db = _get_db(request)
+        org = _get_org(request)
+        config = MembershipLifecycleService.get_policy_config(org, db_alias=db)
+
+        if request.method in ('PATCH', 'POST'):
+            if not self._ensure_org_admin(request):
+                return Response(
+                    {'detail': 'Only Organization Administrators are authorized to update package extension & freeze settings.'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            serializer = MembershipPolicyConfigSerializer(config, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            saved = serializer.save(updated_by_user=request.user)
+            return Response(MembershipPolicyConfigSerializer(saved).data, status=status.HTTP_200_OK)
+
+        return Response(MembershipPolicyConfigSerializer(config).data)
+
+    def create(self, request):
+        return self.current(request)
+
+    def partial_update(self, request, pk=None):
+        return self.current(request)
+
