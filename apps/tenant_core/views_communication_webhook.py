@@ -1,4 +1,4 @@
-﻿"""
+"""
 apps/tenant_core/views_communication_webhook.py — Deterministic Omnichannel Webhook Receiver.
 
 Deterministic Routing:
@@ -169,11 +169,20 @@ class CommunicationWebhookView(APIView):
                 logger.warning("Webhook payload for tenant %s provider %s is neither dict nor list", tenant.id, provider)
                 return Response({'error': 'Webhook payload must be a JSON object or array'}, status=status.HTTP_400_BAD_REQUEST)
 
-            # SARVAM Voice Callback handler
+            # SARVAM Voice Callback handler — payload must be a JSON object (dict).
+            # A bare JSON list or scalar is rejected with 400 before dispatching.
             if provider_upper == 'SARVAM':
+                if not isinstance(payload, dict):
+                    logger.warning(
+                        "Sarvam webhook for tenant %s rejected: payload is not a JSON object (type=%s)",
+                        tenant.id, type(payload).__name__,
+                    )
+                    return Response(
+                        {'error': 'Sarvam webhook payload must be a JSON object.'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
                 from apps.tenant_core.services_voice_calling import VoiceCallingService
-                sarvam_payload = payload if isinstance(payload, dict) else (events[0] if events else {})
-                res = VoiceCallingService.record_call_webhook(org, sarvam_payload, db_alias=db_alias)
+                res = VoiceCallingService.record_call_webhook(org, payload, db_alias=db_alias)
                 return Response(res, status=status.HTTP_200_OK)
 
             # Validate tenant app identity if supported by adapter (prevents cross-tenant spoofing)
