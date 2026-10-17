@@ -12,6 +12,7 @@ Handles:
 
 import re
 import logging
+import zoneinfo
 from typing import Dict, Any, Optional
 from datetime import timedelta
 from django.utils import timezone
@@ -202,6 +203,36 @@ class VoiceCallingService:
         return res
 
     @classmethod
+    def _check_calling_hours(cls) -> None:
+        """
+        Enforces outbound voice calling hours in IST (Asia/Kolkata).
+
+        Blocks calls outside the configured window. Default: 09:00–21:00 IST, every day.
+        Override via env:
+            VOICE_CALLING_HOURS_START  (int, 0-23, default 9)
+            VOICE_CALLING_HOURS_END    (int, 0-23, default 21)
+
+        Bypass in tests/dev with: VOICE_CALLING_ENFORCE_HOURS=false
+        """
+        from django.conf import settings
+        if not getattr(settings, 'VOICE_CALLING_ENFORCE_HOURS', True):
+            return
+
+        IST = zoneinfo.ZoneInfo('Asia/Kolkata')
+        now_ist = timezone.now().astimezone(IST)
+        current_hour = now_ist.hour
+
+        start_hour = getattr(settings, 'VOICE_CALLING_HOURS_START', 9)
+        end_hour = getattr(settings, 'VOICE_CALLING_HOURS_END', 21)
+
+        if not (start_hour <= current_hour < end_hour):
+            raise ValueError(
+                f"Outbound call rejected: AI voice calls are only permitted between "
+                f"{start_hour:02d}:00 and {end_hour:02d}:00 IST. "
+                f"Current time is {now_ist.strftime('%H:%M IST')}."
+            )
+
+    @classmethod
     def verify_lead_calling_eligibility(
         cls,
         lead: Lead,
@@ -209,12 +240,15 @@ class VoiceCallingService:
         custom_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Validates lead suppression, Do Not Contact, and trusted voice consent.
+        Validates calling hours (IST), lead suppression, Do Not Contact, and trusted voice consent.
         Fails closed. Uses authoritative get_lead_voice_consent_status logic.
         """
         alias = db_alias or 'default'
 
-        # Check explicit invocation metadata denial
+        # 0. Calling hours gate (IST 9am-9pm) — fail closed
+        cls._check_calling_hours()
+
+        # 1. Check explicit invocation metadata denial
         if custom_metadata and custom_metadata.get('has_voice_consent') is False:
             raise ValueError(f"Outbound call rejected: Explicit voice calling consent was denied for lead {lead.id}.")
 

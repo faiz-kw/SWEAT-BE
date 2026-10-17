@@ -520,6 +520,9 @@ if 'test' in sys.argv:
         'user': '10000/minute',
         'anon': '10000/minute',
     }
+    # Disable calling-hours gate in tests: tests run at arbitrary times and must not depend
+    # on the current IST clock. Real enforcement is validated by unit tests that mock timezone.now().
+    VOICE_CALLING_ENFORCE_HOURS = False
 else:
     CELERY_TASK_ALWAYS_EAGER = False
     CELERY_TASK_EAGER_PROPAGATES = False
@@ -578,6 +581,11 @@ DEPLOYMENT_ENVIRONMENT = os.getenv('DEPLOYMENT_ENVIRONMENT', 'development' if DE
 META_LEAD_SIMULATOR_ENABLED = os.getenv('META_LEAD_SIMULATOR_ENABLED', 'true' if DEBUG else 'false').lower() in ('true', '1', 't')
 COMMUNICATIONS_OUTBOUND_ENABLED = os.getenv('COMMUNICATIONS_OUTBOUND_ENABLED', 'false' if DEBUG else 'true').lower() in ('true', '1', 't')
 VOICE_CALLING_ENABLED = os.getenv('VOICE_CALLING_ENABLED', 'false').lower() in ('true', '1', 't', 'yes')
+# Calling hours enforcement (IST / Asia/Kolkata). Calls outside the window are rejected.
+# VOICE_CALLING_ENFORCE_HOURS=false disables the check in staging/dev without changing production.
+VOICE_CALLING_ENFORCE_HOURS = os.getenv('VOICE_CALLING_ENFORCE_HOURS', 'true').lower() in ('true', '1', 't', 'yes')
+VOICE_CALLING_HOURS_START = int(os.getenv('VOICE_CALLING_HOURS_START', '9'))   # 09:00 IST
+VOICE_CALLING_HOURS_END   = int(os.getenv('VOICE_CALLING_HOURS_END',   '21'))  # 21:00 IST
 META_APP_ID = os.getenv('META_APP_ID', '').strip()
 META_APP_SECRET = os.getenv('META_APP_SECRET', '').strip()
 META_WEBHOOK_VERIFY_TOKEN = os.getenv('META_WEBHOOK_VERIFY_TOKEN', '').strip()
