@@ -51,7 +51,7 @@ from apps.tenant_core.services_voice_calling import VoiceCallingService
 from apps.tenant_core.services_crm import CRMLeadService
 
 
-@override_settings(COMMUNICATIONS_OUTBOUND_ENABLED=True, VOICE_CALLING_ENABLED=True)
+@override_settings(COMMUNICATIONS_OUTBOUND_ENABLED=True, VOICE_CALLING_ENABLED=True, VOICE_CALLING_ENFORCE_HOURS=False)
 class SarvamVoiceCallingTests(TestCase):
     databases = {'default', 'tenant_test'}
 
@@ -2308,7 +2308,7 @@ class SarvamVoiceCallingTests(TestCase):
 # =============================================================================
 # Task 2 — Safe PostgreSQL Concurrency Verification Suite
 # =============================================================================
-@override_settings(COMMUNICATIONS_OUTBOUND_ENABLED=True, VOICE_CALLING_ENABLED=True)
+@override_settings(COMMUNICATIONS_OUTBOUND_ENABLED=True, VOICE_CALLING_ENABLED=True, VOICE_CALLING_ENFORCE_HOURS=False)
 class SarvamPostgresConcurrencyTests(TransactionTestCase):
     """
     Dedicated transaction-capable concurrency test suite.
