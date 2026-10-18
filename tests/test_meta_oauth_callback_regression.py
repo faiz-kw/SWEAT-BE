@@ -892,3 +892,144 @@ class MetaOAuthCallbackRegressionTests(unittest.TestCase):
             mock_fetch.assert_called_once_with(target_form_id, token_2)
             self.assertNotEqual(mock_fetch.call_args[0][1], token_1)
 
+    def test_24_meta_lead_sarvam_voice_consent_and_program_ingestion(self):
+        """24. Regression: Ingesting a Meta lead parses consent_voice and interested_program,
+        stores canonical +91 phone, sets in-memory lead attributes, and creates authoritative ConsentRecord."""
+        from django.db import transaction
+        from apps.tenant_core.models_catalog import Program
+        from apps.tenant_core.models_crm import Lead, LeadSource
+        from apps.tenant_core.models_org import Branch, Location
+        from apps.tenant_core.models_meta_leads import MetaLeadMapping, MetaLeadImport
+        from apps.tenant_core.models_privacy import ConsentRecord, ProcessingPurpose
+        from apps.tenant_core.services_meta_leads import _apply_mapping
+        from apps.tenant_core.services_voice_calling import VoiceCallingService
+
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            # 1. Setup Location, Branch, LeadSource, Program
+            loc, _ = Location.objects.using(alias).get_or_create(
+                organization=self.org,
+                code='LOC-SWEAT-TEST',
+                defaults={'name': 'SWEAT Test Location', 'status': 'ACTIVE'}
+            )
+            branch, _ = Branch.objects.using(alias).get_or_create(
+                organization=self.org,
+                location=loc,
+                code='BR-SWEAT-FLAGSHIP',
+                defaults={'name': 'SWEAT Flagship Studio', 'status': 'ACTIVE'}
+            )
+            lead_source, _ = LeadSource.objects.using(alias).get_or_create(
+                organization=self.org,
+                code='META_ADS_TEST',
+                defaults={'name': 'Meta Ads Test', 'source_type': 'META', 'status': 'ACTIVE'}
+            )
+            program, _ = Program.objects.using(alias).get_or_create(
+                organization=self.org,
+                name='Pilates Reformer',
+                defaults={'status': 'ACTIVE'}
+            )
+
+            # 2. Setup MetaLeadMapping with voice consent and interested_program
+            mapping, _ = MetaLeadMapping.objects.using(alias).update_or_create(
+                organization=self.org,
+                page_id='1265728509951597',
+                form_id='1755557852149138',
+                defaults={
+                    'name': 'SWEAT LEADS ADS - SARVAM VOICE',
+                    'branch': branch,
+                    'lead_source': lead_source,
+                    'is_active': True,
+                    'field_mappings': {
+                        'first_name': 'first_name',
+                        'last_name': 'last_name',
+                        'phone': 'phone_number',
+                        'email': 'email',
+                        'interested_program': 'interested_program',
+                        'consent_voice': 'do_you_agree_to_be_contacted_via_phone_call?',
+                    },
+                }
+            )
+
+            # 3. Setup incoming MetaLeadImport event
+            event = MetaLeadImport.objects.using(alias).create(
+                organization=self.org,
+                page_id='1265728509951597',
+                form_id='1755557852149138',
+                external_lead_id=f'test_lead_{uuid.uuid4().hex[:8]}',
+                mode='SIMULATION',
+                field_data=[
+                    {'name': 'first_name', 'values': ['Aarav']},
+                    {'name': 'last_name', 'values': ['Sharma']},
+                    {'name': 'phone_number', 'values': ['9876543210']},
+                    {'name': 'email', 'values': ['aarav.sharma@example.com']},
+                    {'name': 'interested_program', 'values': ['Pilates Reformer']},
+                    {'name': 'do_you_agree_to_be_contacted_via_phone_call?', 'values': ['yes']},
+                ],
+                status='PENDING',
+            )
+
+            # 4. Ingest using _apply_mapping
+            with transaction.atomic(using=alias):
+                _apply_mapping(event, mapping, alias, self.user, is_live=False)
+
+            self.assertEqual(event.status, 'IMPORTED')
+            lead = event.lead
+            self.assertIsNotNone(lead)
+            self.assertEqual(lead.first_name, 'Aarav')
+            self.assertEqual(lead.last_name, 'Sharma')
+            self.assertEqual(lead.phone_normalized, '+919876543210')
+            self.assertEqual(lead.current_status, 'NEW_LEAD')
+            self.assertEqual(lead.interested_program_id, program.id)
+            self.assertTrue(lead.consent_voice)
+            self.assertEqual(lead.consent_voice_source, 'META_LEAD_FORM')
+
+            # 5. Verify authoritative database ConsentRecord exists
+            consent_rec = ConsentRecord.objects.using(alias).filter(
+                subject_id=lead.id,
+                subject_type='lead',
+                purpose__code='VOICE_CALL',
+            ).first()
+            self.assertIsNotNone(consent_rec)
+            self.assertEqual(consent_rec.status, 'GRANTED')
+            self.assertEqual(consent_rec.capture_source, 'META_LEAD_FORM')
+
+            # 6. Verify fail-closed VoiceCallingService eligibility verification passes
+            consent_status = VoiceCallingService.get_lead_voice_consent_status(lead, db_alias=alias)
+            self.assertTrue(consent_status['is_eligible'])
+            self.assertEqual(consent_status['status'], 'GRANTED')
+
+    def test_25_tasks_meta_leads_dispatches_automated_sarvam_call_on_imported(self):
+        """25. Regression: process_meta_lead_import_task dispatches trigger_automated_sarvam_call_task
+        when lead import completes with IMPORTED status."""
+        from unittest.mock import patch, MagicMock
+        from apps.tenant_core.models_meta_leads import MetaLeadImport
+        from apps.tenant_core.tasks_meta_leads import process_meta_lead_import_task
+
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            mock_lead_id = uuid.uuid4()
+            event = MetaLeadImport.objects.using(alias).create(
+                organization=self.org,
+                page_id='1265728509951597',
+                form_id='1755557852149138',
+                external_lead_id=f'test_async_{uuid.uuid4().hex[:8]}',
+                mode='LIVE',
+                field_data=[],
+                status='PENDING',
+            )
+
+        mock_event = MagicMock()
+        mock_event.status = 'IMPORTED'
+        mock_event.lead_id = mock_lead_id
+        mock_event.page_id = '1265728509951597'
+        mock_event.form_id = '1755557852149138'
+        mock_event.external_lead_id = event.external_lead_id
+
+        with patch('apps.tenant_core.tasks_meta_leads.process_live_import', return_value=mock_event),              patch('apps.tenant_core.tasks_voice_calling.trigger_automated_sarvam_call_task.delay') as mock_voice_task:
+            
+            res = process_meta_lead_import_task(tenant_id=str(self.tenant.id), import_id=str(event.id))
+            self.assertEqual(res.get('status'), 'IMPORTED')
+            mock_voice_task.assert_called_once_with(
+                tenant_id=str(self.tenant.id),
+                lead_id=str(mock_lead_id),
+            )
+
+
