@@ -473,6 +473,7 @@ class LeadViewSet(viewsets.ModelViewSet):
         'assign': 'crm.leads.edit',
         'book_trial': 'crm.leads.edit',
         'call': 'crm.leads.edit',
+        'voice_consent': 'crm.leads.edit',
         'metadata': 'crm.leads.view',
         'summary_metrics': 'crm.leads.view',
         'summary_metrics_underscore': 'crm.leads.view',
@@ -751,7 +752,7 @@ class LeadViewSet(viewsets.ModelViewSet):
             branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
             tb_qs = TrialBooking.objects.using(alias)
             if org:
-                tb_qs = tb_qs.filter(lead__organization=org)
+                tb_qs = tb_qs.filter(Q(lead__organization=org) | Q(branch__organization=org))
             permitted_branches = get_user_effective_branch_ids(request.user, alias)
             if permitted_branches is not None:
                 tb_qs = tb_qs.filter(branch_id__in=permitted_branches)
@@ -1447,6 +1448,91 @@ class LeadViewSet(viewsets.ModelViewSet):
         }
         return Response(safe_data, status=status.HTTP_201_CREATED)
 
+    @action(detail=True, methods=['post'], url_path='voice-consent')
+    def voice_consent(self, request, pk=None):
+        """
+        Records or updates authoritative voice-calling consent for a lead.
+        POST /api/v1/tenant/leads/{id}/voice-consent/
+        Payload: { status: 'GRANTED' | 'WITHDRAWN', source: 'STAFF_VERIFIED', notes: '...' }
+        """
+        lead = self.get_object()
+        alias = _get_db(request)
+
+        # 1. RBAC Check
+        from .rbac_engine import RBACAuthorizationEngine
+        allowed, reason, check_code = RBACAuthorizationEngine.evaluate(
+            user=request.user,
+            required_module='crm',
+            required_submodule='leads',
+            required_permission='crm.leads.edit',
+            branch_id=str(lead.branch_id) if lead.branch_id else None,
+            request=request,
+        )
+        if not allowed:
+            raise PermissionDenied(f"Permission denied: crm.leads.edit required ({reason})")
+
+        status_param = (request.data.get('status') or 'GRANTED').strip().upper()
+        if status_param not in ('GRANTED', 'WITHDRAWN'):
+            return Response({'error': "status must be either 'GRANTED' or 'WITHDRAWN'."}, status=status.HTTP_400_BAD_REQUEST)
+
+        source = (request.data.get('source') or 'STAFF_VERIFIED').strip()
+        notes = (request.data.get('notes') or '').strip()
+        actor = request.user if (hasattr(request, 'user') and getattr(request.user, 'is_authenticated', False)) else None
+
+        from .models_privacy import ProcessingPurpose, ConsentRecord
+        from .models_users import TenantUser
+        from .services_voice_calling import VoiceCallingService
+
+        purpose = ProcessingPurpose.objects.using(alias).filter(code='VOICE_CALL').first()
+        if not purpose:
+            purpose = ProcessingPurpose.objects.using(alias).create(
+                code='VOICE_CALL',
+                name='AI Voice Calling',
+                description='Consent to receive automated AI voice calls regarding trial bookings and schedule inquiries.',
+                status='ACTIVE',
+            )
+
+        consent_user = actor
+        if not consent_user or not isinstance(consent_user, TenantUser):
+            consent_user = lead.assigned_sales_user or TenantUser.objects.using(alias).filter(organization=lead.organization).first()
+            if not consent_user:
+                consent_user = TenantUser.objects.using(alias).first()
+
+        rec = ConsentRecord.objects.using(alias).create(
+            user=consent_user,
+            purpose=purpose,
+            subject_type='lead',
+            subject_id=lead.id,
+            status=status_param,
+            capture_source=source,
+            consent_method=source,
+            notes=notes or f"Voice calling consent {status_param.lower()} by staff ({actor.email if actor else 'Staff'})",
+            recorded_at=timezone.now(),
+        )
+
+        lead.consent_voice = (status_param == 'GRANTED')
+        lead.consent_voice_source = source
+        lead.consent_voice_recorded_at = timezone.now()
+        if hasattr(lead, '_cached_voice_consent'):
+            delattr(lead, '_cached_voice_consent')
+
+        from .models_crm import LeadActivity
+        LeadActivity.objects.using(alias).create(
+            lead=lead,
+            activity_type='STATUS_CHANGE',
+            outcome=f"Voice Calling Consent: {status_param}",
+            notes=f"Voice calling permission marked as {status_param} by {actor.email if actor else 'Staff'}. Source: {source}.",
+            performed_by_user=actor if isinstance(actor, TenantUser) else None,
+        )
+
+        status_info = VoiceCallingService.get_lead_voice_consent_status(lead, db_alias=alias)
+        return Response({
+            'status': status_param,
+            'is_eligible': status_param == 'GRANTED',
+            'voice_consent': status_info,
+            'message': f"Voice calling consent successfully updated to {status_param}."
+        }, status=status.HTTP_200_OK)
+
     @action(detail=True, methods=['get'], url_path='offers')
     def offers(self, request, pk=None):
         """
@@ -2078,7 +2164,7 @@ class LeadActivityViewSet(viewsets.ModelViewSet):
         org = _get_org(self.request)
         qs = LeadActivity.objects.using(alias).select_related('lead', 'lead__branch', 'performed_by_user')
         if org:
-            qs = qs.filter(lead__organization=org)
+            qs = qs.filter(Q(lead__organization=org) | Q(lead__branch__organization=org))
         permitted_branches = get_user_effective_branch_ids(self.request.user, alias)
         if permitted_branches is not None:
             qs = qs.filter(lead__branch_id__in=permitted_branches)
@@ -2390,7 +2476,7 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
             'assigned_trainer_profile__employee_profile__user_profile__user',
         )
         if org:
-            qs = qs.filter(lead__organization=org)
+            qs = qs.filter(Q(lead__organization=org) | Q(branch__organization=org))
 
         permitted_branches = get_user_effective_branch_ids(self.request.user, alias)
         if permitted_branches is not None:
@@ -2511,7 +2597,7 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
         org = _get_org(request)
         qs = TrialBooking.objects.using(alias)
         if org:
-            qs = qs.filter(lead__organization=org)
+            qs = qs.filter(Q(lead__organization=org) | Q(branch__organization=org))
         permitted_branches = get_user_effective_branch_ids(request.user, alias)
         if permitted_branches is not None:
             qs = qs.filter(branch_id__in=permitted_branches)

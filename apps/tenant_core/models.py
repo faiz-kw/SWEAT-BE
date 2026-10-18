@@ -190,6 +190,7 @@ from .models_bookings import (
     BookingCancellation,
     BookingWaitlistEvent,
     AttendancePolicyEvent,
+    BookingPolicyConfig,
 )
 
 __all__ += [
@@ -205,6 +206,7 @@ __all__ += [
     'BookingCancellation',
     'BookingWaitlistEvent',
     'AttendancePolicyEvent',
+    'BookingPolicyConfig',
 ]
 
 from .models_attendance import (

@@ -396,9 +396,20 @@ class VoiceCallingService:
         if webhook_token:
             webhook_url += f"?token={webhook_token}"
 
+        lead_full_name = f"{lead.first_name} {lead.last_name}".strip()
         call_metadata = {
             'lead_id': str(lead.id),
             'call_session_id': str(session.id),
+            'lead_name': lead_full_name,
+            'caller_name': lead.first_name,
+            'name': lead.first_name,
+            'phone': recipient_phone,
+            'user_phone_number': recipient_phone,
+            'program': lead.interested_program or '',
+            'interested_program': lead.interested_program or '',
+            'branch': lead.branch.name if lead.branch else '',
+            'branch_name': lead.branch.name if lead.branch else '',
+            'fitness_goal': lead.fitness_goal or '',
             **(custom_metadata or {}),
         }
 

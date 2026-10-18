@@ -12,6 +12,7 @@ from .models_bookings import (
     BookingReschedule,
     BookingCancellation,
     BookingWaitlistEvent,
+    BookingPolicyConfig,
 )
 from .models_attendance import AttendanceRecord, AccessEvent
 
@@ -143,6 +144,7 @@ class BookingListSerializer(serializers.ModelSerializer):
         model = Booking
         fields = [
             'id', 'booking_number', 'status', 'booking_type', 'booking_source',
+            'payment_status', 'confirmation_status', 'confirmed_at',
             'waitlist_position', 'booked_at', 'cancelled_at', 'completed_at',
             'user_profile', 'user_profile_name', 'user_profile_email',
             'occurrence', 'occurrence_title', 'occurrence_date', 'occurrence_start_at', 'occurrence_end_at',
@@ -305,4 +307,16 @@ class AccessEventSerializer(serializers.ModelSerializer):
         if not name and obj.user_profile.user:
             name = obj.user_profile.user.full_name or obj.user_profile.user.email
         return name or 'Unknown'
+
+
+class BookingPolicyConfigSerializer(serializers.ModelSerializer):
+    branch_name = serializers.CharField(source='branch.name', read_only=True, allow_null=True)
+    organization_name = serializers.CharField(source='organization.name', read_only=True)
+    updated_by_email = serializers.CharField(source='updated_by_user.email', read_only=True, allow_null=True)
+
+    class Meta:
+        model = BookingPolicyConfig
+        fields = '__all__'
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
 

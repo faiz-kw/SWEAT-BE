@@ -439,4 +439,40 @@ def generate_rolling_occurrences_task(self, tenant_id: str = None, days_ahead: i
         }
 
 
+@shared_task(
+    bind=True,
+    name='apps.tenant_core.tasks.process_booking_auto_cancellations_periodic_task',
+    max_retries=2,
+    acks_late=True,
+)
+def process_booking_auto_cancellations_periodic_task(self, tenant_id: str = None, dry_run: bool = False, **kwargs) -> dict:
+    """
+    Periodic task to scan, evaluate, and auto-cancel expired unpaid and unconfirmed bookings
+    within an isolated tenant database context.
+    Protected against duplicate executions with distributed locks and database-level row locks.
+    """
+    if not tenant_id:
+        return {'status': 'FAILED', 'error': 'tenant_id is mandatory'}
+
+    from .context import tenant_database_context
+    from .services_booking_policy import BookingPolicyService
+
+    try:
+        with tenant_database_context(tenant_id) as db_alias:
+            results = BookingPolicyService.process_auto_cancellations(
+                tenant_id=tenant_id,
+                dry_run=dry_run,
+                db_alias=db_alias,
+            )
+            return {
+                'status': 'COMPLETED',
+                'tenant_id': str(tenant_id),
+                'results': results,
+            }
+    except Exception as exc:
+        logger.error("Auto-cancellation periodic task failed for tenant %s: %s", tenant_id, exc, exc_info=True)
+        return {'status': 'FAILED', 'tenant_id': str(tenant_id), 'error': str(exc)}
+
+
+
 

@@ -553,6 +553,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'apps.tenant_core.tasks_meta_leads.recover_meta_imports_periodic_task',
         'schedule': float(os.getenv('CELERY_SCHEDULE_META_RECOVERY_SECONDS', '120.0')),  # every 2 min
     },
+    'master-process-booking-auto-cancellations': {
+        'task': 'apps.master.tasks.process_all_tenants_booking_auto_cancellations_async',
+        'schedule': float(os.getenv('CELERY_SCHEDULE_BOOKING_AUTOCANCEL_SECONDS', '120.0')),  # every 2 min
+    },
 }
 
 

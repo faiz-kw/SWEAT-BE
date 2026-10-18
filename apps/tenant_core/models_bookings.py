@@ -295,6 +295,26 @@ class Booking(models.Model):
             ('NO_SHOW', 'NO_SHOW'),
         ]
     )
+    payment_status = models.CharField(
+        max_length=30,
+        default='PAID',
+        choices=[
+            ('PAID', 'PAID'),
+            ('UNPAID', 'UNPAID'),
+            ('PENDING', 'PENDING'),
+            ('REFUNDED', 'REFUNDED'),
+        ]
+    )
+    confirmation_status = models.CharField(
+        max_length=30,
+        default='CONFIRMED',
+        choices=[
+            ('CONFIRMED', 'CONFIRMED'),
+            ('PENDING', 'PENDING'),
+            ('DECLINED', 'DECLINED'),
+        ]
+    )
+    confirmed_at = models.DateTimeField(null=True, blank=True)
     waitlist_position = models.IntegerField(null=True, blank=True)
     booked_at = models.DateTimeField(default=timezone.now)
     cancelled_at = models.DateTimeField(null=True, blank=True)
@@ -310,6 +330,8 @@ class Booking(models.Model):
             models.Index(fields=['occurrence', 'status']),
             models.Index(fields=['user_profile', 'status', 'booked_at']),
             models.Index(fields=['branch', 'status', 'booked_at']),
+            models.Index(fields=['status', 'payment_status']),
+            models.Index(fields=['status', 'confirmation_status']),
         ]
 
     def __str__(self):
@@ -436,3 +458,133 @@ class AttendancePolicyEvent(models.Model):
     class Meta:
         db_table = 'attendance_policy_events'
         ordering = ['-created_at']
+
+
+class BookingPolicyConfig(models.Model):
+    """
+    Authoritative booking policy configuration supporting tenant-wide defaults
+    and optional branch-specific overrides.
+    """
+    from decimal import Decimal
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='booking_policy_configs')
+    branch = models.ForeignKey(Branch, on_delete=models.CASCADE, null=True, blank=True, related_name='booking_policy_configs')
+
+    # 1. Unpaid Auto-Cancellation Policy
+    auto_cancel_unpaid_enabled = models.BooleanField(
+        default=True,
+        help_text="Automatically cancel unpaid bookings after time limit"
+    )
+    auto_cancel_unpaid_minutes = models.IntegerField(
+        default=15,
+        help_text="Time limit in minutes from booking creation before unpaid booking is cancelled"
+    )
+
+    # 2. Unconfirmed Auto-Cancellation Policy
+    auto_cancel_unconfirmed_enabled = models.BooleanField(
+        default=True,
+        help_text="Automatically cancel unconfirmed bookings after time limit"
+    )
+    auto_cancel_unconfirmed_minutes = models.IntegerField(
+        default=60,
+        help_text="Time limit in minutes from booking creation before unconfirmed booking is cancelled"
+    )
+
+    # 3. Cancellation & Rescheduling Cutoffs
+    cancellation_cutoff_hours = models.IntegerField(
+        default=2,
+        help_text="Hours before class start time when free member cancellation closes"
+    )
+    rescheduling_cutoff_hours = models.IntegerField(
+        default=2,
+        help_text="Hours before class start time when member rescheduling closes"
+    )
+    max_reschedules_per_booking = models.IntegerField(
+        default=2,
+        help_text="Maximum allowed reschedules for a single booking"
+    )
+
+    # 4. Late Cancellation Policy
+    late_cancellation_allowed = models.BooleanField(
+        default=True,
+        help_text="Whether member is permitted to cancel after cutoff window passes"
+    )
+    late_cancellation_session_action = models.CharField(
+        max_length=20,
+        default='CONSUME',
+        choices=[
+            ('CONSUME', 'CONSUME'),
+            ('RESTORE', 'RESTORE'),
+            ('NO_ACTION', 'NO_ACTION'),
+        ],
+        help_text="Session credit handling: CONSUME forfeits credit, RESTORE refunds it"
+    )
+    late_cancellation_fee = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        help_text="Monetary penalty fee for late cancellations"
+    )
+    late_cancellation_treated_as_no_show = models.BooleanField(
+        default=False,
+        help_text="Treat late cancellation as an attendance no-show strike"
+    )
+
+    # 5. Booking-Type & Eligibility Conditions
+    allowed_booking_types = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Eligible booking types, e.g. ['MEMBER', 'TRIAL', 'PAY_PER_USE', 'WALK_IN']"
+    )
+    require_active_membership = models.BooleanField(
+        default=True,
+        help_text="Strictly require an active non-frozen membership for member class bookings"
+    )
+    max_upcoming_bookings = models.IntegerField(
+        default=5,
+        help_text="Maximum active upcoming bookings permitted per member"
+    )
+    advance_booking_days_max = models.IntegerField(
+        default=14,
+        help_text="Maximum days in advance a member is allowed to book"
+    )
+
+    # 6. Policy Application Scope
+    apply_to_existing_bookings = models.BooleanField(
+        default=False,
+        help_text="If True, auto-cancellation applies to existing eligible bookings. If False, applies to new bookings only."
+    )
+    policy_effective_at = models.DateTimeField(
+        default=timezone.now,
+        help_text="Timestamp when policy was last updated/activated"
+    )
+
+    # 7. Notification Channels & Configuration
+    notify_unpaid_auto_cancellation = models.BooleanField(default=True)
+    notify_unconfirmed_auto_cancellation = models.BooleanField(default=True)
+    notify_late_cancellation = models.BooleanField(default=True)
+    notification_channels = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Enabled channels: e.g. ['WHATSAPP', 'SMS', 'EMAIL', 'IN_APP']"
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by_user = models.ForeignKey(
+        TenantUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='+'
+    )
+
+    class Meta:
+        db_table = 'booking_policy_configs'
+        unique_together = ('organization', 'branch')
+        ordering = ['-updated_at']
+
+    def __str__(self):
+        target = f"Branch {self.branch.name}" if self.branch else f"Org {self.organization.name} Default"
+        return f"BookingPolicyConfig ({target})"
+

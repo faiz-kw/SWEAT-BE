@@ -2025,11 +2025,23 @@ class MobileMyBookingsView(APIView):
                         t_user = emp.user_profile.user
                         trainer_name = f"{t_user.first_name} {t_user.last_name}".strip()
 
+            from .services_booking_policy import BookingPolicyService
+            org = occ.class_template.category.organization if (occ and occ.class_template and occ.class_template.category) else getattr(branch, 'organization', None)
+            bp = BookingPolicyService.get_effective_policy(org, branch=branch, db_alias=alias) if org else {}
+
+            diff_minutes = int((occ.start_at - now).total_seconds() / 60) if (occ and occ.start_at) else 9999
+            cutoff_hours = bp.get('cancellation_cutoff_hours', 2)
+            reschedule_cutoff_hours = bp.get('rescheduling_cutoff_hours', 2)
+            is_late_cancel = diff_minutes < (cutoff_hours * 60)
+            is_past_reschedule_cutoff = diff_minutes < (reschedule_cutoff_hours * 60)
+
             item = {
                 'id': str(b.id),
                 'booking_number': b.booking_number,
                 'occurrence_id': str(occ.id) if occ else None,
                 'status': b.status,
+                'payment_status': getattr(b, 'payment_status', 'PAID'),
+                'confirmation_status': getattr(b, 'confirmation_status', 'CONFIRMED'),
                 'booking_type': b.booking_type,
                 'waitlist_position': b.waitlist_position,
                 'class_name': template.name if template else 'Reformer Pilates',
@@ -2043,8 +2055,14 @@ class MobileMyBookingsView(APIView):
                 'duration_minutes': template.default_duration_minutes if template else 50,
                 'trainer_name': trainer_name,
                 'booked_at': b.booked_at.isoformat() if b.booked_at else None,
-                'can_reschedule': (b.status in ['CONFIRMED', 'RESERVED']),
+                'can_reschedule': (b.status in ['CONFIRMED', 'RESERVED']) and not is_past_reschedule_cutoff,
                 'can_cancel': (b.status in ['CONFIRMED', 'RESERVED']),
+                'cancellation_cutoff_hours': cutoff_hours,
+                'rescheduling_cutoff_hours': reschedule_cutoff_hours,
+                'is_late_cancellation': is_late_cancel,
+                'late_cancellation_session_action': bp.get('late_cancellation_session_action', 'CONSUME'),
+                'cancellation_fee': bp.get('late_cancellation_fee', '0.00'),
+                'late_cancellation_fee': bp.get('late_cancellation_fee', '0.00'),
             }
 
             if b.status == 'WAITLISTED' and occ and occ.start_at >= now:
@@ -2098,25 +2116,40 @@ class MobileCancelBookingView(APIView):
         reason = request.data.get('reason', 'Member cancelled via mobile app.')
 
         try:
+            from .services_booking_policy import BookingPolicyService
+            policy_eval = BookingPolicyService.validate_member_cancellation(booking, cancelled_by_user=user, db_alias=alias)
+            reason_code = 'MEMBER_LATE_CANCEL' if policy_eval['is_late'] else 'MEMBER_MOBILE_CANCEL'
+
             cancellation = BookingWaitlistAttendanceService.cancel_booking(
                 booking=booking,
                 cancelled_by_user=user,
-                reason_code='MEMBER_MOBILE_CANCEL',
+                reason_code=reason_code,
                 reason_text=reason,
                 db_alias=alias,
             )
-            session_action = cancellation.session_action_applied if cancellation else 'RESTORE'
+            session_action = cancellation.session_action_applied if cancellation else policy_eval['session_action']
         except ValidationError as e:
             detail = e.messages[0] if hasattr(e, 'messages') and e.messages else str(e)
             return Response({'detail': detail}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
             return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
+        is_refunded = (session_action == 'RESTORE')
+        detail_msg = (
+            'Booking cancelled. 1 session credit refunded to your passbook.'
+            if is_refunded
+            else 'Booking cancelled. Session credit forfeited per gym policy.'
+        )
+
         return Response({
-            'detail': 'Booking cancelled successfully.',
+            'detail': detail_msg,
             'booking_id': str(booking.id),
             'status': 'CANCELLED',
-            'session_credit_refunded': (session_action == 'RESTORE'),
+            'is_late': policy_eval['is_late'],
+            'session_action': session_action,
+            'session_credit_refunded': is_refunded,
+            'refunded': is_refunded,
+            'fee_applied': str(policy_eval['fee']),
         })
 
 
@@ -2164,6 +2197,9 @@ class MobileRescheduleBookingView(APIView):
             return Response({'detail': 'Target class slot not found.'}, status=status.HTTP_404_NOT_FOUND)
 
         try:
+            from .services_booking_policy import BookingPolicyService
+            BookingPolicyService.validate_member_reschedule(booking, to_occurrence, rescheduled_by_user=user, db_alias=alias)
+
             new_booking = BookingWaitlistAttendanceService.reschedule_booking(
                 booking=booking,
                 to_occurrence=to_occurrence,
@@ -2179,6 +2215,7 @@ class MobileRescheduleBookingView(APIView):
                 'status': new_booking.status,
                 'class_name': to_occurrence.class_template.name,
                 'start_at': to_occurrence.start_at.isoformat() if to_occurrence.start_at else None,
+                'new_start_time': to_occurrence.start_at.isoformat() if to_occurrence.start_at else None,
                 'branch_name': to_occurrence.branch.name if to_occurrence.branch else 'SWEAT Studio',
             }, status=status.HTTP_200_OK)
         except ValidationError as e:

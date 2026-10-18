@@ -554,3 +554,29 @@ def generate_all_tenants_rolling_occurrences_async(self, days_ahead: int = 30) -
     return {'tenants_count': len(results), 'results': results}
 
 
+@shared_task(
+    bind=True,
+    name='apps.master.tasks.process_all_tenants_booking_auto_cancellations_async',
+    acks_late=True,
+)
+def process_all_tenants_booking_auto_cancellations_async(self, dry_run: bool = False) -> dict:
+    """
+    Scheduled orchestrator: iterates all ACTIVE tenants and triggers booking auto-cancellation.
+    Cancels expired unpaid and unconfirmed bookings safely and promotes waitlists.
+    """
+    from apps.master.models_tenant import Tenant
+    from apps.tenant_core.tasks import process_booking_auto_cancellations_periodic_task
+
+    active_tenants = Tenant.objects.using('default').filter(status='ACTIVE')
+    results = []
+    for t in active_tenants:
+        try:
+            res = process_booking_auto_cancellations_periodic_task(tenant_id=str(t.id), dry_run=dry_run)
+            results.append({'tenant_id': str(t.id), 'result': res})
+        except Exception as exc:
+            logger.exception("Error processing booking auto-cancellations for tenant %s: %s", t.id, exc)
+            results.append({'tenant_id': str(t.id), 'error': str(exc)})
+    return {'tenants_count': len(results), 'results': results}
+
+
+
