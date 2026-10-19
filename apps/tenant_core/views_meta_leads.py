@@ -143,13 +143,29 @@ class MappingSerializer(serializers.ModelSerializer):
             if not isinstance(v, (str, int, float, bool)) or len(str(v)) > 200:
                 raise serializers.ValidationError({'field_defaults': 'Default values must be simple values up to 200 characters.'})
 
-        branch_mode = value('branch_mode', 'FIXED')
-        if branch_mode == 'FIXED':
+        # --- FIX: SUPPORT ALL BRANCHES IN MAPPING VALIDATION START ---
+        # WHY: When branch_mode is 'ALL', branch should be None and not required.
+        # FIXES: Validation error 'Choose an active branch' when setting up organization-wide mapping.
+        # IMPACT: Leads from this form will be organization-wide without a fixed branch requirement.
+        # OLD:
+        # branch_mode = value('branch_mode', 'FIXED')
+        # if branch_mode == 'FIXED':
+        #     branch_id = value('branch')
+        #     if not branch_id or not Branch.objects.using(alias).filter(id=branch_id, organization=org, status='ACTIVE').exists():
+        #         raise serializers.ValidationError({'branch': 'Choose an active branch in this organisation.'})
+        #     attrs.update(branch_field='', branch_answers={}, fallback_branch=None)
+        # else:
+        default_mode = getattr(self.instance, 'branch_mode', 'FIXED' if value('branch') else 'ALL')
+        branch_mode = value('branch_mode', default_mode)
+        if branch_mode == 'ALL':
+            attrs.update(branch=None, branch_field='', branch_answers={}, fallback_branch=None)
+        elif branch_mode == 'FIXED':
             branch_id = value('branch')
             if not branch_id or not Branch.objects.using(alias).filter(id=branch_id, organization=org, status='ACTIVE').exists():
                 raise serializers.ValidationError({'branch': 'Choose an active branch in this organisation.'})
             attrs.update(branch_field='', branch_answers={}, fallback_branch=None)
         else:
+        # --- FIX: SUPPORT ALL BRANCHES IN MAPPING VALIDATION END ---
             if not value('branch_field', '').strip():
                 raise serializers.ValidationError({'branch_field': 'Enter the branch question name.'})
             answers = value('branch_answers', {})

@@ -79,7 +79,22 @@ class MetaLeadMapping(models.Model):
     version = models.PositiveIntegerField(default=1)
     field_mappings = models.JSONField(default=dict)
     field_defaults = models.JSONField(default=dict, blank=True)
-    branch_mode = models.CharField(max_length=10, choices=[('FIXED', 'Fixed branch'), ('ANSWER', 'Form answer')], default='FIXED')
+    # --- FIX: ADD ALL BRANCHES MODE FOR ORGANIZATION-WIDE META LEADS START ---
+    # WHY: Allow Meta Lead Ads to ingest enquiries at the organization level without requiring a single branch.
+    # FIXES: Users can choose "All branches" so incoming leads reflect to all studios in the CRM.
+    # IMPACT: branch_mode='ALL' allows branch to remain null and visible across all branches.
+    # OLD:
+    # branch_mode = models.CharField(max_length=10, choices=[('FIXED', 'Fixed branch'), ('ANSWER', 'Form answer')], default='FIXED')
+    branch_mode = models.CharField(
+        max_length=10,
+        choices=[
+            ('ALL', 'All branches (Organization-wide)'),
+            ('FIXED', 'Fixed branch'),
+            ('ANSWER', 'Form answer'),
+        ],
+        default='FIXED',
+    )
+    # --- FIX: ADD ALL BRANCHES MODE FOR ORGANIZATION-WIDE META LEADS END ---
     branch = models.ForeignKey('tenant_core.Branch', null=True, blank=True, on_delete=models.PROTECT)
     branch_field = models.CharField(max_length=100, blank=True, default='')
     branch_answers = models.JSONField(default=dict)

@@ -515,10 +515,18 @@ class LeadViewSet(viewsets.ModelViewSet):
             qs = qs.filter(organization=org)
 
         # Enforce server-side branch scope
+        # --- FIX: INCLUDE ORGANIZATION-WIDE LEADS IN BRANCH SCOPE START ---
+        # WHY: Leads with branch=None belong to the organization and must reflect across all branches.
+        # FIXES: Branch-scoped users can see organization-wide leads alongside their branch leads.
+        # IMPACT: Meta leads mapped to "All branches" reflect across all branches in CRM.
+        # OLD:
+        # permitted_branches = get_user_effective_branch_ids(self.request.user, alias)
+        # if permitted_branches is not None:
+        #     qs = qs.filter(Q(branch_id__in=permitted_branches) | Q(assigned_sales_user=self.request.user))
         permitted_branches = get_user_effective_branch_ids(self.request.user, alias)
         if permitted_branches is not None:
-            # Users can see leads in their permitted branches OR any lead specifically assigned to them within the organization
-            qs = qs.filter(Q(branch_id__in=permitted_branches) | Q(assigned_sales_user=self.request.user))
+            qs = qs.filter(Q(branch_id__in=permitted_branches) | Q(assigned_sales_user=self.request.user) | Q(branch_id__isnull=True))
+        # --- FIX: INCLUDE ORGANIZATION-WIDE LEADS IN BRANCH SCOPE END ---
 
         status_val = self.request.query_params.get('current_status')
         if status_val and status_val not in ('all', 'ALL'):
@@ -543,10 +551,20 @@ class LeadViewSet(viewsets.ModelViewSet):
                 qs = qs.filter(branch_id__in=b_ids)
             else:
                 return qs.none()
+        # --- FIX: INCLUDE ORGANIZATION-WIDE LEADS IN SINGLE BRANCH FILTER START ---
+        # WHY: When a user filters by a single studio branch, organization-wide leads should also reflect.
+        # FIXES: Organization-wide leads remain visible when switching between studio branches.
+        # IMPACT: Central Meta leads reflect to all branches.
+        # OLD:
+        # elif branch_id and branch_id not in ('all', 'ALL'):
+        #     if permitted_branches is not None and str(branch_id) not in permitted_branches:
+        #         return qs.none()
+        #     qs = qs.filter(branch_id=branch_id)
         elif branch_id and branch_id not in ('all', 'ALL'):
             if permitted_branches is not None and str(branch_id) not in permitted_branches:
                 return qs.none()
-            qs = qs.filter(branch_id=branch_id)
+            qs = qs.filter(Q(branch_id=branch_id) | Q(branch_id__isnull=True))
+        # --- FIX: INCLUDE ORGANIZATION-WIDE LEADS IN SINGLE BRANCH FILTER END ---
 
         assigned_to_me = self.request.query_params.get('assigned_to_me')
         if assigned_to_me and str(assigned_to_me).lower() in ('true', '1'):

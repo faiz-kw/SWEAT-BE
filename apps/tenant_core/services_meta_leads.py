@@ -347,6 +347,23 @@ def _apply_mapping(event, mapping, alias, actor_user, is_live: bool = False):
     if mapping.lead_source.organization_id != event.organization_id or mapping.lead_source.status != 'ACTIVE' or mapping.lead_source.source_type != 'META':
         raise ValueError('An active Meta lead source is required.')
 
+    # --- FIX: SUPPORT ALL BRANCHES IN META INGESTION START ---
+    # WHY: If branch_mode is 'ALL', the lead belongs to the organization without a fixed branch.
+    # FIXES: Prevent BRANCH_UNRESOLVED failure when branch_mode == 'ALL'.
+    # IMPACT: Ingests lead with branch=None so it reflects across all branches.
+    # OLD:
+    # branch_id = mapping.branch_id
+    # if mapping.branch_mode == 'ANSWER':
+    #     values = answers.get(mapping.branch_field, [])
+    #     answer = values[0].strip().casefold() if len(values) == 1 else ''
+    #     branch_id = mapping.branch_answers.get(answer)
+    #     if not branch_id and getattr(mapping, 'unmatched_branch_policy', 'HOLD') == 'FALLBACK_BRANCH':
+    #         branch_id = getattr(mapping, 'fallback_branch_id', None)
+    #
+    # branch = Branch.objects.using(alias).filter(id=branch_id, organization_id=event.organization_id, status='ACTIVE').first() if branch_id else None
+    # if not branch:
+    #     event.status, event.error_code, event.error_message = 'NEEDS_ASSIGNMENT', 'BRANCH_UNRESOLVED', 'No active branch matches the saved mapping. The enquiry is held for review.'
+    #     return
     branch_id = mapping.branch_id
     if mapping.branch_mode == 'ANSWER':
         values = answers.get(mapping.branch_field, [])
@@ -354,11 +371,14 @@ def _apply_mapping(event, mapping, alias, actor_user, is_live: bool = False):
         branch_id = mapping.branch_answers.get(answer)
         if not branch_id and getattr(mapping, 'unmatched_branch_policy', 'HOLD') == 'FALLBACK_BRANCH':
             branch_id = getattr(mapping, 'fallback_branch_id', None)
+    elif mapping.branch_mode == 'ALL':
+        branch_id = None
 
     branch = Branch.objects.using(alias).filter(id=branch_id, organization_id=event.organization_id, status='ACTIVE').first() if branch_id else None
-    if not branch:
+    if not branch and mapping.branch_mode != 'ALL':
         event.status, event.error_code, event.error_message = 'NEEDS_ASSIGNMENT', 'BRANCH_UNRESOLVED', 'No active branch matches the saved mapping. The enquiry is held for review.'
         return
+    # --- FIX: SUPPORT ALL BRANCHES IN META INGESTION END ---
 
     email = validate_lead_email(mapped.get('email'), required=False)
     phone = validate_lead_phone(mapped.get('phone'), required=False)

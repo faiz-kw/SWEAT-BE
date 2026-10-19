@@ -938,4 +938,73 @@ class SarvamGupshupWhatsAppTests(TestCase):
         self.assertEqual(msg_rebook_retry.id, msg_rebook.id)
         self.assertEqual(mock_post.call_count, 3)
 
+    # ── Test 22: Concurrent Workers Idempotency Race (IntegrityError Collision) ──
+
+    @patch('requests.post')
+    def test_22_concurrent_workers_idempotency_race_handling(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {'status': 'submitted', 'messageId': 'gs-race-001'}
+        mock_post.return_value = mock_resp
+
+        set_tenant_db_alias('tenant_test')
+        idempotency_key = f"TEST_RACE_KEY_{uuid.uuid4().hex[:8]}"
+
+        from apps.tenant_core.communication.service import CommunicationService
+        from django.db import IntegrityError
+
+        # Worker 1 dispatches first and creates the DB record
+        msg1 = CommunicationService.send_communication(
+            organization=self.org,
+            channel='WHATSAPP',
+            recipient='+919876543210',
+            lead=self.lead,
+            template_reference='sweat_trial_booking_confirm',
+            subject="Test Race",
+            body="Test concurrent body",
+            context_data=["Ananya", "Sweat Pilates", "Sweat Bandra West", "Tomorrow at 10:00 AM"],
+            purpose='TRANSACTIONAL',
+            idempotency_key=idempotency_key,
+        )
+        self.assertIsNotNone(msg1)
+        self.assertEqual(mock_post.call_count, 1)
+
+        # Simulate the concurrency race:
+        # Worker 2 executes Step 1 BEFORE Worker 1 commits (so filter returns None at Step 1),
+        # but Worker 2's msg.save() executes AFTER Worker 1 inserts, raising IntegrityError.
+        orig_filter = CommunicationMessage.objects.filter
+        filter_call_count = [0]
+
+        def race_filter_mock(*args, **kwargs):
+            filter_call_count[0] += 1
+            if filter_call_count[0] == 1:
+                # Step 1: Worker 2 does not see Worker 1's record yet
+                return CommunicationMessage.objects.none()
+            # Step 5 (except IntegrityError): Worker 2 re-queries and finds Worker 1's committed record
+            return orig_filter(*args, **kwargs)
+
+        db_integrity_err = IntegrityError("duplicate key value violates unique constraint 'uq_comm_org_idempotency_key'")
+
+        with patch.object(CommunicationMessage.objects, 'filter', side_effect=race_filter_mock):
+            with patch.object(CommunicationMessage, 'save', side_effect=db_integrity_err):
+                msg2 = CommunicationService.send_communication(
+                    organization=self.org,
+                    channel='WHATSAPP',
+                    recipient='+919876543210',
+                    lead=self.lead,
+                    template_reference='sweat_trial_booking_confirm',
+                    subject="Test Race",
+                    body="Test concurrent body",
+                    context_data=["Ananya", "Sweat Pilates", "Sweat Bandra West", "Tomorrow at 10:00 AM"],
+                    purpose='TRANSACTIONAL',
+                    idempotency_key=idempotency_key,
+                )
+
+        # Worker 2 safely caught IntegrityError and returned Worker 1's record without second dispatch
+        self.assertEqual(msg2.id, msg1.id)
+        self.assertEqual(mock_post.call_count, 1)
+        self.assertGreaterEqual(filter_call_count[0], 2)
+
+
+
 

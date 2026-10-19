@@ -917,6 +917,9 @@ class MetaOAuthCallbackRegressionTests(unittest.TestCase):
                 code='BR-SWEAT-FLAGSHIP',
                 defaults={'name': 'SWEAT Flagship Studio', 'status': 'ACTIVE'}
             )
+            if branch.status != 'ACTIVE':
+                branch.status = 'ACTIVE'
+                branch.save(using=alias)
             lead_source, _ = LeadSource.objects.using(alias).get_or_create(
                 organization=self.org,
                 code='META_ADS_TEST',
@@ -1032,4 +1035,73 @@ class MetaOAuthCallbackRegressionTests(unittest.TestCase):
                 lead_id=str(mock_lead_id),
             )
 
+    def test_26_meta_lead_all_branches_organization_wide(self):
+        """
+        26. Option B Regression: Meta leads with branch_mode='ALL' are ingested with branch=None
+        and remain visible to branch-scoped users across all studios in SWEAT CRM.
+        """
+        from apps.tenant_core.models_crm import Lead, LeadSource
+        from apps.tenant_core.models_meta_leads import MetaLeadMapping, MetaLeadImport
+        from apps.tenant_core.services_meta_leads import _apply_mapping
+        from django.db.models import Q
+        from django.db import transaction
+
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            lead_source, _ = LeadSource.objects.using(alias).get_or_create(
+                organization=self.org,
+                code='META_ADS_ALL_BR',
+                defaults={'name': 'Meta Ads All Branches', 'source_type': 'META', 'status': 'ACTIVE'}
+            )
+
+            mapping, _ = MetaLeadMapping.objects.using(alias).update_or_create(
+                organization=self.org,
+                page_id='1265728509951597',
+                form_id='1755557852149999',
+                defaults={
+                    'name': 'SWEAT ALL BRANCHES LEAD FORM',
+                    'branch_mode': 'ALL',
+                    'branch': None,
+                    'lead_source': lead_source,
+                    'is_active': True,
+                    'field_mappings': {
+                        'first_name': 'first_name',
+                        'last_name': 'last_name',
+                        'phone': 'phone_number',
+                        'email': 'email',
+                    },
+                }
+            )
+
+            unique_phone = f"98{uuid.uuid4().int % 100000000:08d}"
+            unique_email = f"rohan_{uuid.uuid4().hex[:6]}@example.com"
+            event = MetaLeadImport.objects.using(alias).create(
+                organization=self.org,
+                page_id='1265728509951597',
+                form_id='1755557852149999',
+                external_lead_id=f'test_lead_all_{uuid.uuid4().hex[:8]}',
+                mode='SIMULATION',
+                field_data=[
+                    {'name': 'first_name', 'values': ['Rohan']},
+                    {'name': 'last_name', 'values': ['Mehta']},
+                    {'name': 'phone_number', 'values': [unique_phone]},
+                    {'name': 'email', 'values': [unique_email]},
+                ],
+                status='PENDING',
+            )
+
+            with transaction.atomic(using=alias):
+                _apply_mapping(event, mapping, alias, self.user, is_live=False)
+
+            self.assertEqual(event.status, 'IMPORTED')
+            lead = event.lead
+            self.assertIsNotNone(lead)
+            self.assertIsNone(lead.branch)
+            self.assertEqual(lead.first_name, 'Rohan')
+            self.assertEqual(lead.phone_normalized, f'+91{unique_phone}')
+
+            permitted_branches = [str(uuid.uuid4())]
+            scoped_qs = Lead.objects.using(alias).filter(
+                Q(branch_id__in=permitted_branches) | Q(assigned_sales_user=self.user) | Q(branch_id__isnull=True)
+            )
+            self.assertTrue(scoped_qs.filter(id=lead.id).exists())
 
