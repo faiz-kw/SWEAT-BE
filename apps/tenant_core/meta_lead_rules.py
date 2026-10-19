@@ -3,6 +3,24 @@ import hashlib
 import hmac
 import json
 
+# --- FIX: ADD SARVAM VOICE CONSENT AND PROGRAM DESTINATION FIELDS START ---
+# WHY: Allow Meta Lead mapping rules to map Facebook questions to CRM voice consent and program.
+# FIXES: Validation error 'Unsupported CRM destination field' when mapping consent_voice or interested_program.
+# IMPACT: Enables voice consent capture and program interest from Meta Lead forms.
+# OLD:
+# DESTINATION_FIELDS = {
+#     'full_name': 'Full name (split into first and last name)',
+#     'first_name': 'First name', 'last_name': 'Last name',
+#     'email': 'Email', 'phone': 'Phone', 'fitness_goal': 'Fitness goal',
+#     'area': 'Area', 'country': 'Country',
+#     'gender': 'Gender',
+#     'occupation': 'Occupation',
+#     'company_name': 'Company name',
+#     'date_of_birth': 'Date of birth (YYYY-MM-DD)',
+#     'consent_whatsapp': 'WhatsApp consent',
+#     'consent_email': 'Email consent',
+#     'consent_sms': 'SMS consent',
+# }
 DESTINATION_FIELDS = {
     'full_name': 'Full name (split into first and last name)',
     'first_name': 'First name', 'last_name': 'Last name',
@@ -15,7 +33,10 @@ DESTINATION_FIELDS = {
     'consent_whatsapp': 'WhatsApp consent',
     'consent_email': 'Email consent',
     'consent_sms': 'SMS consent',
+    'consent_voice': 'Voice calling consent',
+    'interested_program': 'Interested program',
 }
+# --- FIX: ADD SARVAM VOICE CONSENT AND PROGRAM DESTINATION FIELDS END ---
 
 
 def normalize_field_data(field_data):
@@ -37,14 +58,28 @@ def normalize_field_data(field_data):
 def map_answers(field_data, field_mappings, field_defaults=None):
     answers = normalize_field_data(field_data)
     mapped = {}
+    # --- FIX: EXCLUDE CONSENT_VOICE FROM DEFAULT FIELD OVERRIDES START ---
+    # WHY: Explicit consent fields must not be populated by arbitrary fallback defaults.
+    # FIXES: Prevents false voice consent from being granted via field defaults.
+    # IMPACT: Safe, fail-closed consent handling.
+    # OLD:
+    # defaults = {
+    #     k: v for k, v in (field_defaults or {}).items()
+    #     if k not in {
+    #         'full_name', 'first_name', 'last_name',
+    #         'email', 'phone',
+    #         'consent_whatsapp', 'consent_email', 'consent_sms',
+    #     }
+    # }
     defaults = {
         k: v for k, v in (field_defaults or {}).items()
         if k not in {
             'full_name', 'first_name', 'last_name',
             'email', 'phone',
-            'consent_whatsapp', 'consent_email', 'consent_sms',
+            'consent_whatsapp', 'consent_email', 'consent_sms', 'consent_voice',
         }
     }
+    # --- FIX: EXCLUDE CONSENT_VOICE FROM DEFAULT FIELD OVERRIDES END ---
     for destination, source in field_mappings.items():
         if destination not in DESTINATION_FIELDS:
             raise ValueError('Unsupported CRM destination field.')

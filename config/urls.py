@@ -18,6 +18,16 @@ from apps.tenant_core.views_razorpay_webhook import RazorpayWebhookView
 from apps.tenant_core.views_meta_webhook import MetaLeadWebhookView
 from apps.tenant_core.views_legal import privacy_policy_view, terms_of_service_view, data_deletion_view
 from apps.tenant_core.views_health import HealthLivenessView, HealthReadinessView
+from apps.tenant_core.views_voice_agent import (
+    VoiceAgentBranchesView,
+    VoiceAgentClassesView,
+    VoiceAgentBookTrialView,
+    VoiceAgentLeadContextView,
+    VoiceAgentRescheduleTrialView,
+    VoiceAgentCancelTrialView,
+    VoiceAgentCallOutcomeView,
+    VoiceAgentCallbackView,
+)
 
 # Django admin branding
 admin.site.site_header = "PerformanceOS • Platform Control Panel"
@@ -45,6 +55,15 @@ urlpatterns = [
     path('api/v1/webhooks/meta/leads/<str:tenant_public_id>/', MetaLeadWebhookView.as_view(), name='meta-lead-webhook-tenant'),
     path('api/v1/webhooks/razorpay/', RazorpayWebhookView.as_view(), name='razorpay-webhook-global'),
     path('api/v1/webhooks/razorpay/<str:tenant_slug>/', RazorpayWebhookView.as_view(), name='razorpay-webhook-tenant'),
+    # AI Voice Agent CRM Tools (Sarvam Function Calling)
+    path('api/v1/voice-agent/context/', VoiceAgentLeadContextView.as_view(), name='voice-agent-context'),
+    path('api/v1/voice-agent/branches/', VoiceAgentBranchesView.as_view(), name='voice-agent-branches'),
+    path('api/v1/voice-agent/classes/', VoiceAgentClassesView.as_view(), name='voice-agent-classes'),
+    path('api/v1/voice-agent/book-trial/', VoiceAgentBookTrialView.as_view(), name='voice-agent-book-trial'),
+    path('api/v1/voice-agent/reschedule-trial/', VoiceAgentRescheduleTrialView.as_view(), name='voice-agent-reschedule-trial'),
+    path('api/v1/voice-agent/cancel-trial/', VoiceAgentCancelTrialView.as_view(), name='voice-agent-cancel-trial'),
+    path('api/v1/voice-agent/callback/', VoiceAgentCallbackView.as_view(), name='voice-agent-callback'),
+    path('api/v1/voice-agent/call-outcome/', VoiceAgentCallOutcomeView.as_view(), name='voice-agent-call-outcome'),
 
     # Tenant Admin — Org/Branch/User/RBAC management (scoped to tenant DB)
     path('api/v1/admin/', include('apps.tenant_core.urls')),

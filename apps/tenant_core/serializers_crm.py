@@ -108,7 +108,38 @@ class LeadSerializer(serializers.ModelSerializer):
     class Meta:
         model = Lead
         fields = '__all__'
-        read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
+        # SEC-05 FIX: Expanded read_only_fields to protect all staff-managed and
+        # system-managed fields. Previously only audit fields were protected, leaving
+        # pipeline fields writable by LEAD/MEMBER users via partial_update.
+        # These fields MUST only be set by staff actions or internal service calls.
+        read_only_fields = [
+            'id',
+            'organization',
+            'created_at',
+            'updated_at',
+            # Pipeline / CRM state — staff-only
+            'crm_stage',
+            'current_status',
+            'assigned_sales_user',
+            'assigned_branch',
+            # Conversion & member linkage — system-managed
+            'converted_user_profile',
+            'converted_at',
+            'conversion_locked',
+            # Suppression flags — staff/compliance-only
+            'do_not_call',
+            'do_not_contact',
+            'is_opted_out',
+            # Computed / provenance fields
+            'email_normalized',
+            'phone_normalized',
+            'lead_score',
+            'priority_score',
+            'last_contacted_at',
+            'last_activity_at',
+            'response_sla_breached_at',
+            'stage_sla_breached_at',
+        ]
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -363,9 +394,11 @@ class LeadSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         # Converted lead terminal state validation
-        if self.instance and (self.instance.current_status == 'CONVERTED' or getattr(self.instance, 'converted_user_profile_id', None)):
+        alias = getattr(getattr(self.instance, '_state', None), 'db', None) or 'default'
+        from .models_crm import LeadConversion
+        if self.instance and (self.instance.current_status in ('CONVERTED', 'DEAL_DONE', 'SUBSCRIBED') or getattr(self.instance, 'converted_user_profile_id', None) or LeadConversion.objects.using(alias).filter(lead=self.instance).exists()):
             new_status = attrs.get('current_status')
-            if new_status and new_status != 'CONVERTED':
+            if new_status and new_status not in ('CONVERTED', 'DEAL_DONE', 'SUBSCRIBED'):
                 raise serializers.ValidationError({
                     "current_status": "This lead has already been converted to a member. The CRM sales journey is terminal."
                 })
@@ -858,13 +891,21 @@ class TrialBookingSerializer(serializers.ModelSerializer):
             branch=obj.branch,
             db_alias=alias,
         )
-        if obj.lead and (obj.lead.current_status == 'CONVERTED' or getattr(obj.lead, 'converted_user_profile', None)):
+        from .models_crm import LeadConversion
+        lead_is_converted = bool(
+            obj.lead and (
+                obj.lead.current_status in ('CONVERTED', 'DEAL_DONE', 'SUBSCRIBED') or
+                getattr(obj.lead, 'converted_user_profile', None) or
+                LeadConversion.objects.using(alias).filter(lead=obj.lead).exists()
+            )
+        )
+        if lead_is_converted:
             can_book_new_trial = False
 
         can_convert_member = bool(
             obj.lead and
-            obj.lead.current_status not in ['LOST', 'NOT_INTERESTED', 'CONVERTED'] and
-            not getattr(obj.lead, 'converted_user_profile', None)
+            obj.lead.current_status not in ['LOST', 'NOT_INTERESTED', 'CONVERTED', 'DEAL_DONE', 'SUBSCRIBED'] and
+            not lead_is_converted
         )
 
         return {

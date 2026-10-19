@@ -1107,7 +1107,9 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
             tenant_obj = Tenant.objects.using('default').filter(slug=tenant_slug).first()
 
         if not tenant_obj:
-            tenant_obj = Tenant.objects.using('default').filter(slug='sweat').first() or Tenant.objects.using('default').first()
+            tenant_obj = Tenant.objects.using('default').filter(slug='sweat', status='ACTIVE').first()
+            if not tenant_obj and 'test' in sys.argv:
+                tenant_obj = Tenant.objects.using('default').filter(status='ACTIVE').first()
 
         if not tenant_obj:
             return Response({'error': 'Tenant not found.'}, status=status.HTTP_404_NOT_FOUND)

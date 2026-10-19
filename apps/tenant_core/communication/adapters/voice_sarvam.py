@@ -302,7 +302,8 @@ class SarvamVoiceAdapter(BaseCommunicationAdapter):
                 'duration': payload.get('duration', 0.0),
                 'interaction_transcript': payload.get('interaction_transcript', []),
                 'final_agent_variables': payload.get('final_agent_variables') or {},
-                'metadata': payload.get('metadata') or {},
+                # Per official Sarvam schema, echoed metadata is in webhook_config.metadata.
+                'metadata': (payload.get('webhook_config') or {}).get('metadata') or {},
                 'start_datetime': payload.get('start_datetime'),
                 'end_datetime': payload.get('end_datetime'),
             },

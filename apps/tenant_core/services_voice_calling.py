@@ -12,6 +12,7 @@ Handles:
 
 import re
 import logging
+import zoneinfo
 from typing import Dict, Any, Optional
 from datetime import timedelta
 from django.utils import timezone
@@ -202,6 +203,36 @@ class VoiceCallingService:
         return res
 
     @classmethod
+    def _check_calling_hours(cls) -> None:
+        """
+        Enforces outbound voice calling hours in IST (Asia/Kolkata).
+
+        Blocks calls outside the configured window. Default: 09:00–21:00 IST, every day.
+        Override via env:
+            VOICE_CALLING_HOURS_START  (int, 0-23, default 9)
+            VOICE_CALLING_HOURS_END    (int, 0-23, default 21)
+
+        Bypass in tests/dev with: VOICE_CALLING_ENFORCE_HOURS=false
+        """
+        from django.conf import settings
+        if not getattr(settings, 'VOICE_CALLING_ENFORCE_HOURS', True):
+            return
+
+        IST = zoneinfo.ZoneInfo('Asia/Kolkata')
+        now_ist = timezone.now().astimezone(IST)
+        current_hour = now_ist.hour
+
+        start_hour = getattr(settings, 'VOICE_CALLING_HOURS_START', 9)
+        end_hour = getattr(settings, 'VOICE_CALLING_HOURS_END', 21)
+
+        if not (start_hour <= current_hour < end_hour):
+            raise ValueError(
+                f"Outbound call rejected: AI voice calls are only permitted between "
+                f"{start_hour:02d}:00 and {end_hour:02d}:00 IST. "
+                f"Current time is {now_ist.strftime('%H:%M IST')}."
+            )
+
+    @classmethod
     def verify_lead_calling_eligibility(
         cls,
         lead: Lead,
@@ -209,12 +240,15 @@ class VoiceCallingService:
         custom_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Validates lead suppression, Do Not Contact, and trusted voice consent.
+        Validates calling hours (IST), lead suppression, Do Not Contact, and trusted voice consent.
         Fails closed. Uses authoritative get_lead_voice_consent_status logic.
         """
         alias = db_alias or 'default'
 
-        # Check explicit invocation metadata denial
+        # 0. Calling hours gate (IST 9am-9pm) — fail closed
+        cls._check_calling_hours()
+
+        # 1. Check explicit invocation metadata denial
         if custom_metadata and custom_metadata.get('has_voice_consent') is False:
             raise ValueError(f"Outbound call rejected: Explicit voice calling consent was denied for lead {lead.id}.")
 
@@ -250,6 +284,13 @@ class VoiceCallingService:
         """
         alias = db_alias or 'default'
         org = lead.organization
+
+        # 0. Global Outbound Safety Gates (Fail-closed)
+        from django.conf import settings
+        if not getattr(settings, 'COMMUNICATIONS_OUTBOUND_ENABLED', False):
+            raise ValueError('Outbound communications are disabled in this deployment.')
+        if not getattr(settings, 'VOICE_CALLING_ENABLED', False):
+            raise ValueError('Outbound voice calling is disabled in this deployment.')
 
         # 1. Acquire row lock on Lead within atomic block to serialize concurrent call requests
         with transaction.atomic(using=alias):
@@ -355,9 +396,20 @@ class VoiceCallingService:
         if webhook_token:
             webhook_url += f"?token={webhook_token}"
 
+        lead_full_name = f"{lead.first_name} {lead.last_name}".strip()
         call_metadata = {
             'lead_id': str(lead.id),
             'call_session_id': str(session.id),
+            'lead_name': lead_full_name,
+            'caller_name': lead.first_name,
+            'name': lead.first_name,
+            'phone': recipient_phone,
+            'user_phone_number': recipient_phone,
+            'program': lead.interested_program or '',
+            'interested_program': lead.interested_program or '',
+            'branch': lead.branch.name if lead.branch else '',
+            'branch_name': lead.branch.name if lead.branch else '',
+            'fitness_goal': lead.fitness_goal or '',
             **(custom_metadata or {}),
         }
 
@@ -407,7 +459,13 @@ class VoiceCallingService:
         alias = db_alias or 'default'
         attempt_id = payload.get('attempt_id')
         raw_status = str(payload.get('status') or '').strip().lower()
-        meta = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
+        # Per official Sarvam webhook schema, metadata is echoed inside webhook_config.metadata,
+        # NOT at the top-level payload.metadata key (which does not exist in the Sarvam spec).
+        # See: https://docs.sarvam.ai/voice-agents/api/instant-outbound/webhook-payload.md
+        _wc = payload.get('webhook_config')
+        meta = (_wc.get('metadata') or {}) if isinstance(_wc, dict) else {}
+        if not isinstance(meta, dict):
+            meta = {}
         call_session_id = meta.get('call_session_id')
 
         # 1. Match session by session ID or attempt ID

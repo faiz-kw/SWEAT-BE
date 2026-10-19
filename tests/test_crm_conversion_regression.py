@@ -25,11 +25,13 @@ from config.routers import set_tenant_db_alias
 from apps.tenant_core.models_org import Organization, Branch, Location
 from apps.tenant_core.models_users import TenantUser
 from apps.tenant_core.models_workforce import UserProfile
+from apps.tenant_core.models_rbac import Role, RoleAssignment
 from apps.tenant_core.models_catalog import ProgramCategory, Program, Package, PackageVersion, PackagePrice
-from apps.tenant_core.models_crm import Lead, LeadConversion, LeadSource
+from apps.tenant_core.models_crm import Lead, LeadConversion, LeadSource, TrialBooking
 from apps.tenant_core.models_memberships import Membership
 from apps.tenant_core.models_commerce import Order
 from apps.tenant_core.models_approvals import ApprovalRequest
+from apps.tenant_core.serializers_crm import LeadSerializer
 from apps.tenant_core.views_crm import LeadViewSet
 from apps.tenant_core.views_members import build_member_360_aggregate
 
@@ -294,3 +296,197 @@ class LeadConversionRegressionTestCase(TestCase):
             self.assertEqual(appr.status, 'PENDING')
             self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
             self.assertIn("approval_request_id", response.data)
+
+    def test_lead_creation_does_not_provision_member_profile_or_role(self):
+        """Creating an ordinary CRM lead must not provision a UserProfile or assign MEMBER role."""
+        view = LeadViewSet.as_view({'post': 'create'})
+        unique_email = f"intake_test_{uuid.uuid4().hex[:6]}@test.com"
+        unique_phone = f"+9198{str(uuid.uuid4().int)[:8]}"
+        payload = {
+            'first_name': 'Rohan',
+            'last_name': 'Mehra',
+            'email': unique_email,
+            'phone': unique_phone,
+            'branch': str(self.branch.id),
+            'lead_source': str(self.source.id),
+        }
+        request = self.factory.post('/api/v1/tenant/leads/', payload, format='json')
+        self._prepare_request(request, self.admin)
+        response = view(request)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        lead_id = response.data['id']
+        lead = Lead.objects.using(DB).get(id=lead_id)
+
+        # 1. Lead stage is NEW_LEAD
+        self.assertEqual(lead.current_status, 'NEW_LEAD')
+
+        # 2. converted_user_profile is NOT set
+        self.assertIsNone(lead.converted_user_profile)
+        self.assertIsNone(lead.converted_user_profile_id)
+
+        # 3. No UserProfile created
+        profiles = UserProfile.objects.using(DB).filter(user__email=unique_email)
+        self.assertEqual(profiles.count(), 0)
+
+        # 4. TenantUser created as LEAD, without MEMBER role
+        tenant_user = TenantUser.objects.using(DB).filter(email=unique_email).first()
+        if tenant_user:
+            self.assertEqual(tenant_user.user_type, 'LEAD')
+            member_role_assignments = RoleAssignment.objects.using(DB).filter(
+                user=tenant_user, role__code='MEMBER'
+            )
+            self.assertEqual(member_role_assignments.count(), 0)
+
+        # 5. LeadSerializer representation confirms lead is not converted
+        serializer_data = LeadSerializer(lead).data
+        self.assertIsNone(serializer_data.get('converted_member'))
+        eligibility = serializer_data.get('action_eligibility', {})
+        self.assertFalse(eligibility.get('is_terminal'))
+        self.assertTrue(eligibility.get('can_book_trial'))
+        self.assertTrue(eligibility.get('can_convert'))
+        self.assertTrue(eligibility.get('can_move_stage'))
+
+    def test_trial_booking_and_attended_does_not_convert_lead(self):
+        """Booking and attending a trial progresses lead stages but never converts the lead."""
+        # Booking trial
+        trial = TrialBooking.objects.using(DB).create(
+            branch=self.branch,
+            lead=self.lead,
+            scheduled_start=timezone.now() + timedelta(days=1),
+            scheduled_end=timezone.now() + timedelta(days=1, hours=1),
+            status='BOOKED',
+        )
+        self.lead.current_status = 'TRIAL_BOOKED'
+        self.lead.save(using=DB, update_fields=['current_status'])
+
+        self.lead.refresh_from_db(using=DB)
+        self.assertIsNone(self.lead.converted_user_profile)
+        self.assertEqual(self.lead.current_status, 'TRIAL_BOOKED')
+        ser_data = LeadSerializer(self.lead).data
+        self.assertIsNone(ser_data.get('converted_member'))
+        self.assertFalse(ser_data.get('action_eligibility', {}).get('is_terminal'))
+
+        # Attending trial
+        trial.status = 'ATTENDED'
+        trial.save(using=DB, update_fields=['status'])
+        self.lead.current_status = 'TRIAL_ATTENDED'
+        self.lead.save(using=DB, update_fields=['current_status'])
+
+        self.lead.refresh_from_db(using=DB)
+        self.assertIsNone(self.lead.converted_user_profile)
+        self.assertEqual(self.lead.current_status, 'TRIAL_ATTENDED')
+        ser_data_attended = LeadSerializer(self.lead).data
+        self.assertIsNone(ser_data_attended.get('converted_member'))
+        self.assertFalse(ser_data_attended.get('action_eligibility', {}).get('is_terminal'))
+        self.assertTrue(ser_data_attended.get('action_eligibility', {}).get('can_convert'))
+
+    def test_unpaid_or_pending_order_does_not_convert_lead(self):
+        """An order with status PENDING_PAYMENT does not convert the lead."""
+        order = Order.objects.using(DB).create(
+            branch=self.branch,
+            lead=self.lead,
+            order_number=f"ORD-UNPAID-{uuid.uuid4().hex[:6].upper()}",
+            status='PENDING_PAYMENT',
+            total_amount=Decimal('5900.00'),
+        )
+        self.lead.refresh_from_db(using=DB)
+        self.assertIsNone(self.lead.converted_user_profile)
+        self.assertNotEqual(self.lead.current_status, 'CONVERTED')
+
+        ser_data = LeadSerializer(self.lead).data
+        self.assertIsNone(ser_data.get('converted_member'))
+        self.assertFalse(ser_data.get('action_eligibility', {}).get('is_terminal'))
+        self.assertTrue(ser_data.get('action_eligibility', {}).get('can_convert'))
+
+    def test_lead_with_profile_relationship_not_presented_as_converted_without_conversion_record(self):
+        """A lead in NEW_LEAD with an existing/linked profile is not treated as converted without a conversion record."""
+        dummy_user = TenantUser.objects.using(DB).create(
+            organization=self.org,
+            email=f"dummy_{uuid.uuid4().hex[:6]}@test.com",
+            first_name='Dummy',
+            last_name='User',
+            status='ACTIVE',
+        )
+        dummy_profile = UserProfile.objects.using(DB).create(
+            user=dummy_user,
+            preferred_branch=self.branch,
+        )
+        self.lead.converted_user_profile = dummy_profile
+        self.lead.current_status = 'NEW_LEAD'
+        self.lead.save(using=DB, update_fields=['converted_user_profile', 'current_status'])
+
+        # Serializer representation must NOT present as converted
+        ser_data = LeadSerializer(self.lead).data
+        self.assertIsNone(ser_data.get('converted_member'))
+        eligibility = ser_data.get('action_eligibility', {})
+        self.assertFalse(eligibility.get('is_terminal'))
+        self.assertTrue(eligibility.get('can_convert'))
+
+        # Backend actions: transition_status must be allowed
+        view_trans = LeadViewSet.as_view({'post': 'transition_status'})
+        req_trans = self.factory.post(
+            f"/api/v1/tenant/leads/{self.lead.id}/transition-status/",
+            {'new_status': 'HOT_LEAD'},
+            format='json',
+        )
+        self._prepare_request(req_trans, self.admin)
+        res_trans = view_trans(req_trans, pk=str(self.lead.id))
+        self.assertEqual(res_trans.status_code, status.HTTP_200_OK)
+
+        self.lead.refresh_from_db(using=DB)
+        self.assertEqual(self.lead.current_status, 'HOT_LEAD')
+
+    def test_converted_lead_is_terminal_and_blocks_further_sales_actions(self):
+        """A legitimately converted lead is terminal; transitions, reassignments, and trial bookings are rejected."""
+        conv_user = TenantUser.objects.using(DB).create(
+            organization=self.org,
+            email=f"conv_{uuid.uuid4().hex[:6]}@test.com",
+            first_name='Conv',
+            last_name='User',
+            status='ACTIVE',
+        )
+        conv_profile = UserProfile.objects.using(DB).create(
+            user=conv_user,
+            preferred_branch=self.branch,
+        )
+        self.lead.converted_user_profile = conv_profile
+        self.lead.current_status = 'CONVERTED'
+        self.lead.save(using=DB, update_fields=['converted_user_profile', 'current_status'])
+        LeadConversion.objects.using(DB).create(
+            lead=self.lead,
+            user_profile=conv_profile,
+            converted_at=timezone.now(),
+        )
+
+        # 1. Serializer reports terminal
+        ser_data = LeadSerializer(self.lead).data
+        self.assertIsNotNone(ser_data.get('converted_member'))
+        self.assertTrue(ser_data.get('action_eligibility', {}).get('is_terminal'))
+        self.assertFalse(ser_data.get('action_eligibility', {}).get('can_book_trial'))
+        self.assertFalse(ser_data.get('action_eligibility', {}).get('can_move_stage'))
+        self.assertFalse(ser_data.get('action_eligibility', {}).get('can_convert'))
+
+        # 2. transition_status is rejected
+        view_trans = LeadViewSet.as_view({'post': 'transition_status'})
+        req_trans = self.factory.post(
+            f"/api/v1/tenant/leads/{self.lead.id}/transition-status/",
+            {'new_status': 'HOT_LEAD'},
+            format='json',
+        )
+        self._prepare_request(req_trans, self.admin)
+        res_trans = view_trans(req_trans, pk=str(self.lead.id))
+        self.assertEqual(res_trans.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("already been converted", res_trans.data['error'])
+
+        # 3. assign is rejected
+        view_assign = LeadViewSet.as_view({'post': 'assign'})
+        req_assign = self.factory.post(
+            f"/api/v1/tenant/leads/{self.lead.id}/assign/",
+            {'assigned_to_user_id': str(self.admin.id)},
+            format='json',
+        )
+        self._prepare_request(req_assign, self.admin)
+        res_assign = view_assign(req_assign, pk=str(self.lead.id))
+        self.assertEqual(res_assign.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("already been converted", res_assign.data['error'])

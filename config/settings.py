@@ -246,10 +246,20 @@ REST_FRAMEWORK = {
     # Applied by apps/authentication/throttles.py on login, MFA, and refresh views.
     # These values can be overridden via environment variables; see settings below.
     # ---------------------------------------------------------------------------
+    # SEC-10 FIX: Apply global throttle classes so every API endpoint has a rate
+    # limit fallback. Auth endpoints use custom throttle classes declared in their
+    # view; these catch everything else.
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.UserRateThrottle',
+        'rest_framework.throttling.AnonRateThrottle',
+    ],
     'DEFAULT_THROTTLE_RATES': {
         'auth_login':   os.getenv('THROTTLE_RATE_LOGIN',   '10/minute'),
         'auth_mfa':     os.getenv('THROTTLE_RATE_MFA',     '5/minute'),
         'auth_refresh': os.getenv('THROTTLE_RATE_REFRESH', '20/minute'),
+        # General API throttles (authenticated vs anonymous)
+        'user': os.getenv('THROTTLE_RATE_API_USER', '1000/minute'),
+        'anon': os.getenv('THROTTLE_RATE_API_ANON', '60/minute'),
     },
 }
 
@@ -506,7 +516,13 @@ if 'test' in sys.argv:
         'auth_login':   '10000/minute',
         'auth_mfa':     '10000/minute',
         'auth_refresh': '10000/minute',
+        # Disable global API throttles in tests: all test requests share the same loopback IP.
+        'user': '10000/minute',
+        'anon': '10000/minute',
     }
+    # Disable calling-hours gate in tests: tests run at arbitrary times and must not depend
+    # on the current IST clock. Real enforcement is validated by unit tests that mock timezone.now().
+    VOICE_CALLING_ENFORCE_HOURS = False
 else:
     CELERY_TASK_ALWAYS_EAGER = False
     CELERY_TASK_EAGER_PROPAGATES = False
@@ -537,6 +553,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'apps.tenant_core.tasks_meta_leads.recover_meta_imports_periodic_task',
         'schedule': float(os.getenv('CELERY_SCHEDULE_META_RECOVERY_SECONDS', '120.0')),  # every 2 min
     },
+    'master-process-booking-auto-cancellations': {
+        'task': 'apps.master.tasks.process_all_tenants_booking_auto_cancellations_async',
+        'schedule': float(os.getenv('CELERY_SCHEDULE_BOOKING_AUTOCANCEL_SECONDS', '120.0')),  # every 2 min
+    },
 }
 
 
@@ -564,6 +584,12 @@ ZATA_S3_MAX_FILE_SIZE = int(os.getenv('ZATA_S3_MAX_FILE_SIZE', str(50 * 1024 * 1
 DEPLOYMENT_ENVIRONMENT = os.getenv('DEPLOYMENT_ENVIRONMENT', 'development' if DEBUG else 'production').lower()
 META_LEAD_SIMULATOR_ENABLED = os.getenv('META_LEAD_SIMULATOR_ENABLED', 'true' if DEBUG else 'false').lower() in ('true', '1', 't')
 COMMUNICATIONS_OUTBOUND_ENABLED = os.getenv('COMMUNICATIONS_OUTBOUND_ENABLED', 'false' if DEBUG else 'true').lower() in ('true', '1', 't')
+VOICE_CALLING_ENABLED = os.getenv('VOICE_CALLING_ENABLED', 'false').lower() in ('true', '1', 't', 'yes')
+# Calling hours enforcement (IST / Asia/Kolkata). Calls outside the window are rejected.
+# VOICE_CALLING_ENFORCE_HOURS=false disables the check in staging/dev without changing production.
+VOICE_CALLING_ENFORCE_HOURS = os.getenv('VOICE_CALLING_ENFORCE_HOURS', 'true').lower() in ('true', '1', 't', 'yes')
+VOICE_CALLING_HOURS_START = int(os.getenv('VOICE_CALLING_HOURS_START', '9'))   # 09:00 IST
+VOICE_CALLING_HOURS_END   = int(os.getenv('VOICE_CALLING_HOURS_END',   '21'))  # 21:00 IST
 META_APP_ID = os.getenv('META_APP_ID', '').strip()
 META_APP_SECRET = os.getenv('META_APP_SECRET', '').strip()
 META_WEBHOOK_VERIFY_TOKEN = os.getenv('META_WEBHOOK_VERIFY_TOKEN', '').strip()

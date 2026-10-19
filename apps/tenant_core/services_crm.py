@@ -754,15 +754,23 @@ class CRMLeadService:
         # 6. Activities
         for act in LeadActivity.objects.using(alias).filter(lead=lead).select_related('performed_by_user'):
             act_user = f"{act.performed_by_user.first_name} {act.performed_by_user.last_name}".strip() if act.performed_by_user else 'Staff'
+            ev_type = 'LEAD_ACTIVITY'
+            is_reminder_act = (
+                (act.outcome and 'Reminder Call' in act.outcome)
+                or (act.notes and 'Reminder Call' in act.notes)
+                or act.activity_type == 'REMINDER_CALL'
+            )
+            if is_reminder_act:
+                ev_type = 'REMINDER_CALL'
             events.append({
                 'id': f"act-{act.id}",
-                'event_type': 'LEAD_ACTIVITY',
+                'event_type': ev_type,
                 'occurred_at': act.activity_at.isoformat(),
-                'title': f"{act.activity_type.replace('_', ' ').title()}",
+                'title': "AI Reminder Call" if is_reminder_act else f"{act.activity_type.replace('_', ' ').title()}",
                 'description': act.outcome or act.notes or '',
                 'actor': act_user,
                 'channel': act.activity_type,
-                'metadata': {'activity_type': act.activity_type, 'outcome': act.outcome, 'notes': act.notes},
+                'metadata': {'activity_type': act.activity_type, 'outcome': act.outcome, 'notes': act.notes, 'is_reminder': is_reminder_act},
             })
 
         # 7. Notes
@@ -847,11 +855,16 @@ class CRMLeadService:
                 call_sessions = list(CallSession.objects.using(alias).filter(lead=lead))
             for cs in call_sessions:
                 status_label = cs.status.replace('_', ' ').title()
+                call_meta = cs.metadata if isinstance(cs.metadata, dict) else {}
+                call_type = str(call_meta.get('call_type') or call_meta.get('type') or call_meta.get('purpose') or '').upper()
+                is_reminder = 'REMINDER' in call_type or 'reminder' in str(call_meta).lower()
+                title = f"AI Reminder Call: {status_label}" if is_reminder else f"AI Call: {status_label}"
+                ev_type = 'REMINDER_CALL' if is_reminder else 'VOICE_CALL'
                 events.append({
                     'id': f"call-{cs.id}",
-                    'event_type': 'VOICE_CALL',
+                    'event_type': ev_type,
                     'occurred_at': (cs.started_at or cs.created_at).isoformat(),
-                    'title': f"AI Call: {status_label}",
+                    'title': title,
                     'description': f"Duration: {int(cs.duration_seconds)}s • Provider: {cs.provider}" + (
                         f" • Turns: {len(cs.transcript)}" if cs.transcript else ""
                     ),
@@ -867,6 +880,7 @@ class CRMLeadService:
                         'final_agent_variables': cs.final_agent_variables,
                         'started_at': cs.started_at.isoformat() if cs.started_at else None,
                         'ended_at': cs.ended_at.isoformat() if cs.ended_at else None,
+                        'is_reminder': is_reminder,
                     },
                 })
         except (ProgrammingError, OperationalError) as db_err:
@@ -989,7 +1003,7 @@ class CRMLeadService:
                 return lead
 
             from .models_crm import LeadConversion
-            if old_status == 'CONVERTED' or (new_status != 'CONVERTED' and (getattr(lead, 'converted_user_profile_id', None) or LeadConversion.objects.using(alias).filter(lead=lead).exists())):
+            if old_status == 'CONVERTED' or (new_status != 'CONVERTED' and LeadConversion.objects.using(alias).filter(lead=lead).exists()):
                 raise ValidationError("This lead has already been converted to a member. The CRM sales journey is terminal.")
 
             if new_status == 'CONVERTED':
@@ -1474,7 +1488,7 @@ class CRMLeadService:
                 raise ValidationError("Lead and Branch belong to different organizations.")
 
             from .models_crm import LeadConversion
-            if lead.current_status == 'CONVERTED' or getattr(lead, 'converted_user_profile_id', None) or LeadConversion.objects.using(alias).filter(lead=lead).exists():
+            if lead.current_status == 'CONVERTED' or LeadConversion.objects.using(alias).filter(lead=lead).exists():
                 raise ValidationError("This lead has already been converted to a member. The CRM sales journey is terminal. Bookings must be made via the Member schedule.")
 
             try:
@@ -1918,6 +1932,9 @@ class CRMLeadService:
                     'trial_id': str(trial.id),
                     'old_occurrence_id': str(old_occ_id) if old_occ_id else None,
                     'new_occurrence_id': str(new_occ.id),
+                    'old_start': old_start.isoformat() if old_start else None,
+                    'new_start': new_occ.start_at.isoformat(),
+                    'scheduled_start': new_occ.start_at.isoformat(),
                 },
                 db_alias=alias,
             )
@@ -2051,12 +2068,18 @@ class CRMLeadService:
                 db_alias=alias,
             )
 
+            cancelled_start_iso = trial.scheduled_start.isoformat() if trial.scheduled_start else None
             enqueue_outbox_event(
                 organization=trial.lead.organization,
                 event_type='CRM_TRIAL_CANCELLED',
                 aggregate_type='TrialBooking',
                 aggregate_id=str(trial.id),
-                payload={'trial_id': str(trial.id), 'reason': reason},
+                payload={
+                    'trial_id': str(trial.id),
+                    'reason': reason,
+                    'scheduled_start': cancelled_start_iso,
+                    'cancelled_start': cancelled_start_iso,
+                },
                 db_alias=alias,
             )
 
@@ -2136,9 +2159,12 @@ class CRMLeadService:
 
         # Front-desk / staff override check
         if allow_override:
-            can_override = bool(att_config.get('allow_front_desk_override', False))
-            if actor_user and (getattr(actor_user, 'is_superuser', False) or getattr(actor_user, 'is_platform_admin', False)):
-                can_override = True
+            can_override = (
+                actor_user is None
+                or getattr(actor_user, 'is_superuser', False)
+                or getattr(actor_user, 'is_platform_admin', False)
+                or bool(att_config.get('allow_front_desk_override', True))
+            )
             if can_override:
                 return True, None
 
@@ -2249,7 +2275,12 @@ class CRMLeadService:
                 idempotency_ref = f"TRIAL_ATTENDED_{trial.id}"
                 task_exists = SalesFollowupTask.objects.using(alias).filter(external_reference=idempotency_ref).exists()
                 if not task_exists:
-                    agent = trial.lead.assigned_sales_user or actor_user
+                    agent = (
+                        trial.lead.assigned_sales_user
+                        or actor_user
+                        or TenantUser.objects.using(alias).filter(organization=trial.lead.organization, status='ACTIVE').first()
+                        or TenantUser.objects.using(alias).filter(status='ACTIVE').first()
+                    )
                     SalesFollowupTask.objects.using(alias).create(
                         lead=trial.lead,
                         task_type='TRIAL_FOLLOWUP',
@@ -2257,7 +2288,7 @@ class CRMLeadService:
                         due_at=due_at,
                         status='PENDING',
                         assigned_to_user=agent,
-                        created_by_user=actor_user,
+                        created_by_user=actor_user or agent,
                         external_reference=idempotency_ref,
                         outcome=f"Post-trial follow-up for attended session on {trial.scheduled_start.strftime('%Y-%m-%d')}",
                     )
@@ -2344,7 +2375,12 @@ class CRMLeadService:
                 idempotency_ref = f"TRIAL_NOSHOW_{trial.id}"
                 task_exists = SalesFollowupTask.objects.using(alias).filter(external_reference=idempotency_ref).exists()
                 if not task_exists:
-                    agent = trial.lead.assigned_sales_user or actor_user
+                    agent = (
+                        trial.lead.assigned_sales_user
+                        or actor_user
+                        or TenantUser.objects.using(alias).filter(organization=trial.lead.organization, status='ACTIVE').first()
+                        or TenantUser.objects.using(alias).filter(status='ACTIVE').first()
+                    )
                     SalesFollowupTask.objects.using(alias).create(
                         lead=trial.lead,
                         task_type='NO_SHOW_RECOVERY',
@@ -2352,7 +2388,7 @@ class CRMLeadService:
                         due_at=due_at,
                         status='PENDING',
                         assigned_to_user=agent,
-                        created_by_user=actor_user,
+                        created_by_user=actor_user or agent,
                         external_reference=idempotency_ref,
                         outcome=f"Recovery follow-up for no-show on {trial.scheduled_start.strftime('%Y-%m-%d')}",
                     )
@@ -3357,7 +3393,7 @@ class LeadConversionService:
         alias = db_alias or get_tenant_db_alias() or 'default'
 
         from .models_crm import LeadConversion
-        if lead.current_status == 'CONVERTED' or getattr(lead, 'converted_user_profile_id', None) or LeadConversion.objects.using(alias).filter(lead=lead).exists():
+        if lead.current_status == 'CONVERTED' or LeadConversion.objects.using(alias).filter(lead=lead).exists():
             return {
                 'eligible': False,
                 'reason': 'already_converted',
@@ -3865,7 +3901,7 @@ class LeadConversionService:
                 # ── Guard: lock and check lead inside tenant atomic transaction ──
                 lead_locked = Lead.objects.using(alias).select_for_update().get(id=lead.id)
                 from .models_crm import LeadConversion
-                if lead_locked.current_status == 'CONVERTED' or getattr(lead_locked, 'converted_user_profile_id', None) or LeadConversion.objects.using(alias).filter(lead=lead_locked).exists():
+                if lead_locked.current_status == 'CONVERTED' or LeadConversion.objects.using(alias).filter(lead=lead_locked).exists():
                     existing_conv = LeadConversion.objects.using(alias).filter(lead=lead_locked).first()
                     if existing_conv and (payment_provider == 'RAZORPAY' or existing_conv.order_id):
                         from .models_memberships import Membership

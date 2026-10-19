@@ -162,7 +162,6 @@ class LeadAttentionService:
         from .models_crm import LeadConversion
         if (
             lead.current_status in TERMINAL_STAGES
-            or getattr(lead, 'converted_user_profile_id', None) is not None
             or LeadConversion.objects.using(alias).filter(lead=lead).exists()
         ):
             return cls._empty_attention_response(lead, now)
@@ -508,7 +507,9 @@ class LeadAttentionService:
         sla_info: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Returns clean non-stuck attention response."""
-        is_converted = lead.current_status == 'CONVERTED' or getattr(lead, 'converted_user_profile_id', None) is not None
+        alias = getattr(getattr(lead, '_state', None), 'db', None) or 'default'
+        from .models_crm import LeadConversion
+        is_converted = lead.current_status == 'CONVERTED' or LeadConversion.objects.using(alias).filter(lead=lead).exists()
         stage_age_sec = sla_info['stage_age_seconds'] if sla_info else 0
         sla_due = sla_info['sla_due_at'].isoformat() if sla_info and sla_info.get('sla_due_at') else None
 

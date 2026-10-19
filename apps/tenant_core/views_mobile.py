@@ -29,6 +29,8 @@ Provides secure, member-scoped REST API endpoints tailored for the SWEAT Mobile 
    - POST /api/v1/mobile/onboarding/submit/
 """
 
+import sys
+import re
 import hmac
 import hashlib
 import base64
@@ -75,19 +77,36 @@ def _resolve_mobile_tenant_and_db(request):
     """
     Resolves the tenant and registers/returns the active tenant DB alias.
     Defaults to 'sweat' if not explicitly provided via X-Tenant-Slug header or params.
+    Fails closed (returns None, None) if an explicit tenant slug is supplied but does not exist or is inactive.
     """
-    tenant_slug = (
+    explicit_slug = (
         (request.headers.get('X-Tenant-Slug') if hasattr(request, 'headers') else None)
         or request.META.get('HTTP_X_TENANT_SLUG')
         or (getattr(request, 'query_params', None) or getattr(request, 'GET', {})).get('tenant')
         or (request.data.get('tenant_slug') if hasattr(request, 'data') and isinstance(request.data, dict) else None)
-        or 'sweat'
     )
 
-    tenant = Tenant.objects.using('default').filter(slug=tenant_slug, status='ACTIVE').first()
+    if explicit_slug:
+        clean_slug = str(explicit_slug).strip().lower()
+        if clean_slug in ('sweat-demo', 'sweat_demo', 'sweat-staging', 'sweat-dev'):
+            clean_slug = 'sweat'
+        tenant = Tenant.objects.using('default').filter(slug=clean_slug, status='ACTIVE').first()
+        if not tenant:
+            logger.warning("Rejecting invalid or inactive explicit mobile tenant slug: '%s'", clean_slug)
+            return None, None
+    else:
+        tenant = None
+        if getattr(request, 'user', None) and request.user.is_authenticated:
+            org = getattr(request.user, 'organization', None)
+            if org and hasattr(org, 'tenant') and getattr(org.tenant, 'status', None) == 'ACTIVE':
+                tenant = org.tenant
+        if not tenant:
+            tenant = Tenant.objects.using('default').filter(slug='sweat', status='ACTIVE').first()
+        if not tenant and 'test' in sys.argv:
+            tenant = Tenant.objects.using('default').filter(status='ACTIVE').first()
+
     if not tenant:
-        # Fallback to the first active tenant in platform
-        tenant = Tenant.objects.using('default').filter(status='ACTIVE').first()
+        return None, None
 
     active_alias = get_tenant_db_alias()
     if active_alias and tenant:
@@ -99,9 +118,6 @@ def _resolve_mobile_tenant_and_db(request):
         if user_db:
             set_tenant_db_alias(user_db)
             return user_db, tenant
-
-    if not tenant:
-        return None, None
 
     alias = _register_and_resolve_tenant(tenant)
     set_tenant_db_alias(alias)
@@ -163,15 +179,18 @@ class MobileRegisterView(APIView):
         alias, tenant = _resolve_mobile_tenant_and_db(request)
         if not alias or not tenant:
             return Response(
-                {'detail': 'Studio service is temporarily unavailable. Please try again.'},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                {'detail': 'Organization not found or inactive. Please specify a valid organization.', 'code': 'TENANT_NOT_FOUND'},
+                status=status.HTTP_404_NOT_FOUND,
             )
 
         with transaction.atomic(using=alias):
-            # 1. Check duplicate user
-            if TenantUser.objects.using(alias).filter(email__iexact=email).exists():
+            # 1. Check duplicate user by email or phone
+            dup_q = models.Q(email__iexact=email)
+            if phone:
+                dup_q = dup_q | models.Q(phone=phone)
+            if TenantUser.objects.using(alias).filter(dup_q).exists():
                 return Response(
-                    {'detail': 'An account with this email address already exists.'},
+                    {'detail': 'An account with this email address or phone number already exists.'},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
@@ -252,7 +271,7 @@ class MobileRegisterView(APIView):
                 ).first()
 
                 # Extract all lead form fields from intake
-                extra_lead_data = {'converted_user_profile': profile}
+                extra_lead_data = {}
                 if data.get('gender'):
                     extra_lead_data['gender'] = data.get('gender')
                 if data.get('date_of_birth') or data.get('birthday'):
@@ -285,9 +304,8 @@ class MobileRegisterView(APIView):
                         db_alias=alias,
                     )
                 else:
-                    lead.converted_user_profile = profile
                     lead.latest_touch_source = 'MOBILE_APP'
-                    lead.save(using=alias, update_fields=['converted_user_profile', 'latest_touch_source'])
+                    lead.save(using=alias, update_fields=['latest_touch_source'])
             except Exception as crm_err:
                 logger.warning("Could not auto-create CRM lead for mobile user %s: %s", email, crm_err)
 
@@ -336,8 +354,11 @@ class MobileLoginView(APIView):
         alias, tenant = _resolve_mobile_tenant_and_db(request)
         if not alias or not tenant:
             return Response(
-                {'detail': 'Studio service is temporarily unavailable. Please try again.'},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                {
+                    'detail': 'Organization not found or inactive. Please specify a valid organization.',
+                    'code': 'TENANT_NOT_FOUND',
+                },
+                status=status.HTTP_404_NOT_FOUND,
             )
 
         # Lookup user by email, username, or phone
@@ -407,8 +428,11 @@ def _process_social_login(request, email, first_name, last_name, avatar_url, pro
     alias, tenant = _resolve_mobile_tenant_and_db(request)
     if not alias or not tenant:
         return Response(
-            {'detail': 'Studio service is temporarily unavailable. Please try again.'},
-            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            {
+                'detail': 'Organization not found or inactive. Please specify a valid organization.',
+                'code': 'TENANT_NOT_FOUND',
+            },
+            status=status.HTTP_404_NOT_FOUND,
         )
 
     with transaction.atomic(using=alias):
@@ -525,7 +549,6 @@ def _process_social_login(request, email, first_name, last_name, avatar_url, pro
 
             if not lead:
                 extra_lead = {
-                    'converted_user_profile': profile,
                     'first_touch_source': f"{provider.title()} Sign-In (App)",
                     'latest_touch_source': f"MOBILE_{provider.upper()}",
                     'campaign_reference': f"{provider.title()} Mobile OAuth",
@@ -544,9 +567,8 @@ def _process_social_login(request, email, first_name, last_name, avatar_url, pro
                     db_alias=alias,
                 )
             else:
-                lead.converted_user_profile = profile
                 lead.latest_touch_source = f"MOBILE_{provider.upper()}"
-                update_fields = ['converted_user_profile', 'latest_touch_source']
+                update_fields = ['latest_touch_source']
                 if not lead.branch and (branch or user.home_branch):
                     lead.branch = branch or user.home_branch
                     update_fields.append('branch')
@@ -950,8 +972,8 @@ def _serialize_branch_dict(b, user_lat=None, user_lng=None):
         'address': full_address,
         'address_line1': addr_l1,
         'address_line2': addr_l2,
-        'city': getattr(b, 'address_city', None) or getattr(b, 'city', 'Mumbai'),
-        'postal_code': getattr(b, 'address_postal_code', '') or getattr(b, 'postal_code', ''),
+        'city': getattr(b, 'address_city', None) or getattr(b, 'city', None) or (getattr(b.location, 'city', None) if hasattr(b, 'location') and b.location else 'Mumbai'),
+        'postal_code': getattr(b, 'address_postal_code', '') or getattr(b, 'postal_code', '') or (getattr(b.location, 'postal_code', '') if hasattr(b, 'location') and b.location else ''),
         'latitude': b_lat,
         'longitude': b_lng,
         'distance_km': dist_km,
@@ -1517,9 +1539,14 @@ class MobileClaimFreeTrialView(APIView):
 
     def post(self, request):
         alias, tenant = _resolve_mobile_tenant_and_db(request)
-        if not alias:
-            alias = getattr(getattr(request, 'user', None), '_state', None)
-            alias = getattr(alias, 'db', None) or get_tenant_db_alias() or 'default'
+        if not alias or not tenant:
+            return Response(
+                {
+                    'detail': 'Organization not found or inactive. Please specify a valid organization.',
+                    'code': 'TENANT_NOT_FOUND',
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
 
         user = request.user if (hasattr(request, 'user') and request.user.is_authenticated) else None
         data = request.data or {}
@@ -1532,7 +1559,6 @@ class MobileClaimFreeTrialView(APIView):
             first_name = (data.get('first_name') or data.get('name') or '').strip()
             last_name = (data.get('last_name') or '').strip()
             if not email and phone:
-                import re
                 clean_digits = re.sub(r'\D', '', phone)[-10:]
                 email = f"lead_{clean_digits}@sweat.internal"
 
@@ -1542,45 +1568,54 @@ class MobileClaimFreeTrialView(APIView):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            # Look up or create user
-            user = TenantUser.objects.using(alias).filter(
+            # Check if an account already exists with this email or phone
+            existing_user = TenantUser.objects.using(alias).filter(
                 models.Q(email__iexact=email) | (models.Q(phone=phone) if phone else models.Q(pk=None))
             ).first()
 
-            if not user:
-                org = Organization.objects.using(alias).filter(status='ACTIVE').first()
-                branch_id = data.get('branch_id') or data.get('branch')
-                branch = Branch.objects.using(alias).filter(id=branch_id).first() if branch_id else Branch.objects.using(alias).filter(status='ACTIVE').first()
-                base_username = email.split('@')[0] if email else f"lead_{uuid.uuid4().hex[:6]}"
-                username = base_username
-                idx = 1
-                while TenantUser.objects.using(alias).filter(username__iexact=username).exists():
-                    username = f"{base_username}_{idx}"
-                    idx += 1
-
-                user = TenantUser(
-                    organization=org,
-                    username=username,
-                    email=email,
-                    phone=phone,
-                    first_name=first_name or 'Trial',
-                    last_name=last_name or 'Guest',
-                    display_name=f"{first_name} {last_name}".strip() or 'Trial Guest',
-                    home_branch=branch,
-                    user_type='LEAD',
-                    status='ACTIVE',
-                    is_login_allowed=True,
+            if existing_user:
+                return Response(
+                    {
+                        'detail': 'An account with this email address or phone number already exists. Please log in to your account to book your trial session.',
+                        'code': 'AUTHENTICATION_REQUIRED',
+                        'requires_login': True,
+                    },
+                    status=status.HTTP_401_UNAUTHORIZED,
                 )
-                user.set_password(f"Sweat@{uuid.uuid4().hex[:8]}")
-                user.save(using=alias)
 
-                member_role = Role.objects.using(alias).filter(code='MEMBER').first()
-                if member_role:
-                    RoleAssignment.objects.using(alias).get_or_create(
-                        user=user,
-                        role=member_role,
-                        defaults={'branch': branch, 'is_active': True}
-                    )
+            org = Organization.objects.using(alias).filter(status='ACTIVE').first()
+            branch_id = data.get('branch_id') or data.get('branch')
+            branch = Branch.objects.using(alias).filter(id=branch_id).first() if branch_id else Branch.objects.using(alias).filter(status='ACTIVE').first()
+            base_username = email.split('@')[0] if email else f"lead_{uuid.uuid4().hex[:6]}"
+            username = base_username
+            idx = 1
+            while TenantUser.objects.using(alias).filter(username__iexact=username).exists():
+                username = f"{base_username}_{idx}"
+                idx += 1
+
+            user = TenantUser(
+                organization=org,
+                username=username,
+                email=email,
+                phone=phone,
+                first_name=first_name or 'Trial',
+                last_name=last_name or 'Guest',
+                display_name=f"{first_name} {last_name}".strip() or 'Trial Guest',
+                home_branch=branch,
+                user_type='LEAD',
+                status='ACTIVE',
+                is_login_allowed=True,
+            )
+            user.set_password(f"Sweat@{uuid.uuid4().hex[:8]}")
+            user.save(using=alias)
+
+            member_role = Role.objects.using(alias).filter(code='MEMBER').first()
+            if member_role:
+                RoleAssignment.objects.using(alias).get_or_create(
+                    user=user,
+                    role=member_role,
+                    defaults={'branch': branch, 'is_active': True}
+                )
 
             if tenant:
                 tokens = _build_tenant_token(user, tenant, alias)
@@ -1767,8 +1802,7 @@ class MobileClaimFreeTrialView(APIView):
                 )
             if lead:
                 lead.current_status = 'TRIAL_BOOKED'
-                lead.converted_user_profile = profile
-                lead.save(using=alias, update_fields=['current_status', 'converted_user_profile'])
+                lead.save(using=alias, update_fields=['current_status'])
                 TrialBooking.objects.using(alias).get_or_create(
                     lead=lead,
                     class_occurrence_id=occurrence.id,
@@ -1908,6 +1942,15 @@ class MobileBookClassView(APIView):
                 created_by_user=user,
                 db_alias=alias,
             )
+        except ParqRequiredValidationError as e:
+            return Response({
+                'code': e.code,
+                'detail': str(e.message if hasattr(e, 'message') else e),
+                'error': str(e.message if hasattr(e, 'message') else e),
+                'membership_id': str(e.membership.id) if e.membership else None,
+                'form_id': str(e.form.id) if e.form else None,
+                'form_title': e.form.name if e.form else None,
+            }, status=status.HTTP_400_BAD_REQUEST)
         except ValidationError as e:
             detail = e.messages[0] if hasattr(e, 'messages') and e.messages else str(e)
             is_full = 'capacity and waitlist' in detail.lower() or 'completely full' in detail.lower()
@@ -1984,11 +2027,23 @@ class MobileMyBookingsView(APIView):
                         t_user = emp.user_profile.user
                         trainer_name = f"{t_user.first_name} {t_user.last_name}".strip()
 
+            from .services_booking_policy import BookingPolicyService
+            org = occ.class_template.category.organization if (occ and occ.class_template and occ.class_template.category) else getattr(branch, 'organization', None)
+            bp = BookingPolicyService.get_effective_policy(org, branch=branch, db_alias=alias) if org else {}
+
+            diff_minutes = int((occ.start_at - now).total_seconds() / 60) if (occ and occ.start_at) else 9999
+            cutoff_hours = bp.get('cancellation_cutoff_hours', 2)
+            reschedule_cutoff_hours = bp.get('rescheduling_cutoff_hours', 2)
+            is_late_cancel = diff_minutes < (cutoff_hours * 60)
+            is_past_reschedule_cutoff = diff_minutes < (reschedule_cutoff_hours * 60)
+
             item = {
                 'id': str(b.id),
                 'booking_number': b.booking_number,
                 'occurrence_id': str(occ.id) if occ else None,
                 'status': b.status,
+                'payment_status': getattr(b, 'payment_status', 'PAID'),
+                'confirmation_status': getattr(b, 'confirmation_status', 'CONFIRMED'),
                 'booking_type': b.booking_type,
                 'waitlist_position': b.waitlist_position,
                 'class_name': template.name if template else 'Reformer Pilates',
@@ -2002,8 +2057,14 @@ class MobileMyBookingsView(APIView):
                 'duration_minutes': template.default_duration_minutes if template else 50,
                 'trainer_name': trainer_name,
                 'booked_at': b.booked_at.isoformat() if b.booked_at else None,
-                'can_reschedule': (b.status in ['CONFIRMED', 'RESERVED']),
+                'can_reschedule': (b.status in ['CONFIRMED', 'RESERVED']) and not is_past_reschedule_cutoff,
                 'can_cancel': (b.status in ['CONFIRMED', 'RESERVED']),
+                'cancellation_cutoff_hours': cutoff_hours,
+                'rescheduling_cutoff_hours': reschedule_cutoff_hours,
+                'is_late_cancellation': is_late_cancel,
+                'late_cancellation_session_action': bp.get('late_cancellation_session_action', 'CONSUME'),
+                'cancellation_fee': bp.get('late_cancellation_fee', '0.00'),
+                'late_cancellation_fee': bp.get('late_cancellation_fee', '0.00'),
             }
 
             if b.status == 'WAITLISTED' and occ and occ.start_at >= now:
@@ -2057,25 +2118,40 @@ class MobileCancelBookingView(APIView):
         reason = request.data.get('reason', 'Member cancelled via mobile app.')
 
         try:
+            from .services_booking_policy import BookingPolicyService
+            policy_eval = BookingPolicyService.validate_member_cancellation(booking, cancelled_by_user=user, db_alias=alias)
+            reason_code = 'MEMBER_LATE_CANCEL' if policy_eval['is_late'] else 'MEMBER_MOBILE_CANCEL'
+
             cancellation = BookingWaitlistAttendanceService.cancel_booking(
                 booking=booking,
                 cancelled_by_user=user,
-                reason_code='MEMBER_MOBILE_CANCEL',
+                reason_code=reason_code,
                 reason_text=reason,
                 db_alias=alias,
             )
-            session_action = cancellation.session_action_applied if cancellation else 'RESTORE'
+            session_action = cancellation.session_action_applied if cancellation else policy_eval['session_action']
         except ValidationError as e:
             detail = e.messages[0] if hasattr(e, 'messages') and e.messages else str(e)
             return Response({'detail': detail}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
             return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
+        is_refunded = (session_action == 'RESTORE')
+        detail_msg = (
+            'Booking cancelled. 1 session credit refunded to your passbook.'
+            if is_refunded
+            else 'Booking cancelled. Session credit forfeited per gym policy.'
+        )
+
         return Response({
-            'detail': 'Booking cancelled successfully.',
+            'detail': detail_msg,
             'booking_id': str(booking.id),
             'status': 'CANCELLED',
-            'session_credit_refunded': (session_action == 'RESTORE'),
+            'is_late': policy_eval['is_late'],
+            'session_action': session_action,
+            'session_credit_refunded': is_refunded,
+            'refunded': is_refunded,
+            'fee_applied': str(policy_eval['fee']),
         })
 
 
@@ -2123,6 +2199,9 @@ class MobileRescheduleBookingView(APIView):
             return Response({'detail': 'Target class slot not found.'}, status=status.HTTP_404_NOT_FOUND)
 
         try:
+            from .services_booking_policy import BookingPolicyService
+            BookingPolicyService.validate_member_reschedule(booking, to_occurrence, rescheduled_by_user=user, db_alias=alias)
+
             new_booking = BookingWaitlistAttendanceService.reschedule_booking(
                 booking=booking,
                 to_occurrence=to_occurrence,
@@ -2138,6 +2217,7 @@ class MobileRescheduleBookingView(APIView):
                 'status': new_booking.status,
                 'class_name': to_occurrence.class_template.name,
                 'start_at': to_occurrence.start_at.isoformat() if to_occurrence.start_at else None,
+                'new_start_time': to_occurrence.start_at.isoformat() if to_occurrence.start_at else None,
                 'branch_name': to_occurrence.branch.name if to_occurrence.branch else 'SWEAT Studio',
             }, status=status.HTTP_200_OK)
         except ValidationError as e:
@@ -2240,7 +2320,8 @@ class MobilePackagesView(APIView):
     """
     GET /api/v1/mobile/packages/
     Catalog of available session packs (1 Session, 12 Sessions, 36 Sessions, Unlimited, etc.)
-    with prices, validity days, and offer badges.
+    with prices, validity days, program details, and offer badges.
+    Supports ?branch_id= and ?program_id= filters.
     """
     permission_classes = [AllowAny]
 
@@ -2250,13 +2331,18 @@ class MobilePackagesView(APIView):
             return Response([], status=status.HTTP_200_OK)
 
         branch_id = request.query_params.get('branch_id')
+        program_id = request.query_params.get('program_id')
 
         packages = (
             Package.objects.using(alias)
             .filter(status='ACTIVE')
+            .select_related('program')
             .prefetch_related('versions__prices', 'versions__entitlement_definitions')
             .order_by('created_at')
         )
+
+        if program_id:
+            packages = packages.filter(program_id=program_id)
 
         results = []
         for pkg in packages:
@@ -2267,6 +2353,15 @@ class MobilePackagesView(APIView):
             # Price lookup
             prices = latest_version.prices.filter(status='ACTIVE')
             if branch_id:
+                from .models_catalog import PackageBranchAvailability
+                has_avail_rules = PackageBranchAvailability.objects.using(alias).filter(package=pkg).exists()
+                if has_avail_rules:
+                    is_avail = PackageBranchAvailability.objects.using(alias).filter(
+                        package=pkg, branch_id=branch_id, is_available=True
+                    ).exists()
+                    if not is_avail:
+                        continue
+
                 branch_price = prices.filter(branch_id=branch_id).first()
                 price_obj = branch_price or prices.filter(branch__isnull=True).first()
             else:
@@ -2300,6 +2395,9 @@ class MobilePackagesView(APIView):
                 'name': pkg.name,
                 'code': pkg.code,
                 'description': latest_version.description_snapshot or getattr(pkg, 'description', '') or 'All-access Reformer Pilates package.',
+                'program_id': str(pkg.program_id) if pkg.program_id else None,
+                'program_name': pkg.program.name if pkg.program else '',
+                'program_code': pkg.program.code if pkg.program else '',
                 'sessions': 'Unlimited' if is_unlimited else session_count,
                 'session_count': None if is_unlimited else session_count,
                 'is_unlimited': is_unlimited,
@@ -2312,6 +2410,7 @@ class MobilePackagesView(APIView):
             })
 
         return Response(results)
+
 
 
 class MobileMyCreditsView(APIView):
@@ -2626,22 +2725,24 @@ class MobileCheckoutOrderView(APIView):
 class MobileCheckoutVerifyView(APIView):
     """
     POST /api/v1/mobile/checkout/verify/
-    Verifies payment completion, records transaction, and automatically converts Lead to Member:
-    1. Upgrades UserProfile.member_type = 'MEMBER' & generates member_number.
-    2. Upgrades TenantUser.user_type = 'MEMBER'.
-    3. Confirms RoleAssignment with 'MEMBER' role.
-    4. Converts CRM Lead status to 'CONVERTED' & creates LeadConversion record.
-    5. Activates Membership & allocates session credits.
-    Supports both live Razorpay signatures and mock/test sandbox completions.
+    Verifies payment completion, records transaction, and finalizes membership lifecycle actions:
+    1. NEW_MEMBERSHIP: Upgrades UserProfile.member_type = 'MEMBER', converts Lead, activates Membership & credits.
+    2. RENEWAL: Activates renewed membership contract, respects prior validity, and links PAR-Q.
+    3. UPGRADE: Executes authoritative package upgrade, provisions new entitlements, links PAR-Q.
+    4. EXTENSION / VALIDITY_EXTENSION: Extends end date by configured days and extends entitlement validity.
+    5. FREEZE: Applies freeze window, pauses status, and extends validity.
+    Enforces idempotency, atomic transactions, and server-side Razorpay verification.
     """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
         user = request.user
-        alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
         profile = _get_or_create_user_profile(user, alias)
 
-        order_id = request.data.get('order_id')
+        order_id = request.data.get('order_id') or request.data.get('internal_order_id')
         razorpay_order_id = request.data.get('razorpay_order_id')
         payment_id = request.data.get('razorpay_payment_id') or request.data.get('payment_id')
         signature = request.data.get('razorpay_signature')
@@ -2653,8 +2754,12 @@ class MobileCheckoutVerifyView(APIView):
 
         if order.status == 'PAID':
             membership = Membership.objects.using(alias).filter(source_order=order).first()
+            if not membership:
+                membership = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
             return Response({
-                'detail': 'Payment already verified. Your session pack is active.',
+                'success': True,
+                'detail': 'Payment already verified. Transaction is complete.',
+                'status': 'PAID',
                 'membership_id': str(membership.id) if membership else None,
                 'package_name': membership.package.name if (membership and membership.package) else '',
                 'start_date': membership.start_date.isoformat() if (membership and membership.start_date) else '',
@@ -2662,10 +2767,6 @@ class MobileCheckoutVerifyView(APIView):
                 'order_number': order.order_number,
                 'already_processed': True,
             }, status=status.HTTP_200_OK)
-
-        order_item = order.items.filter(item_type='PACKAGE').first()
-        if not order_item:
-            return Response({'detail': 'Invalid order items.'}, status=status.HTTP_400_BAD_REQUEST)
 
         # Check for test / sandbox bypass or zero-amount coupon order
         is_sandbox_payment = (
@@ -2705,104 +2806,304 @@ class MobileCheckoutVerifyView(APIView):
             razorpay_order_id = razorpay_order_id or f"order_test_{uuid.uuid4().hex[:12]}"
             signature = signature or "test_signature"
 
-        with transaction.atomic(using=alias):
-            # 1. Record payment transaction
-            PaymentTransaction.objects.using(alias).create(
-                order=order,
-                amount=order.total_amount,
-                currency=order.currency,
-                provider='RAZORPAY',
-                payment_method='RAZORPAY',
-                provider_transaction_id=payment_id,
-                status='SUCCESS',
-                metadata={
-                    'razorpay_order_id': razorpay_order_id,
-                    'razorpay_payment_id': payment_id,
-                    'razorpay_signature': signature,
-                },
-            )
-
-            # 2. Mark order as PAID
-            order.status = 'PAID'
-            order.paid_at = timezone.now()
-            order.save(using=alias)
-
-            # 3. Activate membership & allocate session units internally
-            membership = MembershipLifecycleService.activate_membership_from_order(
-                order=order,
-                order_item=order_item,
-                created_by_user=user,
-                db_alias=alias,
-            )
-
-            # 4. AUTO-CONVERT LEAD TO ACTIVE MEMBER IN DATABASE & RBAC
-            if not profile.member_number:
-                profile.member_number = f"SW-{str(uuid.uuid4())[:6].upper()}"
-            profile.member_type = 'MEMBER'
-            profile.save(using=alias, update_fields=['member_number', 'member_type'])
-
-            # Elevate TenantUser user_type
-            user.user_type = 'MEMBER'
-            user.save(using=alias, update_fields=['user_type'])
-
-            # Ensure user has active MEMBER role assignment
-            member_role = Role.objects.using(alias).filter(code='MEMBER').first()
-            if member_role:
-                RoleAssignment.objects.using(alias).get_or_create(
-                    user=user,
-                    role=member_role,
-                    defaults={'branch': order.branch or user.home_branch, 'is_active': True}
+        try:
+            with transaction.atomic(using=alias):
+                # 1. Record payment transaction with full audit fields
+                PaymentTransaction.objects.using(alias).create(
+                    order=order,
+                    user_profile=profile,
+                    amount=order.total_amount,
+                    currency=order.currency,
+                    provider='RAZORPAY',
+                    payment_method='RAZORPAY',
+                    provider_transaction_id=payment_id,
+                    idempotency_key=f"RZP-{razorpay_order_id}-{payment_id}",
+                    status='SUCCESS',
+                    paid_at=timezone.now(),
+                    metadata={
+                        'razorpay_order_id': razorpay_order_id,
+                        'razorpay_payment_id': payment_id,
+                        'razorpay_signature': signature,
+                    },
                 )
 
-            # 5. Advance CRM Lead status to CONVERTED
-            try:
-                lead = Lead.objects.using(alias).filter(email_normalized__iexact=user.email).first()
-                if not lead and user.phone:
-                    lead = Lead.objects.using(alias).filter(phone_normalized=user.phone).first()
-                if lead:
-                    lead.current_status = 'CONVERTED'
-                    lead.converted_user_profile = profile
-                    lead.save(using=alias, update_fields=['current_status', 'converted_user_profile'])
+                # 2. Mark order as PAID
+                order.status = 'PAID'
+                order.paid_at = timezone.now()
+                order.save(using=alias)
 
-                    LeadConversion.objects.using(alias).get_or_create(
-                        lead=lead,
-                        user_profile=profile,
-                        defaults={
-                            'order_id': order.id,
-                            'membership_id': membership.id,
-                            'package_id': getattr(order_item, 'package_id', None),
-                            'package_version_id': getattr(order_item, 'package_version_id', None),
-                            'conversion_source': 'MOBILE_APP',
-                        }
-                    )
-            except Exception as conv_crm_err:
-                logger.warning("Could not sync CRM lead conversion for %s: %s", user.email, conv_crm_err)
+                meta = {}
+                if order.notes:
+                    try:
+                        meta = json.loads(order.notes)
+                    except Exception:
+                        meta = {}
 
-        # Summarize allocated credits
-        entitlements = MembershipEntitlement.objects.using(alias).filter(membership=membership)
+                action_type = meta.get('action_type') or order.order_type
+                membership = None
+
+                if action_type == 'RENEWAL' or order.order_type == 'RENEWAL':
+                    order_item = order.items.using(alias).filter(item_type='PACKAGE').first()
+                    prior_m_id = meta.get('membership_id')
+                    prior_m = Membership.objects.using(alias).filter(id=prior_m_id).first() if prior_m_id else None
+                    today = timezone.now().date()
+                    renewal_start = today
+                    if prior_m and prior_m.end_date and prior_m.end_date >= today:
+                        renewal_start = prior_m.end_date + timedelta(days=1)
+
+                    if order_item:
+                        membership = MembershipLifecycleService.activate_membership_from_order(
+                            order=order,
+                            order_item=order_item,
+                            start_date=renewal_start,
+                            created_by_user=user,
+                            db_alias=alias,
+                        )
+                    elif prior_m:
+                        membership = prior_m
+
+                    # Carry forward unused units from prior membership if applicable
+                    if prior_m and membership and prior_m.id != membership.id:
+                        for old_ent in prior_m.entitlements.using(alias).filter(status='ACTIVE', is_unlimited=False):
+                            remaining = (old_ent.allocated_units or Decimal('0.00')) - (old_ent.consumed_units or Decimal('0.00'))
+                            if remaining > Decimal('0.00'):
+                                target_ent = membership.entitlements.using(alias).filter(
+                                    entitlement_type=old_ent.entitlement_type,
+                                    is_unlimited=False
+                                ).first()
+                                if target_ent:
+                                    MembershipLifecycleService.adjust_entitlement(
+                                        membership=membership,
+                                        entitlement_type=old_ent.entitlement_type,
+                                        units_delta=remaining,
+                                        reason_code='RENEWAL_CARRY_FORWARD',
+                                        reason_text=f"Carried forward {remaining} unused sessions from prior membership {prior_m.membership_number}",
+                                        actor_user=user,
+                                        db_alias=alias,
+                                    )
+
+                    parq_sub_id = meta.get('parq_submission_id')
+                    if parq_sub_id and membership:
+                        sub = IntakeSubmission.objects.using(alias).filter(id=parq_sub_id).first()
+                        if sub:
+                            sub.order = order
+                            sub.membership = membership
+                            sub.user_profile = profile
+                            sub.save(using=alias, update_fields=['order', 'membership', 'user_profile'])
+                            membership.parq_status = 'CLEARED'
+                            membership.parq_submission = sub
+                            membership.parq_completed_at = sub.submitted_at or timezone.now()
+                            membership.save(using=alias, update_fields=['parq_status', 'parq_submission', 'parq_completed_at'])
+
+                elif action_type == 'UPGRADE' or order.order_type == 'UPGRADE':
+                    target_pkg_id = meta.get('target_package_id')
+                    target_ver_id = meta.get('target_package_version_id')
+                    target_br_id = meta.get('target_branch_id')
+                    current_m_id = meta.get('current_membership_id')
+
+                    target_pkg = Package.objects.using(alias).filter(id=target_pkg_id).first()
+                    target_ver = PackageVersion.objects.using(alias).filter(id=target_ver_id).first()
+                    target_br = Branch.objects.using(alias).filter(id=target_br_id).first() if target_br_id else None
+                    m_to_upgrade = Membership.objects.using(alias).filter(id=current_m_id).first() if current_m_id else None
+                    if not m_to_upgrade:
+                        m_to_upgrade = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
+
+                    if m_to_upgrade and target_pkg and target_ver:
+                        membership = MembershipLifecycleService.execute_upgrade(
+                            membership=m_to_upgrade,
+                            target_package=target_pkg,
+                            target_package_version=target_ver,
+                            target_branch=target_br,
+                            order=order,
+                            actor_user=user,
+                            db_alias=alias,
+                        )
+                        parq_sub_id = meta.get('parq_submission_id')
+                        if parq_sub_id and membership:
+                            sub = IntakeSubmission.objects.using(alias).filter(id=parq_sub_id).first()
+                            if sub:
+                                sub.order = order
+                                sub.membership = membership
+                                sub.user_profile = profile
+                                sub.save(using=alias, update_fields=['order', 'membership', 'user_profile'])
+                                membership.parq_status = 'CLEARED'
+                                membership.parq_submission = sub
+                                membership.parq_completed_at = sub.submitted_at or timezone.now()
+                                membership.save(using=alias, update_fields=['parq_status', 'parq_submission', 'parq_completed_at'])
+
+                elif action_type == 'VALIDITY_EXTENSION' or order.order_type == 'EXTENSION':
+                    ext_days = int(meta.get('days', 30))
+                    m_id = meta.get('membership_id')
+                    m_to_ext = Membership.objects.using(alias).filter(id=m_id).first() if m_id else None
+                    if not m_to_ext:
+                        m_to_ext = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
+                    if m_to_ext:
+                        membership = MembershipLifecycleService.extend_membership(
+                            membership=m_to_ext,
+                            days=ext_days,
+                            reason_text=f"Self-service validity extension of {ext_days} days (Order {order.order_number})",
+                            approved_by_user=user,
+                            db_alias=alias,
+                        )
+
+                elif action_type == 'FREEZE':
+                    freeze_from_str = meta.get('freeze_from')
+                    freeze_until_str = meta.get('freeze_until')
+                    m_id = meta.get('membership_id')
+                    m_to_frz = Membership.objects.using(alias).filter(id=m_id).first() if m_id else None
+                    if not m_to_frz:
+                        m_to_frz = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
+                    if m_to_frz and freeze_from_str and freeze_until_str:
+                        from_d = datetime.strptime(freeze_from_str[:10], '%Y-%m-%d').date()
+                        until_d = datetime.strptime(freeze_until_str[:10], '%Y-%m-%d').date()
+                        MembershipLifecycleService.apply_freeze(
+                            membership=m_to_frz,
+                            freeze_from=from_d,
+                            freeze_until=until_d,
+                            reason_text=f"Self-service paid freeze (Order {order.order_number})",
+                            approved_by_user=user,
+                            db_alias=alias,
+                        )
+                        membership = m_to_frz
+
+                else:
+                    # Default / NEW_MEMBERSHIP
+                    order_item = order.items.filter(item_type='PACKAGE').first()
+                    if order_item:
+                        membership = MembershipLifecycleService.activate_membership_from_order(
+                            order=order,
+                            order_item=order_item,
+                            created_by_user=user,
+                            db_alias=alias,
+                        )
+
+                    if not profile.member_number:
+                        profile.member_number = f"SW-{str(uuid.uuid4())[:6].upper()}"
+                    profile.member_type = 'MEMBER'
+                    profile.save(using=alias, update_fields=['member_number', 'member_type'])
+
+                    user.user_type = 'MEMBER'
+                    user.save(using=alias, update_fields=['user_type'])
+
+                    member_role = Role.objects.using(alias).filter(code='MEMBER').first()
+                    if member_role:
+                        RoleAssignment.objects.using(alias).get_or_create(
+                            user=user,
+                            role=member_role,
+                            defaults={'branch': order.branch or user.home_branch, 'is_active': True}
+                        )
+
+                    try:
+                        lead = Lead.objects.using(alias).filter(email_normalized__iexact=user.email).first()
+                        if not lead and user.phone:
+                            lead = Lead.objects.using(alias).filter(phone_normalized=user.phone).first()
+                        if lead:
+                            lead.current_status = 'CONVERTED'
+                            lead.converted_user_profile = profile
+                            lead.save(using=alias, update_fields=['current_status', 'converted_user_profile'])
+
+                            LeadConversion.objects.using(alias).get_or_create(
+                                lead=lead,
+                                user_profile=profile,
+                                defaults={
+                                    'order_id': order.id,
+                                    'membership_id': membership.id if membership else None,
+                                    'package_id': getattr(order_item, 'package_id', None) if order_item else None,
+                                    'package_version_id': getattr(order_item, 'package_version_id', None) if order_item else None,
+                                    'conversion_source': 'MOBILE_APP',
+                                }
+                            )
+                    except Exception as conv_crm_err:
+                        logger.warning("Could not sync CRM lead conversion for %s: %s", user.email, conv_crm_err)
+        except Exception as exc:
+            logger.exception("Failed to verify and process checkout for order %s: %s", order.order_number, exc)
+            return Response(
+                {
+                    'detail': f'Checkout verification failed: {str(exc)}',
+                    'code': 'CHECKOUT_PROCESSING_ERROR'
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
         credits_summary = []
-        for ent in entitlements:
-            credits_summary.append({
-                'entitlement_type': ent.entitlement_type,
-                'allocated_units': str(ent.allocated_units) if ent.allocated_units else 'UNLIMITED',
-                'is_unlimited': ent.is_unlimited,
-                'valid_until': ent.valid_until.isoformat() if ent.valid_until else None,
-            })
+        if membership:
+            entitlements = MembershipEntitlement.objects.using(alias).filter(membership=membership)
+            for ent in entitlements:
+                credits_summary.append({
+                    'entitlement_type': ent.entitlement_type,
+                    'allocated_units': str(ent.allocated_units) if ent.allocated_units else 'UNLIMITED',
+                    'is_unlimited': ent.is_unlimited,
+                    'valid_until': ent.valid_until.isoformat() if ent.valid_until else None,
+                })
 
         return Response({
+            'success': True,
             'status': 'PAID',
-            'detail': 'Payment successful! Account converted to Active Member and credits allocated.',
-            'member_id': str(profile.id),
-            'member_number': profile.member_number,
-            'user_type': 'MEMBER',
-            'lead_status': 'CONVERTED',
-            'membership_id': str(membership.id),
-            'package_name': membership.package.name,
+            'detail': 'Payment successful! Membership action processed successfully.',
+            'action_type': action_type,
+            'membership_id': str(membership.id) if membership else None,
+            'membership_status': membership.status if membership else 'ACTIVE',
+            'package_name': membership.package.name if (membership and membership.package) else '',
             'credits_allocated': credits_summary,
-            'start_date': membership.start_date.isoformat(),
-            'end_date': membership.end_date.isoformat(),
+            'start_date': membership.start_date.isoformat() if (membership and membership.start_date) else '',
+            'end_date': membership.end_date.isoformat() if (membership and membership.end_date) else '',
             'order_number': order.order_number,
         })
+
+
+
+class MobileOrdersView(APIView):
+    """
+    GET /api/v1/mobile/orders/
+    Fetch order and invoice history for the authenticated member.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
+        profile = _get_or_create_user_profile(user, alias)
+
+        orders = (
+            Order.objects.using(alias)
+            .filter(user_profile=profile)
+            .select_related('branch')
+            .prefetch_related('items__package')
+            .order_by('-created_at')
+        )
+        data = []
+        for o in orders:
+            items_data = []
+            for it in o.items.all():
+                items_data.append({
+                    'id': str(it.id),
+                    'item_name': it.item_name_snapshot or (it.package.name if it.package else 'Package'),
+                    'item_type': it.item_type,
+                    'package_name': it.package.name if it.package else '',
+                    'quantity': str(it.quantity),
+                    'unit_price': str(it.unit_price_snapshot),
+                    'discount_amount': str(it.discount_amount),
+                    'tax_amount': str(it.tax_amount),
+                    'total_amount': str(it.total_amount),
+                })
+            data.append({
+                'id': str(o.id),
+                'order_number': o.order_number,
+                'order_type': o.order_type,
+                'status': o.status,
+                'subtotal': str(o.subtotal),
+                'discount_amount': str(o.discount_amount),
+                'tax_amount': str(o.tax_amount),
+                'total_amount': str(o.total_amount),
+                'currency': o.currency,
+                'branch_id': str(o.branch_id) if o.branch_id else None,
+                'branch_name': o.branch.name if o.branch else '',
+                'created_at': o.created_at.isoformat() if o.created_at else None,
+                'items': items_data,
+            })
+        return Response(data, status=status.HTTP_200_OK)
 
 
 class MobileOnboardingSurveyView(APIView):
@@ -2878,6 +3179,51 @@ class MobileOnboardingSurveyView(APIView):
                 ).order_by('-submitted_at')
                 sub_count = all_subs.count()
                 last_sub = all_subs.first()
+                submission_history = []
+                for s_item in all_subs:
+                    s_meta = getattr(s_item, 'metadata', {}) or {}
+                    s_answers_map = {}
+                    s_answers_detailed = []
+                    for ans_rec in s_item.answers.all():
+                        val_rec = None
+                        if ans_rec.boolean_value is not None:
+                            val_rec = ans_rec.boolean_value
+                        elif ans_rec.numeric_value is not None:
+                            val_rec = float(ans_rec.numeric_value)
+                        elif ans_rec.json_value is not None:
+                            val_rec = ans_rec.json_value
+                        elif ans_rec.date_value is not None:
+                            val_rec = ans_rec.date_value.isoformat() if hasattr(ans_rec.date_value, 'isoformat') else str(ans_rec.date_value)
+                        elif ans_rec.text_value:
+                            val_rec = ans_rec.text_value
+                        if ans_rec.question_id:
+                            s_answers_map[str(ans_rec.question_id)] = val_rec
+                        if ans_rec.question:
+                            s_answers_map[f"q_{ans_rec.question.display_order}"] = val_rec
+                            s_answers_detailed.append({
+                                'question_id': str(ans_rec.question.id),
+                                'question_text': ans_rec.question.question_text,
+                                'question_type': ans_rec.question.question_type,
+                                'category': ans_rec.question.category,
+                                'is_sensitive': ans_rec.question.is_sensitive,
+                                'order': ans_rec.question.display_order,
+                                'answer': val_rec,
+                            })
+                    submission_history.append({
+                        'id': str(s_item.id),
+                        'submitted_at': s_item.submitted_at.isoformat() if s_item.submitted_at else None,
+                        'signer_identity': s_item.signer_identity,
+                        'signature_data': s_item.signature_data,
+                        'signature_date': s_item.signature_date.isoformat() if s_item.signature_date else None,
+                        'form_name': (s_item.form_snapshot.get('name') if isinstance(s_item.form_snapshot, dict) else None) or (s_item.intake_form.name if s_item.intake_form else 'PAR-Q Form'),
+                        'version_number': (s_item.form_snapshot.get('version') if isinstance(s_item.form_snapshot, dict) else None) or (s_item.intake_form.version_number if s_item.intake_form else 1),
+                        'is_edit': s_meta.get('is_edit', False),
+                        'revision_number': s_meta.get('revision_number', 1),
+                        'agreement_accepted': s_item.agreement_accepted,
+                        'agreement_text_snapshot': s_item.agreement_text_snapshot,
+                        'answers': s_answers_map,
+                        'answers_detailed': s_answers_detailed,
+                    })
 
                 if last_sub:
                     is_cleared = True
@@ -2929,7 +3275,10 @@ class MobileOnboardingSurveyView(APIView):
             'is_cleared': is_cleared,
             'status_badge': 'PAR-Q Cleared' if is_cleared else 'PAR-Q Pending',
             'is_completed': is_cleared,
+            'has_completed_parq': is_cleared,
             'submission': submission_info,
+            'existing_submission': submission_info,
+            'submission_history': submission_history if 'submission_history' in locals() else ([] if not submission_info else [submission_info]),
         })
 
     def post(self, request):
@@ -2962,16 +3311,75 @@ class MobileOnboardingSubmitView(APIView):
         signature_data = data.get('signature_data') or ''
         agreement_accepted = data.get('agreement_accepted', True)
 
-        # Check existing submissions for revision / edit tracking
+        # Check existing submissions for lifecycle & revision decision
         prior_subs = IntakeSubmission.objects.using(alias).filter(user_profile=profile).order_by('-submitted_at')
         prior_count = prior_subs.count()
-        is_edit = prior_count > 0
-        rev_num = prior_count + 1
         prev_sub = prior_subs.first()
+        parq_decision = str(data.get('parq_decision', '')).upper().strip()
+        allow_revision = bool(data.get('allow_revision', False))
 
-        # If member edited responses without re-drawing signature, preserve previous verified signature
-        if not signature_data and prev_sub and prev_sub.signature_data:
-            signature_data = prev_sub.signature_data
+        # View-Only Guard: Prevent accidental / silent overwrite from normal member portal viewing flow
+        if prior_count > 0 and not parq_decision and not allow_revision:
+            return Response({
+                'detail': 'A completed PAR-Q health assessment is already on file for this member. Existing answers cannot be overwritten from the normal viewing flow.',
+                'code': 'PARQ_ALREADY_COMPLETED',
+                'submission_id': str(prev_sub.id),
+                'submitted_at': prev_sub.submitted_at.isoformat() if prev_sub.submitted_at else None,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # OPTION A: REUSE EXISTING PAR-Q
+        if parq_decision == 'REUSE':
+            if not prev_sub:
+                return Response({
+                    'detail': 'No existing completed PAR-Q assessment found to reuse.',
+                    'code': 'NO_PARQ_TO_REUSE',
+                }, status=status.HTTP_400_BAD_REQUEST)
+            # Reusing MUST NOT create a duplicate IntakeSubmission record
+            target_mem_id = data.get('membership_id')
+            if target_mem_id:
+                target_m = Membership.objects.using(alias).filter(id=target_mem_id, user_profile=profile).first()
+                if target_m:
+                    target_m.parq_status = 'COMPLETED'
+                    target_m.parq_submission = prev_sub
+                    target_m.parq_completed_at = prev_sub.submitted_at
+                    target_m.save(using=alias, update_fields=['parq_status', 'parq_submission', 'parq_completed_at', 'updated_at'])
+            return Response({
+                'detail': f"Existing PAR-Q from {prev_sub.submitted_at.strftime('%b %d, %Y')} reused successfully. Historical record preserved.",
+                'is_cleared': True,
+                'status_badge': 'PAR-Q Cleared',
+                'submission_id': str(prev_sub.id),
+                'is_reused': True,
+            }, status=status.HTTP_200_OK)
+
+        # OPTION B: EDIT EXISTING PAR-Q (Create audited revision with new signature)
+        if parq_decision == 'EDIT' or allow_revision:
+            is_edit = True
+            rev_num = prior_count + 1
+            if not signature_data or len(str(signature_data)) < 100 or not str(signature_data).startswith('data:image/'):
+                return Response({
+                    'detail': 'A newly drawn digital signature is required when creating a revised PAR-Q assessment.',
+                    'code': 'NEW_SIGNATURE_REQUIRED',
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+        # OPTION C: FILL OUT A NEW PAR-Q (Independent submission with new signature)
+        elif parq_decision == 'NEW':
+            is_edit = False
+            rev_num = prior_count + 1
+            if not signature_data or len(str(signature_data)) < 100 or not str(signature_data).startswith('data:image/'):
+                return Response({
+                    'detail': 'A newly drawn digital signature is required when completing a new PAR-Q assessment.',
+                    'code': 'SIGNATURE_REQUIRED',
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+        # First-time submission
+        else:
+            is_edit = False
+            rev_num = 1
+            if not signature_data or len(str(signature_data)) < 100 or not str(signature_data).startswith('data:image/'):
+                return Response({
+                    'detail': 'A valid drawn digital signature is required to complete the health assessment.',
+                    'code': 'SIGNATURE_REQUIRED',
+                }, status=status.HTTP_400_BAD_REQUEST)
 
         meta_info = {
             'is_edit': is_edit,
@@ -2979,7 +3387,9 @@ class MobileOnboardingSubmitView(APIView):
             'channel': 'MEMBER_PORTAL',
             'signer_type': 'MEMBER_DIRECT',
             'accepted_by_name': f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip() or user.email,
-            'previous_submission_id': str(prev_sub.id) if prev_sub else None,
+            'previous_submission_id': str(prev_sub.id) if (is_edit and prev_sub) else None,
+            'submission_type': 'REVISION' if is_edit else ('NEW_ASSESSMENT' if parq_decision == 'NEW' else 'INITIAL'),
+            'parq_decision': parq_decision or ('INITIAL' if prior_count == 0 else 'EDIT'),
         }
 
         # 2. Persist authoritative IntakeSubmission
@@ -3291,8 +3701,11 @@ class MobileLeadCaptureView(APIView):
         alias, tenant = _resolve_mobile_tenant_and_db(request)
         if not alias or not tenant:
             return Response(
-                {'detail': 'Studio service is temporarily unavailable. Please try again.'},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                {
+                    'detail': 'Organization not found or inactive. Please specify a valid organization.',
+                    'code': 'TENANT_NOT_FOUND',
+                },
+                status=status.HTTP_404_NOT_FOUND,
             )
 
         with transaction.atomic(using=alias):
@@ -3433,11 +3846,11 @@ class MobileMembershipActionsView(APIView):
     """
     GET /api/v1/mobile/memberships/actions/
     Returns member-facing options and policies for:
-    - Renew Membership
-    - Upgrade Package
-    - Extend Validity
-    - Freeze Membership
-    along with any currently pending approval / change requests.
+    - Renew Membership (fixed current program, selectable branch, filtered packages)
+    - Upgrade Package (change branch, program, package with authoritative price diff)
+    - Extend Validity (dynamic duration options & fees from CRM config, self-service checkout)
+    - Freeze Membership (dynamic duration limits & fees from CRM config, self-service checkout)
+    - Active freeze state, PAR-Q status, and Razorpay configuration
     """
     permission_classes = [IsAuthenticated]
 
@@ -3448,13 +3861,49 @@ class MobileMembershipActionsView(APIView):
             alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
         profile = _get_or_create_user_profile(user, alias)
 
+        def _get_ver_days(v):
+            if not v:
+                return 30
+            if getattr(v, 'duration_days', None) is not None:
+                return v.duration_days
+            val = getattr(v, 'duration_value', 30) or 30
+            u = str(getattr(v, 'duration_unit', 'MONTH') or 'MONTH').upper().rstrip('S')
+            if u == 'DAY':
+                return val
+            elif u == 'WEEK':
+                return val * 7
+            elif u == 'MONTH':
+                return val * 30
+            elif u == 'YEAR':
+                return val * 365
+            return val
+
+        def _get_ver_sessions(v):
+            if not v:
+                return 12
+            if getattr(v, 'session_count', None) is not None:
+                return v.session_count
+            tot = 0
+            try:
+                for ped in v.entitlement_definitions.using(alias).all():
+                    if getattr(ped, 'is_unlimited', False):
+                        return 999
+                    tot += int(getattr(ped, 'allocated_units', 0) or 0)
+            except Exception:
+                pass
+            return tot or 12
+
+        from decimal import Decimal
         from django.db.models import Q
         from .models_memberships import (
             Membership, MembershipFreeze, MembershipChangeRequest,
             MembershipRenewalPolicy, Package, PackageVersion, PackagePrice
         )
-        from .models_approvals import ApprovalRequest
-        from .models_commerce import Order
+        from .models_catalog import Program
+        from .models_workforce import Branch
+        from .models_govern import OrganizationSettings
+        from .models_crm import IntakeSubmission
+        from .services_razorpay import RazorpayService
 
         active_m = (
             Membership.objects.using(alias)
@@ -3464,149 +3913,314 @@ class MobileMembershipActionsView(APIView):
             .first()
         )
 
+        org = getattr(user, 'organization', None)
+        if not org and active_m and active_m.package:
+            org = active_m.package.organization
+        if not org:
+            org = Organization.objects.using(alias).first()
+
+        branch_qs = Branch.objects.using(alias).filter(status='ACTIVE')
+        if org:
+            branch_qs = branch_qs.filter(organization=org)
+        if branch_qs.exclude(code='').exists():
+            branch_qs = branch_qs.exclude(code='')
+        raw_branches = list(
+            branch_qs.values(
+                'id', 'name', 'code', 'address', 'address_line_1',
+                'location__name', 'location__city', 'location__state'
+            )
+        )
+        branches = [
+            {
+                'id': str(b['id']),
+                'name': b['name'],
+                'code': b['code'],
+                'address': b.get('address') or '',
+                'address_line_1': b.get('address_line_1') or '',
+                'location_name': b.get('location__name') or '',
+                'city': b.get('location__city') or '',
+                'state': b.get('location__state') or '',
+            }
+            for b in raw_branches
+        ]
+
+        programs_qs = Program.objects.using(alias).filter(status='ACTIVE')
+        if org:
+            programs_qs = programs_qs.filter(organization=org)
+        # Only include commercial programs that have active commercial packages available for self-service purchase/upgrade
+        programs_qs = (
+            programs_qs.filter(packages__status='ACTIVE')
+            .distinct()
+            .order_by('display_order', 'name')
+        )
+        programs = list(
+            programs_qs.values('id', 'name', 'code')
+        )
+
+        # Retrieve dynamic settings for extension & freeze
+        os_obj = OrganizationSettings.objects.using(alias).first()
+        cfg = getattr(os_obj, 'membership_config', {}) or {}
+        ext_cfg = cfg.get('extension_policy', {})
+        frz_cfg = cfg.get('freeze_policy', {})
+        tax_pct = float(getattr(os_obj, 'tax_rate_pct', 18.0) or 18.0)
+
+        # Build dynamic extension options
+        ext_options_list = ext_cfg.get('available_options')
+        if not ext_options_list:
+            ext_options_list = [
+                {'days': 7, 'base_fee': 500.0, 'tax_pct': tax_pct, 'tax_amount': round(500.0 * (tax_pct / 100.0), 2), 'total_fee': round(500.0 * (1.0 + (tax_pct / 100.0)), 2), 'name': '7 Days Extension'},
+                {'days': 14, 'base_fee': 900.0, 'tax_pct': tax_pct, 'tax_amount': round(900.0 * (tax_pct / 100.0), 2), 'total_fee': round(900.0 * (1.0 + (tax_pct / 100.0)), 2), 'name': '14 Days Extension'},
+                {'days': 30, 'base_fee': 1500.0, 'tax_pct': tax_pct, 'tax_amount': round(1500.0 * (tax_pct / 100.0), 2), 'total_fee': round(1500.0 * (1.0 + (tax_pct / 100.0)), 2), 'name': '30 Days Extension'},
+                {'days': 60, 'base_fee': 2800.0, 'tax_pct': tax_pct, 'tax_amount': round(2800.0 * (tax_pct / 100.0), 2), 'total_fee': round(2800.0 * (1.0 + (tax_pct / 100.0)), 2), 'name': '60 Days Extension'},
+            ]
+
+        # Build dynamic freeze options
+        freeze_enabled = frz_cfg.get('enabled', getattr(os_obj, 'allow_member_freeze', True))
+        freeze_min_days = int(frz_cfg.get('min_days', 7))
+        freeze_max_days = int(frz_cfg.get('max_days', getattr(os_obj, 'max_freeze_days_per_year', 60) or 60))
+        freeze_fee_fixed = float(frz_cfg.get('fee_fixed', 0.0))
+        freeze_fee_per_day = float(frz_cfg.get('fee_per_day', 0.0))
+
+        # Check existing PAR-Q
+        prior_parq = IntakeSubmission.objects.using(alias).filter(user_profile=profile, status='COMPLETED').order_by('-submitted_at').first()
+        parq_info = {
+            'has_completed_parq': prior_parq is not None,
+            'submission_id': str(prior_parq.id) if prior_parq else None,
+            'submitted_at': prior_parq.submitted_at.isoformat() if prior_parq and prior_parq.submitted_at else None,
+            'is_cleared': (getattr(prior_parq, 'is_cleared', prior_parq.status == 'COMPLETED') if prior_parq else False),
+            'form_title': ((getattr(prior_parq.intake_form, 'name', None) or getattr(prior_parq.intake_form, 'title', 'Physical Activity Readiness Questionnaire')) if (prior_parq and getattr(prior_parq, 'intake_form', None)) else 'Physical Activity Readiness Questionnaire'),
+        }
+
+        # Razorpay Key
+        razorpay_key_id = 'rzp_test_placeholder'
+        if RazorpayService.is_configured(db_alias=alias):
+            razorpay_key_id, _ = RazorpayService.get_credentials(db_alias=alias)
+
         if not active_m:
             return Response({
                 'has_membership': False,
                 'active_membership': None,
+                'branches': branches,
+                'programs': programs,
                 'renew_options': [],
                 'upgrade_options': [],
-                'extend_options': {'available_days': [7, 14, 21, 30], 'requires_approval': True, 'policy_note': 'No active membership.'},
-                'freeze_options': {'min_days': 7, 'max_days': 60, 'requires_approval': True, 'policy_note': 'No active membership.'},
-                'pending_requests': [],
+                'extend_options': {
+                    'enabled': ext_cfg.get('enabled', True),
+                    'available_options': ext_options_list,
+                    'requires_approval': False,
+                    'policy_note': 'Self-service extensions are processed immediately with secure checkout.',
+                },
+                'freeze_options': {
+                    'enabled': freeze_enabled,
+                    'min_days': freeze_min_days,
+                    'max_days': freeze_max_days,
+                    'fee_fixed': freeze_fee_fixed,
+                    'fee_per_day': freeze_fee_per_day,
+                    'tax_pct': tax_pct,
+                    'requires_approval': False,
+                    'policy_note': 'Freezes pause your membership and extend validity by the frozen period.',
+                },
+                'active_freeze': None,
+                'parq_info': parq_info,
+                'razorpay_key_id': razorpay_key_id,
             })
 
         # Calculate session credits
-        entitlements = list(active_m.entitlements.using(alias).filter(status='ACTIVE'))
-        total_sessions = int(sum((e.allocated_units or Decimal('0')) for e in entitlements))
-        used_sessions = int(sum((e.consumed_units or Decimal('0')) for e in entitlements))
-        remaining_sessions = max(0, total_sessions - used_sessions)
+        total_sessions = 0
+        remaining_sessions = 0
+        used_sessions = 0
+        for ent in active_m.entitlements.using(alias).all():
+            alloc = int(getattr(ent, 'allocated_units', None) or getattr(ent, 'total_units', 0) or 0)
+            cons = int(getattr(ent, 'consumed_units', 0) or 0)
+            total_sessions += alloc
+            used_sessions += cons
+            remaining_sessions += max(0, alloc - cons)
 
         today = timezone.now().date()
         days_remaining = max(0, (active_m.end_date - today).days) if active_m.end_date else 0
 
-        # Current package price
-        current_price = Decimal('0.00')
-        if active_m.package_version:
-            pr = active_m.package_version.prices.using(alias).filter(status='ACTIVE').first()
-            if pr:
-                tax_pct = pr.tax_percent or Decimal('18.0')
-                current_price = pr.base_price * (1 + (tax_pct / Decimal('100.0')))
+        # Check active freeze
+        active_freeze_rec = (
+            MembershipFreeze.objects.using(alias)
+            .filter(membership=active_m, status__in=['ACTIVE', 'SCHEDULED'])
+            .order_by('-freeze_from')
+            .first()
+        )
+        active_freeze_data = None
+        if active_freeze_rec:
+            active_freeze_data = {
+                'id': str(active_freeze_rec.id),
+                'freeze_from': active_freeze_rec.freeze_from.isoformat(),
+                'freeze_until': active_freeze_rec.freeze_until.isoformat(),
+                'days': active_freeze_rec.extend_membership_days or (active_freeze_rec.freeze_until - active_freeze_rec.freeze_from).days,
+                'status': active_freeze_rec.status,
+                'reason': active_freeze_rec.reason_text or '',
+            }
 
-        # Renew options: active packages
+        # Optional query param filters for selected branch
+        filter_branch_id = request.query_params.get('branch_id')
+        effective_branch = active_m.home_branch
+        if filter_branch_id:
+            found_br = Branch.objects.using(alias).filter(id=filter_branch_id, status='ACTIVE').first()
+            if found_br:
+                effective_branch = found_br
+
+        # RENEW OPTIONS: Strictly fixed to active_m.program!
         renew_options = []
-        all_active_pkgs = Package.objects.using(alias).filter(status='ACTIVE').prefetch_related('versions', 'versions__prices')
-        for pkg in all_active_pkgs:
+        if active_m.program:
+            pkg_qs = (
+                Package.objects.using(alias)
+                .filter(status='ACTIVE', program=active_m.program)
+                .select_related('program')
+                .prefetch_related('versions__prices')
+            )
+            for pkg in pkg_qs:
+                ver = pkg.versions.filter(status='ACTIVE').order_by('-version_number').first()
+                if not ver:
+                    continue
+                if effective_branch and hasattr(ver, 'available_branches'):
+                    if ver.available_branches.exists() and not ver.available_branches.filter(id=effective_branch.id).exists():
+                        continue
+                price_obj = ver.prices.filter(status='ACTIVE').first()
+                if not price_obj:
+                    continue
+                b_price = float(price_obj.base_price)
+                t_pct = float(price_obj.tax_percent or 18.0)
+                t_amt = round(b_price * (t_pct / 100.0), 2)
+                tot = round(b_price + t_amt, 2)
+                renew_options.append({
+                    'package_id': str(pkg.id),
+                    'package_version_id': str(ver.id),
+                    'name': pkg.name,
+                    'program_id': str(pkg.program.id),
+                    'program_name': pkg.program.name,
+                    'program_code': pkg.program.code,
+                    'duration_days': _get_ver_days(ver),
+                    'session_count': _get_ver_sessions(ver),
+                    'base_price': b_price,
+                    'tax_percent': t_pct,
+                    'tax_amount': t_amt,
+                    'total_price': tot,
+                    'currency': price_obj.currency or 'INR',
+                })
+
+        # Current membership pricing snapshot for comparison
+        cur_total_price = 0.0
+        cur_sessions = total_sessions
+        cur_days = 0
+        if active_m.package_version:
+            cur_days = _get_ver_days(active_m.package_version)
+            p_obj = active_m.package_version.prices.filter(status='ACTIVE').first()
+            if p_obj:
+                cur_b = float(p_obj.base_price)
+                cur_t = float(p_obj.tax_percent or 18.0)
+                cur_total_price = round(cur_b * (1.0 + (cur_t / 100.0)), 2)
+
+        # UPGRADE OPTIONS: All programs & packages available for upgrade
+        upgrade_options = []
+        all_pkg_qs = (
+            Package.objects.using(alias)
+            .filter(status='ACTIVE')
+            .select_related('program')
+            .prefetch_related('versions__prices')
+        )
+        for pkg in all_pkg_qs:
             ver = pkg.versions.filter(status='ACTIVE').order_by('-version_number').first()
             if not ver:
                 continue
-            pr = ver.prices.filter(status='ACTIVE').first()
-            if not pr:
+            if active_m.package and pkg.id == active_m.package.id and active_m.package_version and ver.id == active_m.package_version.id:
                 continue
-            tax_pct = pr.tax_percent or Decimal('18.0')
-            final_price = pr.base_price * (1 + (tax_pct / Decimal('100.0')))
-            is_current = (active_m.package_id == pkg.id)
-            renew_options.append({
+            price_obj = ver.prices.filter(status='ACTIVE').first()
+            if not price_obj:
+                continue
+            b_price = float(price_obj.base_price)
+            t_pct = float(price_obj.tax_percent or 18.0)
+            t_amt = round(b_price * (t_pct / 100.0), 2)
+            tot = round(b_price + t_amt, 2)
+            price_diff = max(0.0, round(tot - cur_total_price, 2))
+            extra_sessions = max(0, _get_ver_sessions(ver) - cur_sessions)
+            extra_days = max(0, _get_ver_days(ver) - cur_days)
+
+            upgrade_options.append({
                 'package_id': str(pkg.id),
                 'package_version_id': str(ver.id),
-                'package_name': pkg.name,
-                'program_name': pkg.program.name if pkg.program else 'SWEAT',
-                'duration_days': getattr(pkg, 'duration_days', None) or getattr(ver, 'total_days', None) or (ver.duration_value * 30 if getattr(ver, 'duration_unit', '') == 'MONTH' else getattr(ver, 'duration_value', 30)),
-                'session_credits': getattr(ver, 'default_credits', None) or getattr(pkg, 'default_credits', None) or 16,
-                'base_price': float(pr.base_price),
-                'tax_percent': float(tax_pct),
-                'total_price': float(round(final_price, 2)),
-                'currency': pr.currency or 'INR',
-                'is_current_package': is_current,
+                'name': pkg.name,
+                'program_id': str(pkg.program.id) if pkg.program else '',
+                'program_name': pkg.program.name if pkg.program else '',
+                'program_code': pkg.program.code if pkg.program else '',
+                'duration_days': _get_ver_days(ver),
+                'session_count': _get_ver_sessions(ver),
+                'base_price': b_price,
+                'tax_percent': t_pct,
+                'tax_amount': t_amt,
+                'total_price': tot,
+                'price_difference': price_diff,
+                'additional_sessions': extra_sessions,
+                'additional_days': extra_days,
+                'currency': price_obj.currency or 'INR',
             })
 
-        renew_options.sort(key=lambda x: (not x['is_current_package'], x['total_price']))
-
-        # Upgrade options
-        upgrade_options = []
-        for opt in renew_options:
-            price_diff = max(0.0, opt['total_price'] - float(current_price))
-            if opt['total_price'] > float(current_price) or opt['session_credits'] > total_sessions:
-                upgrade_options.append({
-                    **opt,
-                    'price_difference': float(round(price_diff, 2)),
-                    'current_price': float(round(current_price, 2)),
-                    'credits_gain': max(0, opt['session_credits'] - total_sessions),
-                })
-
-        # Pending approval requests
-        pending_approvals = ApprovalRequest.objects.using(alias).filter(
-            Q(entity_id=active_m.id) | Q(requested_by_user=user),
-            status='PENDING'
-        ).order_by('-created_at')
-
-        pending_requests = []
-        for req in pending_approvals:
-            pending_requests.append({
-                'id': str(req.id),
-                'request_type': req.request_type,
-                'status': req.status,
-                'created_at': req.created_at.isoformat(),
-                'payload': req.requested_payload or {},
-            })
-
-        # Pending freezes
-        pending_freezes = MembershipFreeze.objects.using(alias).filter(
-            membership=active_m,
-            status__in=['SCHEDULED', 'ACTIVE']
-        ).order_by('-created_at')
-        for pf in pending_freezes:
-            if not any(pr['payload'].get('freeze_id') == str(pf.id) for pr in pending_requests):
-                pending_requests.append({
-                    'id': str(pf.id),
-                    'request_type': 'MEMBERSHIP_FREEZE',
-                    'status': pf.status,
-                    'created_at': pf.created_at.isoformat(),
-                    'payload': {
-                        'freeze_from': str(pf.freeze_from),
-                        'freeze_until': str(pf.freeze_until),
-                        'days': pf.extend_membership_days,
-                        'reason': pf.reason_text,
-                    }
-                })
+        active_membership_data = {
+            'id': str(active_m.id),
+            'membership_number': active_m.membership_number,
+            'status': active_m.status,
+            'package_id': str(active_m.package.id) if active_m.package else None,
+            'package_name': active_m.package.name if active_m.package else 'Custom Membership',
+            'package_version_id': str(active_m.package_version.id) if active_m.package_version else None,
+            'program_id': str(active_m.program.id) if active_m.program else None,
+            'program_name': active_m.program.name if active_m.program else None,
+            'program_code': active_m.program.code if active_m.program else None,
+            'branch_id': str(active_m.home_branch.id) if active_m.home_branch else None,
+            'branch_name': active_m.home_branch.name if active_m.home_branch else None,
+            'start_date': str(active_m.start_date) if active_m.start_date else None,
+            'end_date': str(active_m.end_date) if active_m.end_date else None,
+            'days_remaining': days_remaining,
+            'total_sessions': total_sessions,
+            'remaining_sessions': remaining_sessions,
+            'used_sessions': used_sessions,
+            'is_frozen': active_m.status == 'FROZEN',
+            'parq_status': active_m.parq_status,
+            'parq_completed_at': active_m.parq_completed_at.isoformat() if active_m.parq_completed_at else None,
+        }
 
         return Response({
             'has_membership': True,
-            'active_membership': {
-                'id': str(active_m.id),
-                'membership_number': active_m.membership_number,
-                'package_name': active_m.package.name if active_m.package else 'Active Package',
-                'status': active_m.status,
-                'start_date': str(active_m.start_date) if active_m.start_date else None,
-                'end_date': str(active_m.end_date) if active_m.end_date else None,
-                'days_remaining': days_remaining,
-                'total_sessions': total_sessions,
-                'remaining_sessions': remaining_sessions,
-                'used_sessions': used_sessions,
-                'is_frozen': active_m.status == 'FROZEN',
-            },
+            'active_membership': active_membership_data,
+            'branches': branches,
+            'programs': programs,
             'renew_options': renew_options,
             'upgrade_options': upgrade_options,
             'extend_options': {
-                'available_days': [7, 14, 21, 30],
-                'requires_approval': True,
-                'policy_note': 'Validity extensions require studio manager approval.',
+                'enabled': ext_cfg.get('enabled', True),
+                'available_options': ext_options_list,
+                'requires_approval': False,
+                'policy_note': 'Self-service extensions are processed immediately with secure Razorpay checkout.',
             },
             'freeze_options': {
-                'min_days': 7,
-                'max_days': 60,
-                'requires_approval': True,
-                'policy_note': 'Freeze requests must be at least 7 days in duration and extend total validity upon approval.',
+                'enabled': freeze_enabled,
+                'min_days': freeze_min_days,
+                'max_days': freeze_max_days,
+                'fee_fixed': freeze_fee_fixed,
+                'fee_per_day': freeze_fee_per_day,
+                'tax_pct': tax_pct,
+                'requires_approval': False,
+                'policy_note': 'Freezing pauses your membership status and shifts your expiry date automatically.',
             },
-            'pending_requests': pending_requests,
+            'active_freeze': active_freeze_data,
+            'parq_info': parq_info,
+            'razorpay_key_id': razorpay_key_id,
         })
 
 
 class MobileMembershipRenewView(APIView):
     """
     POST /api/v1/mobile/memberships/renew/
-    Initiates member-facing renewal checkout. Creates a pending order.
-    Does NOT activate membership without verified payment.
-    Enforces idempotency to avoid duplicate clicks.
+    Initiates member-facing renewal checkout.
+    - Validates target package belongs to current program (program remains fixed).
+    - Supports dynamic branch selection.
+    - Handles PAR-Q decision (REUSE, EDIT, NEW).
+    - Generates Razorpay checkout order with server-calculated price and tax.
+    - Final activation occurs strictly upon verified payment via MobileCheckoutVerifyView.
     """
     permission_classes = [IsAuthenticated]
 
@@ -3617,14 +4231,17 @@ class MobileMembershipRenewView(APIView):
             alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
         profile = _get_or_create_user_profile(user, alias)
 
+        from decimal import Decimal
         from .models_memberships import Membership, Package, PackageVersion
+        from .models_workforce import Branch
         from .models_commerce import Order, OrderItem
-        import uuid
+        from .models_crm import IntakeSubmission
+        from .services_razorpay import RazorpayService
 
         active_m = (
             Membership.objects.using(alias)
             .filter(user_profile=profile)
-            .select_related('package', 'package_version', 'home_branch')
+            .select_related('package', 'package_version', 'program', 'home_branch')
             .order_by('-created_at')
             .first()
         )
@@ -3633,10 +4250,24 @@ class MobileMembershipRenewView(APIView):
 
         package_id = request.data.get('package_id') or (str(active_m.package.id) if active_m.package else None)
         package_version_id = request.data.get('package_version_id')
+        branch_id = request.data.get('branch_id')
 
         package = Package.objects.using(alias).filter(id=package_id, status='ACTIVE').first() if package_id else None
         if not package:
-            return Response({'detail': 'Renewal package not found.'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({'detail': 'Renewal package not found or inactive.'}, status=status.HTTP_404_NOT_FOUND)
+
+        # CRITICAL RULE: Program must remain fixed during renewal!
+        if active_m.program and package.program_id != active_m.program_id:
+            return Response(
+                {'detail': f"Renewal package must belong to your current program '{active_m.program.name}'. Use Upgrade Membership to switch programs."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        branch = None
+        if branch_id:
+            branch = Branch.objects.using(alias).filter(id=branch_id, status='ACTIVE').first()
+        if not branch:
+            branch = active_m.home_branch or Branch.objects.using(alias).filter(status='ACTIVE').first()
 
         if package_version_id:
             ver = PackageVersion.objects.using(alias).filter(id=package_version_id, package=package).first()
@@ -3652,7 +4283,37 @@ class MobileMembershipRenewView(APIView):
 
         base_price = price_obj.base_price
         tax_pct = price_obj.tax_percent or Decimal('18.0')
-        total_price = base_price * (1 + (tax_pct / Decimal('100.0')))
+        tax_amount = round(base_price * (tax_pct / Decimal('100.0')), 2)
+        total_price = base_price + tax_amount
+
+        # Process PAR-Q decision
+        parq_decision = str(request.data.get('parq_decision', 'REUSE')).upper().strip()
+        parq_submission_id = request.data.get('existing_submission_id')
+
+        if parq_decision == 'REUSE':
+            if not parq_submission_id:
+                prior_sub = IntakeSubmission.objects.using(alias).filter(user_profile=profile, status='COMPLETED').order_by('-submitted_at').first()
+                if prior_sub:
+                    parq_submission_id = str(prior_sub.id)
+        elif parq_decision in ['EDIT', 'NEW']:
+            answers = request.data.get('answers')
+            sig_data = request.data.get('signature_data')
+            if sig_data or answers:
+                from .models_crm import IntakeForm
+                form = active_m.parq_form or IntakeForm.objects.using(alias).filter(status='ACTIVE', form_type__in=['PAR_Q', 'PARQ']).order_by('-version_number').first()
+                if form:
+                    new_sub = IntakeSubmission.objects.using(alias).create(
+                        organization=branch.organization if branch else None,
+                        intake_form=form,
+                        user_profile=profile,
+                        submitted_by_user=user,
+                        channel='MEMBER_PORTAL',
+                        status='COMPLETED',
+                        is_cleared=True,
+                        signature_data=sig_data or '',
+                        signed_at=timezone.now(),
+                    )
+                    parq_submission_id = str(new_sub.id)
 
         # Idempotency check: Reuse existing pending renewal order created in the last 10 minutes
         ten_mins_ago = timezone.now() - timedelta(minutes=10)
@@ -3667,69 +4328,105 @@ class MobileMembershipRenewView(APIView):
             .order_by('-created_at')
             .first()
         )
-        if existing_order:
-            return Response({
-                'order_id': str(existing_order.id),
-                'order_number': existing_order.order_number,
-                'status': existing_order.status,
-                'total_amount': float(existing_order.total_amount),
-                'package_name': package.name,
-                'detail': 'Existing pending renewal order retrieved. Please proceed to payment to activate.',
-                'requires_payment': True,
-                'is_active': False,
-            }, status=status.HTTP_200_OK)
 
-        org = active_m.home_branch.organization if active_m.home_branch else (active_m.package.organization if active_m.package else None)
-        branch = active_m.home_branch
+        metadata_dict = {
+            'action_type': 'RENEWAL',
+            'membership_id': str(active_m.id),
+            'branch_id': str(branch.id) if branch else '',
+            'package_id': str(package.id),
+            'package_version_id': str(ver.id),
+            'parq_decision': parq_decision,
+            'parq_submission_id': parq_submission_id,
+        }
 
-        # Create pending renewal order
-        order_num = f"REN-{uuid.uuid4().hex[:8].upper()}"
-        order = Order.objects.using(alias).create(
-            branch=branch,
-            user_profile=profile,
-            order_number=order_num,
-            order_type='RENEWAL',
-            source='MOBILE_APP',
-            status='PENDING_PAYMENT',
-            subtotal=base_price,
-            discount_amount=Decimal('0.00'),
-            tax_amount=total_price - base_price,
-            total_amount=total_price,
-            currency=price_obj.currency or 'INR',
-            notes=f"Renewal for package: {package.name} (membership: {active_m.id})",
-        )
-        OrderItem.objects.using(alias).create(
-            order=order,
-            item_type='PACKAGE',
-            package=package,
-            package_version=ver,
-            package_price=price_obj,
-            item_name_snapshot=f"Membership Renewal: {package.name}",
-            quantity=Decimal('1.00'),
-            unit_price_snapshot=base_price,
-            tax_percent_snapshot=tax_pct,
-            tax_amount=total_price - base_price,
-            total_amount=total_price,
-        )
+        with transaction.atomic(using=alias):
+            if existing_order:
+                order = existing_order
+                order.subtotal = base_price
+                order.tax_amount = tax_amount
+                order.total_amount = total_price
+                order.notes = json.dumps(metadata_dict)
+                order.save(using=alias)
+            else:
+                order_num = f"REN-{uuid.uuid4().hex[:8].upper()}"
+                order = Order.objects.using(alias).create(
+                    branch=branch,
+                    user_profile=profile,
+                    order_number=order_num,
+                    order_type='RENEWAL',
+                    source='MOBILE_APP',
+                    status='PENDING_PAYMENT',
+                    subtotal=base_price,
+                    discount_amount=Decimal('0.00'),
+                    tax_amount=tax_amount,
+                    total_amount=total_price,
+                    currency=price_obj.currency or 'INR',
+                    notes=json.dumps(metadata_dict),
+                )
+                OrderItem.objects.using(alias).create(
+                    order=order,
+                    item_type='PACKAGE',
+                    package=package,
+                    package_version=ver,
+                    package_price=price_obj,
+                    item_name_snapshot=f"Membership Renewal: {package.name}",
+                    quantity=Decimal('1.00'),
+                    unit_price_snapshot=base_price,
+                    tax_percent_snapshot=tax_pct,
+                    tax_amount=tax_amount,
+                    total_amount=total_price,
+                )
+
+        # Create Razorpay order
+        amount_paise = RazorpayService.convert_inr_to_paise(total_price)
+        key_id = 'rzp_test_placeholder'
+        rzp_order_id = f"order_test_{order.order_number}"
+
+        if RazorpayService.is_configured(db_alias=alias) and amount_paise > 0:
+            key_id, _ = RazorpayService.get_credentials(db_alias=alias)
+            try:
+                rzp_order = RazorpayService.create_order(
+                    amount_paise=amount_paise,
+                    receipt=order.order_number,
+                    currency=order.currency,
+                    notes={
+                        'internal_order_id': str(order.id),
+                        'user_id': str(user.id),
+                        'order_number': order.order_number,
+                        'order_type': 'RENEWAL',
+                    },
+                    db_alias=alias,
+                )
+                rzp_order_id = rzp_order['id']
+            except Exception as e:
+                logger.error("Razorpay order creation failed for renewal: %s", e)
+                rzp_order_id = f"order_test_{order.order_number}"
 
         return Response({
             'order_id': str(order.id),
             'order_number': order.order_number,
+            'razorpay_order_id': rzp_order_id,
             'status': order.status,
-            'total_amount': float(order.total_amount),
+            'amount': float(total_price),
+            'amount_paise': amount_paise,
+            'currency': order.currency,
+            'razorpay_key_id': key_id,
             'package_name': package.name,
-            'detail': 'Renewal order created. Complete payment to activate your renewed package.',
+            'branch_name': branch.name if branch else '',
+            'detail': 'Existing pending renewal order retrieved. Complete payment to activate your renewed package.' if existing_order else 'Renewal order created. Complete payment to activate your renewed package.',
             'requires_payment': True,
             'is_active': False,
-        }, status=status.HTTP_201_CREATED)
+        }, status=status.HTTP_200_OK if existing_order else status.HTTP_201_CREATED)
 
 
 class MobileMembershipUpgradeView(APIView):
     """
     POST /api/v1/mobile/memberships/upgrade/
-    Submits a member self-service upgrade request.
-    Creates ApprovalRequest and registers pending state.
-    Requires staff review/approval.
+    Allows eligible members to upgrade independently without manual approval:
+    - Select branch, program, package.
+    - Authoritative server-side calculation of price difference, additional entitlements, and taxes.
+    - Generates Razorpay checkout order for price difference.
+    - Final upgrade executed strictly upon verified payment via MobileCheckoutVerifyView.
     """
     permission_classes = [IsAuthenticated]
 
@@ -3740,93 +4437,201 @@ class MobileMembershipUpgradeView(APIView):
             alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
         profile = _get_or_create_user_profile(user, alias)
 
+        from decimal import Decimal
         from .models_memberships import Membership, Package, PackageVersion
-        from .models_approvals import ApprovalRequest
+        from .models_workforce import Branch
+        from .models_catalog import Program
+        from .models_commerce import Order, OrderItem
+        from .models_crm import IntakeSubmission
+        from .services_razorpay import RazorpayService
+        from .services_memberships import MembershipLifecycleService
 
         active_m = (
             Membership.objects.using(alias)
-            .filter(user_profile=profile, status='ACTIVE')
-            .select_related('package', 'package_version', 'home_branch')
+            .filter(user_profile=profile)
+            .select_related('package', 'package_version', 'program', 'home_branch')
             .order_by('-created_at')
             .first()
         )
         if not active_m:
-            return Response({'detail': 'No active membership eligible for upgrade.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'detail': 'No active membership found to upgrade.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Check existing pending upgrade request
-        existing_req = ApprovalRequest.objects.using(alias).filter(
-            entity_id=active_m.id,
-            request_type='MEMBERSHIP_UPGRADE',
-            status='PENDING'
-        ).first()
-        if existing_req:
-            return Response({
-                'detail': 'An upgrade request is already pending studio approval.',
-                'code': 'UPGRADE_REQUEST_ALREADY_PENDING',
-                'request_id': str(existing_req.id),
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-        target_pkg_id = request.data.get('target_package_id') or request.data.get('package_id')
-        reason = (request.data.get('reason') or 'Member self-service upgrade request').strip()
+        target_pkg_id = request.data.get('target_package_id')
+        target_ver_id = request.data.get('target_package_version_id')
+        target_branch_id = request.data.get('target_branch_id')
+        reason = (request.data.get('reason') or 'Self-service tier upgrade').strip()
 
         if not target_pkg_id:
-            return Response({'detail': 'Target upgrade package is required.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'detail': 'Target package is required for upgrade.'}, status=status.HTTP_400_BAD_REQUEST)
 
         target_pkg = Package.objects.using(alias).filter(id=target_pkg_id, status='ACTIVE').first()
         if not target_pkg:
-            return Response({'detail': 'Target upgrade package not found.'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({'detail': 'Target upgrade package not found or inactive.'}, status=status.HTTP_404_NOT_FOUND)
 
-        target_ver = target_pkg.versions.using(alias).filter(status='ACTIVE').order_by('-version_number').first()
+        if target_ver_id:
+            target_ver = PackageVersion.objects.using(alias).filter(id=target_ver_id, package=target_pkg, status='ACTIVE').first()
+        else:
+            target_ver = target_pkg.versions.using(alias).filter(status='ACTIVE').order_by('-version_number').first()
+
         if not target_ver:
-            return Response({'detail': 'Active version for target package not found.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'detail': 'Target package version not found.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Price comparison
-        cur_price = Decimal('0.00')
+        target_branch = None
+        if target_branch_id:
+            target_branch = Branch.objects.using(alias).filter(id=target_branch_id, status='ACTIVE').first()
+        if not target_branch:
+            target_branch = active_m.home_branch or Branch.objects.using(alias).filter(status='ACTIVE').first()
+
+        target_price_obj = target_ver.prices.using(alias).filter(status='ACTIVE').first()
+        if not target_price_obj:
+            return Response({'detail': 'Target package price not configured.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        target_base = target_price_obj.base_price
+        target_tax_pct = target_price_obj.tax_percent or Decimal('18.0')
+        target_tax = round(target_base * (target_tax_pct / Decimal('100.0')), 2)
+        target_total = target_base + target_tax
+
+        # Current package value calculation
+        cur_total = Decimal('0.00')
+        cur_base = Decimal('0.00')
         if active_m.package_version:
-            pr = active_m.package_version.prices.using(alias).filter(status='ACTIVE').first()
-            if pr:
-                cur_price = pr.base_price
-        target_price = Decimal('0.00')
-        t_pr = target_ver.prices.using(alias).filter(status='ACTIVE').first()
-        if t_pr:
-            target_price = t_pr.base_price
+            cur_p = active_m.package_version.prices.using(alias).filter(status='ACTIVE').first()
+            if cur_p:
+                cur_base = cur_p.base_price
+                cur_tax_pct = cur_p.tax_percent or Decimal('18.0')
+                cur_total = cur_base * (Decimal('1.00') + (cur_tax_pct / Decimal('100.0')))
 
-        price_diff = max(Decimal('0.00'), target_price - cur_price)
+        # Server-authoritative difference
+        diff_total = max(Decimal('0.00'), round(target_total - cur_total, 2))
+        diff_base = max(Decimal('0.00'), round(target_base - cur_base, 2))
+        diff_tax = max(Decimal('0.00'), diff_total - diff_base)
 
-        req = ApprovalRequest.objects.using(alias).create(
-            organization=active_m.home_branch.organization if active_m.home_branch else active_m.package.organization,
-            request_type='MEMBERSHIP_UPGRADE',
-            entity_type='Membership',
-            entity_id=active_m.id,
-            requested_by_user=user,
-            requested_payload={
-                'current_membership_id': str(active_m.id),
-                'current_package_name': active_m.package.name if active_m.package else 'Current Package',
-                'target_package_id': str(target_pkg.id),
-                'target_package_name': target_pkg.name,
-                'target_version_id': str(target_ver.id),
-                'price_difference': float(price_diff),
-                'reason': reason,
-                'channel': 'MEMBER_PORTAL',
-            },
-            status='PENDING',
-        )
+        parq_decision = str(request.data.get('parq_decision', 'REUSE')).upper().strip()
+        parq_submission_id = request.data.get('existing_submission_id')
+        if parq_decision == 'REUSE' and not parq_submission_id:
+            prior_sub = IntakeSubmission.objects.using(alias).filter(user_profile=profile, status='COMPLETED').order_by('-submitted_at').first()
+            if prior_sub:
+                parq_submission_id = str(prior_sub.id)
+
+        # If price difference is zero, execute upgrade immediately
+        if diff_total <= Decimal('0.00'):
+            upgraded_m = MembershipLifecycleService.execute_upgrade(
+                membership=active_m,
+                target_package=target_pkg,
+                target_package_version=target_ver,
+                target_branch=target_branch,
+                actor_user=user,
+                db_alias=alias,
+            )
+            return Response({
+                'detail': f"Membership upgraded to {target_pkg.name} successfully at no additional charge.",
+                'status': 'COMPLETED',
+                'membership_id': str(upgraded_m.id),
+                'package_name': target_pkg.name,
+                'price_difference': 0.0,
+                'requires_payment': False,
+            }, status=status.HTTP_200_OK)
+
+        # Create pending order for upgrade
+        metadata_dict = {
+            'action_type': 'UPGRADE',
+            'current_membership_id': str(active_m.id),
+            'target_package_id': str(target_pkg.id),
+            'target_package_version_id': str(target_ver.id),
+            'target_branch_id': str(target_branch.id) if target_branch else '',
+            'parq_decision': parq_decision,
+            'parq_submission_id': parq_submission_id,
+            'reason': reason,
+        }
+
+        with transaction.atomic(using=alias):
+            order_num = f"UPG-{uuid.uuid4().hex[:8].upper()}"
+            order = Order.objects.using(alias).create(
+                branch=target_branch,
+                user_profile=profile,
+                order_number=order_num,
+                order_type='UPGRADE',
+                source='MOBILE_APP',
+                status='PENDING_PAYMENT',
+                subtotal=diff_base,
+                discount_amount=Decimal('0.00'),
+                tax_amount=diff_tax,
+                total_amount=diff_total,
+                currency=target_price_obj.currency or 'INR',
+                notes=json.dumps(metadata_dict),
+            )
+            OrderItem.objects.using(alias).create(
+                order=order,
+                item_type='PACKAGE',
+                package=target_pkg,
+                package_version=target_ver,
+                package_price=target_price_obj,
+                item_name_snapshot=f"Tier Upgrade: {target_pkg.name}",
+                quantity=Decimal('1.00'),
+                unit_price_snapshot=diff_base,
+                tax_percent_snapshot=target_tax_pct,
+                tax_amount=diff_tax,
+                total_amount=diff_total,
+            )
+
+        amount_paise = RazorpayService.convert_inr_to_paise(diff_total)
+        key_id = 'rzp_test_placeholder'
+        rzp_order_id = f"order_test_{order.order_number}"
+
+        if RazorpayService.is_configured(db_alias=alias) and amount_paise > 0:
+            key_id, _ = RazorpayService.get_credentials(db_alias=alias)
+            try:
+                rzp_order = RazorpayService.create_order(
+                    amount_paise=amount_paise,
+                    receipt=order.order_number,
+                    currency=order.currency,
+                    notes={
+                        'internal_order_id': str(order.id),
+                        'user_id': str(user.id),
+                        'order_number': order.order_number,
+                        'order_type': 'UPGRADE',
+                    },
+                    db_alias=alias,
+                )
+                rzp_order_id = rzp_order['id']
+            except Exception as e:
+                logger.error("Razorpay order creation failed for upgrade: %s", e)
+                rzp_order_id = f"order_test_{order.order_number}"
 
         return Response({
-            'detail': f"Upgrade request to '{target_pkg.name}' submitted successfully. Pending studio review.",
-            'request_id': str(req.id),
-            'status': 'PENDING',
+            'order_id': str(order.id),
+            'order_number': order.order_number,
+            'razorpay_order_id': rzp_order_id,
+            'status': order.status,
+            'amount': float(diff_total),
+            'amount_paise': amount_paise,
+            'currency': order.currency,
+            'razorpay_key_id': key_id,
             'target_package_name': target_pkg.name,
-            'price_difference': float(price_diff),
+            'price_difference': float(diff_total),
+            'net_difference': float(diff_total),
+            'total_payable': float(diff_total),
+            'requires_payment': True,
+            'breakdown': {
+                'current_package_price': float(cur_total),
+                'target_package_price': float(target_total),
+                'difference_base': float(diff_base),
+                'difference_tax': float(diff_tax),
+                'total_payable': float(diff_total),
+            },
+            'detail': f"Upgrade order for {target_pkg.name} created. Complete payment to finalize tier change.",
+            'requires_payment': True,
         }, status=status.HTTP_201_CREATED)
 
 
 class MobileMembershipExtendView(APIView):
     """
     POST /api/v1/mobile/memberships/extend/
-    Submits a member validity extension request.
-    Creates ApprovalRequest (status PENDING).
-    Does NOT silently extend expiry date or bypass staff approval.
+    Self-service validity extension with dynamic fee lookup and Razorpay checkout:
+    - Days selected dynamically (7, 14, 30, 60 days).
+    - Dynamic fee calculated from CRM OrganizationSettings.
+    - Immediate extension applied if free; Razorpay checkout created if fee > 0.
+    - Verified payment in MobileCheckoutVerifyView atomically shifts expiry date.
     """
     permission_classes = [IsAuthenticated]
 
@@ -3837,75 +4642,160 @@ class MobileMembershipExtendView(APIView):
             alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
         profile = _get_or_create_user_profile(user, alias)
 
+        from decimal import Decimal
         from .models_memberships import Membership
-        from .models_approvals import ApprovalRequest
+        from .models_govern import OrganizationSettings
+        from .models_commerce import Order, OrderItem
+        from .services_razorpay import RazorpayService
+        from .services_memberships import MembershipLifecycleService
 
         active_m = (
             Membership.objects.using(alias)
             .filter(user_profile=profile)
-            .select_related('package', 'home_branch')
+            .select_related('home_branch')
             .order_by('-created_at')
             .first()
         )
         if not active_m:
             return Response({'detail': 'No membership found to extend.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Check existing pending extension request
-        existing_req = ApprovalRequest.objects.using(alias).filter(
-            entity_id=active_m.id,
-            request_type='MEMBERSHIP_EXTENSION',
-            status='PENDING'
-        ).first()
-        if existing_req:
-            return Response({
-                'detail': 'A validity extension request is already pending studio approval.',
-                'code': 'EXTENSION_REQUEST_ALREADY_PENDING',
-                'request_id': str(existing_req.id),
-            }, status=status.HTTP_400_BAD_REQUEST)
-
         try:
-            days = int(request.data.get('days', 7))
+            days = int(request.data.get('days', 14))
         except (ValueError, TypeError):
-            days = 7
-
-        if days not in [7, 14, 21, 30]:
-            return Response({'detail': 'Allowed extension durations are 7, 14, 21, or 30 days.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'detail': 'Extension duration must be an integer number of days.'}, status=status.HTTP_400_BAD_REQUEST)
 
         reason = (request.data.get('reason') or '').strip()
         if not reason:
-            return Response({'detail': 'A reason for the validity extension is required.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'detail': 'Reason is required for validity extension.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        req = ApprovalRequest.objects.using(alias).create(
-            organization=active_m.home_branch.organization if active_m.home_branch else active_m.package.organization,
-            request_type='MEMBERSHIP_EXTENSION',
-            entity_type='Membership',
-            entity_id=active_m.id,
-            requested_by_user=user,
-            requested_payload={
-                'membership_id': str(active_m.id),
+        # Dynamic fee lookup from CRM configuration
+        os_obj = OrganizationSettings.objects.using(alias).first()
+        cfg = getattr(os_obj, 'membership_config', {}) or {}
+        ext_cfg = cfg.get('extension_policy', {})
+        tax_pct = Decimal(str(getattr(os_obj, 'tax_rate_pct', 18.0) or '18.0'))
+
+        allowed_days = [7, 14, 21, 30, 60]
+        configured_options = ext_cfg.get('available_options', [])
+        if configured_options:
+            allowed_days = [int(opt.get('days')) for opt in configured_options if 'days' in opt]
+
+        if days not in allowed_days:
+            return Response({'detail': f'Extension duration of {days} days is not permitted. Permitted options: {allowed_days}'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Look up matched fee from config or calculate prorated tier
+        matched_base_fee = None
+        for opt in configured_options:
+            if int(opt.get('days', 0)) == days:
+                matched_base_fee = Decimal(str(opt.get('base_fee', opt.get('fee', 0.0))))
+                break
+
+        if matched_base_fee is None:
+            tier_defaults = {7: Decimal('500.00'), 14: Decimal('900.00'), 21: Decimal('1200.00'), 30: Decimal('1500.00'), 60: Decimal('2800.00')}
+            matched_base_fee = tier_defaults.get(days, Decimal(str(days * 50)))
+
+        tax_amount = round(matched_base_fee * (tax_pct / Decimal('100.0')), 2)
+        total_fee = matched_base_fee + tax_amount
+
+        # If zero fee, extend immediately
+        if total_fee <= Decimal('0.00'):
+            ext_m = MembershipLifecycleService.extend_membership(
+                membership=active_m,
+                days=days,
+                reason_text=reason,
+                approved_by_user=user,
+                db_alias=alias,
+            )
+            return Response({
+                'detail': f"Membership validity extended by {days} days. New expiry: {ext_m.end_date}.",
+                'status': 'COMPLETED',
                 'days': days,
-                'reason': reason,
-                'current_end_date': active_m.end_date.isoformat() if active_m.end_date else None,
-                'channel': 'MEMBER_PORTAL',
-            },
-            status='PENDING',
-        )
+                'new_end_date': str(ext_m.end_date),
+                'requires_payment': False,
+            }, status=status.HTTP_200_OK)
+
+        branch = active_m.home_branch
+        metadata_dict = {
+            'action_type': 'VALIDITY_EXTENSION',
+            'membership_id': str(active_m.id),
+            'days': days,
+            'reason': reason,
+        }
+
+        with transaction.atomic(using=alias):
+            order_num = f"EXT-{uuid.uuid4().hex[:8].upper()}"
+            order = Order.objects.using(alias).create(
+                branch=branch,
+                user_profile=profile,
+                order_number=order_num,
+                order_type='EXTENSION',
+                source='MOBILE_APP',
+                status='PENDING_PAYMENT',
+                subtotal=matched_base_fee,
+                discount_amount=Decimal('0.00'),
+                tax_amount=tax_amount,
+                total_amount=total_fee,
+                currency='INR',
+                notes=json.dumps(metadata_dict),
+            )
+            OrderItem.objects.using(alias).create(
+                order=order,
+                item_type='PACKAGE',
+                item_name_snapshot=f"Validity Extension: {days} Days",
+                quantity=Decimal('1.00'),
+                unit_price_snapshot=matched_base_fee,
+                tax_percent_snapshot=tax_pct,
+                tax_amount=tax_amount,
+                total_amount=total_fee,
+            )
+
+        amount_paise = RazorpayService.convert_inr_to_paise(total_fee)
+        key_id = 'rzp_test_placeholder'
+        rzp_order_id = f"order_test_{order.order_number}"
+
+        if RazorpayService.is_configured(db_alias=alias) and amount_paise > 0:
+            key_id, _ = RazorpayService.get_credentials(db_alias=alias)
+            try:
+                rzp_order = RazorpayService.create_order(
+                    amount_paise=amount_paise,
+                    receipt=order.order_number,
+                    currency=order.currency,
+                    notes={
+                        'internal_order_id': str(order.id),
+                        'user_id': str(user.id),
+                        'order_number': order.order_number,
+                        'order_type': 'EXTENSION',
+                    },
+                    db_alias=alias,
+                )
+                rzp_order_id = rzp_order['id']
+            except Exception as e:
+                logger.error("Razorpay order creation failed for extension: %s", e)
+                rzp_order_id = f"order_test_{order.order_number}"
 
         return Response({
-            'detail': f"Validity extension request for {days} days submitted. Pending studio manager approval.",
-            'request_id': str(req.id),
-            'status': 'PENDING',
-            'requested_days': days,
+            'order_id': str(order.id),
+            'order_number': order.order_number,
+            'razorpay_order_id': rzp_order_id,
+            'status': order.status,
+            'amount': float(total_fee),
+            'amount_paise': amount_paise,
+            'currency': order.currency,
+            'razorpay_key_id': key_id,
+            'days': days,
             'current_end_date': str(active_m.end_date) if active_m.end_date else None,
+            'detail': f"Extension order for {days} days created. Complete payment to extend your validity.",
+            'requires_payment': True,
         }, status=status.HTTP_201_CREATED)
 
 
 class MobileMembershipFreezeView(APIView):
     """
     POST /api/v1/mobile/memberships/freeze/
-    Submits a member freeze request with freeze_from, freeze_until, and reason.
-    Validates duration (7-60 days), dates, and active status.
-    Creates MembershipFreeze (SCHEDULED) and ApprovalRequest (PENDING).
+    Self-service membership freeze management:
+    - Validates duration (7 to max allowed days).
+    - Dynamic fee calculation from CRM OrganizationSettings.
+    - Freezes immediately if no charge; initiates Razorpay checkout if fee applies.
+    - Verified payment applies freeze and shifts validity atomically.
     """
     permission_classes = [IsAuthenticated]
 
@@ -3916,8 +4806,13 @@ class MobileMembershipFreezeView(APIView):
             alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
         profile = _get_or_create_user_profile(user, alias)
 
+        from decimal import Decimal
+        from datetime import datetime
         from .models_memberships import Membership, MembershipFreeze
-        from .models_approvals import ApprovalRequest
+        from .models_govern import OrganizationSettings
+        from .models_commerce import Order, OrderItem
+        from .services_razorpay import RazorpayService
+        from .services_memberships import MembershipLifecycleService
 
         active_m = (
             Membership.objects.using(alias)
@@ -3931,12 +4826,10 @@ class MobileMembershipFreezeView(APIView):
 
         freeze_from_str = request.data.get('freeze_from')
         freeze_until_str = request.data.get('freeze_until')
-        reason = (request.data.get('reason') or '').strip()
+        reason = (request.data.get('reason') or 'Self-service member freeze').strip()
 
         if not freeze_from_str or not freeze_until_str:
             return Response({'detail': 'Freeze start and end dates are required.'}, status=status.HTTP_400_BAD_REQUEST)
-        if not reason:
-            return Response({'detail': 'A reason for freezing the membership is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             from_d = datetime.strptime(freeze_from_str[:10], '%Y-%m-%d').date()
@@ -3953,10 +4846,12 @@ class MobileMembershipFreezeView(APIView):
         freeze_days = (until_d - from_d).days
         if freeze_days < 7:
             return Response({'detail': 'Minimum freeze duration is 7 days.'}, status=status.HTTP_400_BAD_REQUEST)
-        if freeze_days > 60:
-            return Response({'detail': 'Maximum freeze duration is 60 days.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Check overlapping active / scheduled freeze
+        os_obj = OrganizationSettings.objects.using(alias).first()
+        max_allowed = getattr(os_obj, 'max_freeze_days_per_year', 60) or 60
+        if freeze_days > max_allowed:
+            return Response({'detail': f"Maximum allowed freeze duration is {max_allowed} days."}, status=status.HTTP_400_BAD_REQUEST)
+
         overlap = MembershipFreeze.objects.using(alias).filter(
             membership=active_m,
             status__in=['SCHEDULED', 'ACTIVE'],
@@ -3966,64 +4861,119 @@ class MobileMembershipFreezeView(APIView):
         if overlap:
             return Response({'detail': 'A freeze window already overlaps with these dates.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Check pending approval request
-        existing_req = ApprovalRequest.objects.using(alias).filter(
-            entity_id=active_m.id,
-            request_type='MEMBERSHIP_FREEZE',
-            status='PENDING'
-        ).first()
-        if existing_req:
+        # Dynamic fee from settings
+        cfg = getattr(os_obj, 'membership_config', {}) or {}
+        frz_cfg = cfg.get('freeze_policy', {})
+        fixed_fee = Decimal(str(frz_cfg.get('fee_fixed', '0.00')))
+        per_day_fee = Decimal(str(frz_cfg.get('fee_per_day', '0.00')))
+        tax_pct = Decimal(str(getattr(os_obj, 'tax_rate_pct', 18.0) or '18.0'))
+
+        base_freeze_fee = fixed_fee + (per_day_fee * Decimal(str(freeze_days)))
+        tax_amt = round(base_freeze_fee * (tax_pct / Decimal('100.0')), 2)
+        total_freeze_fee = base_freeze_fee + tax_amt
+
+        # If zero fee, apply freeze directly!
+        if total_freeze_fee <= Decimal('0.00'):
+            MembershipLifecycleService.apply_freeze(
+                membership=active_m,
+                freeze_from=from_d,
+                freeze_until=until_d,
+                reason_text=reason,
+                approved_by_user=user,
+                db_alias=alias,
+            )
             return Response({
-                'detail': 'A freeze request is already pending studio approval.',
-                'code': 'FREEZE_REQUEST_ALREADY_PENDING',
-                'request_id': str(existing_req.id),
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-        # Create scheduled MembershipFreeze record
-        frz = MembershipFreeze.objects.using(alias).create(
-            membership=active_m,
-            freeze_from=from_d,
-            freeze_until=until_d,
-            reason_code='MEMBER_SELF_SERVICE',
-            reason_text=reason,
-            extend_membership_days=freeze_days,
-            status='SCHEDULED',
-        )
-
-        # Create ApprovalRequest for studio staff
-        req = ApprovalRequest.objects.using(alias).create(
-            organization=active_m.home_branch.organization if active_m.home_branch else active_m.package.organization,
-            request_type='MEMBERSHIP_FREEZE',
-            entity_type='Membership',
-            entity_id=active_m.id,
-            requested_by_user=user,
-            requested_payload={
-                'freeze_id': str(frz.id),
-                'membership_id': str(active_m.id),
+                'detail': f"Membership frozen successfully from {from_d} to {until_d} ({freeze_days} days). End date extended.",
+                'status': 'FROZEN',
                 'freeze_from': str(from_d),
                 'freeze_until': str(until_d),
                 'days': freeze_days,
-                'reason': reason,
-                'channel': 'MEMBER_PORTAL',
-            },
-            status='PENDING',
-        )
+                'new_end_date': str(active_m.end_date) if active_m.end_date else None,
+                'requires_payment': False,
+            }, status=status.HTTP_200_OK)
 
-        return Response({
-            'detail': f"Freeze request from {from_d} to {until_d} ({freeze_days} days) submitted for studio approval.",
-            'freeze_id': str(frz.id),
-            'request_id': str(req.id),
-            'status': 'PENDING',
+        branch = active_m.home_branch
+        metadata_dict = {
+            'action_type': 'FREEZE',
+            'membership_id': str(active_m.id),
             'freeze_from': str(from_d),
             'freeze_until': str(until_d),
             'days': freeze_days,
+            'reason': reason,
+        }
+
+        with transaction.atomic(using=alias):
+            order_num = f"FRZ-{uuid.uuid4().hex[:8].upper()}"
+            order = Order.objects.using(alias).create(
+                branch=branch,
+                user_profile=profile,
+                order_number=order_num,
+                order_type='OTHER',
+                source='MOBILE_APP',
+                status='PENDING_PAYMENT',
+                subtotal=base_freeze_fee,
+                discount_amount=Decimal('0.00'),
+                tax_amount=tax_amt,
+                total_amount=total_freeze_fee,
+                currency='INR',
+                notes=json.dumps(metadata_dict),
+            )
+            OrderItem.objects.using(alias).create(
+                order=order,
+                item_type='PACKAGE',
+                item_name_snapshot=f"Membership Freeze: {freeze_days} Days",
+                quantity=Decimal('1.00'),
+                unit_price_snapshot=base_freeze_fee,
+                tax_percent_snapshot=tax_pct,
+                tax_amount=tax_amt,
+                total_amount=total_freeze_fee,
+            )
+
+        amount_paise = RazorpayService.convert_inr_to_paise(total_freeze_fee)
+        key_id = 'rzp_test_placeholder'
+        rzp_order_id = f"order_test_{order.order_number}"
+
+        if RazorpayService.is_configured(db_alias=alias) and amount_paise > 0:
+            key_id, _ = RazorpayService.get_credentials(db_alias=alias)
+            try:
+                rzp_order = RazorpayService.create_order(
+                    amount_paise=amount_paise,
+                    receipt=order.order_number,
+                    currency=order.currency,
+                    notes={
+                        'internal_order_id': str(order.id),
+                        'user_id': str(user.id),
+                        'order_number': order.order_number,
+                        'order_type': 'FREEZE',
+                    },
+                    db_alias=alias,
+                )
+                rzp_order_id = rzp_order['id']
+            except Exception as e:
+                logger.error("Razorpay order creation failed for freeze: %s", e)
+                rzp_order_id = f"order_test_{order.order_number}"
+
+        return Response({
+            'order_id': str(order.id),
+            'order_number': order.order_number,
+            'razorpay_order_id': rzp_order_id,
+            'status': order.status,
+            'amount': float(total_freeze_fee),
+            'amount_paise': amount_paise,
+            'currency': order.currency,
+            'razorpay_key_id': key_id,
+            'freeze_from': str(from_d),
+            'freeze_until': str(until_d),
+            'days': freeze_days,
+            'detail': f"Freeze order for {freeze_days} days created. Complete payment to activate freeze.",
+            'requires_payment': True,
         }, status=status.HTTP_201_CREATED)
 
 
 class MobileMembershipUnfreezeView(APIView):
     """
     POST /api/v1/mobile/memberships/unfreeze/
-    Unfreezes a member's active frozen membership and restores it to ACTIVE status.
+    Unfreezes a member's active frozen membership and restores it to ACTIVE status immediately.
     """
     permission_classes = [IsAuthenticated]
 

@@ -107,6 +107,17 @@ def process_meta_lead_import_task(self, tenant_id: str, import_id: str):
                     status='IMPORTED',
                     extra={'lead_id': str(event.lead_id) if event.lead_id else ''},
                 )
+                # --- FIX: DISPATCH AUTOMATED SARVAM CALL FOR IMPORTED META LEAD START ---
+                # WHY: Immediately schedule outbound qualification call for newly ingested Meta lead.
+                # FIXES: Connects Meta webhook ingestion pipeline to Sarvam AI voice engine.
+                # IMPACT: Automated voice outreach triggers seamlessly subject to consent & calling hours.
+                if event.lead_id:
+                    try:
+                        from apps.tenant_core.tasks_voice_calling import trigger_automated_sarvam_call_task
+                        trigger_automated_sarvam_call_task.delay(tenant_id=str(tenant_id), lead_id=str(event.lead_id))
+                    except Exception as call_err:
+                        logger.warning("Failed to queue automated Sarvam call for lead %s: %s", event.lead_id, call_err)
+                # --- FIX: DISPATCH AUTOMATED SARVAM CALL FOR IMPORTED META LEAD END ---
             else:
                 log_meta_event(
                     EVT_PROCESSING_FAILED,

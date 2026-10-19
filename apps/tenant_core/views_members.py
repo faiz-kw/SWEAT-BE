@@ -1155,6 +1155,13 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         historical_version = (sub.form_snapshot.get('version_number') if isinstance(getattr(sub, 'form_snapshot', None), dict) else None) or (getattr(sub.intake_form, 'version_number', 1) if sub.intake_form else 1)
         historical_ag_title = (sub.form_snapshot.get('agreement_title') if isinstance(getattr(sub, 'form_snapshot', None), dict) else None) or (getattr(sub.intake_form, 'agreement_title', 'Physical Activity Readiness & Assumption of Risk Agreement') if sub.intake_form else 'Physical Activity Readiness & Assumption of Risk Agreement')
 
+        linked_mems = list(
+            Membership.objects.using(alias)
+            .filter(parq_submission=sub)
+            .values_list('membership_number', flat=True)
+        )
+        is_latest = (len(submissions_data) == 0)
+
         submissions_data.append({
             'id': str(sub.id),
             'form_id': str(sub.intake_form.id) if sub.intake_form else None,
@@ -1163,6 +1170,8 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             'form_type': getattr(sub.intake_form, 'form_type', 'PAR_Q') if sub.intake_form else 'PAR_Q',
             'submitted_at': sub.submitted_at.isoformat(),
             'status': getattr(sub, 'status', 'COMPLETED') or 'COMPLETED',
+            'is_latest': is_latest,
+            'linked_memberships': linked_mems,
             'program_name': sub.program.name if sub.program else None,
             'order_number': sub.order.order_number if sub.order else None,
             'membership_number': sub.membership.membership_number if sub.membership else None,
@@ -2071,6 +2080,21 @@ class MemberViewSet(viewsets.ViewSet):
                     db_alias=alias,
                     created_by_user=request.user,
                 )
+                # PAR-Q Lifecycle Inheritance / Reuse for Renewal
+                parq_decision = str(request.data.get('parq_decision', 'REUSE')).upper().strip()
+                if parq_decision == 'REUSE':
+                    prior_sub = (
+                        IntakeSubmission.objects.using(alias)
+                        .filter(user_profile=profile, status='COMPLETED')
+                        .order_by('-submitted_at')
+                        .first()
+                    )
+                    if prior_sub:
+                        new_membership.parq_status = 'COMPLETED'
+                        new_membership.parq_submission = prior_sub
+                        new_membership.parq_completed_at = prior_sub.submitted_at
+                        new_membership.parq_form = prior_sub.intake_form or new_membership.parq_form
+                        new_membership.save(using=alias, update_fields=['parq_status', 'parq_submission', 'parq_completed_at', 'parq_form', 'updated_at'])
                 new_membership.status = 'PENDING_PAYMENT'
                 new_membership.legacy_reference = f"PROVISIONAL_CASH_PENDING:{approval_req.id}"
                 new_membership.save(using=alias, update_fields=['status', 'legacy_reference', 'updated_at'])
@@ -2096,6 +2120,21 @@ class MemberViewSet(viewsets.ViewSet):
                     db_alias=alias,
                     created_by_user=request.user,
                 )
+                # PAR-Q Lifecycle Inheritance / Reuse for Renewal
+                parq_decision = str(request.data.get('parq_decision', 'REUSE')).upper().strip()
+                if parq_decision == 'REUSE':
+                    prior_sub = (
+                        IntakeSubmission.objects.using(alias)
+                        .filter(user_profile=profile, status='COMPLETED')
+                        .order_by('-submitted_at')
+                        .first()
+                    )
+                    if prior_sub:
+                        new_membership.parq_status = 'COMPLETED'
+                        new_membership.parq_submission = prior_sub
+                        new_membership.parq_completed_at = prior_sub.submitted_at
+                        new_membership.parq_form = prior_sub.intake_form or new_membership.parq_form
+                        new_membership.save(using=alias, update_fields=['parq_status', 'parq_submission', 'parq_completed_at', 'parq_form', 'updated_at'])
                 new_membership.status = 'PENDING_PAYMENT'
                 new_membership.save(using=alias, update_fields=['status', 'updated_at'])
                 new_membership.entitlements.using(alias).update(status='INACTIVE')
@@ -2126,6 +2165,21 @@ class MemberViewSet(viewsets.ViewSet):
                     db_alias=alias,
                     created_by_user=request.user,
                 )
+                # PAR-Q Lifecycle Inheritance / Reuse for Renewal
+                parq_decision = str(request.data.get('parq_decision', 'REUSE')).upper().strip()
+                if parq_decision == 'REUSE':
+                    prior_sub = (
+                        IntakeSubmission.objects.using(alias)
+                        .filter(user_profile=profile, status='COMPLETED')
+                        .order_by('-submitted_at')
+                        .first()
+                    )
+                    if prior_sub:
+                        new_membership.parq_status = 'COMPLETED'
+                        new_membership.parq_submission = prior_sub
+                        new_membership.parq_completed_at = prior_sub.submitted_at
+                        new_membership.parq_form = prior_sub.intake_form or new_membership.parq_form
+                        new_membership.save(using=alias, update_fields=['parq_status', 'parq_submission', 'parq_completed_at', 'parq_form', 'updated_at'])
 
                 if carry_forward:
                     for old_ent in active_m.entitlements.using(alias).filter(status='ACTIVE'):

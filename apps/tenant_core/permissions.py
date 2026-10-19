@@ -159,9 +159,11 @@ class TenantRBACPermission(permissions.BasePermission):
             if 'trial' in view_name:
                 if act in ['create', 'list', 'retrieve', 'available_slots', 'request_reschedule', 'cancel']:
                     return True
-            # D. Lead & Member self-service on leads (e.g. converting themselves, booking trial, or updating conversion status)
+            # D. Lead & Member self-service on leads (e.g. converting themselves or booking trial).
+            # NOTE: partial_update / update / retrieve are intentionally excluded here;
+            # object ownership is verified later in has_object_permission before granting access.
             if 'lead' in view_name:
-                if act in ['convert', 'book_trial', 'partial_update', 'update', 'retrieve', 'patch', 'put']:
+                if act in ['convert', 'book_trial']:
                     return True
             # E. Member self-service on their own member profile (e.g. unfreeze, freeze, extend, renew, member_360)
             if 'member' in view_name:
@@ -211,19 +213,29 @@ class TenantRBACPermission(permissions.BasePermission):
         user_type = getattr(user, 'user_type', None) or getattr(user, 'role', '').upper()
         user_role = str(getattr(user, 'role', '')).lower()
         if user_type in ('MEMBER', 'LEAD') or user_role in ('member', 'lead'):
-            view_name = view.__class__.__name__.lower()
+            # SEC-01/SEC-02 FIX: Object-level access for MEMBER/LEAD is strictly self-owned.
+            # The wildcard SAFE_METHODS fallback has been removed — it allowed any authenticated
+            # member to read any object in the tenant by issuing a GET request.
+            # Only objects that can be verified as belonging to the requesting user are granted.
             if obj.__class__.__name__ == 'Lead':
                 if (getattr(obj, 'email_normalized', '').lower() == (user.email or '').lower() or
                     (user.phone and getattr(obj, 'phone_normalized', '') == user.phone)):
                     return True
+                # Explicit denial — do not fall through to RBAC check for foreign leads
+                from rest_framework.exceptions import PermissionDenied as _PermDenied
+                raise _PermDenied('You do not have permission to access this record.')
             if obj.__class__.__name__ == 'UserProfile' and getattr(obj, 'user_id', None) == user.id:
                 return True
             if hasattr(obj, 'user_profile') and getattr(obj.user_profile, 'user_id', None) == user.id:
                 return True
-            if hasattr(obj, 'lead') and (getattr(obj.lead, 'email_normalized', None) == user.email.lower() or (user.phone and getattr(obj.lead, 'phone_normalized', None) == user.phone)):
+            if hasattr(obj, 'lead') and (
+                getattr(obj.lead, 'email_normalized', None) == (user.email or '').lower()
+                or (user.phone and getattr(obj.lead, 'phone_normalized', None) == user.phone)
+            ):
                 return True
-            if request.method in permissions.SAFE_METHODS:
-                return True
+            # All other objects: MEMBER/LEAD users have no implicit read access.
+            from rest_framework.exceptions import PermissionDenied as _PermDenied
+            raise _PermDenied('You do not have permission to access this record.')
 
         # Validate object-level branch boundary if object has a branch
         branch_id = self._resolve_branch_id(request, view, obj=obj)

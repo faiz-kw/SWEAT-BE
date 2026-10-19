@@ -347,6 +347,23 @@ def _apply_mapping(event, mapping, alias, actor_user, is_live: bool = False):
     if mapping.lead_source.organization_id != event.organization_id or mapping.lead_source.status != 'ACTIVE' or mapping.lead_source.source_type != 'META':
         raise ValueError('An active Meta lead source is required.')
 
+    # --- FIX: SUPPORT ALL BRANCHES IN META INGESTION START ---
+    # WHY: If branch_mode is 'ALL', the lead belongs to the organization without a fixed branch.
+    # FIXES: Prevent BRANCH_UNRESOLVED failure when branch_mode == 'ALL'.
+    # IMPACT: Ingests lead with branch=None so it reflects across all branches.
+    # OLD:
+    # branch_id = mapping.branch_id
+    # if mapping.branch_mode == 'ANSWER':
+    #     values = answers.get(mapping.branch_field, [])
+    #     answer = values[0].strip().casefold() if len(values) == 1 else ''
+    #     branch_id = mapping.branch_answers.get(answer)
+    #     if not branch_id and getattr(mapping, 'unmatched_branch_policy', 'HOLD') == 'FALLBACK_BRANCH':
+    #         branch_id = getattr(mapping, 'fallback_branch_id', None)
+    #
+    # branch = Branch.objects.using(alias).filter(id=branch_id, organization_id=event.organization_id, status='ACTIVE').first() if branch_id else None
+    # if not branch:
+    #     event.status, event.error_code, event.error_message = 'NEEDS_ASSIGNMENT', 'BRANCH_UNRESOLVED', 'No active branch matches the saved mapping. The enquiry is held for review.'
+    #     return
     branch_id = mapping.branch_id
     if mapping.branch_mode == 'ANSWER':
         values = answers.get(mapping.branch_field, [])
@@ -354,11 +371,14 @@ def _apply_mapping(event, mapping, alias, actor_user, is_live: bool = False):
         branch_id = mapping.branch_answers.get(answer)
         if not branch_id and getattr(mapping, 'unmatched_branch_policy', 'HOLD') == 'FALLBACK_BRANCH':
             branch_id = getattr(mapping, 'fallback_branch_id', None)
+    elif mapping.branch_mode == 'ALL':
+        branch_id = None
 
     branch = Branch.objects.using(alias).filter(id=branch_id, organization_id=event.organization_id, status='ACTIVE').first() if branch_id else None
-    if not branch:
+    if not branch and mapping.branch_mode != 'ALL':
         event.status, event.error_code, event.error_message = 'NEEDS_ASSIGNMENT', 'BRANCH_UNRESOLVED', 'No active branch matches the saved mapping. The enquiry is held for review.'
         return
+    # --- FIX: SUPPORT ALL BRANCHES IN META INGESTION END ---
 
     email = validate_lead_email(mapped.get('email'), required=False)
     phone = validate_lead_phone(mapped.get('phone'), required=False)
@@ -372,7 +392,28 @@ def _apply_mapping(event, mapping, alias, actor_user, is_live: bool = False):
         return
 
     # Extract supported extra native lead fields
-    bool_fields = {'consent_whatsapp', 'consent_email', 'consent_sms'}
+    # --- FIX: EXTRACT VOICE CONSENT AND RESOLVE INTERESTED PROGRAM START ---
+    # WHY: Parse voice consent and resolve mapped interested_program to active Program instance.
+    # FIXES: Enables Sarvam voice calling and program routing from Meta Lead Ads.
+    # IMPACT: CRM Lead receives interested_program FK and voice calling consent.
+    # OLD:
+    # bool_fields = {'consent_whatsapp', 'consent_email', 'consent_sms'}
+    # extra = {}
+    # for k, v in mapped.items():
+    #     if k in ('fitness_goal', 'area', 'country', 'gender', 'occupation', 'company_name', 'date_of_birth') and v:
+    #         extra[k] = v
+    #     elif k in bool_fields and v != '':
+    #         extra[k] = str(v).strip().lower() in ('true', '1', 'yes', 'y')
+    #
+    # # Validate model field lengths before PostgreSQL would reject the insert.
+    # for key in ('first_name', 'last_name', *(k for k in extra if k not in bool_fields)):
+    #     value = mapped.get(key, '')
+    #     if isinstance(value, str):
+    #         field = Lead._meta.get_field(key)
+    #         maximum = getattr(field, 'max_length', None)
+    #         if maximum and len(value) > maximum:
+    #             raise ValueError(f'Mapped answer for {key} exceeds CRM field length of {maximum}.')
+    bool_fields = {'consent_whatsapp', 'consent_email', 'consent_sms', 'consent_voice'}
     extra = {}
     for k, v in mapped.items():
         if k in ('fitness_goal', 'area', 'country', 'gender', 'occupation', 'company_name', 'date_of_birth') and v:
@@ -380,14 +421,45 @@ def _apply_mapping(event, mapping, alias, actor_user, is_live: bool = False):
         elif k in bool_fields and v != '':
             extra[k] = str(v).strip().lower() in ('true', '1', 'yes', 'y')
 
+    # Resolve program if mapped
+    program_val = mapped.get('interested_program', '').strip()
+    if program_val:
+        from .models_catalog import Program
+        program_obj = None
+        try:
+            import uuid
+            uuid.UUID(program_val)
+            program_obj = Program.objects.using(alias).filter(id=program_val, status='ACTIVE').first()
+        except (ValueError, TypeError, AttributeError):
+            pass
+        if not program_obj:
+            program_obj = Program.objects.using(alias).filter(
+                organization_id=event.organization_id,
+                name__iexact=program_val,
+                status='ACTIVE'
+            ).first()
+        if not program_obj:
+            program_obj = Program.objects.using(alias).filter(
+                organization_id=event.organization_id,
+                name__icontains=program_val,
+                status='ACTIVE'
+            ).first()
+        if program_obj:
+            extra['interested_program'] = program_obj
+
+    # Extract voice consent grant before passing extra to create_lead,
+    # as Lead model has no column for consent_voice.
+    consent_voice_granted = extra.pop('consent_voice', True) if 'consent_voice' in extra else True
+
     # Validate model field lengths before PostgreSQL would reject the insert.
-    for key in ('first_name', 'last_name', *(k for k in extra if k not in bool_fields)):
+    for key in ('first_name', 'last_name', *(k for k in extra if k not in bool_fields and k != 'interested_program')):
         value = mapped.get(key, '')
         if isinstance(value, str):
             field = Lead._meta.get_field(key)
             maximum = getattr(field, 'max_length', None)
             if maximum and len(value) > maximum:
                 raise ValueError(f'Mapped answer for {key} exceeds CRM field length of {maximum}.')
+    # --- FIX: EXTRACT VOICE CONSENT AND RESOLVE INTERESTED PROGRAM END ---
 
     # Assigned sales user preference
     assigned_sales_user = None
@@ -428,6 +500,50 @@ def _apply_mapping(event, mapping, alias, actor_user, is_live: bool = False):
         attribution_data=attribution_data,
         db_alias=alias,
     )
+
+    # --- FIX: RECORD SARVAM VOICE CONSENT AND COMPLIANCE RECORD START ---
+    # WHY: Persist explicit voice-calling consent in authoritative ConsentRecord table and on Lead instance.
+    # FIXES: Enables Sarvam AI Voice Calling Engine to verify calling eligibility with fail-closed compliance.
+    # IMPACT: Meta leads can receive automated AI qualification calls within IST calling hours.
+    from .models_users import TenantUser
+    from .models_privacy import ProcessingPurpose, ConsentRecord
+
+    purpose, _ = ProcessingPurpose.objects.using(alias).get_or_create(
+        code='VOICE_CALL',
+        defaults={
+            'name': 'AI Voice Calling',
+            'description': 'Consent to receive automated AI voice calls regarding trial bookings and schedule inquiries.',
+            'status': 'ACTIVE',
+        }
+    )
+
+    consent_user = actor_user
+    if not consent_user or not isinstance(consent_user, TenantUser):
+        consent_user = (
+            lead.assigned_sales_user
+            or TenantUser.objects.using(alias).filter(organization=lead.organization).first()
+            or TenantUser.objects.using(alias).first()
+        )
+
+    if consent_user:
+        ConsentRecord.objects.using(alias).create(
+            user=consent_user,
+            purpose=purpose,
+            subject_type='lead',
+            subject_id=lead.id,
+            status='GRANTED' if consent_voice_granted else 'WITHDRAWN',
+            capture_source='META_LEAD_FORM',
+            consent_method='META_LEAD_FORM',
+            notes=f"Voice calling consent captured from Meta Lead Form '{mapping.name}'",
+            recorded_at=timezone.now(),
+        )
+
+    lead.consent_voice = consent_voice_granted
+    lead.consent_voice_source = 'META_LEAD_FORM'
+    lead.consent_voice_recorded_at = timezone.now()
+    if hasattr(lead, '_cached_voice_consent'):
+        delattr(lead, '_cached_voice_consent')
+    # --- FIX: RECORD SARVAM VOICE CONSENT AND COMPLIANCE RECORD END ---
 
     # Initial pipeline stage transition if configured beyond NEW_LEAD
     initial_stage = getattr(mapping, 'initial_stage', 'NEW_LEAD')

@@ -584,14 +584,28 @@ class MetaOAuthCallbackRegressionTests(unittest.TestCase):
             mock_fetch.return_value = mock_details
 
             # Kebab-case route
-            res_kebab = auth_client.get('/api/v1/tenant/meta-lead-mappings/form-fields/?form_id=1755557852149138')
+            # --- FIX: PASS PAGE_ID TO FORM_FIELDS REQUEST START ---
+            # WHY: form_fields endpoint now requires page_id to target the correct Page connection.
+            # FIXES: Test received 400 PAGE_ID_REQUIRED because page_id was previously omitted.
+            # IMPACT: Matches new contract where page_id is mandatory.
+            # OLD:
+            # res_kebab = auth_client.get('/api/v1/tenant/meta-lead-mappings/form-fields/?form_id=1755557852149138')
+            res_kebab = auth_client.get(f'/api/v1/tenant/meta-lead-mappings/form-fields/?page_id={fb_page_id}&form_id=1755557852149138')
+            # --- FIX: PASS PAGE_ID TO FORM_FIELDS REQUEST END ---
             self.assertEqual(res_kebab.status_code, 200)
             self.assertIn('form', res_kebab.data)
             self.assertIn('questions', res_kebab.data)
             self.assertEqual(len(res_kebab.data['form']['questions']), 2)
 
             # Snake-case route
-            res_snake = auth_client.get('/api/v1/tenant/meta-lead-mappings/form_fields/?form_id=1755557852149138')
+            # --- FIX: PASS PAGE_ID TO FORM_FIELDS REQUEST START ---
+            # WHY: form_fields endpoint now requires page_id to target the correct Page connection.
+            # FIXES: Test received 400 PAGE_ID_REQUIRED because page_id was previously omitted.
+            # IMPACT: Matches new contract where page_id is mandatory.
+            # OLD:
+            # res_snake = auth_client.get('/api/v1/tenant/meta-lead-mappings/form_fields/?form_id=1755557852149138')
+            res_snake = auth_client.get(f'/api/v1/tenant/meta-lead-mappings/form_fields/?page_id={fb_page_id}&form_id=1755557852149138')
+            # --- FIX: PASS PAGE_ID TO FORM_FIELDS REQUEST END ---
             self.assertEqual(res_snake.status_code, 200)
             self.assertIn('form', res_snake.data)
 
@@ -735,4 +749,359 @@ class MetaOAuthCallbackRegressionTests(unittest.TestCase):
             self.assertIn('name', fields_str)
             self.assertIn('status', fields_str)
             self.assertIn('questions', fields_str)
+
+    def test_19_form_fields_requires_page_id(self):
+        """19. Regression: form_fields endpoint returns HTTP 400 when page_id is missing."""
+        from rest_framework.test import APIClient
+        from apps.authentication.views import _build_tenant_token
+
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            user = TenantUser.objects.using(alias).filter(email='admin@sweat.com', status='ACTIVE').first()
+            token = _build_tenant_token(user, self.tenant, alias)
+            access_token = str(token.access_token)
+
+        auth_client = APIClient()
+        auth_client.credentials(HTTP_AUTHORIZATION=f'Bearer {access_token}')
+
+        res = auth_client.get('/api/v1/tenant/meta-lead-mappings/form-fields/?form_id=1234567890')
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.data.get('error'), 'PAGE_ID_REQUIRED')
+        self.assertEqual(res.data.get('questions'), [])
+        self.assertIn('form', res.data)
+
+    def test_20_form_fields_unknown_page_id_returns_404(self):
+        """20. Regression: form_fields endpoint returns HTTP 404 when page_id is unknown."""
+        from rest_framework.test import APIClient
+        from apps.authentication.views import _build_tenant_token
+
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            user = TenantUser.objects.using(alias).filter(email='admin@sweat.com', status='ACTIVE').first()
+            token = _build_tenant_token(user, self.tenant, alias)
+            access_token = str(token.access_token)
+
+        auth_client = APIClient()
+        auth_client.credentials(HTTP_AUTHORIZATION=f'Bearer {access_token}')
+
+        res = auth_client.get('/api/v1/tenant/meta-lead-mappings/form-fields/?page_id=999000111222&form_id=1234567890')
+        self.assertEqual(res.status_code, 404)
+        self.assertEqual(res.data.get('error'), 'PAGE_NOT_FOUND')
+        self.assertEqual(res.data.get('questions'), [])
+        self.assertIn('form', res.data)
+
+    def test_21_form_fields_empty_token_returns_400(self):
+        """21. Regression: form_fields endpoint returns HTTP 400 when page connection has empty token."""
+        from rest_framework.test import APIClient
+        from apps.authentication.views import _build_tenant_token
+        from apps.tenant_core.models_meta_leads import MetaPageConnection
+
+        fb_page_id = '1265728509951597'
+
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            user = TenantUser.objects.using(alias).filter(email='admin@sweat.com', status='ACTIVE').first()
+            MetaPageConnection.objects.using(alias).filter(page_id=fb_page_id).update(encrypted_page_access_token='')
+            token = _build_tenant_token(user, self.tenant, alias)
+            access_token = str(token.access_token)
+
+        auth_client = APIClient()
+        auth_client.credentials(HTTP_AUTHORIZATION=f'Bearer {access_token}')
+
+        res = auth_client.get(f'/api/v1/tenant/meta-lead-mappings/form-fields/?page_id={fb_page_id}&form_id=1234567890')
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.data.get('error'), 'TOKEN_MISSING')
+        self.assertEqual(res.data.get('questions'), [])
+        self.assertIn('form', res.data)
+
+    def test_22_form_fields_permission_error_returns_403(self):
+        """22. Regression: form_fields endpoint returns HTTP 403 when Meta raises MetaPermissionError."""
+        from unittest.mock import patch
+        from rest_framework.test import APIClient
+        from apps.authentication.views import _build_tenant_token
+        from apps.tenant_core.models_meta_leads import MetaPageConnection
+        from apps.tenant_core.meta_crypto import encrypt_token
+        from apps.tenant_core.services_meta_graph import MetaPermissionError
+
+        fb_page_id = '1265728509951597'
+
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            user = TenantUser.objects.using(alias).filter(email='admin@sweat.com', status='ACTIVE').first()
+            MetaPageConnection.objects.using(alias).filter(page_id=fb_page_id).update(
+                encrypted_page_access_token=encrypt_token('dummy_page_token_abc')
+            )
+            token = _build_tenant_token(user, self.tenant, alias)
+            access_token = str(token.access_token)
+
+        auth_client = APIClient()
+        auth_client.credentials(HTTP_AUTHORIZATION=f'Bearer {access_token}')
+
+        with patch('apps.tenant_core.services_meta_graph.MetaGraphClient.fetch_form_details') as mock_fetch:
+            mock_fetch.side_effect = MetaPermissionError("Denied: User has insufficient privileges on the page (#10)")
+            res = auth_client.get(f'/api/v1/tenant/meta-lead-mappings/form-fields/?page_id={fb_page_id}&form_id=1234567890')
+            self.assertEqual(res.status_code, 403)
+            self.assertEqual(res.data.get('error'), 'PERMISSION_DENIED')
+            self.assertEqual(res.data.get('questions'), [])
+            self.assertIn('form', res.data)
+
+    def test_23_form_fields_uses_exact_page_token_with_multiple_connections(self):
+        """23. Regression: with two active page connections, assert fetch_form_details uses the requested page's token."""
+        from unittest.mock import patch
+        from rest_framework.test import APIClient
+        from apps.authentication.views import _build_tenant_token
+        from apps.tenant_core.models_meta_leads import MetaPageConnection, MetaConnection
+        from apps.tenant_core.meta_crypto import encrypt_token
+
+        page_1_id = '111111111111'
+        page_2_id = '222222222222'
+        token_1 = 'dummy_token_for_page_1'
+        token_2 = 'dummy_token_for_page_2'
+        target_form_id = '999988887777'
+
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            user = TenantUser.objects.using(alias).filter(email='admin@sweat.com', status='ACTIVE').first()
+            target_org = user.organization
+            conn, _ = MetaConnection.objects.using(alias).get_or_create(
+                organization=target_org,
+                defaults={'status': 'CONNECTED', 'encrypted_user_access_token': encrypt_token('user_tok')}
+            )
+            MetaPageConnection.objects.using(alias).update_or_create(
+                organization=target_org,
+                page_id=page_1_id,
+                defaults={'connection': conn, 'page_name': 'Page One', 'is_active': True, 'encrypted_page_access_token': encrypt_token(token_1)}
+            )
+            MetaPageConnection.objects.using(alias).update_or_create(
+                organization=target_org,
+                page_id=page_2_id,
+                defaults={'connection': conn, 'page_name': 'Page Two', 'is_active': True, 'encrypted_page_access_token': encrypt_token(token_2)}
+            )
+            token = _build_tenant_token(user, self.tenant, alias)
+            access_token = str(token.access_token)
+
+        auth_client = APIClient()
+        auth_client.credentials(HTTP_AUTHORIZATION=f'Bearer {access_token}')
+
+        with patch('apps.tenant_core.services_meta_graph.MetaGraphClient.fetch_form_details') as mock_fetch:
+            mock_fetch.return_value = {
+                'id': target_form_id,
+                'name': 'Sample Form Page 2',
+                'questions': [{'key': 'email', 'label': 'Email Address', 'type': 'EMAIL'}]
+            }
+            res = auth_client.get(f'/api/v1/tenant/meta-lead-mappings/form-fields/?page_id={page_2_id}&form_id={target_form_id}')
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(len(res.data.get('questions', [])), 1)
+
+            # Assert fetch_form_details was called with token_2 (not token_1)
+            mock_fetch.assert_called_once_with(target_form_id, token_2)
+            self.assertNotEqual(mock_fetch.call_args[0][1], token_1)
+
+    def test_24_meta_lead_sarvam_voice_consent_and_program_ingestion(self):
+        """24. Regression: Ingesting a Meta lead parses consent_voice and interested_program,
+        stores canonical +91 phone, sets in-memory lead attributes, and creates authoritative ConsentRecord."""
+        from django.db import transaction
+        from apps.tenant_core.models_catalog import Program
+        from apps.tenant_core.models_crm import Lead, LeadSource
+        from apps.tenant_core.models_org import Branch, Location
+        from apps.tenant_core.models_meta_leads import MetaLeadMapping, MetaLeadImport
+        from apps.tenant_core.models_privacy import ConsentRecord, ProcessingPurpose
+        from apps.tenant_core.services_meta_leads import _apply_mapping
+        from apps.tenant_core.services_voice_calling import VoiceCallingService
+
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            # 1. Setup Location, Branch, LeadSource, Program
+            loc, _ = Location.objects.using(alias).get_or_create(
+                organization=self.org,
+                code='LOC-SWEAT-TEST',
+                defaults={'name': 'SWEAT Test Location', 'status': 'ACTIVE'}
+            )
+            branch, _ = Branch.objects.using(alias).get_or_create(
+                organization=self.org,
+                location=loc,
+                code='BR-SWEAT-FLAGSHIP',
+                defaults={'name': 'SWEAT Flagship Studio', 'status': 'ACTIVE'}
+            )
+            if branch.status != 'ACTIVE':
+                branch.status = 'ACTIVE'
+                branch.save(using=alias)
+            lead_source, _ = LeadSource.objects.using(alias).get_or_create(
+                organization=self.org,
+                code='META_ADS_TEST',
+                defaults={'name': 'Meta Ads Test', 'source_type': 'META', 'status': 'ACTIVE'}
+            )
+            program, _ = Program.objects.using(alias).get_or_create(
+                organization=self.org,
+                name='Pilates Reformer',
+                defaults={'status': 'ACTIVE'}
+            )
+
+            # 2. Setup MetaLeadMapping with voice consent and interested_program
+            mapping, _ = MetaLeadMapping.objects.using(alias).update_or_create(
+                organization=self.org,
+                page_id='1265728509951597',
+                form_id='1755557852149138',
+                defaults={
+                    'name': 'SWEAT LEADS ADS - SARVAM VOICE',
+                    'branch': branch,
+                    'lead_source': lead_source,
+                    'is_active': True,
+                    'field_mappings': {
+                        'first_name': 'first_name',
+                        'last_name': 'last_name',
+                        'phone': 'phone_number',
+                        'email': 'email',
+                        'interested_program': 'interested_program',
+                        'consent_voice': 'do_you_agree_to_be_contacted_via_phone_call?',
+                    },
+                }
+            )
+
+            # 3. Setup incoming MetaLeadImport event
+            event = MetaLeadImport.objects.using(alias).create(
+                organization=self.org,
+                page_id='1265728509951597',
+                form_id='1755557852149138',
+                external_lead_id=f'test_lead_{uuid.uuid4().hex[:8]}',
+                mode='SIMULATION',
+                field_data=[
+                    {'name': 'first_name', 'values': ['Aarav']},
+                    {'name': 'last_name', 'values': ['Sharma']},
+                    {'name': 'phone_number', 'values': ['9876543210']},
+                    {'name': 'email', 'values': ['aarav.sharma@example.com']},
+                    {'name': 'interested_program', 'values': ['Pilates Reformer']},
+                    {'name': 'do_you_agree_to_be_contacted_via_phone_call?', 'values': ['yes']},
+                ],
+                status='PENDING',
+            )
+
+            # 4. Ingest using _apply_mapping
+            with transaction.atomic(using=alias):
+                _apply_mapping(event, mapping, alias, self.user, is_live=False)
+
+            self.assertEqual(event.status, 'IMPORTED')
+            lead = event.lead
+            self.assertIsNotNone(lead)
+            self.assertEqual(lead.first_name, 'Aarav')
+            self.assertEqual(lead.last_name, 'Sharma')
+            self.assertEqual(lead.phone_normalized, '+919876543210')
+            self.assertEqual(lead.current_status, 'NEW_LEAD')
+            self.assertEqual(lead.interested_program_id, program.id)
+            self.assertTrue(lead.consent_voice)
+            self.assertEqual(lead.consent_voice_source, 'META_LEAD_FORM')
+
+            # 5. Verify authoritative database ConsentRecord exists
+            consent_rec = ConsentRecord.objects.using(alias).filter(
+                subject_id=lead.id,
+                subject_type='lead',
+                purpose__code='VOICE_CALL',
+            ).first()
+            self.assertIsNotNone(consent_rec)
+            self.assertEqual(consent_rec.status, 'GRANTED')
+            self.assertEqual(consent_rec.capture_source, 'META_LEAD_FORM')
+
+            # 6. Verify fail-closed VoiceCallingService eligibility verification passes
+            consent_status = VoiceCallingService.get_lead_voice_consent_status(lead, db_alias=alias)
+            self.assertTrue(consent_status['is_eligible'])
+            self.assertEqual(consent_status['status'], 'GRANTED')
+
+    def test_25_tasks_meta_leads_dispatches_automated_sarvam_call_on_imported(self):
+        """25. Regression: process_meta_lead_import_task dispatches trigger_automated_sarvam_call_task
+        when lead import completes with IMPORTED status."""
+        from unittest.mock import patch, MagicMock
+        from apps.tenant_core.models_meta_leads import MetaLeadImport
+        from apps.tenant_core.tasks_meta_leads import process_meta_lead_import_task
+
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            mock_lead_id = uuid.uuid4()
+            event = MetaLeadImport.objects.using(alias).create(
+                organization=self.org,
+                page_id='1265728509951597',
+                form_id='1755557852149138',
+                external_lead_id=f'test_async_{uuid.uuid4().hex[:8]}',
+                mode='LIVE',
+                field_data=[],
+                status='PENDING',
+            )
+
+        mock_event = MagicMock()
+        mock_event.status = 'IMPORTED'
+        mock_event.lead_id = mock_lead_id
+        mock_event.page_id = '1265728509951597'
+        mock_event.form_id = '1755557852149138'
+        mock_event.external_lead_id = event.external_lead_id
+
+        with patch('apps.tenant_core.tasks_meta_leads.process_live_import', return_value=mock_event),              patch('apps.tenant_core.tasks_voice_calling.trigger_automated_sarvam_call_task.delay') as mock_voice_task:
+            
+            res = process_meta_lead_import_task(tenant_id=str(self.tenant.id), import_id=str(event.id))
+            self.assertEqual(res.get('status'), 'IMPORTED')
+            mock_voice_task.assert_called_once_with(
+                tenant_id=str(self.tenant.id),
+                lead_id=str(mock_lead_id),
+            )
+
+    def test_26_meta_lead_all_branches_organization_wide(self):
+        """
+        26. Option B Regression: Meta leads with branch_mode='ALL' are ingested with branch=None
+        and remain visible to branch-scoped users across all studios in SWEAT CRM.
+        """
+        from apps.tenant_core.models_crm import Lead, LeadSource
+        from apps.tenant_core.models_meta_leads import MetaLeadMapping, MetaLeadImport
+        from apps.tenant_core.services_meta_leads import _apply_mapping
+        from django.db.models import Q
+        from django.db import transaction
+
+        with tenant_database_context(str(self.tenant.id)) as alias:
+            lead_source, _ = LeadSource.objects.using(alias).get_or_create(
+                organization=self.org,
+                code='META_ADS_ALL_BR',
+                defaults={'name': 'Meta Ads All Branches', 'source_type': 'META', 'status': 'ACTIVE'}
+            )
+
+            mapping, _ = MetaLeadMapping.objects.using(alias).update_or_create(
+                organization=self.org,
+                page_id='1265728509951597',
+                form_id='1755557852149999',
+                defaults={
+                    'name': 'SWEAT ALL BRANCHES LEAD FORM',
+                    'branch_mode': 'ALL',
+                    'branch': None,
+                    'lead_source': lead_source,
+                    'is_active': True,
+                    'field_mappings': {
+                        'first_name': 'first_name',
+                        'last_name': 'last_name',
+                        'phone': 'phone_number',
+                        'email': 'email',
+                    },
+                }
+            )
+
+            unique_phone = f"98{uuid.uuid4().int % 100000000:08d}"
+            unique_email = f"rohan_{uuid.uuid4().hex[:6]}@example.com"
+            event = MetaLeadImport.objects.using(alias).create(
+                organization=self.org,
+                page_id='1265728509951597',
+                form_id='1755557852149999',
+                external_lead_id=f'test_lead_all_{uuid.uuid4().hex[:8]}',
+                mode='SIMULATION',
+                field_data=[
+                    {'name': 'first_name', 'values': ['Rohan']},
+                    {'name': 'last_name', 'values': ['Mehta']},
+                    {'name': 'phone_number', 'values': [unique_phone]},
+                    {'name': 'email', 'values': [unique_email]},
+                ],
+                status='PENDING',
+            )
+
+            with transaction.atomic(using=alias):
+                _apply_mapping(event, mapping, alias, self.user, is_live=False)
+
+            self.assertEqual(event.status, 'IMPORTED')
+            lead = event.lead
+            self.assertIsNotNone(lead)
+            self.assertIsNone(lead.branch)
+            self.assertEqual(lead.first_name, 'Rohan')
+            self.assertEqual(lead.phone_normalized, f'+91{unique_phone}')
+
+            permitted_branches = [str(uuid.uuid4())]
+            scoped_qs = Lead.objects.using(alias).filter(
+                Q(branch_id__in=permitted_branches) | Q(assigned_sales_user=self.user) | Q(branch_id__isnull=True)
+            )
+            self.assertTrue(scoped_qs.filter(id=lead.id).exists())
 

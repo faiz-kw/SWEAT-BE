@@ -5,8 +5,9 @@ Deterministic Routing:
 1. Public integration identifier resolves tenant in Master DB ('default').
 2. Transitions fail-closed into dedicated tenant database using tenant_database_context.
 3. Authenticates provider cryptographic signature/token using tenant's stored Integration configuration.
-4. Normalizes provider payloads to delivery status events or inbound messages.
-5. Ingests without guessing, preserving out-of-order protection and idempotency.
+4. Validates tenant app identity / sender to prevent cross-tenant ingestion.
+5. Normalizes provider payloads to delivery status events or inbound messages (supports single and batch).
+6. Ingests without guessing, preserving out-of-order protection and idempotency.
 """
 
 import json
@@ -70,6 +71,7 @@ class CommunicationWebhookView(APIView):
     def post(self, request, provider: str, public_integration_id: str):
         """
         Ingests delivery receipts, status callbacks, and inbound customer messages.
+        Supports single JSON payloads and batch arrays of events.
         """
         provider_upper = provider.strip().upper()
 
@@ -119,7 +121,13 @@ class CommunicationWebhookView(APIView):
                 if integration.secret_reference:
                     try:
                         credentials = SecretResolver.resolve(integration.secret_reference) or {}
-                        if not isinstance(credentials, dict):
+                        if isinstance(credentials, str):
+                            try:
+                                parsed = json.loads(credentials)
+                                credentials = parsed if isinstance(parsed, dict) else {'api_token': credentials}
+                            except Exception:
+                                credentials = {'api_token': credentials}
+                        elif not isinstance(credentials, dict):
                             credentials = {'api_token': credentials}
                     except Exception as e:
                         logger.error("Failed to resolve secret for integration %s: %s", integration.id, type(e).__name__)
@@ -132,7 +140,7 @@ class CommunicationWebhookView(APIView):
                 logger.warning("Invalid webhook signature for tenant %s provider %s", tenant.id, provider)
                 return Response({'error': 'Invalid webhook signature'}, status=status.HTTP_401_UNAUTHORIZED)
 
-            # Step 4: Safely parse validated request payload
+            # Step 4: Safely parse validated request payload (supports dict or list of dicts)
             payload = {}
             raw_body = request.body
             if raw_body:
@@ -150,74 +158,126 @@ class CommunicationWebhookView(APIView):
             else:
                 payload = request.POST.dict() or {}
 
-            if not isinstance(payload, dict):
-                logger.warning("Webhook payload for tenant %s provider %s is not a JSON object", tenant.id, provider)
-                return Response({'error': 'Webhook payload must be a JSON object'}, status=status.HTTP_400_BAD_REQUEST)
+            # Handle both single dict and batch list of events
+            if isinstance(payload, dict):
+                is_batch = False
+                events = [payload]
+            elif isinstance(payload, list):
+                is_batch = True
+                events = [ev for ev in payload if isinstance(ev, dict)]
+            else:
+                logger.warning("Webhook payload for tenant %s provider %s is neither dict nor list", tenant.id, provider)
+                return Response({'error': 'Webhook payload must be a JSON object or array'}, status=status.HTTP_400_BAD_REQUEST)
 
-            # SARVAM Voice Callback handler
+            # SARVAM Voice Callback handler — payload must be a JSON object (dict).
+            # A bare JSON list or scalar is rejected with 400 before dispatching.
             if provider_upper == 'SARVAM':
+                if not isinstance(payload, dict):
+                    logger.warning(
+                        "Sarvam webhook for tenant %s rejected: payload is not a JSON object (type=%s)",
+                        tenant.id, type(payload).__name__,
+                    )
+                    return Response(
+                        {'error': 'Webhook payload must be a JSON object'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
                 from apps.tenant_core.services_voice_calling import VoiceCallingService
                 res = VoiceCallingService.record_call_webhook(org, payload, db_alias=db_alias)
                 return Response(res, status=status.HTTP_200_OK)
 
-            # Step 4: Check for Delivery Status Event
-            status_event = adapter.parse_status_webhook(payload, request.META)
-            if status_event and status_event.provider_message_id:
-                msg = CommunicationMessage.objects.filter(
-                    organization=org,
-                    provider_message_id=status_event.provider_message_id,
-                ).first()
+            # Validate tenant app identity if supported by adapter (prevents cross-tenant spoofing)
+            if hasattr(adapter, 'validate_payload_app_identity'):
+                for ev in events:
+                    if not adapter.validate_payload_app_identity(ev):
+                        logger.warning("Tenant app identity mismatch for tenant %s provider %s", tenant.id, provider)
+                        return Response({'error': 'Tenant app or sender identity mismatch'}, status=status.HTTP_403_FORBIDDEN)
 
-                if msg:
-                    CommunicationService.record_status_event(
-                        message=msg,
-                        to_status=status_event.status,
-                        provider_event_id=status_event.provider_event_id,
-                        occurred_at=status_event.occurred_at,
-                        raw_metadata=status_event.raw_metadata,
-                        error_code=status_event.error_code,
-                        error_message=status_event.error_message,
+            # Step 5: Process Events (Single or Batch)
+            recorded_statuses = 0
+            recorded_inbound = 0
+            ignored_count = 0
+            last_status_resp = None
+            last_inbound_resp = None
+
+            for ev in events:
+                # Check for Delivery Status Event
+                status_event = adapter.parse_status_webhook(ev, request.META)
+                if status_event and status_event.provider_message_id:
+                    msg = CommunicationMessage.objects.filter(
+                        organization=org,
+                        provider_message_id=status_event.provider_message_id,
+                    ).first()
+
+                    if msg:
+                        CommunicationService.record_status_event(
+                            message=msg,
+                            to_status=status_event.status,
+                            provider_event_id=status_event.provider_event_id,
+                            occurred_at=status_event.occurred_at,
+                            raw_metadata=status_event.raw_metadata,
+                            error_code=status_event.error_code,
+                            error_message=status_event.error_message,
+                        )
+                        recorded_statuses += 1
+                        last_status_resp = {
+                            'status': 'recorded',
+                            'type': 'STATUS_EVENT',
+                            'message_id': str(msg.id),
+                            'current_status': msg.status,
+                        }
+                        continue
+
+                # Check for Inbound Customer Message
+                inbound_msg_data = adapter.parse_inbound_message(ev, request.META)
+                if inbound_msg_data and inbound_msg_data.sender_identifier:
+                    inbound_msg = CommunicationService.ingest_inbound_message(
+                        organization=org,
+                        channel=inbound_msg_data.channel,
+                        sender_identifier=inbound_msg_data.sender_identifier,
+                        body=inbound_msg_data.body,
+                        provider=provider_upper,
+                        provider_message_id=inbound_msg_data.provider_message_id,
+                        in_reply_to_provider_id=inbound_msg_data.in_reply_to_provider_id,
+                        raw_payload=inbound_msg_data.raw_payload,
                     )
-                    return Response({
+
+                    # Check if text is a confirmation or reschedule keyword
+                    body_clean = inbound_msg_data.body.strip().upper()
+                    if inbound_msg.lead and inbound_msg.related_trial:
+                        trial = inbound_msg.related_trial
+                        if 'CONFIRM' in body_clean and trial.confirmation_status == 'PENDING':
+                            from apps.tenant_core.services_crm import CRMTrialService
+                            CRMTrialService.confirm_trial(trial, confirmed_by='INBOUND_REPLY', channel=inbound_msg_data.channel)
+                        elif 'RESCHEDULE' in body_clean:
+                            from apps.tenant_core.services_crm import CRMTrialService
+                            CRMTrialService.request_reschedule(trial, reason=inbound_msg_data.body[:200])
+
+                    recorded_inbound += 1
+                    last_inbound_resp = {
                         'status': 'recorded',
-                        'type': 'STATUS_EVENT',
-                        'message_id': str(msg.id),
-                        'current_status': msg.status,
-                    })
+                        'type': 'INBOUND_MESSAGE',
+                        'message_id': str(inbound_msg.id),
+                        'resolution_status': inbound_msg.resolution_status,
+                    }
+                    continue
 
-            # Step 5: Check for Inbound Customer Message
-            inbound_msg_data = adapter.parse_inbound_message(payload, request.META)
-            if inbound_msg_data and inbound_msg_data.sender_identifier:
-                inbound_msg = CommunicationService.ingest_inbound_message(
-                    organization=org,
-                    channel=inbound_msg_data.channel,
-                    sender_identifier=inbound_msg_data.sender_identifier,
-                    body=inbound_msg_data.body,
-                    provider=provider_upper,
-                    provider_message_id=inbound_msg_data.provider_message_id,
-                    in_reply_to_provider_id=inbound_msg_data.in_reply_to_provider_id,
-                    raw_payload=inbound_msg_data.raw_payload,
-                )
+                ignored_count += 1
 
-                # Check if text is a confirmation or reschedule keyword
-                body_clean = inbound_msg_data.body.strip().upper()
-                if inbound_msg.lead and inbound_msg.related_trial:
-                    trial = inbound_msg.related_trial
-                    if 'CONFIRM' in body_clean and trial.confirmation_status == 'PENDING':
-                        from apps.tenant_core.services_crm import CRMTrialService
-                        CRMTrialService.confirm_trial(trial, confirmed_by='INBOUND_REPLY', channel=inbound_msg_data.channel)
-                    elif 'RESCHEDULE' in body_clean:
-                        from apps.tenant_core.services_crm import CRMTrialService
-                        CRMTrialService.request_reschedule(trial, reason=inbound_msg_data.body[:200])
+            if not is_batch:
+                if last_status_resp:
+                    return Response(last_status_resp, status=status.HTTP_200_OK)
+                if last_inbound_resp:
+                    return Response(last_inbound_resp, status=status.HTTP_201_CREATED)
+                return Response({'status': 'ignored_or_unrecognized'}, status=status.HTTP_200_OK)
 
-                return Response({
-                    'status': 'recorded',
-                    'type': 'INBOUND_MESSAGE',
-                    'message_id': str(inbound_msg.id),
-                    'resolution_status': inbound_msg.resolution_status,
-                }, status=status.HTTP_201_CREATED)
-
-            return Response({'status': 'ignored_or_unrecognized'}, status=status.HTTP_200_OK)
+            return Response({
+                'status': 'recorded',
+                'batch': True,
+                'total_events': len(events),
+                'statuses_recorded': recorded_statuses,
+                'inbound_recorded': recorded_inbound,
+                'ignored': ignored_count,
+            }, status=status.HTTP_200_OK)
 
     def _resolve_tenant(self, public_id: str) -> Tenant | None:
         """
@@ -240,3 +300,4 @@ class CommunicationWebhookView(APIView):
         if tenant and tenant.is_accessible:
             return tenant
         return None
+

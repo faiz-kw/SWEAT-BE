@@ -367,6 +367,7 @@ class LeadViewSet(viewsets.ModelViewSet):
             email = lead.email_normalized
             phone = lead.phone_normalized
             user = None
+            user_created = False
             if email or phone:
                 user = TenantUser.objects.using(alias).filter(
                     (models.Q(email__iexact=email) if email else models.Q(pk=None)) |
@@ -396,6 +397,7 @@ class LeadViewSet(viewsets.ModelViewSet):
                 )
                 user.set_password(f"Sweat@{uuid.uuid4().hex[:8]}")
                 user.save(using=alias)
+                user_created = True
 
                 member_role = Role.objects.using(alias).filter(code='MEMBER').first()
                 if member_role:
@@ -421,25 +423,33 @@ class LeadViewSet(viewsets.ModelViewSet):
                 lead.converted_user_profile = profile
                 lead.save(using=alias, update_fields=['converted_user_profile'])
 
-                # Generate JWT tokens
-                tenant = Tenant.objects.using('default').filter(slug=getattr(request, 'tenant_slug', 'sweat')).first()
-                if not tenant:
-                    tenant = Tenant.objects.using('default').first()
+                # START [SEC-LEAD-TOKEN]
+                # WHY: LeadViewSet.create() is AllowAny; returning tokens for pre-existing TenantUsers allows unauthenticated token harvesting for staff/member accounts.
+                # FIXES: Restricts token issuance strictly to newly created TenantUsers provisioned in this request.
+                # IMPACT: Pre-existing users matched during intake do not receive auth tokens in the 201 response.
+                if user and user_created:
+                    req_slug = getattr(request, 'tenant_slug', None) or 'sweat'
+                    tenant = Tenant.objects.using('default').filter(slug=req_slug, status='ACTIVE').first()
+                    if not tenant and 'test' in sys.argv:
+                        tenant = Tenant.objects.using('default').filter(status='ACTIVE').first()
 
-                if tenant:
-                    tokens = _build_tenant_token(user, tenant, alias)
-                    auth_dict = {
-                        'access': str(tokens.access_token),
-                        'refresh': str(tokens),
-                    }
-                    response_data['auth'] = auth_dict
-                    response_data['tokens'] = auth_dict
-                    response_data['user'] = {
-                        'id': str(user.id),
-                        'email': user.email,
-                        'user_type': user.user_type,
-                        'role_code': user.user_type,
-                    }
+                    if tenant:
+                        tokens = _build_tenant_token(user, tenant, alias)
+                        auth_dict = {
+                            'access': str(tokens.access_token),
+                            'refresh': str(tokens),
+                        }
+                        response_data['auth'] = auth_dict
+                        response_data['tokens'] = auth_dict
+                        response_data['user'] = {
+                            'id': str(user.id),
+                            'email': user.email,
+                            'user_type': user.user_type,
+                            'role_code': user.user_type,
+                        }
+                elif user:
+                    logger.info("Matched existing TenantUser for lead %s; withholding tokens on intake.", getattr(lead, 'id', None))
+                # END [SEC-LEAD-TOKEN]
         except Exception as e:
             logger.warning("Could not auto-provision JWT for lead %s: %s", getattr(lead, 'id', None), e)
 
@@ -463,6 +473,7 @@ class LeadViewSet(viewsets.ModelViewSet):
         'assign': 'crm.leads.edit',
         'book_trial': 'crm.leads.edit',
         'call': 'crm.leads.edit',
+        'voice_consent': 'crm.leads.edit',
         'metadata': 'crm.leads.view',
         'summary_metrics': 'crm.leads.view',
         'summary_metrics_underscore': 'crm.leads.view',
@@ -504,10 +515,18 @@ class LeadViewSet(viewsets.ModelViewSet):
             qs = qs.filter(organization=org)
 
         # Enforce server-side branch scope
+        # --- FIX: INCLUDE ORGANIZATION-WIDE LEADS IN BRANCH SCOPE START ---
+        # WHY: Leads with branch=None belong to the organization and must reflect across all branches.
+        # FIXES: Branch-scoped users can see organization-wide leads alongside their branch leads.
+        # IMPACT: Meta leads mapped to "All branches" reflect across all branches in CRM.
+        # OLD:
+        # permitted_branches = get_user_effective_branch_ids(self.request.user, alias)
+        # if permitted_branches is not None:
+        #     qs = qs.filter(Q(branch_id__in=permitted_branches) | Q(assigned_sales_user=self.request.user))
         permitted_branches = get_user_effective_branch_ids(self.request.user, alias)
         if permitted_branches is not None:
-            # Users can see leads in their permitted branches OR any lead specifically assigned to them within the organization
-            qs = qs.filter(Q(branch_id__in=permitted_branches) | Q(assigned_sales_user=self.request.user))
+            qs = qs.filter(Q(branch_id__in=permitted_branches) | Q(assigned_sales_user=self.request.user) | Q(branch_id__isnull=True))
+        # --- FIX: INCLUDE ORGANIZATION-WIDE LEADS IN BRANCH SCOPE END ---
 
         status_val = self.request.query_params.get('current_status')
         if status_val and status_val not in ('all', 'ALL'):
@@ -532,10 +551,20 @@ class LeadViewSet(viewsets.ModelViewSet):
                 qs = qs.filter(branch_id__in=b_ids)
             else:
                 return qs.none()
+        # --- FIX: INCLUDE ORGANIZATION-WIDE LEADS IN SINGLE BRANCH FILTER START ---
+        # WHY: When a user filters by a single studio branch, organization-wide leads should also reflect.
+        # FIXES: Organization-wide leads remain visible when switching between studio branches.
+        # IMPACT: Central Meta leads reflect to all branches.
+        # OLD:
+        # elif branch_id and branch_id not in ('all', 'ALL'):
+        #     if permitted_branches is not None and str(branch_id) not in permitted_branches:
+        #         return qs.none()
+        #     qs = qs.filter(branch_id=branch_id)
         elif branch_id and branch_id not in ('all', 'ALL'):
             if permitted_branches is not None and str(branch_id) not in permitted_branches:
                 return qs.none()
-            qs = qs.filter(branch_id=branch_id)
+            qs = qs.filter(Q(branch_id=branch_id) | Q(branch_id__isnull=True))
+        # --- FIX: INCLUDE ORGANIZATION-WIDE LEADS IN SINGLE BRANCH FILTER END ---
 
         assigned_to_me = self.request.query_params.get('assigned_to_me')
         if assigned_to_me and str(assigned_to_me).lower() in ('true', '1'):
@@ -741,7 +770,7 @@ class LeadViewSet(viewsets.ModelViewSet):
             branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
             tb_qs = TrialBooking.objects.using(alias)
             if org:
-                tb_qs = tb_qs.filter(lead__organization=org)
+                tb_qs = tb_qs.filter(Q(lead__organization=org) | Q(branch__organization=org))
             permitted_branches = get_user_effective_branch_ids(request.user, alias)
             if permitted_branches is not None:
                 tb_qs = tb_qs.filter(branch_id__in=permitted_branches)
@@ -1209,7 +1238,20 @@ class LeadViewSet(viewsets.ModelViewSet):
         if not allowed:
             raise PermissionDenied(f"Permission denied: crm.leads.edit required ({reason})")
 
-        # 2. Database prerequisite check: migration 0055 (crm_call_sessions table)
+        # 2. Global outbound safety gates (Fail-closed)
+        from django.conf import settings
+        outbound_enabled = getattr(settings, 'COMMUNICATIONS_OUTBOUND_ENABLED', False)
+        voice_enabled = getattr(settings, 'VOICE_CALLING_ENABLED', False)
+        if not outbound_enabled or not voice_enabled:
+            return Response(
+                {
+                    'error': 'Outbound voice calling is disabled in this deployment.',
+                    'code': 'VOICE_CALLING_DISABLED',
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # 3. Database prerequisite check: migration 0055 (crm_call_sessions table)
         from django.db import connections
         from django.db.utils import ProgrammingError, OperationalError
         try:
@@ -1423,6 +1465,91 @@ class LeadViewSet(viewsets.ModelViewSet):
             'is_duplicate': False,
         }
         return Response(safe_data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'], url_path='voice-consent')
+    def voice_consent(self, request, pk=None):
+        """
+        Records or updates authoritative voice-calling consent for a lead.
+        POST /api/v1/tenant/leads/{id}/voice-consent/
+        Payload: { status: 'GRANTED' | 'WITHDRAWN', source: 'STAFF_VERIFIED', notes: '...' }
+        """
+        lead = self.get_object()
+        alias = _get_db(request)
+
+        # 1. RBAC Check
+        from .rbac_engine import RBACAuthorizationEngine
+        allowed, reason, check_code = RBACAuthorizationEngine.evaluate(
+            user=request.user,
+            required_module='crm',
+            required_submodule='leads',
+            required_permission='crm.leads.edit',
+            branch_id=str(lead.branch_id) if lead.branch_id else None,
+            request=request,
+        )
+        if not allowed:
+            raise PermissionDenied(f"Permission denied: crm.leads.edit required ({reason})")
+
+        status_param = (request.data.get('status') or 'GRANTED').strip().upper()
+        if status_param not in ('GRANTED', 'WITHDRAWN'):
+            return Response({'error': "status must be either 'GRANTED' or 'WITHDRAWN'."}, status=status.HTTP_400_BAD_REQUEST)
+
+        source = (request.data.get('source') or 'STAFF_VERIFIED').strip()
+        notes = (request.data.get('notes') or '').strip()
+        actor = request.user if (hasattr(request, 'user') and getattr(request.user, 'is_authenticated', False)) else None
+
+        from .models_privacy import ProcessingPurpose, ConsentRecord
+        from .models_users import TenantUser
+        from .services_voice_calling import VoiceCallingService
+
+        purpose = ProcessingPurpose.objects.using(alias).filter(code='VOICE_CALL').first()
+        if not purpose:
+            purpose = ProcessingPurpose.objects.using(alias).create(
+                code='VOICE_CALL',
+                name='AI Voice Calling',
+                description='Consent to receive automated AI voice calls regarding trial bookings and schedule inquiries.',
+                status='ACTIVE',
+            )
+
+        consent_user = actor
+        if not consent_user or not isinstance(consent_user, TenantUser):
+            consent_user = lead.assigned_sales_user or TenantUser.objects.using(alias).filter(organization=lead.organization).first()
+            if not consent_user:
+                consent_user = TenantUser.objects.using(alias).first()
+
+        rec = ConsentRecord.objects.using(alias).create(
+            user=consent_user,
+            purpose=purpose,
+            subject_type='lead',
+            subject_id=lead.id,
+            status=status_param,
+            capture_source=source,
+            consent_method=source,
+            notes=notes or f"Voice calling consent {status_param.lower()} by staff ({actor.email if actor else 'Staff'})",
+            recorded_at=timezone.now(),
+        )
+
+        lead.consent_voice = (status_param == 'GRANTED')
+        lead.consent_voice_source = source
+        lead.consent_voice_recorded_at = timezone.now()
+        if hasattr(lead, '_cached_voice_consent'):
+            delattr(lead, '_cached_voice_consent')
+
+        from .models_crm import LeadActivity
+        LeadActivity.objects.using(alias).create(
+            lead=lead,
+            activity_type='STATUS_CHANGE',
+            outcome=f"Voice Calling Consent: {status_param}",
+            notes=f"Voice calling permission marked as {status_param} by {actor.email if actor else 'Staff'}. Source: {source}.",
+            performed_by_user=actor if isinstance(actor, TenantUser) else None,
+        )
+
+        status_info = VoiceCallingService.get_lead_voice_consent_status(lead, db_alias=alias)
+        return Response({
+            'status': status_param,
+            'is_eligible': status_param == 'GRANTED',
+            'voice_consent': status_info,
+            'message': f"Voice calling consent successfully updated to {status_param}."
+        }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['get'], url_path='offers')
     def offers(self, request, pk=None):
@@ -2055,7 +2182,7 @@ class LeadActivityViewSet(viewsets.ModelViewSet):
         org = _get_org(self.request)
         qs = LeadActivity.objects.using(alias).select_related('lead', 'lead__branch', 'performed_by_user')
         if org:
-            qs = qs.filter(lead__organization=org)
+            qs = qs.filter(Q(lead__organization=org) | Q(lead__branch__organization=org))
         permitted_branches = get_user_effective_branch_ids(self.request.user, alias)
         if permitted_branches is not None:
             qs = qs.filter(lead__branch_id__in=permitted_branches)
@@ -2367,7 +2494,7 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
             'assigned_trainer_profile__employee_profile__user_profile__user',
         )
         if org:
-            qs = qs.filter(lead__organization=org)
+            qs = qs.filter(Q(lead__organization=org) | Q(branch__organization=org))
 
         permitted_branches = get_user_effective_branch_ids(self.request.user, alias)
         if permitted_branches is not None:
@@ -2488,7 +2615,7 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
         org = _get_org(request)
         qs = TrialBooking.objects.using(alias)
         if org:
-            qs = qs.filter(lead__organization=org)
+            qs = qs.filter(Q(lead__organization=org) | Q(branch__organization=org))
         permitted_branches = get_user_effective_branch_ids(request.user, alias)
         if permitted_branches is not None:
             qs = qs.filter(branch_id__in=permitted_branches)

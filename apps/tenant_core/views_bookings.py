@@ -336,6 +336,8 @@ class BookingViewSet(viewsets.ModelViewSet):
                     'user_profile': None,
                     'user_profile_name': f"{t.lead.first_name} {t.lead.last_name}".strip() if t.lead else 'Prospect',
                     'user_profile_email': t.lead.email_normalized if t.lead else None,
+                    'user_profile_phone': t.lead.phone_normalized if t.lead else None,
+                    'phone': t.lead.phone_normalized if t.lead else None,
                     'occurrence': str(t.class_occurrence_id) if t.class_occurrence_id else None,
                     'occurrence_title': occ_info.get('title', 'Trial Session'),
                     'occurrence_date': occ_info.get('date', t.scheduled_start.date().isoformat() if t.scheduled_start else None),
@@ -708,7 +710,35 @@ class BookingViewSet(viewsets.ModelViewSet):
                 return Response({'status': confirmed.status, 'confirmation_status': confirmed.confirmation_status}, status=status.HTTP_200_OK)
             except ValidationError as e:
                 return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
-        return Response({'detail': 'Booking not found or not a trial.'}, status=status.HTTP_404_NOT_FOUND)
+
+        booking = Booking.objects.using(alias).filter(id=pk).first()
+        if booking:
+            permitted_branches = get_user_effective_branch_ids(request.user, alias)
+            if permitted_branches is not None and str(booking.branch_id) not in permitted_branches:
+                return Response({'detail': 'User lacks permission to modify bookings for this branch.'}, status=status.HTTP_403_FORBIDDEN)
+            booking.confirmation_status = 'CONFIRMED'
+            booking.confirmed_at = timezone.now()
+            if booking.status == 'RESERVED':
+                booking.status = 'CONFIRMED'
+            booking.save(using=alias, update_fields=['confirmation_status', 'confirmed_at', 'status', 'updated_at'])
+
+            BookingStatusHistory.objects.using(alias).create(
+                booking=booking,
+                from_status='RESERVED',
+                to_status=booking.status,
+                reason_code='MANUAL_CONFIRMED',
+                reason_text=request.data.get('notes', 'Confirmed by staff'),
+                changed_by_user=request.user,
+                changed_at=timezone.now()
+            )
+            return Response({
+                'id': str(booking.id),
+                'status': booking.status,
+                'confirmation_status': booking.confirmation_status,
+                'detail': 'Booking confirmed successfully.'
+            }, status=status.HTTP_200_OK)
+
+        return Response({'detail': 'Booking not found.'}, status=status.HTTP_404_NOT_FOUND)
 
     @action(detail=False, methods=['post'], url_path='promote-waitlist')
     def promote_waitlist(self, request):
@@ -953,3 +983,171 @@ class AccessEventViewSet(viewsets.ModelViewSet):
         )
         serializer = self.get_serializer(event)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class BookingPolicyViewSet(viewsets.ViewSet):
+    """
+    API endpoint for retrieving, updating, and triggering configurable booking policies.
+    Supports tenant-wide defaults and optional branch overrides.
+    Captures explicit choice: new bookings only vs existing eligible bookings.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def list(self, request):
+        alias = _get_db(request)
+        from .models_org import Organization
+        from .services_booking_policy import BookingPolicyService
+        from .serializers_bookings import BookingPolicyConfigSerializer
+        from .models_bookings import BookingPolicyConfig
+
+        org = Organization.objects.using(alias).filter(status='ACTIVE').first()
+        if not org:
+            return Response({'detail': 'No active organization found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
+        branch = None
+        if branch_id:
+            branch = Branch.objects.using(alias).filter(id=branch_id).first()
+
+        effective = BookingPolicyService.get_effective_policy(org, branch=branch, db_alias=alias)
+        config_obj = BookingPolicyConfig.objects.using(alias).filter(organization=org, branch=branch).first()
+
+        return Response({
+            'organization_id': str(org.id),
+            'branch_id': str(branch.id) if branch else None,
+            'is_branch_override': branch is not None and config_obj is not None,
+            'effective_policy': effective,
+            'saved_config': BookingPolicyConfigSerializer(config_obj).data if config_obj else None,
+        }, status=status.HTTP_200_OK)
+
+    def create(self, request):
+        alias = _get_db(request)
+        from .models_org import Organization
+        from .services_booking_policy import BookingPolicyService
+        from .serializers_bookings import BookingPolicyConfigSerializer
+
+        org = Organization.objects.using(alias).filter(status='ACTIVE').first()
+        if not org:
+            return Response({'detail': 'No active organization found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        branch_id = request.data.get('branch_id') or request.data.get('branch')
+        branch = None
+        if branch_id:
+            branch = Branch.objects.using(alias).filter(id=branch_id).first()
+            if not branch:
+                return Response({'detail': f"Branch '{branch_id}' not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        apply_to_existing = request.data.get('apply_to_existing_bookings', False)
+        if isinstance(apply_to_existing, str):
+            apply_to_existing = apply_to_existing.lower() in ('true', '1', 'yes')
+
+        saved_cfg = BookingPolicyService.save_policy(
+            organization=org,
+            policy_data=request.data,
+            branch=branch,
+            apply_to_existing=bool(apply_to_existing),
+            actor_user=request.user,
+            db_alias=alias,
+        )
+
+        effective = BookingPolicyService.get_effective_policy(org, branch=branch, db_alias=alias)
+
+        return Response({
+            'detail': 'Booking policy saved successfully.',
+            'is_branch_override': branch is not None,
+            'apply_to_existing_bookings': saved_cfg.apply_to_existing_bookings,
+            'policy_effective_at': saved_cfg.policy_effective_at.isoformat(),
+            'effective_policy': effective,
+            'saved_config': BookingPolicyConfigSerializer(saved_cfg).data,
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['post'], url_path='run-auto-cancellation')
+    def run_auto_cancellation(self, request):
+        alias = _get_db(request)
+        from .models_org import Organization
+        from .services_booking_policy import BookingPolicyService
+
+        org = Organization.objects.using(alias).filter(status='ACTIVE').first()
+        if not org:
+            return Response({'detail': 'No active organization found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        branch_id = request.data.get('branch_id')
+        branch = Branch.objects.using(alias).filter(id=branch_id).first() if branch_id else None
+        dry_run = request.data.get('dry_run', False)
+
+        results = BookingPolicyService.process_auto_cancellations(
+            organization=org,
+            branch=branch,
+            dry_run=bool(dry_run),
+            db_alias=alias,
+        )
+        cancelled_unpaid = results.get('cancelled_unpaid_count', 0)
+        cancelled_unconfirmed = results.get('cancelled_unconfirmed_count', 0)
+        total_cancelled = results.get('auto_cancelled_count', cancelled_unpaid + cancelled_unconfirmed)
+        promoted = results.get('promoted_from_waitlist_count', 0)
+        detail = (
+            f"Auto-cancellation complete: {total_cancelled} cancelled "
+            f"({cancelled_unpaid} unpaid, {cancelled_unconfirmed} unconfirmed), "
+            f"{promoted} promoted from waitlist."
+        )
+        return Response({
+            'detail': detail,
+            'auto_cancelled_count': total_cancelled,
+            'cancelled_unpaid_count': cancelled_unpaid,
+            'cancelled_unconfirmed_count': cancelled_unconfirmed,
+            'promoted_from_waitlist_count': promoted,
+            'evaluated_count': results.get('evaluated_count', 0),
+            'results': results,
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['post'], url_path='reset-branch-override')
+    def reset_branch_override(self, request):
+        alias = _get_db(request)
+        from .models_org import Organization
+        from .services_booking_policy import BookingPolicyService
+        from .models_bookings import BookingPolicyConfig
+        from apps.tenant_core.services_reliability import record_business_audit
+
+        org = Organization.objects.using(alias).filter(status='ACTIVE').first()
+        if not org:
+            return Response({'detail': 'No active organization found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        branch_id = request.data.get('branch_id')
+        if not branch_id:
+            return Response({'detail': 'branch_id is required to reset branch override.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        branch = Branch.objects.using(alias).filter(id=branch_id).first()
+        if not branch:
+            return Response({'detail': f"Branch '{branch_id}' not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        cfg = BookingPolicyConfig.objects.using(alias).filter(organization=org, branch=branch).first()
+        if cfg:
+            cfg.delete(using=alias)
+
+        from .models_govern import BranchSettings
+        b_settings = BranchSettings.objects.using(alias).filter(branch=branch).first()
+        if b_settings:
+            b_settings.booking_config = None
+            b_settings.booking_cancellation_window_hours = None
+            b_settings.late_cancellation_fee = None
+            b_settings.save(using=alias, update_fields=['booking_config', 'booking_cancellation_window_hours', 'late_cancellation_fee', 'updated_at'])
+
+        record_business_audit(
+            organization=org,
+            module='BOOKINGS',
+            action_code='BOOKING_POLICY_BRANCH_OVERRIDE_REMOVED',
+            entity_type='BookingPolicyConfig',
+            entity_id=None,
+            branch=branch,
+            actor_user=request.user,
+            metadata={'branch_name': branch.name},
+            db_alias=alias,
+        )
+
+        effective = BookingPolicyService.get_effective_policy(org, branch=branch, db_alias=alias)
+        return Response({
+            'detail': f"Branch override for '{branch.name}' removed. Reverted to organization defaults.",
+            'is_branch_override': False,
+            'effective_policy': effective,
+        }, status=status.HTTP_200_OK)
+

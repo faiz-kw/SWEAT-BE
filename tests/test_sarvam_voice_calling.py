@@ -21,7 +21,7 @@ import io
 import urllib.error
 from unittest.mock import patch, MagicMock
 from datetime import timedelta
-from django.test import TestCase, TransactionTestCase
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -51,8 +51,9 @@ from apps.tenant_core.services_voice_calling import VoiceCallingService
 from apps.tenant_core.services_crm import CRMLeadService
 
 
+@override_settings(COMMUNICATIONS_OUTBOUND_ENABLED=True, VOICE_CALLING_ENABLED=True, VOICE_CALLING_ENFORCE_HOURS=False)
 class SarvamVoiceCallingTests(TestCase):
-    databases = '__all__'
+    databases = {'default', 'tenant_test'}
 
     def setUp(self):
         super().setUp()
@@ -583,7 +584,11 @@ class SarvamVoiceCallingTests(TestCase):
             'status': 'connected',
             'duration': 180.0,
             'interaction_transcript': [{'role': 'agent', 'en_text': 'Spoofed call'}],
-            'metadata': {'call_session_id': str(session.id)},
+            # Correct Sarvam schema: metadata is echoed inside webhook_config.metadata
+            'webhook_config': {
+                'url': 'https://test.example.com/webhook',
+                'metadata': {'call_session_id': str(session.id)},
+            },
         }
 
         # Submit with incorrect token
@@ -632,9 +637,14 @@ class SarvamVoiceCallingTests(TestCase):
                 'intent': 'BOOK_TRIAL',
                 'preferred_time': '10:00 AM',
             },
-            'metadata': {
-                'call_session_id': str(session.id),
-                'lead_id': str(self.lead_a.id),
+            # Official Sarvam schema: metadata echoed inside webhook_config.metadata
+            # See: https://docs.sarvam.ai/voice-agents/api/instant-outbound/webhook-payload.md
+            'webhook_config': {
+                'url': 'https://test.example.com/webhook',
+                'metadata': {
+                    'call_session_id': str(session.id),
+                    'lead_id': str(self.lead_a.id),
+                },
             },
         }
 
@@ -672,10 +682,14 @@ class SarvamVoiceCallingTests(TestCase):
 
         url = f"/api/v1/webhooks/communications/sarvam/{self.tenant_a.id}/"
         # Out-of-order callback arriving late with status 'ringing'
+        # Uses correct Sarvam schema: metadata inside webhook_config.metadata
         delayed_payload = {
             'attempt_id': 'attempt_terminal_1',
             'status': 'ringing',
-            'metadata': {'call_session_id': str(session.id)},
+            'webhook_config': {
+                'url': 'https://test.example.com/webhook',
+                'metadata': {'call_session_id': str(session.id)},
+            },
         }
 
         response = self.client.post(
@@ -715,7 +729,10 @@ class SarvamVoiceCallingTests(TestCase):
         payload = {
             'attempt_id': 'attempt_iso_a',
             'status': 'connected',
-            'metadata': {'call_session_id': str(session_a.id)},
+            'webhook_config': {
+                'url': 'https://test.example.com/webhook',
+                'metadata': {'call_session_id': str(session_a.id)},
+            },
         }
 
         # Tenant B has no Sarvam integration configured in its DB
@@ -1152,7 +1169,11 @@ class SarvamVoiceCallingTests(TestCase):
             'status': 'connected',
             'duration': 42.0,
             'interaction_transcript': [{'role': 'agent', 'text': 'Hello'}],
-            'metadata': {'call_session_id': str(session.id)},
+            # Correct Sarvam schema
+            'webhook_config': {
+                'url': 'https://test.example.com/webhook',
+                'metadata': {'call_session_id': str(session.id)},
+            },
         }
 
         result = VoiceCallingService.record_call_webhook(self.org_a, webhook_payload, db_alias='tenant_test')
@@ -1181,7 +1202,10 @@ class SarvamVoiceCallingTests(TestCase):
         failed_payload = {
             'attempt_id': 'attempt_term_001',
             'status': 'failed',
-            'metadata': {'call_session_id': str(session.id)},
+            'webhook_config': {
+                'url': 'https://test.example.com/webhook',
+                'metadata': {'call_session_id': str(session.id)},
+            },
         }
 
         result = VoiceCallingService.record_call_webhook(self.org_a, failed_payload, db_alias='tenant_test')
@@ -1206,7 +1230,10 @@ class SarvamVoiceCallingTests(TestCase):
         completed_payload = {
             'attempt_id': 'attempt_term_002',
             'status': 'connected',
-            'metadata': {'call_session_id': str(session.id)},
+            'webhook_config': {
+                'url': 'https://test.example.com/webhook',
+                'metadata': {'call_session_id': str(session.id)},
+            },
         }
 
         result = VoiceCallingService.record_call_webhook(self.org_a, completed_payload, db_alias='tenant_test')
@@ -1235,7 +1262,10 @@ class SarvamVoiceCallingTests(TestCase):
             'status': 'connected',
             'duration': 0.0,
             'interaction_transcript': [],
-            'metadata': {'call_session_id': str(session.id)},
+            'webhook_config': {
+                'url': 'https://test.example.com/webhook',
+                'metadata': {'call_session_id': str(session.id)},
+            },
         }
 
         result = VoiceCallingService.record_call_webhook(self.org_a, duplicate_payload, db_alias='tenant_test')
@@ -1261,7 +1291,10 @@ class SarvamVoiceCallingTests(TestCase):
         late_payload = {
             'attempt_id': 'attempt_term_004',
             'status': 'ringing',
-            'metadata': {'call_session_id': str(session.id)},
+            'webhook_config': {
+                'url': 'https://test.example.com/webhook',
+                'metadata': {'call_session_id': str(session.id)},
+            },
         }
 
         result = VoiceCallingService.record_call_webhook(self.org_a, late_payload, db_alias='tenant_test')
@@ -1286,7 +1319,11 @@ class SarvamVoiceCallingTests(TestCase):
             'attempt_id': 'attempt_malformed_test_123',
             'status': 'connected',
             'duration': 25.0,
-            'metadata': {'call_session_id': 'not-a-valid-uuid-string-12345'},
+            # Bad UUID in correct Sarvam location; must fall back to attempt_id matching
+            'webhook_config': {
+                'url': 'https://test.example.com/webhook',
+                'metadata': {'call_session_id': 'not-a-valid-uuid-string-12345'},
+            },
         }
 
         result = VoiceCallingService.record_call_webhook(self.org_a, malformed_payload, db_alias='tenant_test')
@@ -1296,6 +1333,236 @@ class SarvamVoiceCallingTests(TestCase):
         session.refresh_from_db()
         self.assertEqual(session.status, 'COMPLETED')
         self.assertEqual(session.duration_seconds, 25.0)
+
+    # -------------------------------------------------------------------------
+    # Regression Tests: Official Sarvam webhook_config.metadata Schema
+    # Ref: https://docs.sarvam.ai/voice-agents/api/instant-outbound/webhook-payload.md
+    # -------------------------------------------------------------------------
+
+    def test_sarvam_official_schema_webhook_config_metadata_matches_session_by_id(self):
+        """
+        REGRESSION: Official Sarvam payload places call_session_id in webhook_config.metadata.
+        The service must extract it from there and match the CallSession by primary key.
+        This is the critical path that was broken (payload['metadata'] was read instead of
+        payload['webhook_config']['metadata']).
+        """
+        session = CallSession.objects.using('tenant_test').create(
+            organization=self.org_a,
+            lead=self.lead_a,
+            provider='SARVAM',
+            status='INITIATED',
+            direction='OUTBOUND',
+            user_phone_number='+919876543210',
+            # Deliberately no provider_attempt_id so ONLY session-ID match can succeed
+        )
+
+        # Exact shape Sarvam sends per official documentation
+        official_sarvam_payload = {
+            'attempt_id': 'attempt_official_schema_test_001',
+            'status': 'connected',
+            'channel_info': {
+                'channel_type': 'v2v',
+                'channel_provider': 'exotel',
+                'agent_phone_number': '+918040000000',
+            },
+            'duration': 33.5,
+            'interaction_id': '20260101/abc123def456',
+            'failure_reason': None,
+            'final_agent_variables': {'intent': 'TRIAL_BOOKED'},
+            'interaction_transcript': [
+                {'role': 'agent', 'en_text': 'Hi, calling from SWEAT!'},
+                {'role': 'user', 'en_text': 'Yes, I want to join.'},
+            ],
+            # metadata lives here per official spec, NOT at top level
+            'webhook_config': {
+                'url': 'https://api.fitness.vibecopilot.ai/api/v1/webhooks/communications/sarvam/sweat/',
+                'metadata': {
+                    'call_session_id': str(session.id),
+                    'lead_id': str(self.lead_a.id),
+                },
+            },
+        }
+
+        result = VoiceCallingService.record_call_webhook(
+            self.org_a, official_sarvam_payload, db_alias='tenant_test'
+        )
+
+        self.assertEqual(result['status'], 'recorded', f"Expected 'recorded', got: {result}")
+        self.assertEqual(result['call_session_id'], str(session.id))
+        self.assertEqual(result['call_status'], 'COMPLETED')
+        self.assertEqual(result['duration'], 33.5)
+
+        session.refresh_from_db()
+        self.assertEqual(session.status, 'COMPLETED')
+        self.assertEqual(session.duration_seconds, 33.5)
+        self.assertEqual(session.provider_attempt_id, 'attempt_official_schema_test_001')
+        self.assertEqual(len(session.transcript), 2)
+        self.assertEqual(session.final_agent_variables.get('intent'), 'TRIAL_BOOKED')
+
+    def test_sarvam_schema_null_webhook_config_metadata_falls_back_to_attempt_id(self):
+        """
+        REGRESSION: When webhook_config.metadata is null (as Sarvam sends for no-answer/busy),
+        the service must NOT crash and must fall back to matching by provider_attempt_id.
+        """
+        session = CallSession.objects.using('tenant_test').create(
+            organization=self.org_a,
+            lead=self.lead_a,
+            provider='SARVAM',
+            status='INITIATED',
+            direction='OUTBOUND',
+            provider_attempt_id='attempt_null_meta_001',
+            user_phone_number='+919876543210',
+        )
+
+        # Sarvam sends metadata: null for unanswered calls
+        no_answer_payload = {
+            'attempt_id': 'attempt_null_meta_001',
+            'status': 'no_answer',
+            'channel_info': {
+                'channel_type': 'v2v',
+                'channel_provider': 'exotel',
+                'agent_phone_number': '+918040000000',
+            },
+            'duration': None,
+            'interaction_id': None,
+            'failure_reason': None,
+            'final_agent_variables': None,
+            'interaction_transcript': None,
+            'webhook_config': {
+                'url': 'https://api.fitness.vibecopilot.ai/api/v1/webhooks/communications/sarvam/sweat/',
+                'metadata': None,  # Sarvam sends null when no custom metadata was provided
+            },
+        }
+
+        result = VoiceCallingService.record_call_webhook(
+            self.org_a, no_answer_payload, db_alias='tenant_test'
+        )
+
+        self.assertEqual(result['status'], 'recorded')
+        self.assertEqual(result['call_status'], 'NO_ANSWER')
+
+        session.refresh_from_db()
+        self.assertEqual(session.status, 'NO_ANSWER')
+
+    def test_sarvam_schema_missing_webhook_config_falls_back_to_attempt_id(self):
+        """
+        REGRESSION: If webhook_config is entirely absent (e.g. Sarvam schema change or
+        stripped by a proxy), the service must not crash and must fall back to attempt_id.
+        """
+        session = CallSession.objects.using('tenant_test').create(
+            organization=self.org_a,
+            lead=self.lead_a,
+            provider='SARVAM',
+            status='INITIATED',
+            direction='OUTBOUND',
+            provider_attempt_id='attempt_no_wc_001',
+            user_phone_number='+919876543210',
+        )
+
+        payload_no_wc = {
+            'attempt_id': 'attempt_no_wc_001',
+            'status': 'busy',
+            # No webhook_config key at all
+        }
+
+        result = VoiceCallingService.record_call_webhook(
+            self.org_a, payload_no_wc, db_alias='tenant_test'
+        )
+
+        self.assertEqual(result['status'], 'recorded')
+        self.assertEqual(result['call_status'], 'BUSY')
+
+        session.refresh_from_db()
+        self.assertEqual(session.status, 'BUSY')
+
+    def test_parse_status_webhook_extracts_metadata_from_webhook_config(self):
+        """
+        REGRESSION: parse_status_webhook must extract echoed metadata from
+        payload['webhook_config']['metadata'], not payload['metadata'].
+        """
+        from apps.tenant_core.communication.adapters.voice_sarvam import SarvamVoiceAdapter
+
+        adapter = SarvamVoiceAdapter(
+            configuration={'webhook_token': 'test_token'},
+            secret_credentials={},
+        )
+
+        official_payload = {
+            'attempt_id': 'attempt_parse_test_001',
+            'status': 'connected',
+            'duration': 20.0,
+            'interaction_id': '20260101/xyz',
+            'final_agent_variables': {'key': 'value'},
+            'interaction_transcript': [{'role': 'agent', 'en_text': 'Hello'}],
+            'webhook_config': {
+                'url': 'https://example.com/webhook',
+                'metadata': {
+                    'call_session_id': 'some-uuid-123',
+                    'lead_id': 'lead-456',
+                },
+            },
+        }
+
+        event = adapter.parse_status_webhook(official_payload)
+        self.assertIsNotNone(event)
+        self.assertEqual(event.provider_message_id, 'attempt_parse_test_001')
+        self.assertEqual(event.status, 'COMPLETED')
+
+        # The critical assertion: metadata must come from webhook_config.metadata
+        self.assertEqual(
+            event.raw_metadata['metadata']['call_session_id'],
+            'some-uuid-123',
+            "parse_status_webhook must extract metadata from webhook_config.metadata, not payload.metadata"
+        )
+        self.assertEqual(event.raw_metadata['metadata']['lead_id'], 'lead-456')
+        self.assertEqual(event.raw_metadata['duration'], 20.0)
+
+        # Also verify that a payload with null webhook_config does not crash
+        null_wc_payload = {
+            'attempt_id': 'attempt_parse_null_wc',
+            'status': 'failed',
+            'webhook_config': None,
+        }
+        event2 = adapter.parse_status_webhook(null_wc_payload)
+        self.assertIsNotNone(event2)
+        self.assertEqual(event2.raw_metadata['metadata'], {})
+
+    def test_top_level_metadata_no_longer_used_for_session_matching(self):
+        """
+        REGRESSION GUARD: A payload with call_session_id at the OLD top-level 'metadata'
+        key (not in webhook_config.metadata) must NOT match by session ID — it must fall
+        back to attempt_id or return 'unmatched'. This confirms the fix is in effect.
+        """
+        session = CallSession.objects.using('tenant_test').create(
+            organization=self.org_a,
+            lead=self.lead_a,
+            provider='SARVAM',
+            status='INITIATED',
+            direction='OUTBOUND',
+            # No provider_attempt_id, so ONLY session-ID lookup can find it
+        )
+
+        old_style_payload = {
+            'attempt_id': 'attempt_old_style_meta_999',
+            'status': 'connected',
+            'duration': 10.0,
+            # Old (wrong) location — top-level metadata. This must NOT match the session.
+            'metadata': {'call_session_id': str(session.id)},
+        }
+
+        result = VoiceCallingService.record_call_webhook(
+            self.org_a, old_style_payload, db_alias='tenant_test'
+        )
+
+        # Must be 'unmatched': session ID not found (metadata ignored), no attempt_id match
+        self.assertEqual(
+            result['status'], 'unmatched',
+            "Top-level payload.metadata must not be used for session ID matching after the fix."
+        )
+
+        # Original session must remain INITIATED — untouched
+        session.refresh_from_db()
+        self.assertEqual(session.status, 'INITIATED')
 
     # -------------------------------------------------------------------------
     # Comprehensive Voice Consent & Suppression Enforcement Tests
@@ -1827,10 +2094,221 @@ class SarvamVoiceCallingTests(TestCase):
             self.assertNotIn('webhook_secret_token', raw_json)
             self.assertNotIn('env://SARVAM_API_KEY', raw_json)
 
+    # =========================================================================
+    # Task 3 — Global Outbound Voice Calling Safety Gate Verification
+    # =========================================================================
+
+    @patch('urllib.request.urlopen')
+    def test_safety_gate_both_flags_enabled_allows_dispatch(self, mock_urlopen):
+        """
+        When both COMMUNICATIONS_OUTBOUND_ENABLED and VOICE_CALLING_ENABLED are True,
+        execution proceeds to provider-mocking logic and succeeds (HTTP 201).
+        """
+        mock_response = MagicMock()
+        mock_response.getcode.return_value = 200
+        mock_response.read.return_value = json.dumps({'attempt_id': 'att_gate_allowed_1'}).encode('utf-8')
+        mock_response.__enter__.return_value = mock_response
+        mock_urlopen.return_value = mock_response
+
+        with override_settings(COMMUNICATIONS_OUTBOUND_ENABLED=True, VOICE_CALLING_ENABLED=True):
+            with patch.dict('os.environ', {'SARVAM_API_KEY': 'mock_secret'}):
+                self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.token_editor}')
+                response = self.client.post(
+                    f"/api/v1/tenant/leads/{self.lead_a.id}/call/",
+                    data={},
+                    format='json',
+                    HTTP_X_IDEMPOTENCY_KEY='gate-allowed-key-1',
+                )
+
+                self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+                self.assertEqual(response.data['status'], 'INITIATED')
+                self.assertEqual(mock_urlopen.call_count, 1)
+
+    @patch('urllib.request.urlopen')
+    def test_safety_gate_communications_outbound_disabled_blocks_dispatch(self, mock_urlopen):
+        """
+        When COMMUNICATIONS_OUTBOUND_ENABLED=False (even if VOICE_CALLING_ENABLED=True),
+        provider dispatch is blocked at both service and view level.
+        """
+        with override_settings(COMMUNICATIONS_OUTBOUND_ENABLED=False, VOICE_CALLING_ENABLED=True):
+            # 1. Service direct call fails closed with ValueError
+            with self.assertRaises(ValueError) as ctx:
+                VoiceCallingService.initiate_outbound_call(
+                    lead=self.lead_a,
+                    idempotency_key='gate-comm-disabled-svc',
+                    db_alias='tenant_test',
+                )
+            self.assertIn('Outbound communications are disabled in this deployment.', str(ctx.exception))
+            mock_urlopen.assert_not_called()
+
+            # 2. View returns HTTP 403 Forbidden with VOICE_CALLING_DISABLED
+            self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.token_editor}')
+            response = self.client.post(
+                f"/api/v1/tenant/leads/{self.lead_a.id}/call/",
+                data={},
+                format='json',
+                HTTP_X_IDEMPOTENCY_KEY='gate-comm-disabled-view',
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+            self.assertEqual(response.data.get('code'), 'VOICE_CALLING_DISABLED')
+            mock_urlopen.assert_not_called()
+
+    @patch('urllib.request.urlopen')
+    def test_safety_gate_voice_calling_disabled_blocks_dispatch(self, mock_urlopen):
+        """
+        When VOICE_CALLING_ENABLED=False (even if COMMUNICATIONS_OUTBOUND_ENABLED=True),
+        provider dispatch is blocked at both service and view level.
+        """
+        with override_settings(COMMUNICATIONS_OUTBOUND_ENABLED=True, VOICE_CALLING_ENABLED=False):
+            # 1. Service direct call fails closed with ValueError
+            with self.assertRaises(ValueError) as ctx:
+                VoiceCallingService.initiate_outbound_call(
+                    lead=self.lead_a,
+                    idempotency_key='gate-voice-disabled-svc',
+                    db_alias='tenant_test',
+                )
+            self.assertIn('Outbound voice calling is disabled in this deployment.', str(ctx.exception))
+            mock_urlopen.assert_not_called()
+
+            # 2. View returns HTTP 403 Forbidden with VOICE_CALLING_DISABLED
+            self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.token_editor}')
+            response = self.client.post(
+                f"/api/v1/tenant/leads/{self.lead_a.id}/call/",
+                data={},
+                format='json',
+                HTTP_X_IDEMPOTENCY_KEY='gate-voice-disabled-view',
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+            self.assertEqual(response.data.get('code'), 'VOICE_CALLING_DISABLED')
+            mock_urlopen.assert_not_called()
+
+    @patch('urllib.request.urlopen')
+    def test_safety_gate_both_flags_disabled_blocks_dispatch(self, mock_urlopen):
+        """
+        When both COMMUNICATIONS_OUTBOUND_ENABLED=False and VOICE_CALLING_ENABLED=False,
+        provider dispatch is strictly blocked.
+        """
+        with override_settings(COMMUNICATIONS_OUTBOUND_ENABLED=False, VOICE_CALLING_ENABLED=False):
+            with self.assertRaises(ValueError):
+                VoiceCallingService.initiate_outbound_call(
+                    lead=self.lead_a,
+                    idempotency_key='gate-both-disabled-svc',
+                    db_alias='tenant_test',
+                )
+            mock_urlopen.assert_not_called()
+
+            self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.token_editor}')
+            response = self.client.post(
+                f"/api/v1/tenant/leads/{self.lead_a.id}/call/",
+                data={},
+                format='json',
+                HTTP_X_IDEMPOTENCY_KEY='gate-both-disabled-view',
+            )
+
+            self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+            self.assertEqual(response.data.get('code'), 'VOICE_CALLING_DISABLED')
+            mock_urlopen.assert_not_called()
+
+    @patch('urllib.request.urlopen')
+    def test_safety_gate_missing_voice_calling_enabled_fails_closed(self, mock_urlopen):
+        """
+        When VOICE_CALLING_ENABLED is completely absent / deleted from settings,
+        the system must fail closed (treat as False) and block provider dispatch.
+        """
+        from django.conf import settings
+        has_voice_flag = hasattr(settings, 'VOICE_CALLING_ENABLED')
+        orig_val = getattr(settings, 'VOICE_CALLING_ENABLED', None)
+        try:
+            if has_voice_flag:
+                delattr(settings._wrapped if hasattr(settings, '_wrapped') else settings, 'VOICE_CALLING_ENABLED')
+
+            with override_settings(COMMUNICATIONS_OUTBOUND_ENABLED=True):
+                with self.assertRaises(ValueError) as ctx:
+                    VoiceCallingService.initiate_outbound_call(
+                        lead=self.lead_a,
+                        idempotency_key='gate-missing-svc',
+                        db_alias='tenant_test',
+                    )
+                self.assertIn('Outbound voice calling is disabled in this deployment.', str(ctx.exception))
+                mock_urlopen.assert_not_called()
+
+                self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.token_editor}')
+                response = self.client.post(
+                    f"/api/v1/tenant/leads/{self.lead_a.id}/call/",
+                    data={},
+                    format='json',
+                    HTTP_X_IDEMPOTENCY_KEY='gate-missing-view',
+                )
+
+                self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+                self.assertEqual(response.data.get('code'), 'VOICE_CALLING_DISABLED')
+                mock_urlopen.assert_not_called()
+        finally:
+            if has_voice_flag:
+                setattr(settings._wrapped if hasattr(settings, '_wrapped') else settings, 'VOICE_CALLING_ENABLED', orig_val)
+
+    @patch('urllib.request.urlopen')
+    def test_safety_gate_consent_and_idempotency_preserved_when_enabled(self, mock_urlopen):
+        """
+        Confirms that when gates are enabled, existing consent enforcement and
+        idempotency caching operate without degradation.
+        """
+        mock_response = MagicMock()
+        mock_response.getcode.return_value = 200
+        mock_response.read.return_value = json.dumps({'attempt_id': 'att_gate_preserve_1'}).encode('utf-8')
+        mock_response.__enter__.return_value = mock_response
+        mock_urlopen.return_value = mock_response
+
+        with override_settings(COMMUNICATIONS_OUTBOUND_ENABLED=True, VOICE_CALLING_ENABLED=True):
+            with patch.dict('os.environ', {'SARVAM_API_KEY': 'mock_secret'}):
+                lead_unconsented = Lead.objects.using('tenant_test').create(
+                    organization=self.org_a,
+                    branch=self.branch_a,
+                    first_name='Unconsented',
+                    last_name='Lead',
+                    phone_normalized='+919876543291',
+                    lead_source=self.lead_source,
+                    current_status='NEW_LEAD',
+                    do_not_contact=False,
+                )
+                self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.token_editor}')
+                response = self.client.post(
+                    f"/api/v1/tenant/leads/{lead_unconsented.id}/call/",
+                    data={},
+                    format='json',
+                    HTTP_X_IDEMPOTENCY_KEY='gate-preserve-unconsented',
+                )
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertEqual(response.data.get('code'), 'INVALID_RECIPIENT_OR_CONSENT')
+                mock_urlopen.assert_not_called()
+
+                # Idempotency safe replay test
+                response1 = self.client.post(
+                    f"/api/v1/tenant/leads/{self.lead_a.id}/call/",
+                    data={},
+                    format='json',
+                    HTTP_X_IDEMPOTENCY_KEY='gate-preserve-idem-key',
+                )
+                self.assertEqual(response1.status_code, status.HTTP_201_CREATED)
+                self.assertEqual(mock_urlopen.call_count, 1)
+
+                response2 = self.client.post(
+                    f"/api/v1/tenant/leads/{self.lead_a.id}/call/",
+                    data={},
+                    format='json',
+                    HTTP_X_IDEMPOTENCY_KEY='gate-preserve-idem-key',
+                )
+                self.assertEqual(response2.status_code, status.HTTP_200_OK)
+                self.assertTrue(response2.data.get('is_duplicate'))
+                self.assertEqual(mock_urlopen.call_count, 1)
+
 
 # =============================================================================
 # Task 2 — Safe PostgreSQL Concurrency Verification Suite
 # =============================================================================
+@override_settings(COMMUNICATIONS_OUTBOUND_ENABLED=True, VOICE_CALLING_ENABLED=True, VOICE_CALLING_ENFORCE_HOURS=False)
 class SarvamPostgresConcurrencyTests(TransactionTestCase):
     """
     Dedicated transaction-capable concurrency test suite.
@@ -1841,7 +2319,7 @@ class SarvamPostgresConcurrencyTests(TransactionTestCase):
     3. External Sarvam adapter is NEVER called more than once and is mocked safely.
     4. Database lock is released BEFORE external provider I/O.
     """
-    databases = '__all__'
+    databases = {'default', 'tenant_test'}
 
     def setUp(self):
         super().setUp()

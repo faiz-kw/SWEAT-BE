@@ -10,6 +10,16 @@ from .views import (
     BranchWorkingHoursViewSet, BranchOperatingExceptionViewSet,
     VerifyAccessView, TenantDatabaseHealthView,
 )
+from .views_voice_agent import (
+    VoiceAgentBranchesView,
+    VoiceAgentClassesView,
+    VoiceAgentBookTrialView,
+    VoiceAgentLeadContextView,
+    VoiceAgentRescheduleTrialView,
+    VoiceAgentCancelTrialView,
+    VoiceAgentCallOutcomeView,
+    VoiceAgentCallbackView,
+)
 from .views_storage import (
     FileViewSet,
     StorageConfirmUploadView,
@@ -39,6 +49,7 @@ from .views_workforce import (
     TrainerSpecialtyViewSet,
     TrainerSpecialtyAssignmentViewSet,
 )
+from .views_whatsapp import WhatsAppAutomationPolicyViewSet
 from .views_crm import (
     LeadSourceViewSet,
     LeadViewSet,
@@ -141,6 +152,7 @@ from .views_bookings import (
     BookingViewSet,
     BookingPolicySetViewSet,
     BookingCancellationRuleViewSet,
+    BookingPolicyViewSet,
     RewardRedemptionRuleViewSet,
     AttendancePolicySetViewSet,
     AttendancePenaltyRuleViewSet,
@@ -177,6 +189,7 @@ router.register(r'reward-ledgers', RewardLedgerViewSet, basename='reward-ledger'
 router.register(r'order-reward-redemptions', OrderRewardRedemptionViewSet, basename='order-reward-redemption')
 
 router.register(r'bookings', BookingViewSet, basename='booking')
+router.register(r'booking-policy', BookingPolicyViewSet, basename='booking-policy')
 router.register(r'booking-policy-sets', BookingPolicySetViewSet, basename='booking-policy-set')
 router.register(r'booking-cancellation-rules', BookingCancellationRuleViewSet, basename='booking-cancellation-rule')
 router.register(r'reward-redemption-rules', RewardRedemptionRuleViewSet, basename='reward-redemption-rule')
@@ -282,6 +295,7 @@ router.register(r'crm/trial-reminder-policy', CRMTrialReminderPolicyViewSet, bas
 router.register(r'crm/attention-policy', CRMAttentionPolicyViewSet, basename='crm-attention-policy')
 router.register(r'crm/agent-assignment-config', CRMAgentAssignmentConfigViewSet, basename='crm-agent-assignment-config')
 router.register(r'crm/channels', CRMCommunicationChannelsViewSet, basename='crm-channel')
+router.register(r'crm/whatsapp-policy', WhatsAppAutomationPolicyViewSet, basename='crm-whatsapp-policy')
 router.register(r'crm/communications', CommunicationMessageViewSet, basename='crm-communication')
 router.register(r'crm/campaigns', CRMCampaignPerformanceViewSet, basename='crm-campaign')
 router.register(r'crm/dashboard', CRMDashboardViewSet, basename='crm-dashboard')
@@ -334,5 +348,13 @@ urlpatterns = [
     path('storage/confirm-upload/', StorageConfirmUploadView.as_view(), name='storage-confirm-upload'),
     path('storage/presign-download/<uuid:id>/', StoragePresignDownloadView.as_view(), name='storage-presign-download'),
     path('classes/metadata/', ClassesMetadataView.as_view(), name='classes-metadata'),
+    path('voice-agent/context/', VoiceAgentLeadContextView.as_view(), name='tenant-voice-agent-context'),
+    path('voice-agent/branches/', VoiceAgentBranchesView.as_view(), name='tenant-voice-agent-branches'),
+    path('voice-agent/classes/', VoiceAgentClassesView.as_view(), name='tenant-voice-agent-classes'),
+    path('voice-agent/book-trial/', VoiceAgentBookTrialView.as_view(), name='tenant-voice-agent-book-trial'),
+    path('voice-agent/reschedule-trial/', VoiceAgentRescheduleTrialView.as_view(), name='tenant-voice-agent-reschedule-trial'),
+    path('voice-agent/cancel-trial/', VoiceAgentCancelTrialView.as_view(), name='tenant-voice-agent-cancel-trial'),
+    path('voice-agent/callback/', VoiceAgentCallbackView.as_view(), name='tenant-voice-agent-callback'),
+    path('voice-agent/call-outcome/', VoiceAgentCallOutcomeView.as_view(), name='tenant-voice-agent-call-outcome'),
     path('', include(router.urls)),
 ]

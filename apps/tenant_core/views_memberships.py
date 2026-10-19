@@ -376,7 +376,7 @@ class MembershipViewSet(viewsets.ModelViewSet):
                  user.email and membership.user_profile.user.email.lower() == user.email.lower())
             )
         )
-        is_staff = user.is_authenticated and getattr(user, 'is_staff_or_admin', True)
+        is_staff = user.is_authenticated and (getattr(user, 'is_staff_or_admin', False) or getattr(user, 'is_staff', False) or getattr(user, 'role', '') in ('ADMIN', 'OWNER', 'STAFF', 'MANAGER'))
         if not (is_owner or is_staff):
             return Response({'detail': 'Permission denied.'}, status=status.HTTP_403_FORBIDDEN)
 
@@ -431,6 +431,46 @@ class MembershipViewSet(viewsets.ModelViewSet):
             from .serializers_crm import IntakeFormSerializer
             form_data = IntakeFormSerializer(form).data
 
+        from .models_crm import IntakeSubmission
+        user_prof = membership.user_profile
+        prior_subs = (
+            IntakeSubmission.objects.using(alias)
+            .filter(user_profile=user_prof, status='COMPLETED')
+            .order_by('-submitted_at')
+        ) if user_prof else IntakeSubmission.objects.none()
+        
+        submission_history = []
+        for s_rec in prior_subs:
+            s_answers = []
+            for a_rec in s_rec.answers.all():
+                val_text = a_rec.text_value or ('Yes' if a_rec.boolean_value is True else ('No' if a_rec.boolean_value is False else str(a_rec.numeric_value or '')))
+                s_answers.append({
+                    'question_id': str(a_rec.question.id) if a_rec.question else '',
+                    'question_text': a_rec.question.question_text if a_rec.question else '',
+                    'question_type': getattr(a_rec.question, 'question_type', 'TEXT') if a_rec.question else 'TEXT',
+                    'category': getattr(a_rec.question, 'category', 'GENERAL') if a_rec.question else 'GENERAL',
+                    'is_sensitive': getattr(a_rec.question, 'is_sensitive', False) if a_rec.question else False,
+                    'answer': val_text,
+                    'boolean_value': a_rec.boolean_value,
+                    'numeric_value': float(a_rec.numeric_value) if a_rec.numeric_value is not None else None,
+                })
+            s_meta = getattr(s_rec, 'metadata', {}) or {}
+            submission_history.append({
+                'id': str(s_rec.id),
+                'form_title': (s_rec.form_snapshot.get('form_title') if isinstance(s_rec.form_snapshot, dict) else None) or (s_rec.intake_form.name if s_rec.intake_form else 'PAR-Q Form'),
+                'form_version': (s_rec.form_snapshot.get('version_number') if isinstance(s_rec.form_snapshot, dict) else None) or (s_rec.intake_form.version_number if s_rec.intake_form else 1),
+                'submitted_at': s_rec.submitted_at.isoformat() if s_rec.submitted_at else None,
+                'signature_date': s_rec.signature_date.isoformat() if s_rec.signature_date else None,
+                'signer_identity': s_rec.signer_identity,
+                'signature_data': s_rec.signature_data,
+                'agreement_accepted': s_rec.agreement_accepted,
+                'agreement_title': getattr(s_rec.intake_form, 'agreement_title', '') if s_rec.intake_form else '',
+                'agreement_text_snapshot': s_rec.agreement_text_snapshot,
+                'is_edit': s_meta.get('is_edit', False),
+                'revision_number': s_meta.get('revision_number', 1),
+                'answers': s_answers,
+            })
+
         submission_data = None
         if membership.parq_submission:
             sub = membership.parq_submission
@@ -447,6 +487,8 @@ class MembershipViewSet(viewsets.ModelViewSet):
                 'agreement_text_snapshot': sub.agreement_text_snapshot,
                 'form_snapshot': sub.form_snapshot,
             }
+        elif submission_history:
+            submission_data = submission_history[0]
 
         return Response({
             'membership_id': str(membership.id),
@@ -458,6 +500,9 @@ class MembershipViewSet(viewsets.ModelViewSet):
             'is_configured': form is not None,
             'form': form_data,
             'submission': submission_data,
+            'has_existing_submission': len(submission_history) > 0,
+            'existing_submission': submission_history[0] if submission_history else None,
+            'submission_history': submission_history,
         }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'], url_path='sign-parq')
@@ -485,8 +530,46 @@ class MembershipViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN
             )
 
-        # Idempotency / duplicate check
-        if membership.parq_status == 'COMPLETED':
+        # Decision & Idempotency check
+        parq_decision = str(request.data.get('parq_decision', '')).upper().strip()
+
+        # OPTION A: REUSE EXISTING PAR-Q
+        if parq_decision == 'REUSE':
+            from .models_crm import IntakeSubmission
+            prior_subs = (
+                IntakeSubmission.objects.using(alias)
+                .filter(user_profile=user_profile, status='COMPLETED')
+                .order_by('-submitted_at')
+            )
+            existing_sub_id = request.data.get('existing_submission_id')
+            existing_sub = prior_subs.filter(id=existing_sub_id).first() if existing_sub_id else prior_subs.first()
+            if not existing_sub:
+                return Response(
+                    {'detail': 'No existing completed PAR-Q submission found to reuse.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Reusing MUST NOT create a duplicate IntakeSubmission record
+            with transaction.atomic(using=alias):
+                membership = Membership.objects.using(alias).select_for_update().get(id=membership.id)
+                membership.parq_status = 'COMPLETED'
+                membership.parq_submission = existing_sub
+                membership.parq_completed_at = existing_sub.submitted_at
+                membership.parq_form = existing_sub.intake_form or form
+                membership.save(using=alias, update_fields=['parq_status', 'parq_submission', 'parq_completed_at', 'parq_form', 'updated_at'])
+
+            return Response({
+                'success': True,
+                'message': f"Existing PAR-Q from {existing_sub.submitted_at.strftime('%b %d, %Y')} reused successfully. Historical record preserved.",
+                'membership_id': str(membership.id),
+                'membership_number': membership.membership_number,
+                'submission_id': str(existing_sub.id),
+                'parq_status': 'COMPLETED',
+                'is_reused': True,
+                'completed_at': existing_sub.submitted_at.isoformat(),
+            }, status=status.HTTP_200_OK)
+
+        if membership.parq_status == 'COMPLETED' and not parq_decision:
             return Response(
                 {'detail': f"PAR-Q has already been completed and digitally signed for membership {membership.membership_number}."},
                 status=status.HTTP_400_BAD_REQUEST
@@ -642,6 +725,9 @@ class MembershipViewSet(viewsets.ModelViewSet):
                     'signer_type': 'MEMBER_DIRECT',
                     'channel': 'MEMBER_PORTAL',
                     'membership_number': membership.membership_number,
+                    'is_edit': parq_decision == 'EDIT',
+                    'submission_type': 'REVISION' if parq_decision == 'EDIT' else ('NEW_ASSESSMENT' if parq_decision == 'NEW' else 'INITIAL'),
+                    'parq_decision': parq_decision or 'INITIAL',
                 },
                 signature_data=signature_data,
                 signature_date=now_dt,

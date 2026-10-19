@@ -25,6 +25,7 @@ from .views_mobile import (
     MobileValidateCouponView,
     MobileCheckoutOrderView,
     MobileCheckoutVerifyView,
+    MobileOrdersView,
     MobileOnboardingSurveyView,
     MobileOnboardingSubmitView,
     MobilePTAppointmentsView,
@@ -96,6 +97,7 @@ urlpatterns = [
     path('coupons/validate/', MobileValidateCouponView.as_view(), name='mobile-validate-coupon'),
     path('checkout/create-order/', MobileCheckoutOrderView.as_view(), name='mobile-checkout-create-order'),
     path('checkout/verify/', MobileCheckoutVerifyView.as_view(), name='mobile-checkout-verify'),
+    path('orders/', MobileOrdersView.as_view(), name='mobile-orders'),
 
     # 6. Onboarding & Health Assessments / PAR-Q
     path('onboarding/survey/', MobileOnboardingSurveyView.as_view(), name='mobile-onboarding-survey'),

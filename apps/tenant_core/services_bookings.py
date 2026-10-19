@@ -557,6 +557,9 @@ class BookingWaitlistAttendanceService:
         booking_source: str = 'WEB',
         membership: Membership = None,
         created_by_user=None,
+        payment_status: str = 'PAID',
+        confirmation_status: str = 'CONFIRMED',
+        initial_status: str = None,
         db_alias: str = None,
     ) -> Booking:
         alias = db_alias or get_current_tenant_db_alias() or 'default'
@@ -638,6 +641,20 @@ class BookingWaitlistAttendanceService:
                         ).count()
                         if trials_used >= booking_policy.max_trial_bookings:
                             raise ValidationError(f"Maximum trial bookings ({booking_policy.max_trial_bookings}) exceeded.")
+
+            # 4b. Check Configurable BookingPolicyService for booking types & advance limits
+            from .services_booking_policy import BookingPolicyService
+            effective_bp = BookingPolicyService.get_effective_policy(organization, branch=branch, db_alias=alias)
+            allowed_types = effective_bp.get('allowed_booking_types')
+            if allowed_types and booking_type not in allowed_types:
+                raise ValidationError(f"Booking type '{booking_type}' is not permitted by current booking policy.")
+
+            # Check advance booking window limit
+            adv_days_max = effective_bp.get('advance_booking_days_max')
+            if adv_days_max and occurrence.occurrence_date:
+                max_allowed_date = timezone.now().date() + timedelta(days=int(adv_days_max))
+                if occurrence.occurrence_date > max_allowed_date:
+                    raise ValidationError(f"Advance bookings beyond {adv_days_max} days are not permitted.")
 
             # 5. Member validation & Package Class Access
             units_to_consume = Decimal('1.00')
@@ -841,6 +858,7 @@ class BookingWaitlistAttendanceService:
                     )
                     entitlement = ent
 
+                resolved_status = initial_status or ('CONFIRMED' if confirmation_status == 'CONFIRMED' else 'RESERVED')
                 booking = Booking.objects.using(alias).create(
                     booking_number=booking_number,
                     user_profile=user_profile,
@@ -850,7 +868,10 @@ class BookingWaitlistAttendanceService:
                     branch=branch,
                     booking_type=booking_type,
                     booking_source=booking_source,
-                    status='CONFIRMED',
+                    status=resolved_status,
+                    payment_status=payment_status,
+                    confirmation_status=confirmation_status,
+                    confirmed_at=timezone.now() if confirmation_status == 'CONFIRMED' else None,
                     booked_at=timezone.now(),
                     created_by_user=created_by_user,
                 )
@@ -858,9 +879,9 @@ class BookingWaitlistAttendanceService:
                 BookingStatusHistory.objects.using(alias).create(
                     booking=booking,
                     from_status=None,
-                    to_status='CONFIRMED',
+                    to_status=resolved_status,
                     reason_code='INITIAL_BOOKING',
-                    reason_text='Confirmed booking created with session entitlement allocation',
+                    reason_text=f'{resolved_status} booking created with session entitlement allocation',
                     changed_by_user=created_by_user,
                     changed_at=timezone.now()
                 )
@@ -976,20 +997,27 @@ class BookingWaitlistAttendanceService:
             diff_minutes = int((occurrence.start_at - now).total_seconds() / 60)
             old_status = booking.status
 
-            # Find applied cancellation rule via canonical resolution
+            # Evaluate cancellation policy and cutoffs via BookingPolicyService
+            from .services_booking_policy import BookingPolicyService
             applied_rule = cls.resolve_cancellation_rule(booking, db_alias=alias)
 
-            session_action = 'RESTORE'
+            policy_eval = BookingPolicyService.validate_member_cancellation(booking, cancelled_by_user=cancelled_by_user, db_alias=alias)
+            within_cutoff = not policy_eval['is_late']
+            session_action = policy_eval['session_action']
+            treated_as_no_show = policy_eval['treated_as_no_show']
             session_units = Decimal('1.00')
-            treated_as_no_show = False
-            within_cutoff = diff_minutes > 60
 
+            # If an explicit BookingCancellationRule exists, it overrides default policy
             if applied_rule:
                 if applied_rule.min_minutes_before is not None:
                     within_cutoff = diff_minutes >= applied_rule.min_minutes_before
                 session_action = applied_rule.session_action
                 if applied_rule.cancellation_type == 'TREATED_AS_NO_SHOW':
                     treated_as_no_show = True
+
+            # If auto-cancelled due to non-payment, never consume membership credits
+            if reason_code == 'AUTO_CANCELLED_UNPAID' or getattr(booking, 'payment_status', 'PAID') in ['UNPAID', 'PENDING']:
+                session_action = 'NO_ACTION'
 
             if old_status in ['CONFIRMED', 'RESERVED']:
                 # Restore entitlement if configured and was consumed
@@ -1442,7 +1470,10 @@ class BookingWaitlistAttendanceService:
             if enrolled_target >= to_occ_locked.capacity:
                 raise ValidationError("Target class occurrence capacity is full; cannot reschedule to a full class.")
 
-            # 4. Check policy max_reschedules
+            # 4. Check policy max_reschedules and cutoffs via BookingPolicyService
+            from .services_booking_policy import BookingPolicyService
+            BookingPolicyService.validate_member_reschedule(booking, to_occ_locked, rescheduled_by_user=rescheduled_by_user, db_alias=alias)
+
             organization = to_occ_locked.class_template.category.organization
             policy = BookingPolicySet.objects.using(alias).filter(organization=organization, status='ACTIVE').first()
             if policy and policy.max_reschedules:
