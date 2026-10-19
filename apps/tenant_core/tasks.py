@@ -261,6 +261,76 @@ def process_dsr_erasure_task(self, tenant_id: str = None, privacy_request_id: st
         return {'status': 'FAILED', 'error': str(tre)}
 
 
+def _resolve_outbox_timestamp(event, *keys: str):
+    """
+    Distinguishes an absent timestamp from an invalid or naive timestamp in outbox event payloads.
+    Returns:
+        (should_proceed: bool, override_dt: Optional[datetime])
+        - If none of the keys exist in event.payload (legacy event):
+          returns (True, None) -> Caller falls back to current model timestamp.
+        - If a key exists and contains a valid timezone-aware ISO string:
+          returns (True, aware_dt) -> Caller uses override_dt.
+        - If a key exists and is malformed, invalid, or naive (missing tz offset):
+          returns (False, None) -> Caller suppresses dispatch and logs warning.
+    """
+    payload = getattr(event, 'payload', None) or {}
+    matched_key = None
+    for k in keys:
+        if k in payload:
+            matched_key = k
+            break
+
+    # 1. Genuinely legacy event: no timestamp key was provided in payload
+    if matched_key is None:
+        return (True, None)
+
+    raw_val = payload[matched_key]
+    if raw_val is None or (isinstance(raw_val, str) and not raw_val.strip()):
+        logger.warning(
+            "Outbox event %s (%s) aggregate %s contains empty timestamp for key '%s'. Suppressing dispatch.",
+            event.id, event.event_type, event.aggregate_id, matched_key
+        )
+        return (False, None)
+
+    dt = None
+    from datetime import datetime
+    if isinstance(raw_val, datetime):
+        dt = raw_val
+    elif isinstance(raw_val, str):
+        try:
+            from django.utils.dateparse import parse_datetime
+            dt = parse_datetime(raw_val)
+        except Exception as exc:
+            logger.warning(
+                "Outbox event %s (%s) aggregate %s contains unparseable timestamp '%s' for key '%s': %s. Suppressing dispatch.",
+                event.id, event.event_type, event.aggregate_id, raw_val, matched_key, exc
+            )
+            return (False, None)
+    else:
+        logger.warning(
+            "Outbox event %s (%s) aggregate %s contains non-string timestamp '%s' (type %s) for key '%s'. Suppressing dispatch.",
+            event.id, event.event_type, event.aggregate_id, raw_val, type(raw_val).__name__, matched_key
+        )
+        return (False, None)
+
+    if dt is None:
+        logger.warning(
+            "Outbox event %s (%s) aggregate %s parse_datetime returned None for '%s'. Suppressing dispatch.",
+            event.id, event.event_type, event.aggregate_id, raw_val
+        )
+        return (False, None)
+
+    # 2. Check for naive datetime (missing timezone offset)
+    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+        logger.warning(
+            "Outbox event %s (%s) aggregate %s contains naive timestamp without timezone '%s'. Suppressing dispatch.",
+            event.id, event.event_type, event.aggregate_id, raw_val
+        )
+        return (False, None)
+
+    return (True, dt)
+
+
 @shared_task(bind=True, acks_late=True, max_retries=3)
 def process_domain_outbox_events_task(self, tenant_id: str, limit: int = 50, **kwargs):
     """
@@ -289,13 +359,47 @@ def process_domain_outbox_events_task(self, tenant_id: str, limit: int = 50, **k
 
                 try:
                     if event.event_type == 'CRM_TRIAL_BOOKED':
-                        from apps.tenant_core.communication.service import CommunicationService
+                        from apps.tenant_core.communication.whatsapp_automation import WhatsAppAutomationService
                         from apps.tenant_core.models_crm import TrialBooking
                         trial_id = event.aggregate_id or event.payload.get('trial_id')
                         if trial_id:
                             tb = TrialBooking.objects.using(db_alias).filter(id=trial_id).first()
                             if tb:
-                                CommunicationService.send_trial_confirmation(tb)
+                                can_dispatch, override_dt = _resolve_outbox_timestamp(event, 'scheduled_start')
+                                if can_dispatch:
+                                    WhatsAppAutomationService.send_sarvam_trial_booking_confirmation(
+                                        tb, db_alias=db_alias, scheduled_start_override=override_dt
+                                    )
+                                else:
+                                    logger.warning("Suppressed CRM_TRIAL_BOOKED dispatch for event %s due to malformed timestamp.", event.id)
+                    elif event.event_type == 'CRM_TRIAL_RESCHEDULED':
+                        from apps.tenant_core.communication.whatsapp_automation import WhatsAppAutomationService
+                        from apps.tenant_core.models_crm import TrialBooking
+                        trial_id = event.aggregate_id or event.payload.get('trial_id')
+                        if trial_id:
+                            tb = TrialBooking.objects.using(db_alias).filter(id=trial_id).first()
+                            if tb:
+                                can_dispatch, override_dt = _resolve_outbox_timestamp(event, 'new_start', 'scheduled_start')
+                                if can_dispatch:
+                                    WhatsAppAutomationService.send_sarvam_trial_reschedule_confirmation(
+                                        tb, db_alias=db_alias, scheduled_start_override=override_dt
+                                    )
+                                else:
+                                    logger.warning("Suppressed CRM_TRIAL_RESCHEDULED dispatch for event %s due to malformed timestamp.", event.id)
+                    elif event.event_type == 'CRM_TRIAL_CANCELLED':
+                        from apps.tenant_core.communication.whatsapp_automation import WhatsAppAutomationService
+                        from apps.tenant_core.models_crm import TrialBooking
+                        trial_id = event.aggregate_id or event.payload.get('trial_id')
+                        if trial_id:
+                            tb = TrialBooking.objects.using(db_alias).filter(id=trial_id).first()
+                            if tb:
+                                can_dispatch, override_dt = _resolve_outbox_timestamp(event, 'cancelled_start', 'scheduled_start')
+                                if can_dispatch:
+                                    WhatsAppAutomationService.send_sarvam_trial_cancellation(
+                                        tb, db_alias=db_alias, scheduled_start_override=override_dt
+                                    )
+                                else:
+                                    logger.warning("Suppressed CRM_TRIAL_CANCELLED dispatch for event %s due to malformed timestamp.", event.id)
 
                     # 2. Generic Automation Engine consumption
                     try:

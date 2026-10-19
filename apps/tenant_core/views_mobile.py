@@ -88,6 +88,8 @@ def _resolve_mobile_tenant_and_db(request):
 
     if explicit_slug:
         clean_slug = str(explicit_slug).strip().lower()
+        if clean_slug in ('sweat-demo', 'sweat_demo', 'sweat-staging', 'sweat-dev'):
+            clean_slug = 'sweat'
         tenant = Tenant.objects.using('default').filter(slug=clean_slug, status='ACTIVE').first()
         if not tenant:
             logger.warning("Rejecting invalid or inactive explicit mobile tenant slug: '%s'", clean_slug)
@@ -970,8 +972,8 @@ def _serialize_branch_dict(b, user_lat=None, user_lng=None):
         'address': full_address,
         'address_line1': addr_l1,
         'address_line2': addr_l2,
-        'city': getattr(b, 'address_city', None) or getattr(b, 'city', 'Mumbai'),
-        'postal_code': getattr(b, 'address_postal_code', '') or getattr(b, 'postal_code', ''),
+        'city': getattr(b, 'address_city', None) or getattr(b, 'city', None) or (getattr(b.location, 'city', None) if hasattr(b, 'location') and b.location else 'Mumbai'),
+        'postal_code': getattr(b, 'address_postal_code', '') or getattr(b, 'postal_code', '') or (getattr(b.location, 'postal_code', '') if hasattr(b, 'location') and b.location else ''),
         'latitude': b_lat,
         'longitude': b_lng,
         'distance_km': dist_km,

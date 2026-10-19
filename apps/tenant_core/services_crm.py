@@ -1932,6 +1932,9 @@ class CRMLeadService:
                     'trial_id': str(trial.id),
                     'old_occurrence_id': str(old_occ_id) if old_occ_id else None,
                     'new_occurrence_id': str(new_occ.id),
+                    'old_start': old_start.isoformat() if old_start else None,
+                    'new_start': new_occ.start_at.isoformat(),
+                    'scheduled_start': new_occ.start_at.isoformat(),
                 },
                 db_alias=alias,
             )
@@ -2065,12 +2068,18 @@ class CRMLeadService:
                 db_alias=alias,
             )
 
+            cancelled_start_iso = trial.scheduled_start.isoformat() if trial.scheduled_start else None
             enqueue_outbox_event(
                 organization=trial.lead.organization,
                 event_type='CRM_TRIAL_CANCELLED',
                 aggregate_type='TrialBooking',
                 aggregate_id=str(trial.id),
-                payload={'trial_id': str(trial.id), 'reason': reason},
+                payload={
+                    'trial_id': str(trial.id),
+                    'reason': reason,
+                    'scheduled_start': cancelled_start_iso,
+                    'cancelled_start': cancelled_start_iso,
+                },
                 db_alias=alias,
             )
 

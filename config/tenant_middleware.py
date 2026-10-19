@@ -364,6 +364,8 @@ class TenantDatabaseMiddleware:
             if not tenant_id and explicit_slug:
                 from apps.master.models_tenant import Tenant
                 clean_slug = str(explicit_slug).strip().lower()
+                if clean_slug in ('sweat-demo', 'sweat_demo', 'sweat-staging', 'sweat-dev'):
+                    clean_slug = 'sweat'
                 t_obj = Tenant.objects.using('default').filter(slug=clean_slug, status='ACTIVE').first()
                 if not t_obj:
                     logger.warning(

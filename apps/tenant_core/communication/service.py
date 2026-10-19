@@ -113,7 +113,8 @@ class CommunicationService:
         Database idempotency guarantees at most one message per organization + idempotency_key.
         """
         from django.conf import settings
-        if not getattr(settings, 'COMMUNICATIONS_OUTBOUND_ENABLED', True):
+        outbound_enabled = getattr(settings, 'COMMUNICATIONS_OUTBOUND_ENABLED', False)
+        if outbound_enabled is not True:
             raise ValueError('Outbound communications are disabled in this deployment.')
         if lead:
             from apps.tenant_core.models_meta_leads import MetaLeadImport

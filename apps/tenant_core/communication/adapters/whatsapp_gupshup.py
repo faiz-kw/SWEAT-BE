@@ -1,4 +1,4 @@
-﻿"""
+"""
 apps/tenant_core/communication/adapters/whatsapp_gupshup.py - Gupshup Enterprise WhatsApp Adapter.
 
 Phase 1 Implementation:
@@ -55,7 +55,7 @@ class GupshupWhatsAppAdapter(BaseCommunicationAdapter):
                     pass
 
     def _get_api_key(self) -> str:
-        """Resolve API key safely from credentials."""
+        """Resolve API key safely from resolved secret credentials."""
         return (
             self.credentials.get('api_key')
             or self.credentials.get('apikey')
@@ -104,6 +104,16 @@ class GupshupWhatsAppAdapter(BaseCommunicationAdapter):
                 status='FAILED',
                 error_code='UNCONFIGURED_PROVIDER',
                 error_message='Gupshup WhatsApp credentials or app_name not configured for this tenant.',
+            )
+
+        from django.conf import settings
+        outbound_enabled = getattr(settings, 'COMMUNICATIONS_OUTBOUND_ENABLED', False)
+        if outbound_enabled is not True:
+            return ProviderSendResult(
+                success=False,
+                status='FAILED',
+                error_code='OUTBOUND_DISABLED',
+                error_message='Outbound communications are disabled in this deployment.',
             )
 
         api_key = self._get_api_key()

@@ -49,6 +49,7 @@ from .views_workforce import (
     TrainerSpecialtyViewSet,
     TrainerSpecialtyAssignmentViewSet,
 )
+from .views_whatsapp import WhatsAppAutomationPolicyViewSet
 from .views_crm import (
     LeadSourceViewSet,
     LeadViewSet,
@@ -294,6 +295,7 @@ router.register(r'crm/trial-reminder-policy', CRMTrialReminderPolicyViewSet, bas
 router.register(r'crm/attention-policy', CRMAttentionPolicyViewSet, basename='crm-attention-policy')
 router.register(r'crm/agent-assignment-config', CRMAgentAssignmentConfigViewSet, basename='crm-agent-assignment-config')
 router.register(r'crm/channels', CRMCommunicationChannelsViewSet, basename='crm-channel')
+router.register(r'crm/whatsapp-policy', WhatsAppAutomationPolicyViewSet, basename='crm-whatsapp-policy')
 router.register(r'crm/communications', CommunicationMessageViewSet, basename='crm-communication')
 router.register(r'crm/campaigns', CRMCampaignPerformanceViewSet, basename='crm-campaign')
 router.register(r'crm/dashboard', CRMDashboardViewSet, basename='crm-dashboard')

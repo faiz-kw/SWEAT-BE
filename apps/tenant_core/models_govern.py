@@ -273,3 +273,99 @@ class InAppNotification(models.Model):
 
     def __str__(self):
         return f"Notification({self.user_id}: {self.title} [read={self.is_read}])"
+
+
+class WhatsAppAutomationPolicy(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.OneToOneField(
+        Organization,
+        on_delete=models.CASCADE,
+        related_name='whatsapp_automation_policy',
+    )
+    whatsapp_enabled = models.BooleanField(
+        default=False,
+        help_text='Master switch. When False, no automated WhatsApp messages are sent.'
+    )
+    booking_confirmation_enabled = models.BooleanField(default=True)
+    booking_confirmation_template_name = models.CharField(
+        max_length=120, blank=True, default='sweat_class_booking_confirm',
+        help_text='Gupshup-approved template name for class booking confirmation.'
+    )
+    booking_confirmation_variable_map = models.JSONField(
+        default=dict, blank=True,
+        help_text='Ordered list of variable keys resolved at send time.'
+    )
+    booking_reminder_enabled = models.BooleanField(default=True)
+    booking_reminder_template_name = models.CharField(
+        max_length=120, blank=True, default='sweat_class_reminder',
+        help_text='Gupshup-approved template name for class/trial reminder.'
+    )
+    booking_reminder_variable_map = models.JSONField(
+        default=dict, blank=True,
+        help_text='Variable mapping for the reminder template.'
+    )
+    booking_reminder_offsets_minutes = models.JSONField(
+        default=list, blank=True,
+        help_text='List of reminder offsets in minutes before the class starts.'
+    )
+    lead_welcome_enabled = models.BooleanField(default=True)
+    lead_welcome_template_name = models.CharField(
+        max_length=120, blank=True, default='sweat_lead_welcome',
+    )
+    lead_welcome_variable_map = models.JSONField(
+        default=dict, blank=True,
+    )
+    trial_confirmation_enabled = models.BooleanField(default=True)
+    trial_confirmation_template_name = models.CharField(
+        max_length=120, blank=True, default='sweat_trial_booking_confirm',
+    )
+    trial_confirmation_variable_map = models.JSONField(
+        default=dict, blank=True,
+    )
+    inbound_confirm_keyword = models.CharField(
+        max_length=50, default='CONFIRM',
+        help_text='Case-insensitive keyword that triggers trial/booking confirmation.'
+    )
+    inbound_reschedule_keyword = models.CharField(
+        max_length=50, default='RESCHEDULE',
+        help_text='Case-insensitive keyword that triggers reschedule request.'
+    )
+    confirm_action_notify_staff = models.BooleanField(
+        default=True,
+        help_text='Send an in-app alert to assigned staff when a member replies CONFIRM.'
+    )
+    reschedule_action_create_task = models.BooleanField(
+        default=True,
+        help_text='Create a follow-up task for front-desk staff when a member replies RESCHEDULE.'
+    )
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        app_label = 'tenant_core'
+        db_table = 'whatsapp_automation_policy'
+        verbose_name = 'WhatsApp Automation Policy'
+        verbose_name_plural = 'WhatsApp Automation Policies'
+
+    def __str__(self):
+        status = 'enabled' if self.whatsapp_enabled else 'disabled'
+        return f'WhatsAppAutomationPolicy({self.organization_id} [{status}])'
+
+    @classmethod
+    def get_for_org(cls, organization):
+        defaults = {
+            'booking_confirmation_variable_map': [
+                'member_name', 'class_name', 'start_datetime', 'trainer_name'
+            ],
+            'booking_reminder_variable_map': ['start_datetime'],
+            'booking_reminder_offsets_minutes': [120, 30],
+            'lead_welcome_variable_map': ['lead_name'],
+            'trial_confirmation_variable_map': [
+                'lead_name', 'class_name', 'start_datetime', 'trainer_name'
+            ],
+        }
+        policy, _ = cls.objects.get_or_create(
+            organization=organization,
+            defaults=defaults,
+        )
+        return policy

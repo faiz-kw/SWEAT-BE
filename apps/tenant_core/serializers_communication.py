@@ -103,3 +103,41 @@ class CommunicationChannelStatusSerializer(serializers.Serializer):
     capabilities = serializers.ListField(child=serializers.CharField())
     implemented_adapters = serializers.ListField(child=serializers.CharField())
     last_sync_at = serializers.DateTimeField(allow_null=True)
+
+from apps.tenant_core.models_govern import WhatsAppAutomationPolicy
+
+
+class WhatsAppAutomationPolicySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = WhatsAppAutomationPolicy
+        fields = [
+            'id',
+            'organization',
+            'whatsapp_enabled',
+            'booking_confirmation_enabled',
+            'booking_confirmation_template_name',
+            'booking_confirmation_variable_map',
+            'booking_reminder_enabled',
+            'booking_reminder_template_name',
+            'booking_reminder_variable_map',
+            'booking_reminder_offsets_minutes',
+            'lead_welcome_enabled',
+            'lead_welcome_template_name',
+            'lead_welcome_variable_map',
+            'trial_confirmation_enabled',
+            'trial_confirmation_template_name',
+            'trial_confirmation_variable_map',
+            'inbound_confirm_keyword',
+            'inbound_reschedule_keyword',
+            'confirm_action_notify_staff',
+            'reschedule_action_create_task',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
+
+
+class WhatsAppTestSendSerializer(serializers.Serializer):
+    recipient = serializers.CharField(max_length=32)
+    template_name = serializers.CharField(max_length=120, required=False, allow_blank=True)
+    sample_variables = serializers.ListField(child=serializers.CharField(), required=False, default=list)
