@@ -1,4 +1,4 @@
-﻿"""Tenant-owned Meta lead connections, mappings, and durable import history.
+"""Tenant-owned Meta lead connections, mappings, and durable import history.
 
 Zero Meta credentials belong in plaintext. OAuth tokens are Fernet-encrypted.
 """
@@ -102,7 +102,7 @@ class MetaLeadMapping(models.Model):
     fallback_branch = models.ForeignKey('tenant_core.Branch', null=True, blank=True, on_delete=models.PROTECT, related_name='+')
     lead_source = models.ForeignKey('tenant_core.LeadSource', on_delete=models.PROTECT)
     initial_stage = models.CharField(max_length=40, default='NEW_LEAD')
-    repeat_policy = models.CharField(max_length=20, choices=[('REVIEW', 'Hold for review'), ('CREATE_NEW', 'Create a new enquiry')], default='REVIEW')
+    repeat_policy = models.CharField(max_length=20, choices=[('REVIEW', 'Hold for review'), ('CREATE_NEW', 'Create a new enquiry'), ('UPDATE_EXISTING', 'Update existing lead & log activity')], default='REVIEW')
     assignment_mode = models.CharField(max_length=20, choices=ASSIGNMENT_MODES, default='TENANT_POLICY')
     assigned_sales_user = models.ForeignKey('tenant_core.TenantUser', null=True, blank=True, on_delete=models.SET_NULL, related_name='+')
     create_followup_task = models.BooleanField(default=False)

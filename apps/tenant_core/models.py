@@ -311,5 +311,12 @@ __all__ += [
     'WorkoutContentTag',
 ]
 
+from .models_inventory import Product
+
+__all__ += [
+    'Product',
+]
+
+
 
 

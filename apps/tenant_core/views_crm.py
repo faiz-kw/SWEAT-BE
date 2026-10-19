@@ -352,7 +352,11 @@ class LeadViewSet(viewsets.ModelViewSet):
         lead = serializer.instance
         alias = _get_db(request)
 
-        response_data = dict(serializer.data)
+        response_data = dict(LeadSerializer(lead).data)
+        is_duplicate = getattr(lead, 'is_duplicate_intake', False)
+        if is_duplicate:
+            response_data['is_duplicate'] = True
+            response_data['deduplicated'] = True
 
         # Auto-provision TenantUser & UserProfile for this lead and return JWT tokens for seamless checkout
         try:
@@ -407,53 +411,44 @@ class LeadViewSet(viewsets.ModelViewSet):
                         defaults={'branch': lead.branch, 'is_active': True}
                     )
 
-            if user:
+            if user and not user_created:
                 profile = UserProfile.objects.using(alias).filter(user=user).first()
-                if not profile:
-                    profile = UserProfile.objects.using(alias).create(
-                        user=user,
-                        member_number=None,
-                        preferred_branch=user.home_branch or lead.branch,
-                        first_name_snapshot=user.first_name,
-                        last_name_snapshot=user.last_name,
-                        member_type='TRIAL',
-                        member_status='ACTIVE',
-                        acquisition_source='CRM_LEAD',
-                    )
-                lead.converted_user_profile = profile
-                lead.save(using=alias, update_fields=['converted_user_profile'])
+                if profile and not lead.converted_user_profile_id:
+                    lead.converted_user_profile = profile
+                    lead.save(using=alias, update_fields=['converted_user_profile'])
 
-                # START [SEC-LEAD-TOKEN]
-                # WHY: LeadViewSet.create() is AllowAny; returning tokens for pre-existing TenantUsers allows unauthenticated token harvesting for staff/member accounts.
-                # FIXES: Restricts token issuance strictly to newly created TenantUsers provisioned in this request.
-                # IMPACT: Pre-existing users matched during intake do not receive auth tokens in the 201 response.
-                if user and user_created:
-                    req_slug = getattr(request, 'tenant_slug', None) or 'sweat'
-                    tenant = Tenant.objects.using('default').filter(slug=req_slug, status='ACTIVE').first()
-                    if not tenant and 'test' in sys.argv:
-                        tenant = Tenant.objects.using('default').filter(status='ACTIVE').first()
+            # START [SEC-LEAD-TOKEN]
+            # WHY: LeadViewSet.create() is AllowAny; returning tokens for pre-existing TenantUsers allows unauthenticated token harvesting for staff/member accounts.
+            # FIXES: Restricts token issuance strictly to newly created TenantUsers provisioned in this request.
+            # IMPACT: Pre-existing users matched during intake do not receive auth tokens in the 201 response.
+            if user and user_created:
+                req_slug = getattr(request, 'tenant_slug', None) or 'sweat'
+                tenant = getattr(request, 'tenant', None) or Tenant.objects.using('default').filter(slug=req_slug, status='ACTIVE').first()
+                if not tenant and 'test' in sys.argv:
+                    tenant = Tenant.objects.using('default').filter(status='ACTIVE').first()
 
-                    if tenant:
-                        tokens = _build_tenant_token(user, tenant, alias)
-                        auth_dict = {
-                            'access': str(tokens.access_token),
-                            'refresh': str(tokens),
-                        }
-                        response_data['auth'] = auth_dict
-                        response_data['tokens'] = auth_dict
-                        response_data['user'] = {
-                            'id': str(user.id),
-                            'email': user.email,
-                            'user_type': user.user_type,
-                            'role_code': user.user_type,
-                        }
-                elif user:
-                    logger.info("Matched existing TenantUser for lead %s; withholding tokens on intake.", getattr(lead, 'id', None))
-                # END [SEC-LEAD-TOKEN]
+                if tenant:
+                    tokens = _build_tenant_token(user, tenant, alias)
+                    auth_dict = {
+                        'access': str(tokens.access_token),
+                        'refresh': str(tokens),
+                    }
+                    response_data['auth'] = auth_dict
+                    response_data['tokens'] = auth_dict
+                    response_data['user'] = {
+                        'id': str(user.id),
+                        'email': user.email,
+                        'user_type': user.user_type,
+                        'role_code': user.user_type,
+                    }
+            elif user:
+                logger.info("Matched existing TenantUser for lead %s; withholding tokens on intake.", getattr(lead, 'id', None))
+            # END [SEC-LEAD-TOKEN]
         except Exception as e:
             logger.warning("Could not auto-provision JWT for lead %s: %s", getattr(lead, 'id', None), e)
 
-        return Response(response_data, status=status.HTTP_201_CREATED, headers=headers)
+        status_code = status.HTTP_200_OK if is_duplicate else status.HTTP_201_CREATED
+        return Response(response_data, status=status_code, headers=headers)
 
     def get_permissions(self):
         if self.action == 'create':

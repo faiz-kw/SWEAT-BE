@@ -224,6 +224,7 @@ class CRMLeadService:
         actor_user: Optional[TenantUser] = None,
         extra_fields: Optional[Dict[str, Any]] = None,
         attribution_data: Optional[Dict[str, Any]] = None,
+        deduplicate: bool = True,
         db_alias: Optional[str] = None,
     ) -> Lead:
         alias = db_alias or get_tenant_db_alias() or 'default'
@@ -237,6 +238,192 @@ class CRMLeadService:
             pan_number = extra.pop('pan_number', None)
             attribution_from_extra = extra.pop('attribution', None)
             assignment_mode = extra.pop('assignment_mode', None)
+
+            if email:
+                email = validate_lead_email(email, required=False)
+            if phone:
+                phone = validate_lead_phone(phone, required=False)
+
+            # --- LEAD DEDUPLICATION ON INTAKE START ---
+            # Rule: When an existing phone number or email submits a new inquiry, do NOT create a new row in Leads;
+            # instead, update the existing Lead and log a new activity/touchpoint in their timeline.
+            existing_lead = None
+            if deduplicate and (phone or email):
+                contact_q = Q()
+                if phone:
+                    contact_q |= Q(phone_normalized=phone)
+                    clean_digits = re.sub(r'\D', '', str(phone))
+                    if len(clean_digits) == 10:
+                        contact_q |= Q(phone_normalized=f"+91{clean_digits}") | Q(phone_normalized=clean_digits)
+                if email:
+                    contact_q |= Q(email_normalized__iexact=email)
+
+                existing_lead = (
+                    Lead.objects.using(alias)
+                    .filter(organization=organization)
+                    .filter(contact_q)
+                    .order_by('-created_at')
+                    .first()
+                )
+
+            if existing_lead:
+                existing_lead.is_duplicate_intake = True
+                update_fields = set()
+
+                if not existing_lead.last_name and last_name:
+                    existing_lead.last_name = last_name
+                    update_fields.add('last_name')
+
+                source_label = (
+                    getattr(lead_source, 'name', None)
+                    or getattr(lead_source, 'code', None)
+                    or (attribution_data.get('platform') if attribution_data else None)
+                    or 'Direct Inquiry'
+                )
+                existing_lead.latest_touch_source = source_label
+                update_fields.add('latest_touch_source')
+
+                if not existing_lead.first_touch_source:
+                    existing_lead.first_touch_source = source_label
+                    update_fields.add('first_touch_source')
+
+                camp_ref = None
+                if attribution_data:
+                    camp_ref = attribution_data.get('campaign_name') or attribution_data.get('campaign_id')
+                if not camp_ref and extra.get('campaign_reference'):
+                    camp_ref = extra.get('campaign_reference')
+                if camp_ref:
+                    existing_lead.campaign_reference = str(camp_ref)[:200]
+                    update_fields.add('campaign_reference')
+
+                if extra.get('interested_program') and not existing_lead.interested_program_id:
+                    existing_lead.interested_program = extra['interested_program']
+                    update_fields.add('interested_program')
+
+                if extra.get('fitness_goal') and not existing_lead.fitness_goal:
+                    existing_lead.fitness_goal = extra['fitness_goal']
+                    update_fields.add('fitness_goal')
+
+                if not existing_lead.branch_id and branch:
+                    existing_lead.branch = branch
+                    update_fields.add('branch')
+
+                if phone and not existing_lead.phone_normalized:
+                    existing_lead.phone_normalized = phone
+                    update_fields.add('phone_normalized')
+                if email and not existing_lead.email_normalized:
+                    existing_lead.email_normalized = email
+                    update_fields.add('email_normalized')
+
+                # Re-activate lost or not interested leads on repeat inquiry
+                if existing_lead.current_status in ('LOST', 'NOT_INTERESTED'):
+                    old_status = existing_lead.current_status
+                    existing_lead.current_status = 'INTERESTED'
+                    update_fields.add('current_status')
+                    LeadStatusHistory.objects.using(alias).create(
+                        lead=existing_lead,
+                        from_status=old_status,
+                        to_status='INTERESTED',
+                        reason_code='REPEAT_INQUIRY_REACTIVATION',
+                        reason_text='Lead re-engaged via repeat inquiry submission',
+                        changed_by_user=actor_user,
+                    )
+
+                if update_fields:
+                    update_fields.add('updated_at')
+                    existing_lead.save(using=alias, update_fields=list(update_fields))
+                else:
+                    existing_lead.save(using=alias, update_fields=['updated_at'])
+
+                if billing_name or gst_number or pan_number:
+                    cp, created_cp = LeadCommercialProfile.objects.using(alias).get_or_create(
+                        lead=existing_lead,
+                        defaults={
+                            'billing_name': billing_name,
+                            'gst_number': gst_number,
+                            'pan_number': pan_number,
+                        }
+                    )
+                    if not created_cp:
+                        cp_changed = False
+                        if billing_name and not cp.billing_name:
+                            cp.billing_name = billing_name
+                            cp_changed = True
+                        if gst_number and not cp.gst_number:
+                            cp.gst_number = gst_number
+                            cp_changed = True
+                        if pan_number and not cp.pan_number:
+                            cp.pan_number = pan_number
+                            cp_changed = True
+                        if cp_changed:
+                            cp.save(using=alias)
+
+                notes_parts = [f"Repeat inquiry received via {source_label}."]
+                if extra.get('fitness_goal'):
+                    notes_parts.append(f"Goal: {extra.get('fitness_goal')}")
+                if extra.get('interested_program'):
+                    prog_name = getattr(extra.get('interested_program'), 'name', str(extra.get('interested_program')))
+                    notes_parts.append(f"Program: {prog_name}")
+                if camp_ref:
+                    notes_parts.append(f"Campaign: {camp_ref}")
+
+                cls.record_lead_activity(
+                    lead=existing_lead,
+                    activity_type='OTHER',
+                    outcome='Repeat Inquiry',
+                    notes=' | '.join(notes_parts),
+                    performed_by_user=actor_user,
+                    activity_at=timezone.now(),
+                    external_reference=attribution_data.get('external_lead_id') if attribution_data else None,
+                    actor_user=actor_user,
+                    db_alias=alias,
+                )
+
+                attr_payload = attribution_data or attribution_from_extra
+                if attr_payload and isinstance(attr_payload, dict):
+                    has_meaningful_data = any(
+                        bool(str(v).strip()) for k, v in attr_payload.items()
+                        if k not in ('touch_type', 'raw_metadata') and v is not None
+                    )
+                    if has_meaningful_data:
+                        payload_copy = dict(attr_payload)
+                        payload_copy.setdefault('touch_type', 'ASSISTED_TOUCH')
+                        cls.record_lead_attribution(
+                            lead=existing_lead,
+                            attribution_data=payload_copy,
+                            actor_user=actor_user,
+                            db_alias=alias,
+                        )
+
+                record_business_audit(
+                    organization=organization,
+                    branch=existing_lead.branch,
+                    actor_type='EMPLOYEE' if actor_user else 'SYSTEM',
+                    actor_user=actor_user,
+                    module='crm',
+                    action_code='LEAD_REPEAT_INQUIRY',
+                    entity_type='Lead',
+                    entity_id=existing_lead.id,
+                    event_description=f"Repeat inquiry logged for lead {existing_lead.first_name} {existing_lead.last_name}",
+                    after_data={'lead_id': str(existing_lead.id), 'status': existing_lead.current_status, 'source': source_label},
+                    db_alias=alias,
+                )
+
+                enqueue_outbox_event(
+                    organization=organization,
+                    event_type='LEAD_REPEAT_INQUIRY',
+                    aggregate_type='Lead',
+                    aggregate_id=existing_lead.id,
+                    payload={
+                        'lead_id': str(existing_lead.id),
+                        'branch_id': str(existing_lead.branch_id) if existing_lead.branch_id else None,
+                        'is_duplicate': True,
+                    },
+                    db_alias=alias,
+                )
+
+                return existing_lead
+            # --- LEAD DEDUPLICATION ON INTAKE END ---
 
             from .models_crm import CRMAgentAssignmentConfig
             from .services_lead_assignment import (
@@ -303,11 +490,6 @@ class CRMLeadService:
                 assigned_sales_user = None
                 assignment_source = 'MANUAL'
                 assignment_reason = 'Created unassigned (Manual assignment required)'
-
-            if email:
-                email = validate_lead_email(email, required=False)
-            if phone:
-                phone = validate_lead_phone(phone, required=False)
 
             lead = Lead.objects.using(alias).create(
                 organization=organization,
