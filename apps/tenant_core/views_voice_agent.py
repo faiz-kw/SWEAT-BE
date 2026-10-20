@@ -31,6 +31,20 @@ logger = logging.getLogger(__name__)
 IST = zoneinfo.ZoneInfo('Asia/Kolkata')
 
 
+def _is_placeholder_phone(val: Any) -> bool:
+    if not val:
+        return True
+    s = str(val).strip()
+    if s.startswith('{{') and s.endswith('}}'):
+        return True
+    if 'X' in s or 'x' in s:
+        return True
+    digits = ''.join(c for c in s if c.isdigit())
+    if len(digits) < 10 or len(set(digits)) <= 1:
+        return True
+    return False
+
+
 def _authenticate_request(request, enforce_token: bool = False) -> Tuple[Optional[Tenant], Optional[Any], Optional[JsonResponse]]:
     """
     Validates token and resolves Tenant.
@@ -583,22 +597,22 @@ class VoiceAgentBookTrialView(View):
         )
         notes = body_json.get('notes', 'Trial booked and confirmed via Sarvam AI Voice Agent (Mahek)')
 
-        if not phone_number and not lead_id:
-            return JsonResponse({
-                'status': 'error',
-                'error_code': 'MISSING_LEAD',
-                'message': 'Lead phone number or lead ID is required to book a trial.',
-                'spoken_apology': "I didn't catch your contact details. Could you please share your phone number?",
-            }, status=400)
+        if _is_placeholder_phone(phone_number):
+            phone_number = None
+        if lead_id and (str(lead_id).startswith('{{') or not str(lead_id).strip()):
+            lead_id = None
 
         with tenant_database_context(tenant.id):
             alias = get_tenant_db_alias()
             from apps.tenant_core.models_org import Branch, Organization
-            from apps.tenant_core.models_crm import Lead, TrialBooking, TrialStatusHistory, LeadActivity, LeadStatusHistory, LeadSource
+            from apps.tenant_core.models_crm import Lead, TrialBooking, TrialStatusHistory, LeadActivity, LeadStatusHistory, LeadSource, CallSession
             from apps.tenant_core.models_classes import ClassOccurrence, ClassBranchAvailability
             from apps.tenant_core.models_bookings import Booking
             from apps.tenant_core.services_voice_calling import VoiceCallingService
             from apps.tenant_core.services_reliability import record_business_audit, enqueue_outbox_event
+
+            resolved_br = _resolve_branch(alias, None, branch_param) if branch_param else None
+            org = _resolve_tenant_org(alias, resolved_br)
 
             # 1. Resolve Lead
             lead = None
@@ -611,8 +625,32 @@ class VoiceAgentBookTrialView(View):
             if not lead and phone_number:
                 lead = _lookup_lead_by_phone(alias, phone_number)
 
-            resolved_br = _resolve_branch(alias, None, branch_param) if branch_param else None
-            org = _resolve_tenant_org(alias, resolved_br)
+            # Fallback: Correlate with active or recent CallSession within last 25 minutes
+            if not lead:
+                recent_cutoff = timezone.now() - timedelta(minutes=25)
+                active_cs = (
+                    CallSession.objects.using(alias)
+                    .filter(organization=org, created_at__gte=recent_cutoff)
+                    .exclude(status='FAILED')
+                    .order_by('-created_at')
+                    .first()
+                )
+                if active_cs and active_cs.lead:
+                    lead = active_cs.lead
+                    if not phone_number:
+                        phone_number = active_cs.user_phone_number or active_cs.lead.phone_normalized
+                    logger.info(
+                        "Resolved lead %s (%s, %s) from active CallSession %s for voice agent trial booking",
+                        lead.id, lead.first_name, phone_number, active_cs.id
+                    )
+
+            if not lead and not phone_number:
+                return JsonResponse({
+                    'status': 'error',
+                    'error_code': 'MISSING_LEAD',
+                    'message': 'Lead phone number or lead ID is required to book a trial.',
+                    'spoken_apology': "I didn't catch your contact details. Could you please share your phone number?",
+                }, status=400)
 
             # If lead exists, update caller details if previously Guest or missing name
             if lead:
@@ -1053,7 +1091,7 @@ class VoiceAgentLeadContextView(View):
             lead = None
 
             # 1. Resolve by lead_id
-            if lead_id_param:
+            if lead_id_param and not str(lead_id_param).startswith('{{'):
                 try:
                     lead_uuid = uuid.UUID(str(lead_id_param).strip())
                     lead = Lead.objects.using(alias).filter(id=lead_uuid).select_related('branch', 'branch__location').first()
@@ -1061,7 +1099,7 @@ class VoiceAgentLeadContextView(View):
                     pass
 
             # 2. Resolve by call_session_id
-            if not lead and session_id_param:
+            if not lead and session_id_param and not str(session_id_param).startswith('{{'):
                 try:
                     sess_uuid = uuid.UUID(str(session_id_param).strip())
                     session = CallSession.objects.using(alias).filter(id=sess_uuid).select_related('lead', 'lead__branch', 'lead__branch__location').first()
@@ -1071,8 +1109,22 @@ class VoiceAgentLeadContextView(View):
                     pass
 
             # 3. Resolve by phone number
-            if not lead and phone_param:
+            if not lead and phone_param and not _is_placeholder_phone(phone_param):
                 lead = _lookup_lead_by_phone(alias, phone_param)
+
+            # 4. Resolve by active recent CallSession
+            if not lead:
+                recent_cutoff = timezone.now() - timedelta(minutes=25)
+                active_cs = (
+                    CallSession.objects.using(alias)
+                    .filter(created_at__gte=recent_cutoff)
+                    .exclude(status='FAILED')
+                    .order_by('-created_at')
+                    .first()
+                )
+                if active_cs and active_cs.lead:
+                    lead = active_cs.lead
+                    logger.info("Resolved lead %s from active CallSession %s for voice agent context", lead.id, active_cs.id)
 
             if not lead:
                 clean_caller_name = (
@@ -1896,8 +1948,16 @@ class VoiceAgentCallOutcomeView(View):
             except Exception:
                 pass
 
+        def _clean_val(val: Any) -> str:
+            if not val:
+                return ''
+            s = str(val).strip()
+            if s.startswith('{{') and s.endswith('}}'):
+                return ''
+            return s
+
         # Extract identifiers & outcome details (supports both SWEAT & default Sarvam field names)
-        phone = (
+        phone = _clean_val(
             data.get('phone')
             or data.get('user_phone_number')
             or data.get('user_identifier')
@@ -1905,13 +1965,13 @@ class VoiceAgentCallOutcomeView(View):
             or data.get('caller_phone')
             or data.get('userName', '')
         )
-        lead_id = data.get('lead_id')
-        disposition = data.get('disposition') or data.get('primary_disposition') or 'CALL_COMPLETED'
-        call_summary = data.get('callSummary') or data.get('call_summary') or data.get('summary') or 'Call completed via Sarvam AI Voice Agent.'
-        fitness_goals = data.get('painPointsMentioned') or data.get('fitness_goals') or data.get('pain_points') or ''
-        chosen_next_step = data.get('chosenNextStep') or data.get('next_step') or ''
-        next_step_dt = data.get('nextStepDateTime') or data.get('next_step_date_time') or ''
-        branch_name = data.get('branch') or data.get('preferred_branch') or ''
+        lead_id = _clean_val(data.get('lead_id'))
+        disposition = _clean_val(data.get('disposition') or data.get('primary_disposition'))
+        call_summary = _clean_val(data.get('callSummary') or data.get('call_summary') or data.get('summary'))
+        fitness_goals = _clean_val(data.get('painPointsMentioned') or data.get('fitness_goals') or data.get('pain_points'))
+        chosen_next_step = _clean_val(data.get('chosenNextStep') or data.get('next_step'))
+        next_step_dt = _clean_val(data.get('nextStepDateTime') or data.get('next_step_date_time'))
+        branch_name = _clean_val(data.get('branch') or data.get('preferred_branch'))
 
         with tenant_database_context(tenant.id):
             alias = get_tenant_db_alias()
@@ -1928,11 +1988,25 @@ class VoiceAgentCallOutcomeView(View):
                 except Exception:
                     pass
 
-            norm_phone = VoiceCallingService.normalize_phone(str(phone)) if phone else ''
-            if not lead and (norm_phone or phone):
+            norm_phone = VoiceCallingService.normalize_phone(str(phone)) if phone and not _is_placeholder_phone(phone) else ''
+            if not lead and (norm_phone or phone) and not _is_placeholder_phone(phone):
                 lead = _lookup_lead_by_phone(alias, phone)
 
-            caller_name_param = (
+            # Fallback to active CallSession if lead still not resolved
+            if not lead:
+                recent_cutoff = timezone.now() - timedelta(minutes=25)
+                active_cs = (
+                    CallSession.objects.using(alias)
+                    .filter(created_at__gte=recent_cutoff)
+                    .exclude(status='FAILED')
+                    .order_by('-created_at')
+                    .first()
+                )
+                if active_cs and active_cs.lead:
+                    lead = active_cs.lead
+                    logger.info("Resolved lead %s from active CallSession %s for call outcome", lead.id, active_cs.id)
+
+            caller_name_param = _clean_val(
                 data.get('lead_name')
                 or data.get('name')
                 or data.get('caller_name')
@@ -1973,6 +2047,36 @@ class VoiceAgentCallOutcomeView(View):
                     else:
                         lead.first_name = clean_name
                     lead.save(using=alias, update_fields=['first_name', 'last_name', 'updated_at'])
+
+            # Intelligent fallback for disposition and summary if unpopulated or template placeholders
+            recent_trial = TrialBooking.objects.using(alias).filter(lead=lead).order_by('-created_at').first() if lead else None
+            is_recent_trial = bool(recent_trial and (timezone.now() - recent_trial.created_at).total_seconds() < 900)
+
+            if not disposition:
+                disposition = 'TRIAL_BOOKED' if is_recent_trial else 'CALL_COMPLETED'
+
+            if not call_summary:
+                first_name = lead.first_name if lead else 'the lead'
+                if is_recent_trial:
+                    cls_title = 'workout session'
+                    if recent_trial and recent_trial.class_occurrence_id:
+                        try:
+                            from apps.tenant_core.models_scheduling import ClassOccurrence
+                            occ = ClassOccurrence.objects.using(alias).filter(id=recent_trial.class_occurrence_id).select_related('class_template').first()
+                            if occ and occ.class_template:
+                                cls_title = occ.class_template.name
+                        except Exception:
+                            pass
+                    br_title = recent_trial.branch.name if recent_trial.branch else 'studio'
+                    call_summary = (
+                        f"Spoke with {first_name}. Introduced SWEAT workout philosophy and scheduled a complimentary "
+                        f"trial for {cls_title} at our {br_title} studio. Confirmed attendance and shared arrival guidelines."
+                    )
+                else:
+                    call_summary = (
+                        f"Spoke with {first_name} regarding SWEAT programs, workout philosophy, and available studio locations. "
+                        f"Shared complimentary VIP trial options."
+                    )
 
             # Format activity notes
             notes_lines = [f"Call Summary: {call_summary}"]

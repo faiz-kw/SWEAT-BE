@@ -7,7 +7,7 @@ import uuid
 from datetime import timedelta
 from unittest.mock import patch, MagicMock
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 from rest_framework import status
@@ -41,6 +41,7 @@ from config.routers import set_tenant_db_alias
 from config.secrets import SecretResolver
 
 
+@override_settings(COMMUNICATIONS_OUTBOUND_ENABLED=True)
 class GupshupWhatsAppPhase2Tests(TestCase):
     databases = {'default', 'tenant_test'}
 

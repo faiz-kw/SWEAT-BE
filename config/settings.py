@@ -316,6 +316,10 @@ from corsheaders.defaults import default_headers
 CORS_ALLOW_HEADERS = list(default_headers) + [
     'x-tenant-slug',
     'x-correlation-id',
+    'x-idempotency-key',
+    'idempotency-key',
+    'x-tenant-id',
+    'x-voice-agent-token',
 ]
 
 if not CORS_ALLOWED_ORIGINS and not DEBUG:
@@ -587,7 +591,7 @@ COMMUNICATIONS_OUTBOUND_ENABLED = os.getenv('COMMUNICATIONS_OUTBOUND_ENABLED', '
 VOICE_CALLING_ENABLED = os.getenv('VOICE_CALLING_ENABLED', 'false').lower() in ('true', '1', 't', 'yes')
 # Calling hours enforcement (IST / Asia/Kolkata). Calls outside the window are rejected.
 # VOICE_CALLING_ENFORCE_HOURS=false disables the check in staging/dev without changing production.
-VOICE_CALLING_ENFORCE_HOURS = os.getenv('VOICE_CALLING_ENFORCE_HOURS', 'true').lower() in ('true', '1', 't', 'yes')
+VOICE_CALLING_ENFORCE_HOURS = os.getenv('VOICE_CALLING_ENFORCE_HOURS', 'false' if DEBUG else 'true').lower() in ('true', '1', 't', 'yes')
 VOICE_CALLING_HOURS_START = int(os.getenv('VOICE_CALLING_HOURS_START', '9'))   # 09:00 IST
 VOICE_CALLING_HOURS_END   = int(os.getenv('VOICE_CALLING_HOURS_END',   '21'))  # 21:00 IST
 META_APP_ID = os.getenv('META_APP_ID', '').strip()

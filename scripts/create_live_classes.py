@@ -1,3 +1,4 @@
+import os
 import re
 import requests
 from datetime import datetime, timedelta
@@ -18,8 +19,8 @@ def run():
         if m: csrf = m.group(1)
         
     login_data = {
-        'username': 'platform.admin@sweat-demo.example',
-        'password': 'Sw!9UsCKWGRUsOW_3oFgb8o7',
+        'username': os.environ.get('PLATFORM_ADMIN_USERNAME', 'platform.admin@sweat-demo.example'),
+        'password': os.environ.get('PLATFORM_ADMIN_PASSWORD', ''),
         'csrfmiddlewaretoken': csrf,
         'next': '/admin/'
     }

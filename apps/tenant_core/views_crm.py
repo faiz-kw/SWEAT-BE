@@ -1438,10 +1438,12 @@ class LeadViewSet(viewsets.ModelViewSet):
                 db_alias=alias,
             )
         except ValueError as val_err:
+            err_msg = str(val_err)
+            err_code = 'OUTSIDE_CALLING_HOURS' if 'permitted between' in err_msg.lower() else 'INVALID_RECIPIENT_OR_CONSENT'
             return Response(
                 {
-                    'error': str(val_err),
-                    'code': 'INVALID_RECIPIENT_OR_CONSENT',
+                    'error': err_msg,
+                    'code': err_code,
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
