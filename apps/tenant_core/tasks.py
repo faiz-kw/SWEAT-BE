@@ -578,5 +578,12 @@ def process_booking_auto_cancellations_periodic_task(self, tenant_id: str = None
         return {'status': 'FAILED', 'tenant_id': str(tenant_id), 'error': str(exc)}
 
 
-
-
+# Ensure specialized task modules are loaded and registered when Celery imports tasks.py
+from .tasks_voice_calling import (  # noqa: F401
+    trigger_automated_sarvam_call_task,
+    process_trial_voice_reminders_task,
+)
+from .tasks_meta_leads import (  # noqa: F401
+    process_meta_lead_import_task,
+    recover_meta_imports_periodic_task,
+)

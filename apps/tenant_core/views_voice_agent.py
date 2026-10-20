@@ -802,19 +802,25 @@ class VoiceAgentBookTrialView(View):
 
                 if existing_for_slot:
                     ist_dt = occurrence.start_at.astimezone(IST)
+                    prog_name = occurrence.class_template.program.name if (occurrence.class_template and occurrence.class_template.program) else occurrence.class_template.name
                     arrival_instructions = (
-                        "Please arrive at least 30 minutes before your class starts, and remember "
-                        "to bring your water bottle, appropriate shoes, and any other required items."
+                        "Stay Hydrated: Carry an empty bottle and get it filled at our studio. "
+                        "Comfy Clothes: Wear anything comfortable, such as shorts, tracks, leggings, pants, T-shirts, or tank tops. "
+                        "Carry a Fresh Pair of Grip Shoes: Please bring a fresh pair of shoes and socks to maintain hygiene at all times."
                     )
                     spoken_conf = (
-                        f"Good news, {lead.first_name}! You are already booked for this session of "
-                        f"{occurrence.class_template.name} at our {branch_short} studio on "
-                        f"{ist_dt.strftime('%A at %I:%M %p')}. {arrival_instructions} We look forward to seeing you!"
+                        f"Good news, {lead.first_name}! You are already booked for {prog_name} ({occurrence.class_template.name}) "
+                        f"at our {branch_short} studio on {ist_dt.strftime('%A at %I:%M %p')}. "
+                        f"As a reminder: Stay Hydrated — carry an empty bottle and get it filled at our studio. "
+                        f"Comfy Clothes — wear anything comfortable like shorts, tracks, or leggings. "
+                        f"Carry a Fresh Pair of Grip Shoes — please bring a fresh pair of shoes and socks to maintain hygiene at all times. "
+                        f"We look forward to seeing you!"
                     )
                     return JsonResponse({
                         'status': 'success',
                         'already_booked': True,
                         'booking_id': str(existing_for_slot.id),
+                        'program_name': prog_name,
                         'class_name': occurrence.class_template.name,
                         'branch_name': branch_name,
                         'date': ist_dt.strftime('%A, %b %d'),
@@ -942,12 +948,18 @@ class VoiceAgentBookTrialView(View):
                         f"{occurrence.branch.address_line_1}, {occurrence.branch.location.city}"
                         if occurrence.branch.address_line_1 and occurrence.branch.location else occurrence.branch.name
                     )
+                    prog_name = occurrence.class_template.program.name if (occurrence.class_template and occurrence.class_template.program) else occurrence.class_template.name
                     wa_body = (
                         f"Hi {lead.first_name}! 🎉 Your complimentary trial session at SWEAT is confirmed!\n\n"
-                        f"🏋️ Class: {occurrence.class_template.name}\n"
+                        f"🏋️ Program: {prog_name}\n"
+                        f"🤸 Class: {occurrence.class_template.name}\n"
                         f"📍 Branch: {branch_name} ({addr_str})\n"
                         f"📅 Date & Time: {ist_dt.strftime('%A, %b %d at %I:%M %p')}\n\n"
-                        f"Please arrive 10 minutes early in comfortable workout gear. If you need to reschedule or have questions, just reply to this message!"
+                        f"📋 Important Instructions for Your Visit:\n"
+                        f"💧 Stay Hydrated: Carry an empty bottle and get it filled at our studio.\n"
+                        f"👕 Comfy Clothes: Wear anything comfortable, such as shorts, tracks, leggings, pants, T-shirts, or tank tops.\n"
+                        f"👟 Carry a Fresh Pair of Grip Shoes: Please bring a fresh pair of shoes and socks to maintain hygiene at all times.\n\n"
+                        f"Please arrive 15 minutes early. If you need to reschedule or have questions, just reply to this message!"
                     )
                     CommunicationService.send_communication(
                         organization=lead.organization,
@@ -964,22 +976,27 @@ class VoiceAgentBookTrialView(View):
                 except Exception as wa_err:
                     logger.warning("Could not dispatch automated WhatsApp booking confirmation: %s", wa_err)
 
+            prog_name = occurrence.class_template.program.name if (occurrence.class_template and occurrence.class_template.program) else occurrence.class_template.name
+
             arrival_instructions = (
-                "Please arrive at least 30 minutes before your class starts, and remember "
-                "to bring your water bottle, appropriate shoes, and any other required items."
+                "Stay Hydrated: Carry an empty bottle and get it filled at our studio. "
+                "Comfy Clothes: Wear anything comfortable, such as shorts, tracks, leggings, pants, T-shirts, or tank tops. "
+                "Carry a Fresh Pair of Grip Shoes: Please bring a fresh pair of shoes and socks to maintain hygiene at all times."
             )
             spoken_conf = (
-                f"You're all set, {lead.first_name}! I have booked your complimentary trial for "
-                f"{occurrence.class_template.name} at our {branch_short} branch on "
-                f"{ist_dt.strftime('%A at %I:%M %p')}. "
-                f"{arrival_instructions} "
+                f"You're all set, {lead.first_name}! Before we wrap up, let me reconfirm all your details: "
+                f"Your complimentary trial is booked for {prog_name} ({occurrence.class_template.name}) "
+                f"at our {branch_short} branch on {ist_dt.strftime('%A at %I:%M %p')}. "
+                f"Please keep these instructions in mind before visiting: "
+                f"First, Stay Hydrated: Carry an empty bottle and get it filled at our studio. "
+                f"Second, Comfy Clothes: Wear anything comfortable, such as shorts, tracks, leggings, pants, T-shirts, or tank tops. "
+                f"Third, Carry a Fresh Pair of Grip Shoes: Please bring a fresh pair of shoes and socks to maintain hygiene at all times. "
                 f"I've also sent the confirmation and location details to your WhatsApp. "
                 f"We are excited to see you at SWEAT!"
             )
 
             logger.info("Voice Agent successfully booked trial: lead=%s trial=%s occurrence=%s branch=%s", lead.id, trial.id, occurrence.id, branch_name)
 
-            prog_name = occurrence.class_template.program.name if (occurrence.class_template and occurrence.class_template.program) else occurrence.class_template.name
             return JsonResponse({
                 'status': 'success',
                 'booking_id': str(trial.id),
@@ -1386,12 +1403,18 @@ class VoiceAgentRescheduleTrialView(View):
                             f"{target_occ.branch.address_line_1}, {target_occ.branch.location.city}"
                             if target_occ.branch.address_line_1 and target_occ.branch.location else target_occ.branch.name
                         )
+                        prog_name = target_occ.class_template.program.name if (target_occ.class_template and target_occ.class_template.program) else target_occ.class_template.name
                         wa_body = (
                             f"Hi {lead.first_name}! 🔄 Your SWEAT trial session has been successfully rescheduled.\n\n"
-                            f"🏋️ Class: {target_occ.class_template.name}\n"
+                            f"🏋️ Program: {prog_name}\n"
+                            f"🤸 Class: {target_occ.class_template.name}\n"
                             f"📍 Branch: {branch_name} ({addr_str})\n"
                             f"📅 New Date & Time: {new_ist_dt.strftime('%A, %b %d at %I:%M %p')}\n\n"
-                            f"Please arrive 10 minutes early in workout gear. Reply here if you need any further assistance!"
+                            f"📋 Important Instructions for Your Visit:\n"
+                            f"💧 Stay Hydrated: Carry an empty bottle and get it filled at our studio.\n"
+                            f"👕 Comfy Clothes: Wear anything comfortable, such as shorts, tracks, leggings, pants, T-shirts, or tank tops.\n"
+                            f"👟 Carry a Fresh Pair of Grip Shoes: Please bring a fresh pair of shoes and socks to maintain hygiene at all times.\n\n"
+                            f"Please arrive 15 minutes early. Reply here if you need any further assistance!"
                         )
                         CommunicationService.send_communication(
                             organization=lead.organization,
@@ -1407,10 +1430,14 @@ class VoiceAgentRescheduleTrialView(View):
                     except Exception as wa_err:
                         logger.warning("Could not dispatch automated WhatsApp reschedule notification: %s", wa_err)
 
+                prog_name = target_occ.class_template.program.name if (target_occ.class_template and target_occ.class_template.program) else target_occ.class_template.name
                 spoken_conf = (
                     f"You're all set, {lead.first_name}! I have rescheduled your trial session for "
-                    f"{target_occ.class_template.name} at our {branch_short} branch to "
+                    f"{prog_name} ({target_occ.class_template.name}) at our {branch_short} branch to "
                     f"{new_ist_dt.strftime('%A, %b %d at %I:%M %p')}. "
+                    f"As a reminder: Stay Hydrated — carry an empty bottle and get it filled at our studio. "
+                    f"Comfy Clothes — wear anything comfortable like shorts, tracks, or leggings. "
+                    f"Carry a Fresh Pair of Grip Shoes — please bring a fresh pair of shoes and socks to maintain hygiene. "
                     f"I've also sent the updated details to your WhatsApp. See you on the mat!"
                 )
 

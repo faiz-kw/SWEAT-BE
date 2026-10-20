@@ -140,6 +140,40 @@ class PublicLeadCaptureView(APIView):
                     db_alias=db_alias,
                 )
 
+                # Record voice consent and dispatch automated Sarvam call task for website leads
+                if lead and getattr(lead, 'phone_normalized', None):
+                    try:
+                        from apps.tenant_core.models_privacy import ProcessingPurpose, ConsentRecord
+                        from apps.tenant_core.models_users import TenantUser
+                        from apps.tenant_core.tasks_voice_calling import trigger_automated_sarvam_call_task
+                        from django.utils import timezone
+
+                        purpose, _ = ProcessingPurpose.objects.using(db_alias).get_or_create(
+                            code='VOICE_CALL',
+                            defaults={
+                                'name': 'AI Voice Calling',
+                                'description': 'Consent to receive automated AI voice calls regarding trial bookings and schedule inquiries.',
+                                'status': 'ACTIVE',
+                            }
+                        )
+                        consent_user = lead.assigned_sales_user or TenantUser.objects.using(db_alias).first()
+                        if consent_user:
+                            ConsentRecord.objects.using(db_alias).create(
+                                user=consent_user,
+                                purpose=purpose,
+                                subject_type='lead',
+                                subject_id=lead.id,
+                                status='GRANTED',
+                                capture_source='WEBSITE',
+                                consent_method='WEBSITE_FORM',
+                                notes='Voice calling consent granted during public website inquiry form submission.',
+                                recorded_at=timezone.now(),
+                            )
+                        trigger_automated_sarvam_call_task.delay(tenant_id=str(tenant.id), lead_id=str(lead.id))
+                        logger.info("Dispatched automated Sarvam call for public website lead %s", lead.id)
+                    except Exception as call_err:
+                        logger.warning("Could not queue automated Sarvam call for public website lead: %s", call_err)
+
                 return Response({
                     'status': 'success',
                     'lead_id': str(lead.id),

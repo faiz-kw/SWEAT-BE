@@ -81,8 +81,8 @@ class Command(BaseCommand):
         parser.add_argument(
             '--admin-password',
             type=str,
-            default='SweatAdmin@123!',
-            help='Tenant Administrator password (default: SweatAdmin@123!)',
+            default='Sweat@2026!',
+            help='Tenant Administrator password (default: Sweat@2026!)',
         )
         parser.add_argument(
             '--reset-passwords',
@@ -334,7 +334,7 @@ class Command(BaseCommand):
                 },
                 {
                     'email': 'frontdesk@sweat.com',
-                    'password': 'FrontDesk@123!',
+                    'password': 'Sweat@2026!',
                     'first_name': 'Fiona',
                     'last_name': 'FrontDesk',
                     'role_code': 'FRONT_DESK',
@@ -342,7 +342,7 @@ class Command(BaseCommand):
                 },
                 {
                     'email': 'sales@sweat.com',
-                    'password': 'SalesRep@123!',
+                    'password': 'Sweat@2026!',
                     'first_name': 'Sam',
                     'last_name': 'Sales',
                     'role_code': 'SALES_REP',
@@ -350,7 +350,7 @@ class Command(BaseCommand):
                 },
                 {
                     'email': 'trainer@sweat.com',
-                    'password': 'Trainer@123!',
+                    'password': 'Sweat@2026!',
                     'first_name': 'Tom',
                     'last_name': 'Trainer',
                     'role_code': 'TRAINER',

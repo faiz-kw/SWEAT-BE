@@ -692,6 +692,70 @@ class LeadViewSet(viewsets.ModelViewSet):
         )
         serializer.instance = lead
 
+        # Check if caller requested automated AI call trigger, provided voice consent,
+        # or if lead registered via self-service mobile app / portal signup
+        is_self_signup = not (hasattr(self.request, 'user') and getattr(self.request.user, 'is_authenticated', False))
+        is_app_source = (
+            getattr(lead_source, 'source_type', None) == 'MOBILE_APP'
+            or getattr(lead_source, 'code', None) in ('MOBILE_APP', 'APP_SIGNUP')
+        )
+        trigger_call = self.request.data.get('trigger_ai_call') or self.request.data.get('trigger_call')
+        consent_voice = self.request.data.get('consent_voice')
+
+        should_record_consent = trigger_call or consent_voice or (is_self_signup and is_app_source)
+        should_trigger_call = trigger_call or (is_self_signup and is_app_source)
+
+        if should_record_consent:
+            consent_src = 'APP_SIGNUP' if is_self_signup else 'STAFF_VERIFIED'
+            try:
+                from .models_privacy import ProcessingPurpose, ConsentRecord
+                from .models_users import TenantUser
+                purpose = ProcessingPurpose.objects.using(alias).filter(code='VOICE_CALL').first()
+                if not purpose:
+                    purpose = ProcessingPurpose.objects.using(alias).create(
+                        code='VOICE_CALL',
+                        name='AI Voice Calling',
+                        description='Consent to receive automated AI voice calls regarding trial bookings and schedule inquiries.',
+                        status='ACTIVE',
+                    )
+                actor = self.request.user if (hasattr(self.request, 'user') and getattr(self.request.user, 'is_authenticated', False)) else None
+                consent_user = actor if isinstance(actor, TenantUser) else (lead.assigned_sales_user or TenantUser.objects.using(alias).first())
+                if consent_user:
+                    ConsentRecord.objects.using(alias).create(
+                        user=consent_user,
+                        purpose=purpose,
+                        subject_type='lead',
+                        subject_id=lead.id,
+                        status='GRANTED',
+                        capture_source=consent_src,
+                        consent_method=consent_src,
+                        notes=f"Voice calling consent granted during lead creation ({consent_src})",
+                        recorded_at=timezone.now(),
+                    )
+            except Exception as e:
+                logger.warning("Could not persist ConsentRecord on lead creation: %s", e)
+
+            lead.consent_voice = True
+            lead.consent_voice_source = consent_src
+            lead.consent_voice_recorded_at = timezone.now()
+            if hasattr(lead, '_cached_voice_consent'):
+                delattr(lead, '_cached_voice_consent')
+
+            if should_trigger_call:
+                try:
+                    from apps.tenant_core.tasks_voice_calling import trigger_automated_sarvam_call_task
+                    from apps.master.models_tenant import Tenant
+                    tenant = getattr(self.request, 'tenant', None)
+                    tenant_id = str(tenant.id) if tenant else None
+                    if not tenant_id:
+                        t = Tenant.objects.filter(slug='sweat', status='ACTIVE').first() or Tenant.objects.filter(status='ACTIVE').first()
+                        tenant_id = str(t.id) if t else None
+                    if tenant_id:
+                        trigger_automated_sarvam_call_task.delay(tenant_id=tenant_id, lead_id=str(lead.id))
+                        logger.info("Dispatched automated Sarvam call task on lead creation (source=%s) for lead %s", consent_src, lead.id)
+                except Exception as call_err:
+                    logger.warning("Could not queue automated Sarvam call on lead creation: %s", call_err)
+
     def perform_update(self, serializer):
         lead = self.get_object()
         alias = _get_db(self.request)

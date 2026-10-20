@@ -1789,8 +1789,21 @@ class MemberViewSet(viewsets.ViewSet):
         if not profile:
             return Response({'detail': 'Member not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        profile.member_status = 'INACTIVE'
-        profile.save(using=alias)
+        # If profile belongs to a staff/admin user, remove member identity without deleting the staff user
+        if profile.user and getattr(profile.user, 'user_type', None) == 'STAFF':
+            profile.member_number = None
+            profile.member_type = 'STAFF'
+            profile.acquisition_source = None
+            profile.member_status = 'ACTIVE'
+            profile.save(using=alias)
+            Membership.objects.using(alias).filter(user_profile=profile).delete()
+        else:
+            profile.member_number = None
+            profile.member_type = 'CUSTOMER'
+            profile.member_status = 'INACTIVE'
+            profile.save(using=alias)
+            Membership.objects.using(alias).filter(user_profile=profile).delete()
+
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     # -------------------------------------------------------------------------
