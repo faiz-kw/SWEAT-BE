@@ -2287,3 +2287,158 @@ class VoiceAgentCallOutcomeView(View):
             }, status=200)
 
 
+@method_decorator(csrf_exempt, name='dispatch')
+class VoiceAgentRecordingAudioView(View):
+    """
+    Streams the raw audio recording (WAV) for an AI voice CallSession.
+    Fetches and caches the audio from Sarvam Analytics Recordings API if not already cached.
+    Supports browser HTML5 audio playback, scrub-seeking, and byte ranges.
+    """
+
+    def get(self, request, session_id, *args, **kwargs):
+        import os
+        import requests
+        from datetime import timedelta
+        from django.conf import settings
+        from django.utils import timezone
+        from apps.master.models import Tenant, TenantDataSource
+        from config.tenant_middleware import _register_tenant_connection
+        from config.routers import build_tenant_db_alias, set_tenant_db_alias
+        from apps.tenant_core.models_crm import CallSession
+        from django.http import FileResponse, Http404, HttpResponse
+
+        def _serve_audio(path):
+            file_size = os.path.getsize(path)
+            http_range = request.META.get('HTTP_RANGE', '')
+            start = 0
+            end = file_size - 1
+            status_code = 200
+
+            if http_range:
+                import re
+                match = re.match(r'bytes=(\d+)-(\d*)', http_range)
+                if match:
+                    status_code = 206
+                    start = int(match.group(1))
+                    if match.group(2):
+                        end = min(int(match.group(2)), file_size - 1)
+
+            length = end - start + 1
+
+            def stream_chunks():
+                with open(path, 'rb') as f:
+                    f.seek(start)
+                    remaining = length
+                    while remaining > 0:
+                        chunk_size = min(65536, remaining)
+                        data = f.read(chunk_size)
+                        if not data:
+                            break
+                        remaining -= len(data)
+                        yield data
+
+            from django.http import StreamingHttpResponse
+            resp = StreamingHttpResponse(
+                stream_chunks(),
+                status=status_code,
+                content_type='audio/wav'
+            )
+            resp['Accept-Ranges'] = 'bytes'
+            resp['Content-Length'] = str(length)
+            if status_code == 206:
+                resp['Content-Range'] = f'bytes {start}-{end}/{file_size}'
+            resp['Content-Disposition'] = f'inline; filename="call_{session_id}.wav"'
+            resp['Access-Control-Allow-Origin'] = '*'
+            resp['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+            resp['Access-Control-Allow-Headers'] = 'Range, Content-Type, Accept'
+            resp['Access-Control-Expose-Headers'] = 'Content-Range, Content-Length, Accept-Ranges'
+            return resp
+
+        # 1. Immediate Disk Cache Check (Zero DB queries if already cached)
+        cache_dir = os.path.join(settings.BASE_DIR, 'media', 'recordings')
+        os.makedirs(cache_dir, exist_ok=True)
+        local_path = os.path.join(cache_dir, f"{session_id}.wav")
+
+        if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+            return _serve_audio(local_path)
+
+        # 2. Locate CallSession across tenants to fetch from Sarvam if not cached
+        cs = None
+        target_alias = None
+        for t in Tenant.objects.all():
+            try:
+                ds = TenantDataSource.objects.filter(tenant=t).first()
+                if not ds:
+                    continue
+                alias = build_tenant_db_alias(t.id)
+                _register_tenant_connection(alias, db_name=ds.db_name, data_source=ds, tenant_id=t.id)
+                found = CallSession.objects.using(alias).filter(id=session_id).first()
+                if found:
+                    cs = found
+                    target_alias = alias
+                    break
+            except Exception:
+                continue
+
+        if not cs:
+            raise Http404("Call session recording not found.")
+
+        if not os.path.exists(local_path) or os.path.getsize(local_path) == 0:
+            api_key = os.getenv('SARVAM_API_KEY', '')
+            org_id = os.getenv('SARVAM_ORG_ID', '')
+            workspace_id = os.getenv('SARVAM_WORKSPACE_ID', '')
+            app_id = os.getenv('SARVAM_APP_ID', '')
+
+            inter_id = cs.metadata.get('interaction_id') if isinstance(cs.metadata, dict) else None
+
+            # If no interaction_id in metadata, look it up via interactions list
+            if not inter_id and api_key and org_id and workspace_id and app_id:
+                try:
+                    now = timezone.now()
+                    list_url = f"https://apps.sarvam.ai/api/analytics/v1/{org_id}/{workspace_id}/{app_id}/interactions"
+                    params = {
+                        'start_datetime': (now - timedelta(days=2)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                        'end_datetime': (now + timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                        'include_transcript': 'true',
+                    }
+                    lr = requests.get(list_url, headers={'X-API-Key': api_key}, params=params, timeout=12)
+                    if lr.status_code == 200:
+                        items = lr.json().get('items', [])
+                        if items:
+                            latest_item = items[-1]
+                            inter_id = latest_item.get('interaction_id')
+                            if isinstance(cs.metadata, dict):
+                                cs.metadata['interaction_id'] = inter_id
+                                if latest_item.get('original_transcript') and not cs.transcript:
+                                    cs.transcript = latest_item.get('original_transcript')
+                                cs.save(using=target_alias, update_fields=['metadata', 'transcript', 'updated_at'])
+                except Exception as list_err:
+                    logger.warning("Failed to lookup interaction ID from Sarvam: %s", list_err)
+
+            if inter_id and api_key and org_id and workspace_id and app_id:
+                encoded_inter = str(inter_id).replace('/', '%2F')
+                rec_url = f"https://apps.sarvam.ai/api/analytics/v1/{org_id}/{workspace_id}/{app_id}/recordings/{encoded_inter}"
+                try:
+                    resp = requests.get(rec_url, headers={'X-API-Key': api_key}, timeout=25)
+                    if resp.status_code == 200 and resp.content:
+                        with open(local_path, 'wb') as f:
+                            f.write(resp.content)
+                except Exception as dl_err:
+                    logger.error("Failed to download recording from Sarvam: %s", dl_err)
+
+        if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+            return _serve_audio(local_path)
+
+        return HttpResponse("Audio recording is being processed by Sarvam telephony.", status=404)
+
+    def options(self, request, *args, **kwargs):
+        from django.http import HttpResponse
+        response = HttpResponse()
+        response['Access-Control-Allow-Origin'] = '*'
+        response['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+        response['Access-Control-Allow-Headers'] = 'Range, Content-Type, Accept'
+        response['Access-Control-Expose-Headers'] = 'Content-Range, Content-Length, Accept-Ranges'
+        return response
+
+
+

@@ -934,6 +934,14 @@ class CRMLeadService:
                 })
 
         # 6. Activities
+        # Pre-lookup latest CallSession for the lead to attach recording and transcript to call activities
+        lead_latest_cs = None
+        try:
+            from .models_crm import CallSession
+            lead_latest_cs = CallSession.objects.using(alias).filter(lead=lead).order_by('-started_at').first()
+        except Exception:
+            pass
+
         for act in LeadActivity.objects.using(alias).filter(lead=lead).select_related('performed_by_user'):
             act_user = f"{act.performed_by_user.first_name} {act.performed_by_user.last_name}".strip() if act.performed_by_user else 'Staff'
             ev_type = 'LEAD_ACTIVITY'
@@ -942,8 +950,32 @@ class CRMLeadService:
                 or (act.notes and 'Reminder Call' in act.notes)
                 or act.activity_type == 'REMINDER_CALL'
             )
+            is_call_act = (
+                act.activity_type == 'CALL'
+                or (act.outcome and 'call' in act.outcome.lower())
+                or (act.notes and 'call' in act.notes.lower() and 'summary' in act.notes.lower())
+            )
             if is_reminder_act:
                 ev_type = 'REMINDER_CALL'
+            elif is_call_act:
+                ev_type = 'VOICE_CALL'
+
+            act_metadata = {
+                'activity_type': act.activity_type,
+                'outcome': act.outcome,
+                'notes': act.notes,
+                'is_reminder': is_reminder_act,
+            }
+            if is_call_act and lead_latest_cs:
+                cs_meta = lead_latest_cs.metadata if isinstance(lead_latest_cs.metadata, dict) else {}
+                act_metadata.update({
+                    'call_session_id': str(lead_latest_cs.id),
+                    'recording_url': cs_meta.get('recording_url') or f"/api/v1/voice-agent/recordings/{lead_latest_cs.id}/audio/",
+                    'duration_seconds': lead_latest_cs.duration_seconds,
+                    'transcript': lead_latest_cs.transcript or act.notes,
+                    'disposition': cs_meta.get('disposition') or 'TRIAL_BOOKED',
+                })
+
             events.append({
                 'id': f"act-{act.id}",
                 'event_type': ev_type,
@@ -952,7 +984,7 @@ class CRMLeadService:
                 'description': act.outcome or act.notes or '',
                 'actor': act_user,
                 'channel': act.activity_type,
-                'metadata': {'activity_type': act.activity_type, 'outcome': act.outcome, 'notes': act.notes, 'is_reminder': is_reminder_act},
+                'metadata': act_metadata,
             })
 
         # 7. Notes
@@ -1073,7 +1105,7 @@ class CRMLeadService:
                         'direction': cs.direction,
                         'duration_seconds': cs.duration_seconds,
                         'duration_formatted': f"{int(cs.duration_seconds // 60)}m {int(cs.duration_seconds % 60)}s" if cs.duration_seconds else "--",
-                        'recording_url': call_meta.get('recording_url') or call_meta.get('audio_url') or call_meta.get('recording') or '',
+                        'recording_url': call_meta.get('recording_url') or call_meta.get('audio_url') or call_meta.get('recording') or f"/api/v1/voice-agent/recordings/{cs.id}/audio/",
                         'transcript': cs.transcript,
                         'disposition': disp or 'TRIAL_BOOKED',
                         'call_summary': call_summary,

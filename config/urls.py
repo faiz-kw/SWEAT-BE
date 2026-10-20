@@ -27,6 +27,7 @@ from apps.tenant_core.views_voice_agent import (
     VoiceAgentCancelTrialView,
     VoiceAgentCallOutcomeView,
     VoiceAgentCallbackView,
+    VoiceAgentRecordingAudioView,
 )
 
 # Django admin branding
@@ -64,6 +65,9 @@ urlpatterns = [
     path('api/v1/voice-agent/cancel-trial/', VoiceAgentCancelTrialView.as_view(), name='voice-agent-cancel-trial'),
     path('api/v1/voice-agent/callback/', VoiceAgentCallbackView.as_view(), name='voice-agent-callback'),
     path('api/v1/voice-agent/call-outcome/', VoiceAgentCallOutcomeView.as_view(), name='voice-agent-call-outcome'),
+    path('api/v1/voice-agent/recordings/<uuid:session_id>/audio/', VoiceAgentRecordingAudioView.as_view(), name='voice-agent-recording-audio'),
+    path('api/v1/voice-agent/recordings/<uuid:session_id>/audio.wav', VoiceAgentRecordingAudioView.as_view(), name='voice-agent-recording-audio-wav'),
+    path('api/v1/voice-agent/recordings/<uuid:session_id>/audio', VoiceAgentRecordingAudioView.as_view(), name='voice-agent-recording-audio-bare'),
 
     # Tenant Admin — Org/Branch/User/RBAC management (scoped to tenant DB)
     path('api/v1/admin/', include('apps.tenant_core.urls')),
