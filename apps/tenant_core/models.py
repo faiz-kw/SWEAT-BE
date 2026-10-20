@@ -317,6 +317,30 @@ __all__ += [
     'Product',
 ]
 
+from .models_wellness import (
+    FoodCategory,
+    FoodProvenance,
+    MealType,
+    FoodItem,
+    NutritionTarget,
+    MealLog,
+    MealLogItem,
+    WaterLog,
+    SleepLog,
+)
+
+__all__ += [
+    'FoodCategory',
+    'FoodProvenance',
+    'MealType',
+    'FoodItem',
+    'NutritionTarget',
+    'MealLog',
+    'MealLogItem',
+    'WaterLog',
+    'SleepLog',
+]
+
 
 
 

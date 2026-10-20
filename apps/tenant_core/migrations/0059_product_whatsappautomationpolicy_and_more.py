@@ -38,50 +38,104 @@ class Migration(migrations.Migration):
                 'ordering': ['-created_at'],
             },
         ),
-        migrations.CreateModel(
-            name='WhatsAppAutomationPolicy',
-            fields=[
-                ('id', models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
-                ('whatsapp_enabled', models.BooleanField(default=False, help_text='Master switch. When False, no automated WhatsApp messages are sent.')),
-                ('booking_confirmation_enabled', models.BooleanField(default=True)),
-                ('booking_confirmation_template_name', models.CharField(blank=True, default='sweat_class_booking_confirm', help_text='Gupshup-approved template name for class booking confirmation.', max_length=120)),
-                ('booking_confirmation_variable_map', models.JSONField(blank=True, default=dict, help_text='Ordered list of variable keys resolved at send time.')),
-                ('booking_reminder_enabled', models.BooleanField(default=True)),
-                ('booking_reminder_template_name', models.CharField(blank=True, default='sweat_class_reminder', help_text='Gupshup-approved template name for class/trial reminder.', max_length=120)),
-                ('booking_reminder_variable_map', models.JSONField(blank=True, default=dict, help_text='Variable mapping for the reminder template.')),
-                ('booking_reminder_offsets_minutes', models.JSONField(blank=True, default=list, help_text='List of reminder offsets in minutes before the class starts.')),
-                ('lead_welcome_enabled', models.BooleanField(default=True)),
-                ('lead_welcome_template_name', models.CharField(blank=True, default='sweat_lead_welcome', max_length=120)),
-                ('lead_welcome_variable_map', models.JSONField(blank=True, default=dict)),
-                ('trial_confirmation_enabled', models.BooleanField(default=True)),
-                ('trial_confirmation_template_name', models.CharField(blank=True, default='sweat_trial_booking_confirm', max_length=120)),
-                ('trial_confirmation_variable_map', models.JSONField(blank=True, default=dict)),
-                ('inbound_confirm_keyword', models.CharField(default='CONFIRM', help_text='Case-insensitive keyword that triggers trial/booking confirmation.', max_length=50)),
-                ('inbound_reschedule_keyword', models.CharField(default='RESCHEDULE', help_text='Case-insensitive keyword that triggers reschedule request.', max_length=50)),
-                ('confirm_action_notify_staff', models.BooleanField(default=True, help_text='Send an in-app alert to assigned staff when a member replies CONFIRM.')),
-                ('reschedule_action_create_task', models.BooleanField(default=True, help_text='Create a follow-up task for front-desk staff when a member replies RESCHEDULE.')),
-                ('created_at', models.DateTimeField(default=django.utils.timezone.now)),
-                ('updated_at', models.DateTimeField(auto_now=True)),
+        migrations.SeparateDatabaseAndState(
+            state_operations=[
+                migrations.CreateModel(
+                    name='WhatsAppAutomationPolicy',
+                    fields=[
+                        ('id', models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
+                        ('whatsapp_enabled', models.BooleanField(default=False, help_text='Master switch. When False, no automated WhatsApp messages are sent.')),
+                        ('booking_confirmation_enabled', models.BooleanField(default=True)),
+                        ('booking_confirmation_template_name', models.CharField(blank=True, default='sweat_class_booking_confirm', help_text='Gupshup-approved template name for class booking confirmation.', max_length=120)),
+                        ('booking_confirmation_variable_map', models.JSONField(blank=True, default=dict, help_text='Ordered list of variable keys resolved at send time.')),
+                        ('booking_reminder_enabled', models.BooleanField(default=True)),
+                        ('booking_reminder_template_name', models.CharField(blank=True, default='sweat_class_reminder', help_text='Gupshup-approved template name for class/trial reminder.', max_length=120)),
+                        ('booking_reminder_variable_map', models.JSONField(blank=True, default=dict, help_text='Variable mapping for the reminder template.')),
+                        ('booking_reminder_offsets_minutes', models.JSONField(blank=True, default=list, help_text='List of reminder offsets in minutes before the class starts.')),
+                        ('lead_welcome_enabled', models.BooleanField(default=True)),
+                        ('lead_welcome_template_name', models.CharField(blank=True, default='sweat_lead_welcome', max_length=120)),
+                        ('lead_welcome_variable_map', models.JSONField(blank=True, default=dict)),
+                        ('trial_confirmation_enabled', models.BooleanField(default=True)),
+                        ('trial_confirmation_template_name', models.CharField(blank=True, default='sweat_trial_booking_confirm', max_length=120)),
+                        ('trial_confirmation_variable_map', models.JSONField(blank=True, default=dict)),
+                        ('inbound_confirm_keyword', models.CharField(default='CONFIRM', help_text='Case-insensitive keyword that triggers trial/booking confirmation.', max_length=50)),
+                        ('inbound_reschedule_keyword', models.CharField(default='RESCHEDULE', help_text='Case-insensitive keyword that triggers reschedule request.', max_length=50)),
+                        ('confirm_action_notify_staff', models.BooleanField(default=True, help_text='Send an in-app alert to assigned staff when a member replies CONFIRM.')),
+                        ('reschedule_action_create_task', models.BooleanField(default=True, help_text='Create a follow-up task for front-desk staff when a member replies RESCHEDULE.')),
+                        ('created_at', models.DateTimeField(default=django.utils.timezone.now)),
+                        ('updated_at', models.DateTimeField(auto_now=True)),
+                    ],
+                    options={
+                        'verbose_name': 'WhatsApp Automation Policy',
+                        'verbose_name_plural': 'WhatsApp Automation Policies',
+                        'db_table': 'whatsapp_automation_policy',
+                    },
+                ),
             ],
-            options={
-                'verbose_name': 'WhatsApp Automation Policy',
-                'verbose_name_plural': 'WhatsApp Automation Policies',
-                'db_table': 'whatsapp_automation_policy',
-            },
+            database_operations=[
+                migrations.RunSQL(
+                    sql="""
+                    CREATE TABLE IF NOT EXISTS "whatsapp_automation_policy" (
+                        "id" uuid NOT NULL PRIMARY KEY,
+                        "whatsapp_enabled" boolean NOT NULL,
+                        "booking_confirmation_enabled" boolean NOT NULL,
+                        "booking_confirmation_template_name" varchar(120) NOT NULL,
+                        "booking_confirmation_variable_map" jsonb NOT NULL,
+                        "booking_reminder_enabled" boolean NOT NULL,
+                        "booking_reminder_template_name" varchar(120) NOT NULL,
+                        "booking_reminder_variable_map" jsonb NOT NULL,
+                        "booking_reminder_offsets_minutes" jsonb NOT NULL,
+                        "lead_welcome_enabled" boolean NOT NULL,
+                        "lead_welcome_template_name" varchar(120) NOT NULL,
+                        "lead_welcome_variable_map" jsonb NOT NULL,
+                        "trial_confirmation_enabled" boolean NOT NULL,
+                        "trial_confirmation_template_name" varchar(120) NOT NULL,
+                        "trial_confirmation_variable_map" jsonb NOT NULL,
+                        "inbound_confirm_keyword" varchar(50) NOT NULL,
+                        "inbound_reschedule_keyword" varchar(50) NOT NULL,
+                        "confirm_action_notify_staff" boolean NOT NULL,
+                        "reschedule_action_create_task" boolean NOT NULL,
+                        "created_at" timestamp with time zone NOT NULL,
+                        "updated_at" timestamp with time zone NOT NULL
+                    );
+                    """,
+                    reverse_sql=""
+                ),
+            ],
         ),
         migrations.AlterModelOptions(
             name='bookingpolicyconfig',
             options={'ordering': ['-updated_at']},
         ),
-        migrations.RenameIndex(
-            model_name='booking',
-            new_name='bookings_status_1b5f35_idx',
-            old_name='idx_bk_status_paystatus',
-        ),
-        migrations.RenameIndex(
-            model_name='booking',
-            new_name='bookings_status_6369a6_idx',
-            old_name='idx_bk_status_confstatus',
+        migrations.SeparateDatabaseAndState(
+            state_operations=[
+                migrations.RenameIndex(
+                    model_name='booking',
+                    new_name='bookings_status_1b5f35_idx',
+                    old_name='idx_bk_status_paystatus',
+                ),
+                migrations.RenameIndex(
+                    model_name='booking',
+                    new_name='bookings_status_6369a6_idx',
+                    old_name='idx_bk_status_confstatus',
+                ),
+            ],
+            database_operations=[
+                migrations.RunSQL(
+                    sql="""
+                    DO $$
+                    BEGIN
+                        IF EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_bk_status_paystatus') THEN
+                            ALTER INDEX idx_bk_status_paystatus RENAME TO bookings_status_1b5f35_idx;
+                        END IF;
+                        IF EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_bk_status_confstatus') THEN
+                            ALTER INDEX idx_bk_status_confstatus RENAME TO bookings_status_6369a6_idx;
+                        END IF;
+                    END $$;
+                    """,
+                    reverse_sql=""
+                ),
+            ],
         ),
         migrations.AlterField(
             model_name='metaleadmapping',
@@ -103,10 +157,30 @@ class Migration(migrations.Migration):
             name='organization',
             field=models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='products', to='tenant_core.organization'),
         ),
-        migrations.AddField(
-            model_name='whatsappautomationpolicy',
-            name='organization',
-            field=models.OneToOneField(on_delete=django.db.models.deletion.CASCADE, related_name='whatsapp_automation_policy', to='tenant_core.organization'),
+        migrations.SeparateDatabaseAndState(
+            state_operations=[
+                migrations.AddField(
+                    model_name='whatsappautomationpolicy',
+                    name='organization',
+                    field=models.OneToOneField(on_delete=django.db.models.deletion.CASCADE, related_name='whatsapp_automation_policy', to='tenant_core.organization'),
+                ),
+            ],
+            database_operations=[
+                migrations.RunSQL(
+                    sql="""
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns 
+                            WHERE table_name='whatsapp_automation_policy' AND column_name='organization_id'
+                        ) THEN
+                            ALTER TABLE "whatsapp_automation_policy" ADD COLUMN "organization_id" uuid NOT NULL REFERENCES "organizations"("id") DEFERRABLE INITIALLY DEFERRED;
+                        END IF;
+                    END $$;
+                    """,
+                    reverse_sql=""
+                ),
+            ],
         ),
         migrations.AddIndex(
             model_name='product',

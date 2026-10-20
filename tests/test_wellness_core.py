@@ -1,0 +1,500 @@
+"""
+backend/tests/test_wellness_core.py — Automated Tests for SWEAT Nutrition MVP (Milestone 1)
+
+Covers:
+1. Portion calculation and serving math.
+2. Historical nutrient snapshot immutability upon catalog mutation.
+3. Server-side UserProfile scoping and member privacy isolation.
+4. Multi-tenant boundary isolation (custom foods).
+5. Idempotent catalog seeding without duplicates.
+6. Water logging API & intraday aggregation.
+7. Manual sleep tracking API & duration computation.
+8. Daily summary contract & rollup against targets.
+"""
+
+import uuid
+from decimal import Decimal
+from datetime import date, datetime, time, timedelta
+
+from django.test import TestCase
+from django.utils import timezone
+from django.core.management import call_command
+from rest_framework.test import APIClient
+from rest_framework import status
+
+from config.routers import set_tenant_db_alias
+from apps.master.models_tenant import Tenant
+from apps.master.models_infra import TenantDataSource
+from apps.master.models_saas import SaasPlan, TenantSubscription
+from apps.authentication.views import _build_tenant_token
+from apps.tenant_core.models_org import Organization, Location, Branch
+from apps.tenant_core.models_users import TenantUser
+from apps.tenant_core.models_workforce import UserProfile
+from apps.tenant_core.models_wellness import (
+    FoodItem,
+    FoodCategory,
+    FoodProvenance,
+    MealType,
+    MealLog,
+    MealLogItem,
+    WaterLog,
+    SleepLog,
+    NutritionTarget,
+)
+
+
+class WellnessCoreTests(TestCase):
+    databases = '__all__'
+
+    def setUp(self):
+        super().setUp()
+        self.alias = 'tenant_test'
+        set_tenant_db_alias(self.alias)
+
+        # 1. Master Tenant Setup
+        self.tenant = Tenant.objects.using('default').create(
+            code='SWEAT-WELLNESS-TEST',
+            name='SWEAT Elite UAT',
+            slug='sweat',
+            status='ACTIVE',
+        )
+        self.ds = TenantDataSource.objects.using('default').create(
+            tenant=self.tenant,
+            db_name='test_fitness_tenant',
+            database_name='test_fitness_tenant',
+            status='ACTIVE',
+            database_engine='POSTGRESQL',
+        )
+        self.plan = SaasPlan.objects.using('default').create(
+            name='Wellness Test Plan',
+            code='WELLNESS-PLAN',
+            tier='ENTERPRISE',
+            status='ACTIVE',
+        )
+        self.sub = TenantSubscription.objects.using('default').create(
+            tenant=self.tenant,
+            plan=self.plan,
+            status='ACTIVE',
+        )
+
+        # 2. Second Tenant for Tenant Isolation Verification
+        self.tenant_b = Tenant.objects.using('default').create(
+            code='OTHER-GYM',
+            name='Other Gym',
+            slug='other-gym',
+            status='ACTIVE',
+        )
+
+        # 3. Tenant DB Org Setup
+        self.org = Organization.objects.using(self.alias).create(
+            code='SWEAT-ORG',
+            name='SWEAT Studio',
+            status='ACTIVE',
+        )
+        self.org_b = Organization.objects.using(self.alias).create(
+            code='OTHER-ORG',
+            name='Other Studio',
+            status='ACTIVE',
+        )
+        self.loc = Location.objects.using(self.alias).create(
+            organization=self.org,
+            code='IND-BLR',
+            name='Bangalore',
+            status='ACTIVE',
+        )
+        self.branch = Branch.objects.using(self.alias).create(
+            organization=self.org,
+            location=self.loc,
+            code='BLR-KOR',
+            name='Koramangala',
+            status='ACTIVE',
+        )
+
+        # 4. Member A (Alice)
+        self.user_alice = TenantUser.objects.using(self.alias).create(
+            organization=self.org,
+            email='alice@sweat.test',
+            first_name='Alice',
+            last_name='Member',
+            home_branch=self.branch,
+            status='ACTIVE',
+        )
+        self.user_alice.set_password('Pass123!')
+        self.user_alice.save(using=self.alias)
+        self.profile_alice = UserProfile.objects.using(self.alias).create(
+            user=self.user_alice,
+            member_number='SW-001',
+            first_name_snapshot='Alice',
+            last_name_snapshot='Member',
+            preferred_branch=self.branch,
+            member_status='ACTIVE',
+        )
+
+        # 5. Member B (Bob)
+        self.user_bob = TenantUser.objects.using(self.alias).create(
+            organization=self.org,
+            email='bob@sweat.test',
+            first_name='Bob',
+            last_name='Member',
+            home_branch=self.branch,
+            status='ACTIVE',
+        )
+        self.user_bob.set_password('Pass123!')
+        self.user_bob.save(using=self.alias)
+        self.profile_bob = UserProfile.objects.using(self.alias).create(
+            user=self.user_bob,
+            member_number='SW-002',
+            first_name_snapshot='Bob',
+            last_name_snapshot='Member',
+            preferred_branch=self.branch,
+            member_status='ACTIVE',
+        )
+
+        # 6. Seed Foods for Alice and Bob
+        call_command('seed_indian_food_catalog', database=self.alias)
+
+        # API Clients with Tokens
+        self.client_alice = APIClient()
+        token_alice = str(_build_tenant_token(self.user_alice, self.tenant, self.alias).access_token)
+        self.client_alice.credentials(HTTP_AUTHORIZATION=f'Bearer {token_alice}')
+
+        self.client_bob = APIClient()
+        token_bob = str(_build_tenant_token(self.user_bob, self.tenant, self.alias).access_token)
+        self.client_bob.credentials(HTTP_AUTHORIZATION=f'Bearer {token_bob}')
+
+    # -------------------------------------------------------------------------
+    # TEST 1: Catalog Seeding & Mathematical Reconciliations
+    # -------------------------------------------------------------------------
+    def test_catalog_seeded_values_and_idempotency(self):
+        """Verify the 25 items are seeded with exact mathematical values and idempotent re-runs."""
+        foods = FoodItem.objects.using(self.alias).filter(is_system=True)
+        self.assertEqual(foods.count(), 25)
+
+        # Plain Dosa check
+        dosa = foods.get(name='Plain Dosa')
+        self.assertEqual(dosa.calories, Decimal('204.80'))
+        self.assertEqual(dosa.protein_g, Decimal('5.50'))
+        self.assertEqual(dosa.carbs_g, Decimal('35.10'))
+        self.assertEqual(dosa.fat_g, Decimal('4.40'))
+        self.assertEqual(dosa.fiber_g, Decimal('1.20'))
+        self.assertEqual(dosa.provenance, FoodProvenance.RECIPE_ESTIMATE)
+        self.assertFalse(dosa.is_nutritionist_verified)
+
+        # Steamed Idli check
+        idli = foods.get(name='Steamed Idli')
+        self.assertEqual(idli.calories, Decimal('59.50'))
+        self.assertEqual(idli.protein_g, Decimal('1.90'))
+        self.assertEqual(idli.carbs_g, Decimal('12.40'))
+        self.assertEqual(idli.fat_g, Decimal('0.20'))
+        self.assertEqual(idli.fiber_g, Decimal('0.40'))
+        self.assertEqual(idli.provenance, FoodProvenance.RECIPE_ESTIMATE)
+        self.assertFalse(idli.is_nutritionist_verified)
+
+        # Phulka check
+        phulka = foods.get(name='Phulka / Plain Roti')
+        self.assertEqual(phulka.calories, Decimal('102.00'))
+        self.assertEqual(phulka.protein_g, Decimal('4.00'))
+        self.assertEqual(phulka.carbs_g, Decimal('21.60'))
+        self.assertEqual(phulka.fat_g, Decimal('0.80'))
+        self.assertEqual(phulka.fiber_g, Decimal('3.20'))
+        self.assertEqual(phulka.provenance, FoodProvenance.RECIPE_ESTIMATE)
+
+        # USDA Direct item check (Egg, Whole, Boiled)
+        egg = foods.get(name='Egg, Whole, Boiled')
+        self.assertEqual(egg.provenance, FoodProvenance.USDA_DIRECT)
+        self.assertEqual(egg.source_reference_id, 'FDC: 171287')
+
+        # Idempotency: Re-run seed command
+        call_command('seed_indian_food_catalog', database=self.alias)
+        self.assertEqual(FoodItem.objects.using(self.alias).filter(is_system=True).count(), 25)
+
+    # -------------------------------------------------------------------------
+    # TEST 2: Portion Calculation & Meal Logging API
+    # -------------------------------------------------------------------------
+    def test_meal_logging_portion_math(self):
+        """Verify portion scaling math when logging multiple items."""
+        phulka = FoodItem.objects.using(self.alias).get(name='Phulka / Plain Roti')
+        dal = FoodItem.objects.using(self.alias).get(name='Yellow Dal Tadka')
+
+        payload = {
+            'logged_date': '2026-10-20',
+            'logged_time': '13:00:00',
+            'meal_type': 'LUNCH',
+            'notes': '2 phulkas and 1 katori dal',
+            'items': [
+                {
+                    'food_item_id': str(phulka.id),
+                    'quantity': 2.0,
+                    'unit_name': 'piece',
+                    'consumed_grams': 70.0,
+                },
+                {
+                    'food_item_id': str(dal.id),
+                    'quantity': 1.0,
+                    'unit_name': 'katori',
+                    'consumed_grams': 150.0,
+                },
+            ],
+        }
+
+        res = self.client_alice.post('/api/v1/mobile/wellness/meal-logs/', payload, format='json')
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        data = res.data
+
+        # 2 Phulkas: 102 * 2 = 204.0 kcal, 4.0 * 2 = 8.0g P
+        # 1 Dal (150g): 179.2 kcal, 8.2g P
+        # Total cals: 204.0 + 179.2 = 383.2 kcal
+        self.assertAlmostEqual(float(data['total_calories']), 383.2, places=1)
+        self.assertAlmostEqual(float(data['total_protein_g']), 16.2, places=1)
+        self.assertEqual(len(data['items']), 2)
+
+    # -------------------------------------------------------------------------
+    # TEST 3: Nutrient Snapshot Immutability
+    # -------------------------------------------------------------------------
+    def test_nutrient_snapshot_immutability(self):
+        """Logged MealLogItem snapshot values must never change even if FoodItem catalog values mutate."""
+        phulka = FoodItem.objects.using(self.alias).get(name='Phulka / Plain Roti')
+
+        payload = {
+            'logged_date': '2026-10-20',
+            'meal_type': 'DINNER',
+            'items': [
+                {
+                    'food_item_id': str(phulka.id),
+                    'quantity': 1.0,
+                    'unit_name': 'piece',
+                    'consumed_grams': 35.0,
+                }
+            ],
+        }
+        res = self.client_alice.post('/api/v1/mobile/wellness/meal-logs/', payload, format='json')
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        meal_id = res.data['id']
+        logged_item_id = res.data['items'][0]['id']
+
+        # Mutate the catalog item in database
+        phulka.calories = Decimal('999.00')
+        phulka.protein_g = Decimal('88.00')
+        phulka.save(using=self.alias)
+
+        # Retrieve the meal log again
+        res_get = self.client_alice.get(f'/api/v1/mobile/wellness/meal-logs/{meal_id}/')
+        self.assertEqual(res_get.status_code, status.HTTP_200_OK)
+        item_data = res_get.data['items'][0]
+
+        # Snapshot MUST remain 102 kcal and 4.0g P
+        self.assertEqual(float(item_data['snapshot_calories']), 102.0)
+        self.assertEqual(float(item_data['snapshot_protein_g']), 4.0)
+
+    # -------------------------------------------------------------------------
+    # TEST 4: Server-Side UserProfile Scoping & Privacy Enforcement
+    # -------------------------------------------------------------------------
+    def test_member_privacy_and_user_profile_scoping(self):
+        """A member cannot access or mutate another member's wellness logs."""
+        phulka = FoodItem.objects.using(self.alias).get(name='Phulka / Plain Roti')
+
+        # Alice creates a meal log
+        payload = {
+            'logged_date': '2026-10-20',
+            'meal_type': 'BREAKFAST',
+            'items': [
+                {
+                    'food_item_id': str(phulka.id),
+                    'quantity': 1.0,
+                    'unit_name': 'piece',
+                    'consumed_grams': 35.0,
+                }
+            ],
+        }
+        res_alice = self.client_alice.post('/api/v1/mobile/wellness/meal-logs/', payload, format='json')
+        self.assertEqual(res_alice.status_code, status.HTTP_201_CREATED)
+        alice_meal_id = res_alice.data['id']
+
+        # Bob attempts to GET Alice's meal log -> 404
+        res_bob_get = self.client_bob.get(f'/api/v1/mobile/wellness/meal-logs/{alice_meal_id}/')
+        self.assertEqual(res_bob_get.status_code, status.HTTP_404_NOT_FOUND)
+
+        # Bob attempts to PATCH Alice's meal log -> 404
+        res_bob_patch = self.client_bob.patch(
+            f'/api/v1/mobile/wellness/meal-logs/{alice_meal_id}/',
+            {'notes': 'Hacked notes'},
+            format='json'
+        )
+        self.assertEqual(res_bob_patch.status_code, status.HTTP_404_NOT_FOUND)
+
+        # Bob attempts to DELETE Alice's meal log -> 404
+        res_bob_del = self.client_bob.delete(f'/api/v1/mobile/wellness/meal-logs/{alice_meal_id}/')
+        self.assertEqual(res_bob_del.status_code, status.HTTP_404_NOT_FOUND)
+
+        # Alice's meal log still exists untouched
+        self.assertTrue(MealLog.objects.using(self.alias).filter(id=alice_meal_id).exists())
+
+    # -------------------------------------------------------------------------
+    # TEST 5: Multi-Tenant Boundary Isolation (Custom Foods)
+    # -------------------------------------------------------------------------
+    def test_tenant_custom_food_isolation(self):
+        """Custom food items created by Org B must never be visible to Org A."""
+        # Create Org B custom food
+        custom_food_b = FoodItem.objects.using(self.alias).create(
+            organization=self.org_b,
+            is_system=False,
+            name='Secret Protein Shake',
+            calories=Decimal('350.00'),
+            protein_g=Decimal('40.00'),
+            carbs_g=Decimal('10.00'),
+            fat_g=Decimal('5.00'),
+            fiber_g=Decimal('2.00'),
+            provenance=FoodProvenance.CUSTOM_TENANT,
+        )
+
+        # Alice (Org A) searches for 'Secret Protein Shake'
+        res = self.client_alice.get('/api/v1/mobile/wellness/foods/?q=Secret')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        # Must return 0 results
+        self.assertEqual(res.data['count'], 0)
+
+        # But system foods are visible
+        res_sys = self.client_alice.get('/api/v1/mobile/wellness/foods/?q=Dosa')
+        self.assertEqual(res_sys.status_code, status.HTTP_200_OK)
+        self.assertGreater(res_sys.data['count'], 0)
+
+    # -------------------------------------------------------------------------
+    # TEST 6: Water Tracking API
+    # -------------------------------------------------------------------------
+    def test_water_logging_and_intraday_total(self):
+        """Log water intake and verify daily total and deletion."""
+        # 1. Log 500 ml
+        res1 = self.client_alice.post('/api/v1/mobile/wellness/water-logs/', {
+            'logged_date': '2026-10-20',
+            'amount_ml': 500,
+        }, format='json')
+        self.assertEqual(res1.status_code, status.HTTP_201_CREATED)
+        water_id = res1.data['id']
+
+        # 2. Log 250 ml
+        res2 = self.client_alice.post('/api/v1/mobile/wellness/water-logs/', {
+            'logged_date': '2026-10-20',
+            'amount_ml': 250,
+        }, format='json')
+        self.assertEqual(res2.status_code, status.HTTP_201_CREATED)
+
+        # 3. GET list for today
+        res_list = self.client_alice.get('/api/v1/mobile/wellness/water-logs/?date=2026-10-20')
+        self.assertEqual(res_list.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_list.data['total_ml'], 750)
+        self.assertEqual(res_list.data['count'], 2)
+
+        # 4. Bob cannot delete Alice's water log
+        res_bob_del = self.client_bob.delete(f'/api/v1/mobile/wellness/water-logs/{water_id}/')
+        self.assertEqual(res_bob_del.status_code, status.HTTP_404_NOT_FOUND)
+
+        # 5. Alice deletes 500 ml entry
+        res_del = self.client_alice.delete(f'/api/v1/mobile/wellness/water-logs/{water_id}/')
+        self.assertEqual(res_del.status_code, status.HTTP_200_OK)
+
+        # Check total is now 250
+        res_check = self.client_alice.get('/api/v1/mobile/wellness/water-logs/?date=2026-10-20')
+        self.assertEqual(res_check.data['total_ml'], 250)
+
+    # -------------------------------------------------------------------------
+    # TEST 7: Sleep Tracking API & Duration Computation
+    # -------------------------------------------------------------------------
+    def test_manual_sleep_logging(self):
+        """Log sleep entry, verify automated duration calculation and validation."""
+        start = timezone.now() - timedelta(hours=8)
+        end = timezone.now()
+
+        payload = {
+            'logged_date': '2026-10-20',
+            'start_time': start.isoformat(),
+            'end_time': end.isoformat(),
+            'quality_rating': 4,
+            'notes': 'Deep restorative sleep',
+        }
+
+        res = self.client_alice.post('/api/v1/mobile/wellness/sleep-logs/', payload, format='json')
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res.data['duration_minutes'], 480)
+        self.assertEqual(res.data['quality_rating'], 4)
+
+        # Invalid end before start
+        bad_payload = {
+            'logged_date': '2026-10-20',
+            'start_time': end.isoformat(),
+            'end_time': start.isoformat(),
+        }
+        res_bad = self.client_alice.post('/api/v1/mobile/wellness/sleep-logs/', bad_payload, format='json')
+        self.assertEqual(res_bad.status_code, status.HTTP_400_BAD_REQUEST)
+
+    # -------------------------------------------------------------------------
+    # TEST 8: Daily Summary API Contract
+    # -------------------------------------------------------------------------
+    def test_daily_summary_aggregation(self):
+        """Verify daily summary rolls up targets, consumed nutrients, water and sleep."""
+        # Custom target for Alice: 1800 kcal, 100g P
+        self.client_alice.put('/api/v1/mobile/wellness/targets/', {
+            'daily_calories': 1800.0,
+            'protein_grams': 100.0,
+            'water_ml': 2000,
+            'sleep_target_minutes': 480,
+        }, format='json')
+
+        # Log Meal: 1 Dosa (204.8 kcal, 5.5g P)
+        dosa = FoodItem.objects.using(self.alias).get(name='Plain Dosa')
+        self.client_alice.post('/api/v1/mobile/wellness/meal-logs/', {
+            'logged_date': '2026-10-20',
+            'meal_type': 'BREAKFAST',
+            'items': [{
+                'food_item_id': str(dosa.id),
+                'quantity': 1.0,
+                'unit_name': 'piece',
+                'consumed_grams': 80.0,
+            }],
+        }, format='json')
+
+        # Log Water: 1000 ml
+        self.client_alice.post('/api/v1/mobile/wellness/water-logs/', {
+            'logged_date': '2026-10-20',
+            'amount_ml': 1000,
+        }, format='json')
+
+        # Log Sleep: 420 mins (7h)
+        start = timezone.now() - timedelta(hours=7)
+        end = timezone.now()
+        self.client_alice.post('/api/v1/mobile/wellness/sleep-logs/', {
+            'logged_date': '2026-10-20',
+            'start_time': start.isoformat(),
+            'end_time': end.isoformat(),
+            'duration_minutes': 420,
+            'quality_rating': 5,
+        }, format='json')
+
+        # Request Daily Summary
+        res_summary = self.client_alice.get('/api/v1/mobile/wellness/daily-summary/?date=2026-10-20')
+        self.assertEqual(res_summary.status_code, status.HTTP_200_OK)
+        data = res_summary.data
+
+        # Check Targets
+        self.assertEqual(data['targets']['calories'], 1800.0)
+        self.assertEqual(data['targets']['protein_g'], 100.0)
+        self.assertEqual(data['targets']['water_ml'], 2000)
+
+        # Check Consumed
+        self.assertAlmostEqual(data['consumed']['calories'], 204.8, places=1)
+        self.assertAlmostEqual(data['consumed']['protein_g'], 5.5, places=1)
+
+        # Check Remaining
+        self.assertAlmostEqual(data['remaining']['calories'], 1800.0 - 204.8, places=1)
+        self.assertAlmostEqual(data['remaining']['protein_g'], 100.0 - 5.5, places=1)
+
+        # Check Water
+        self.assertEqual(data['water']['consumed_ml'], 1000)
+        self.assertEqual(data['water']['percentage'], 50.0)
+
+        # Check Sleep
+        self.assertEqual(data['sleep']['duration_minutes'], 420)
+        self.assertEqual(data['sleep']['quality_rating'], 5)
+
+        # Check Meals breakdown
+        self.assertEqual(len(data['meals']), 1)
+        self.assertEqual(data['meals'][0]['meal_type'], 'BREAKFAST')
