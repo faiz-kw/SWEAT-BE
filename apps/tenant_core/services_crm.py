@@ -1042,15 +1042,29 @@ class CRMLeadService:
                 is_reminder = 'REMINDER' in call_type or 'reminder' in str(call_meta).lower()
                 title = f"AI Reminder Call: {status_label}" if is_reminder else f"AI Call: {status_label}"
                 ev_type = 'REMINDER_CALL' if is_reminder else 'VOICE_CALL'
+                raw_transcript = cs.transcript or ""
+                call_summary = ""
+                disp = str(call_meta.get('disposition') or '')
+                if isinstance(raw_transcript, str) and "Call Summary:" in raw_transcript:
+                    for line in raw_transcript.splitlines():
+                        if line.startswith("Call Summary:"):
+                            call_summary = line.replace("Call Summary:", "").strip()
+                        elif line.startswith("Disposition:") and not disp:
+                            disp = line.replace("Disposition:", "").strip()
+
+                desc = call_summary or (
+                    f"Duration: {int(cs.duration_seconds)}s • Provider: {cs.provider}" + (
+                        f" • Turns: {len(cs.transcript)}" if isinstance(cs.transcript, list) else ""
+                    )
+                )
+
                 events.append({
                     'id': f"call-{cs.id}",
                     'event_type': ev_type,
                     'occurred_at': (cs.started_at or cs.created_at).isoformat(),
                     'title': title,
-                    'description': f"Duration: {int(cs.duration_seconds)}s • Provider: {cs.provider}" + (
-                        f" • Turns: {len(cs.transcript)}" if cs.transcript else ""
-                    ),
-                    'actor': f"{cs.provider.title()} Voice Agent",
+                    'description': desc,
+                    'actor': f"{cs.provider.title()} Voice Agent (Mahek)",
                     'channel': 'VOICE',
                     'metadata': {
                         'call_session_id': str(cs.id),
@@ -1058,7 +1072,11 @@ class CRMLeadService:
                         'status': cs.status,
                         'direction': cs.direction,
                         'duration_seconds': cs.duration_seconds,
+                        'duration_formatted': f"{int(cs.duration_seconds // 60)}m {int(cs.duration_seconds % 60)}s" if cs.duration_seconds else "--",
+                        'recording_url': call_meta.get('recording_url') or call_meta.get('audio_url') or call_meta.get('recording') or '',
                         'transcript': cs.transcript,
+                        'disposition': disp or 'TRIAL_BOOKED',
+                        'call_summary': call_summary,
                         'final_agent_variables': cs.final_agent_variables,
                         'started_at': cs.started_at.isoformat() if cs.started_at else None,
                         'ended_at': cs.ended_at.isoformat() if cs.ended_at else None,

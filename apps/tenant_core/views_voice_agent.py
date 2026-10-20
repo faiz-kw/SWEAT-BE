@@ -2141,13 +2141,28 @@ class VoiceAgentCallOutcomeView(View):
                     recent_sess = CallSession.objects.using(alias).filter(lead=lead).order_by('-created_at').first()
 
                 if recent_sess:
+                    fields_to_save = ['transcript', 'metadata', 'updated_at']
                     if is_reminder:
                         if not isinstance(recent_sess.metadata, dict):
                             recent_sess.metadata = {}
                         recent_sess.metadata['call_type'] = 'REMINDER'
                     if not recent_sess.transcript:
                         recent_sess.transcript = full_notes
-                    recent_sess.save(using=alias, update_fields=['transcript', 'metadata', 'updated_at'])
+                    recent_sess.status = 'COMPLETED'
+                    fields_to_save.append('status')
+                    if not recent_sess.ended_at:
+                        recent_sess.ended_at = timezone.now()
+                        fields_to_save.append('ended_at')
+                    if (not recent_sess.duration_seconds or recent_sess.duration_seconds <= 0) and recent_sess.started_at:
+                        diff = (recent_sess.ended_at - recent_sess.started_at).total_seconds()
+                        recent_sess.duration_seconds = max(1.0, round(diff, 1))
+                        fields_to_save.append('duration_seconds')
+                    rec_url_input = data.get('recording_url') or data.get('recording') or data.get('audio_url')
+                    if rec_url_input:
+                        if not isinstance(recent_sess.metadata, dict):
+                            recent_sess.metadata = {}
+                        recent_sess.metadata['recording_url'] = str(rec_url_input).strip()
+                    recent_sess.save(using=alias, update_fields=fields_to_save)
                 else:
                     CallSession.objects.using(alias).create(
                         organization=lead.organization,
