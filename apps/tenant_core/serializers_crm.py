@@ -359,6 +359,15 @@ class LeadSerializer(serializers.ModelSerializer):
             'recommended_action': full['recommended_action'],
         }
 
+    def to_internal_value(self, data):
+        # Allow phone_normalized and email_normalized to be accepted as aliases for phone and email
+        mutable_data = data.copy() if hasattr(data, 'copy') else dict(data)
+        if 'phone_normalized' in mutable_data and not mutable_data.get('phone'):
+            mutable_data['phone'] = mutable_data['phone_normalized']
+        if 'email_normalized' in mutable_data and not mutable_data.get('email'):
+            mutable_data['email'] = mutable_data['email_normalized']
+        return super().to_internal_value(mutable_data)
+
     def validate_first_name(self, value):
         if not value or not value.strip():
             raise serializers.ValidationError("First name is required.")
