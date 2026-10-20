@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import uuid
+from decimal import Decimal
 from typing import Any, Callable, Dict, Optional
 from datetime import timedelta
 from django.utils import timezone
@@ -25,7 +26,7 @@ SENSITIVE_KEYS = {
 
 def sanitize_payload(data: Any) -> Any:
     """
-    Recursively strip or mask sensitive keys from audit payloads.
+    Recursively strip or mask sensitive keys from audit payloads and ensure JSON-safe primitives.
     """
     if isinstance(data, dict):
         sanitized = {}
@@ -37,7 +38,14 @@ def sanitize_payload(data: Any) -> Any:
         return sanitized
     elif isinstance(data, list):
         return [sanitize_payload(item) for item in data]
+    elif isinstance(data, Decimal):
+        return float(data)
+    elif isinstance(data, uuid.UUID):
+        return str(data)
+    elif hasattr(data, 'isoformat'):
+        return data.isoformat()
     return data
+
 
 
 def compute_request_hash(data: Any) -> str:

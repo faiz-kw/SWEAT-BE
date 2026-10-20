@@ -49,7 +49,17 @@ class PublicLeadCaptureView(APIView):
 
         # 2. Switch into Tenant's Dedicated Database Context
         with tenant_database_context(tenant.id) as db_alias:
-            org = Organization.objects.using(db_alias).filter(status='ACTIVE').order_by('-created_at').first()
+            org = None
+            if payload.get('organization_id'):
+                org = Organization.objects.using(db_alias).filter(id=payload['organization_id'], status='ACTIVE').first()
+            if not org and payload.get('organization_code'):
+                org = Organization.objects.using(db_alias).filter(code__iexact=payload['organization_code'], status='ACTIVE').first()
+            if not org and getattr(tenant, 'code', None):
+                org = Organization.objects.using(db_alias).filter(code__icontains=tenant.code, status='ACTIVE').first()
+            if not org:
+                org = Organization.objects.using(db_alias).filter(status='ACTIVE', branches__isnull=False).distinct().first()
+            if not org:
+                org = Organization.objects.using(db_alias).filter(status='ACTIVE').order_by('created_at').first()
             if not org:
                 return Response({'error': 'Tenant organization not found'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 

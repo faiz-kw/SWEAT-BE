@@ -22,10 +22,11 @@ Endpoints:
 import logging
 from decimal import Decimal
 from datetime import date, datetime, timedelta
+from typing import Optional, Dict, Any
 
 from django.db import transaction, models
 from django.utils import timezone
-from rest_framework import status
+from rest_framework import status, serializers
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
@@ -49,10 +50,29 @@ from .serializers_wellness import (
     CreateWaterLogSerializer,
     SleepLogSerializer,
     CreateSleepLogSerializer,
+    UpdateSleepLogSerializer,
     NutritionTargetSerializer,
 )
+from .services_reliability import execute_idempotent_operation, IdempotencyConflictError
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_idempotency_key(request) -> Optional[str]:
+    """
+    Extract Idempotency-Key from headers (Idempotency-Key, X-Idempotency-Key, HTTP_IDEMPOTENCY_KEY)
+    or body payload. Strips whitespace.
+    """
+    key = None
+    if hasattr(request, 'headers'):
+        key = request.headers.get('Idempotency-Key') or request.headers.get('X-Idempotency-Key')
+    if not key and hasattr(request, 'META'):
+        key = request.META.get('HTTP_IDEMPOTENCY_KEY') or request.META.get('HTTP_X_IDEMPOTENCY_KEY')
+    if not key and isinstance(getattr(request, 'data', None), dict):
+        key = request.data.get('idempotency_key')
+    if key:
+        key = str(key).strip()
+    return key or None
 
 
 def _get_active_organization(request, alias):
@@ -64,6 +84,7 @@ def _get_active_organization(request, alias):
     if not org:
         org = Organization.objects.using(alias).first()
     return org
+
 
 
 class FoodSearchMobileView(APIView):
@@ -230,6 +251,8 @@ class MealLogListCreateMobileView(APIView):
             return Response({'error': 'Tenant database not found'}, status=status.HTTP_400_BAD_REQUEST)
 
         org = _get_active_organization(request, alias)
+        if not org:
+            return Response({'error': 'Active organization not found'}, status=status.HTTP_400_BAD_REQUEST)
         profile = _get_or_create_user_profile(request.user, alias)
 
         input_serializer = CreateMealLogSerializer(data=request.data)
@@ -237,80 +260,104 @@ class MealLogListCreateMobileView(APIView):
             return Response(input_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         valid_data = input_serializer.validated_data
-        logged_date = valid_data['logged_date']
-        logged_time = valid_data.get('logged_time') or timezone.now().time()
-        meal_type = valid_data['meal_type']
-        notes = valid_data.get('notes', '')
-        items_data = valid_data['items']
 
-        with transaction.atomic(using=alias):
-            meal_log = MealLog(
-                organization=org,
-                user=request.user,
-                profile=profile,
-                logged_date=logged_date,
-                logged_time=logged_time,
-                meal_type=meal_type,
-                notes=notes,
-            )
-            meal_log.save(using=alias)
+        def _do_create_meal():
+            logged_date = valid_data['logged_date']
+            logged_time = valid_data.get('logged_time') or timezone.now().time()
+            meal_type = valid_data['meal_type']
+            notes = valid_data.get('notes', '')
+            items_data = valid_data['items']
 
-            for item_in in items_data:
-                food_id = item_in['food_item_id']
-                quantity = Decimal(str(item_in.get('quantity') or '1.00'))
-                unit_name = (item_in.get('unit_name') or 'g').strip()
-                consumed_grams_raw = item_in.get('consumed_grams')
-
-                food = FoodItem.objects.using(alias).filter(id=food_id, is_active=True).first()
-                if not food:
-                    raise serializers.ValidationError({'food_item_id': f'Food item {food_id} does not exist.'})
-
-                # Portion & gram resolution
-                if consumed_grams_raw is not None and Decimal(str(consumed_grams_raw)) > 0:
-                    consumed_grams = Decimal(str(consumed_grams_raw))
-                else:
-                    matching_measure = next(
-                        (
-                            m for m in (food.household_measures or [])
-                            if str(m.get('unit', '')).lower() == unit_name.lower()
-                            or str(m.get('name', '')).lower() == unit_name.lower()
-                        ),
-                        None
-                    )
-                    if matching_measure and matching_measure.get('weight_g'):
-                        consumed_grams = quantity * Decimal(str(matching_measure['weight_g']))
-                    elif unit_name.lower() in ('g', 'gram', 'grams', 'ml'):
-                        consumed_grams = quantity
-                    else:
-                        consumed_grams = quantity * food.serving_weight_grams
-
-                # Proportion of base serving
-                ratio = consumed_grams / food.serving_weight_grams
-
-                # Nutrient snapshots
-                snap_calories = round(food.calories * ratio, 2)
-                snap_protein = round(food.protein_g * ratio, 2)
-                snap_carbs = round(food.carbs_g * ratio, 2)
-                snap_fat = round(food.fat_g * ratio, 2)
-                snap_fiber = round(food.fiber_g * ratio, 2)
-
-                log_item = MealLogItem(
-                    meal_log=meal_log,
-                    food_item=food,
-                    food_name_snapshot=food.name,
-                    quantity=quantity,
-                    unit_name=unit_name,
-                    consumed_grams=consumed_grams,
-                    snapshot_calories=snap_calories,
-                    snapshot_protein_g=snap_protein,
-                    snapshot_carbs_g=snap_carbs,
-                    snapshot_fat_g=snap_fat,
-                    snapshot_fiber_g=snap_fiber,
+            with transaction.atomic(using=alias):
+                meal_log = MealLog(
+                    organization=org,
+                    user=request.user,
+                    profile=profile,
+                    logged_date=logged_date,
+                    logged_time=logged_time,
+                    meal_type=meal_type,
+                    notes=notes,
                 )
-                log_item.save(using=alias)
+                meal_log.save(using=alias)
 
-        out_serializer = MealLogSerializer(meal_log)
-        return Response(out_serializer.data, status=status.HTTP_201_CREATED)
+                for item_in in items_data:
+                    food_id = item_in['food_item_id']
+                    quantity = Decimal(str(item_in.get('quantity') or '1.00'))
+                    unit_name = (item_in.get('unit_name') or 'g').strip()
+                    consumed_grams_raw = item_in.get('consumed_grams')
+
+                    food = FoodItem.objects.using(alias).filter(id=food_id, is_active=True).first()
+                    if not food:
+                        raise serializers.ValidationError({'food_item_id': f'Food item {food_id} does not exist.'})
+
+                    # Portion & gram resolution
+                    if consumed_grams_raw is not None and Decimal(str(consumed_grams_raw)) > 0:
+                        consumed_grams = Decimal(str(consumed_grams_raw))
+                    else:
+                        matching_measure = next(
+                            (
+                                m for m in (food.household_measures or [])
+                                if str(m.get('unit', '')).lower() == unit_name.lower()
+                                or str(m.get('name', '')).lower() == unit_name.lower()
+                            ),
+                            None
+                        )
+                        if matching_measure and matching_measure.get('weight_g'):
+                            consumed_grams = quantity * Decimal(str(matching_measure['weight_g']))
+                        elif unit_name.lower() in ('g', 'gram', 'grams', 'ml'):
+                            consumed_grams = quantity
+                        else:
+                            consumed_grams = quantity * food.serving_weight_grams
+
+                    # Proportion of base serving
+                    ratio = consumed_grams / food.serving_weight_grams
+
+                    # Nutrient snapshots
+                    snap_calories = round(food.calories * ratio, 2)
+                    snap_protein = round(food.protein_g * ratio, 2)
+                    snap_carbs = round(food.carbs_g * ratio, 2)
+                    snap_fat = round(food.fat_g * ratio, 2)
+                    snap_fiber = round(food.fiber_g * ratio, 2)
+
+                    log_item = MealLogItem(
+                        meal_log=meal_log,
+                        food_item=food,
+                        food_name_snapshot=food.name,
+                        quantity=quantity,
+                        unit_name=unit_name,
+                        consumed_grams=consumed_grams,
+                        snapshot_calories=snap_calories,
+                        snapshot_protein_g=snap_protein,
+                        snapshot_carbs_g=snap_carbs,
+                        snapshot_fat_g=snap_fat,
+                        snapshot_fiber_g=snap_fiber,
+                    )
+                    log_item.save(using=alias)
+
+            out_serializer = MealLogSerializer(meal_log)
+            return out_serializer.data
+
+        idempotency_key = _extract_idempotency_key(request)
+        if idempotency_key:
+            scoped_key = f"u:{request.user.id}:{idempotency_key}"
+            try:
+                result = execute_idempotent_operation(
+                    organization=org,
+                    operation_type='WELLNESS_MEAL_LOG',
+                    idempotency_key=scoped_key,
+                    operation_func=_do_create_meal,
+                    request_data=request.data,
+                    actor_user=request.user,
+                    ttl_seconds=86400,
+                    db_alias=alias,
+                )
+                return Response(result, status=status.HTTP_201_CREATED)
+            except IdempotencyConflictError as exc:
+                return Response({'error': str(exc)}, status=status.HTTP_409_CONFLICT)
+        else:
+            result = _do_create_meal()
+            return Response(result, status=status.HTTP_201_CREATED)
+
 
 
 class MealLogDetailMobileView(APIView):
@@ -420,6 +467,8 @@ class WaterLogListCreateMobileView(APIView):
             return Response({'error': 'Tenant database not found'}, status=status.HTTP_400_BAD_REQUEST)
 
         org = _get_active_organization(request, alias)
+        if not org:
+            return Response({'error': 'Active organization not found'}, status=status.HTTP_400_BAD_REQUEST)
         profile = _get_or_create_user_profile(request.user, alias)
 
         serializer = CreateWaterLogSerializer(data=request.data)
@@ -427,22 +476,45 @@ class WaterLogListCreateMobileView(APIView):
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         data = serializer.validated_data
-        logged_date = data['logged_date']
-        amount_ml = data['amount_ml']
-        logged_at = data.get('logged_at') or timezone.now()
 
-        log = WaterLog(
-            organization=org,
-            user=request.user,
-            profile=profile,
-            logged_date=logged_date,
-            amount_ml=amount_ml,
-            logged_at=logged_at,
-        )
-        log.save(using=alias)
+        def _do_create_water():
+            logged_date = data['logged_date']
+            amount_ml = data['amount_ml']
+            logged_at = data.get('logged_at') or timezone.now()
 
-        out_serializer = WaterLogSerializer(log)
-        return Response(out_serializer.data, status=status.HTTP_201_CREATED)
+            log = WaterLog(
+                organization=org,
+                user=request.user,
+                profile=profile,
+                logged_date=logged_date,
+                amount_ml=amount_ml,
+                logged_at=logged_at,
+            )
+            log.save(using=alias)
+
+            out_serializer = WaterLogSerializer(log)
+            return out_serializer.data
+
+        idempotency_key = _extract_idempotency_key(request)
+        if idempotency_key:
+            scoped_key = f"u:{request.user.id}:{idempotency_key}"
+            try:
+                result = execute_idempotent_operation(
+                    organization=org,
+                    operation_type='WELLNESS_WATER_LOG',
+                    idempotency_key=scoped_key,
+                    operation_func=_do_create_water,
+                    request_data=request.data,
+                    actor_user=request.user,
+                    ttl_seconds=86400,
+                    db_alias=alias,
+                )
+                return Response(result, status=status.HTTP_201_CREATED)
+            except IdempotencyConflictError as exc:
+                return Response({'error': str(exc)}, status=status.HTTP_409_CONFLICT)
+        else:
+            result = _do_create_water()
+            return Response(result, status=status.HTTP_201_CREATED)
 
 
 class WaterLogDetailMobileView(APIView):
@@ -470,6 +542,7 @@ class SleepLogListCreateMobileView(APIView):
     GET  /api/v1/mobile/wellness/sleep-logs/?date=YYYY-MM-DD
     POST /api/v1/mobile/wellness/sleep-logs/
     Log or retrieve sleep entries.
+    Supports idempotent submission and atomic single-daily-record update strategy.
     """
     permission_classes = [IsAuthenticated]
 
@@ -507,6 +580,8 @@ class SleepLogListCreateMobileView(APIView):
             return Response({'error': 'Tenant database not found'}, status=status.HTTP_400_BAD_REQUEST)
 
         org = _get_active_organization(request, alias)
+        if not org:
+            return Response({'error': 'Active organization not found'}, status=status.HTTP_400_BAD_REQUEST)
         profile = _get_or_create_user_profile(request.user, alias)
 
         serializer = CreateSleepLogSerializer(data=request.data)
@@ -514,35 +589,140 @@ class SleepLogListCreateMobileView(APIView):
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         data = serializer.validated_data
-        logged_date = data['logged_date']
-        start_time = data['start_time']
-        end_time = data['end_time']
-        duration_minutes = data['duration_minutes']
-        quality_rating = data.get('quality_rating', 3)
-        notes = data.get('notes', '')
 
-        log = SleepLog(
-            organization=org,
-            user=request.user,
-            profile=profile,
-            logged_date=logged_date,
-            start_time=start_time,
-            end_time=end_time,
-            duration_minutes=duration_minutes,
-            quality_rating=quality_rating,
-            notes=notes,
-        )
-        log.save(using=alias)
+        def _do_save_sleep():
+            logged_date = data['logged_date']
+            start_time = data['start_time']
+            end_time = data['end_time']
+            duration_minutes = data['duration_minutes']
+            quality_rating = data.get('quality_rating', 3)
+            notes = data.get('notes', '')
 
-        out_serializer = SleepLogSerializer(log)
-        return Response(out_serializer.data, status=status.HTTP_201_CREATED)
+            with transaction.atomic(using=alias):
+                sleep_log, created = SleepLog.objects.using(alias).select_for_update().get_or_create(
+                    user=request.user,
+                    logged_date=logged_date,
+                    defaults={
+                        'organization': org,
+                        'profile': profile,
+                        'start_time': start_time,
+                        'end_time': end_time,
+                        'duration_minutes': duration_minutes,
+                        'quality_rating': quality_rating,
+                        'notes': notes,
+                    }
+                )
+                if not created:
+                    sleep_log.start_time = start_time
+                    sleep_log.end_time = end_time
+                    sleep_log.duration_minutes = duration_minutes
+                    sleep_log.quality_rating = quality_rating
+                    if 'notes' in data:
+                        sleep_log.notes = notes
+                    sleep_log.save(using=alias)
+
+            out_serializer = SleepLogSerializer(sleep_log)
+            res = dict(out_serializer.data)
+            res['_is_created'] = created
+            return res
+
+        idempotency_key = _extract_idempotency_key(request)
+        if idempotency_key:
+            scoped_key = f"u:{request.user.id}:{idempotency_key}"
+            try:
+                result = execute_idempotent_operation(
+                    organization=org,
+                    operation_type='WELLNESS_SLEEP_LOG',
+                    idempotency_key=scoped_key,
+                    operation_func=_do_save_sleep,
+                    request_data=request.data,
+                    actor_user=request.user,
+                    ttl_seconds=86400,
+                    db_alias=alias,
+                )
+                is_created = result.pop('_is_created', True)
+                return Response(result, status=status.HTTP_201_CREATED if is_created else status.HTTP_200_OK)
+            except IdempotencyConflictError as exc:
+                return Response({'error': str(exc)}, status=status.HTTP_409_CONFLICT)
+        else:
+            result = _do_save_sleep()
+            is_created = result.pop('_is_created', True)
+            return Response(result, status=status.HTTP_201_CREATED if is_created else status.HTTP_200_OK)
 
 
 class SleepLogDetailMobileView(APIView):
     """
+    GET    /api/v1/mobile/wellness/sleep-logs/<id>/
+    PATCH  /api/v1/mobile/wellness/sleep-logs/<id>/
+    PUT    /api/v1/mobile/wellness/sleep-logs/<id>/
     DELETE /api/v1/mobile/wellness/sleep-logs/<id>/
+    Member-scoped operations on an existing sleep log.
     """
     permission_classes = [IsAuthenticated]
+
+    def _get_object(self, request, alias, pk):
+        profile = _get_or_create_user_profile(request.user, alias)
+        return SleepLog.objects.using(alias).filter(
+            id=pk,
+            user=request.user,
+            profile=profile,
+        ).first()
+
+    def get(self, request, pk):
+        alias, tenant = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            return Response({'error': 'Tenant database not found'}, status=status.HTTP_400_BAD_REQUEST)
+
+        sleep = self._get_object(request, alias, pk)
+        if not sleep:
+            return Response({'error': 'Sleep log not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = SleepLogSerializer(sleep)
+        return Response(serializer.data)
+
+    def patch(self, request, pk):
+        return self._update(request, pk, partial=True)
+
+    def put(self, request, pk):
+        return self._update(request, pk, partial=False)
+
+    def _update(self, request, pk, partial=True):
+        alias, tenant = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            return Response({'error': 'Tenant database not found'}, status=status.HTTP_400_BAD_REQUEST)
+
+        sleep = self._get_object(request, alias, pk)
+        if not sleep:
+            return Response({'error': 'Sleep log not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = UpdateSleepLogSerializer(data=request.data, partial=partial)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        data = serializer.validated_data
+        if 'start_time' in data:
+            sleep.start_time = data['start_time']
+        if 'end_time' in data:
+            sleep.end_time = data['end_time']
+        if 'duration_minutes' in data:
+            sleep.duration_minutes = data['duration_minutes']
+        elif 'start_time' in data or 'end_time' in data:
+            diff = (sleep.end_time - sleep.start_time).total_seconds() / 60.0
+            sleep.duration_minutes = max(1, int(round(diff)))
+        if 'quality_rating' in data:
+            sleep.quality_rating = data['quality_rating']
+        if 'notes' in data:
+            sleep.notes = data['notes']
+
+        # Boundary checks
+        if sleep.end_time <= sleep.start_time:
+            return Response({'error': 'end_time must be after start_time.'}, status=status.HTTP_400_BAD_REQUEST)
+        if (sleep.end_time - sleep.start_time).total_seconds() > 86400:
+            return Response({'error': 'Sleep duration cannot exceed 24 hours.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        sleep.save(using=alias)
+        out_serializer = SleepLogSerializer(sleep)
+        return Response(out_serializer.data, status=status.HTTP_200_OK)
 
     def delete(self, request, pk):
         alias, tenant = _resolve_mobile_tenant_and_db(request)
@@ -556,6 +736,7 @@ class SleepLogDetailMobileView(APIView):
 
         log.delete(using=alias)
         return Response({'success': True, 'message': 'Sleep log deleted.'}, status=status.HTTP_200_OK)
+
 
 
 class DailySummaryMobileView(APIView):

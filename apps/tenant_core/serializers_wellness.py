@@ -4,6 +4,8 @@ apps/tenant_core/serializers_wellness.py — Serializers for Nutrition & Wellnes
 
 from decimal import Decimal
 from rest_framework import serializers
+from datetime import timedelta
+from django.utils import timezone
 from .models_wellness import (
     FoodItem,
     NutritionTarget,
@@ -15,6 +17,7 @@ from .models_wellness import (
     FoodProvenance,
     MealType,
 )
+
 
 
 class FoodItemSerializer(serializers.ModelSerializer):
@@ -131,6 +134,11 @@ class CreateMealLogSerializer(serializers.Serializer):
     notes = serializers.CharField(required=False, allow_blank=True, default='')
     items = MealLogItemInputSerializer(many=True, required=True)
 
+    def validate_logged_date(self, value):
+        if value > timezone.now().date() + timedelta(days=1):
+            raise serializers.ValidationError("Cannot log meals for future dates.")
+        return value
+
     def validate_items(self, value):
         if not value:
             raise serializers.ValidationError("At least one food item must be logged.")
@@ -154,6 +162,11 @@ class CreateWaterLogSerializer(serializers.Serializer):
     logged_date = serializers.DateField(required=True)
     amount_ml = serializers.IntegerField(min_value=1, max_value=5000, required=True)
     logged_at = serializers.DateTimeField(required=False)
+
+    def validate_logged_date(self, value):
+        if value > timezone.now().date() + timedelta(days=1):
+            raise serializers.ValidationError("Cannot log water for future dates.")
+        return value
 
 
 class SleepLogSerializer(serializers.ModelSerializer):
@@ -181,15 +194,52 @@ class CreateSleepLogSerializer(serializers.Serializer):
     quality_rating = serializers.IntegerField(min_value=1, max_value=5, required=False, default=3)
     notes = serializers.CharField(required=False, allow_blank=True, default='')
 
+    def validate_logged_date(self, value):
+        if value > timezone.now().date() + timedelta(days=1):
+            raise serializers.ValidationError("Cannot log sleep for future dates.")
+        return value
+
     def validate(self, attrs):
         start = attrs.get('start_time')
         end = attrs.get('end_time')
-        if start and end and end <= start:
-            raise serializers.ValidationError({"end_time": "end_time must be after start_time."})
-        if not attrs.get('duration_minutes') and start and end:
-            diff = (end - start).total_seconds() / 60.0
-            attrs['duration_minutes'] = max(1, int(round(diff)))
+        if start and end:
+            if end <= start:
+                raise serializers.ValidationError({"end_time": "end_time must be after start_time."})
+            duration_sec = (end - start).total_seconds()
+            if duration_sec > 86400:
+                raise serializers.ValidationError({"end_time": "Sleep duration cannot exceed 24 hours (1440 minutes)."})
+            if duration_sec < 60:
+                raise serializers.ValidationError({"duration_minutes": "Sleep duration must be at least 1 minute."})
+            calc_minutes = max(1, int(round(duration_sec / 60.0)))
+            if not attrs.get('duration_minutes'):
+                attrs['duration_minutes'] = calc_minutes
+            elif attrs['duration_minutes'] > 1440:
+                raise serializers.ValidationError({"duration_minutes": "duration_minutes cannot exceed 1440 minutes."})
         return attrs
+
+
+class UpdateSleepLogSerializer(serializers.Serializer):
+    start_time = serializers.DateTimeField(required=False)
+    end_time = serializers.DateTimeField(required=False)
+    duration_minutes = serializers.IntegerField(min_value=1, max_value=1440, required=False)
+    quality_rating = serializers.IntegerField(min_value=1, max_value=5, required=False)
+    notes = serializers.CharField(required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        start = attrs.get('start_time')
+        end = attrs.get('end_time')
+        if start and end:
+            if end <= start:
+                raise serializers.ValidationError({"end_time": "end_time must be after start_time."})
+            duration_sec = (end - start).total_seconds()
+            if duration_sec > 86400:
+                raise serializers.ValidationError({"end_time": "Sleep duration cannot exceed 24 hours (1440 minutes)."})
+            if duration_sec < 60:
+                raise serializers.ValidationError({"duration_minutes": "Sleep duration must be at least 1 minute."})
+            if not attrs.get('duration_minutes'):
+                attrs['duration_minutes'] = max(1, int(round(duration_sec / 60.0)))
+        return attrs
+
 
 
 class NutritionTargetSerializer(serializers.ModelSerializer):

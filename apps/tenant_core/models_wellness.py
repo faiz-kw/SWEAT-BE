@@ -256,6 +256,13 @@ class SleepLog(models.Model):
         app_label = 'tenant_core'
         db_table = 'sleep_logs'
         ordering = ['-logged_date']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['user', 'logged_date'],
+                name='uq_sleep_log_user_date'
+            )
+        ]
 
     def __str__(self):
         return f"{self.user.email} - {self.duration_minutes}m sleep ({self.logged_date})"
+

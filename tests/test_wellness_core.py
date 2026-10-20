@@ -41,6 +41,8 @@ from apps.tenant_core.models_wellness import (
     SleepLog,
     NutritionTarget,
 )
+from apps.tenant_core.models_audit_outbox import IdempotencyRecord
+
 
 
 class WellnessCoreTests(TestCase):
@@ -498,3 +500,352 @@ class WellnessCoreTests(TestCase):
         # Check Meals breakdown
         self.assertEqual(len(data['meals']), 1)
         self.assertEqual(data['meals'][0]['meal_type'], 'BREAKFAST')
+
+    # =========================================================================
+    # Milestone 1.1 Tests: Idempotency & Sleep Hardening
+    # =========================================================================
+
+    def test_meal_log_idempotency_replay_and_conflict(self):
+        """
+        Verify that:
+        1. Initial POST with Idempotency-Key returns 201 Created.
+        2. Retried POST with identical key & payload returns replayed 201 without creating duplicate rows.
+        3. Reused key with different payload returns 409 Conflict.
+        """
+        food = FoodItem.objects.using(self.alias).filter(name__icontains='Khichdi').first()
+        payload = {
+            'logged_date': '2026-10-20',
+            'meal_type': 'LUNCH',
+            'notes': 'Post-workout khichdi',
+            'items': [{
+                'food_item_id': str(food.id),
+                'quantity': 1.0,
+                'unit_name': 'katori',
+                'consumed_grams': 200.0,
+            }],
+        }
+
+        # 1. Initial Request with Idempotency-Key
+        headers = {'HTTP_IDEMPOTENCY_KEY': 'meal-key-001'}
+        res1 = self.client_alice.post('/api/v1/mobile/wellness/meal-logs/', payload, format='json', **headers)
+        self.assertEqual(res1.status_code, status.HTTP_201_CREATED)
+        meal_id = res1.data['id']
+        self.assertEqual(MealLog.objects.using(self.alias).filter(user=self.user_alice).count(), 1)
+        self.assertEqual(MealLogItem.objects.using(self.alias).filter(meal_log_id=meal_id).count(), 1)
+
+        # 2. Retried Request with SAME Key and IDENTICAL Payload
+        res2 = self.client_alice.post('/api/v1/mobile/wellness/meal-logs/', payload, format='json', **headers)
+        self.assertEqual(res2.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res2.data['id'], meal_id)
+        # Verify no duplicate created in DB
+        self.assertEqual(MealLog.objects.using(self.alias).filter(user=self.user_alice).count(), 1)
+        self.assertEqual(MealLogItem.objects.using(self.alias).filter(meal_log_id=meal_id).count(), 1)
+
+        # 3. Request with SAME Key but DIFFERENT Payload (e.g. DINNER instead of LUNCH)
+        conflict_payload = dict(payload)
+        conflict_payload['meal_type'] = 'DINNER'
+        res3 = self.client_alice.post('/api/v1/mobile/wellness/meal-logs/', conflict_payload, format='json', **headers)
+        self.assertEqual(res3.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn('different payload', res3.data.get('error', '').lower())
+        # Still exactly 1 meal in DB
+        self.assertEqual(MealLog.objects.using(self.alias).filter(user=self.user_alice).count(), 1)
+
+    def test_water_log_idempotency_replay_and_conflict(self):
+        """
+        Verify water logging idempotency prevents double-counting on network retry,
+        and returns 409 Conflict when key is reused with different amount.
+        """
+        payload = {
+            'logged_date': '2026-10-20',
+            'amount_ml': 250,
+        }
+        headers = {'HTTP_IDEMPOTENCY_KEY': 'water-key-001'}
+
+        # 1. Initial Request
+        res1 = self.client_alice.post('/api/v1/mobile/wellness/water-logs/', payload, format='json', **headers)
+        self.assertEqual(res1.status_code, status.HTTP_201_CREATED)
+        water_id = res1.data['id']
+        self.assertEqual(res1.data['amount_ml'], 250)
+        self.assertEqual(WaterLog.objects.using(self.alias).filter(user=self.user_alice).count(), 1)
+
+        # 2. Network Retry with SAME Key and IDENTICAL Payload
+        res2 = self.client_alice.post('/api/v1/mobile/wellness/water-logs/', payload, format='json', **headers)
+        self.assertEqual(res2.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res2.data['id'], water_id)
+        # Total water in DB must still be 250 ml (NOT 500 ml)
+        logs = WaterLog.objects.using(self.alias).filter(user=self.user_alice)
+        self.assertEqual(logs.count(), 1)
+        self.assertEqual(sum(l.amount_ml for l in logs), 250)
+
+        # 3. Conflict: Same Key with DIFFERENT Payload (500 ml)
+        conflict_payload = {'logged_date': '2026-10-20', 'amount_ml': 500}
+        res3 = self.client_alice.post('/api/v1/mobile/wellness/water-logs/', conflict_payload, format='json', **headers)
+        self.assertEqual(res3.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(WaterLog.objects.using(self.alias).filter(user=self.user_alice).count(), 1)
+
+    def test_idempotency_user_and_endpoint_scoping(self):
+        """
+        Verify that:
+        1. Two distinct members (Alice and Bob) can use the same key without conflict.
+        2. The same key can be used across different endpoints (MealLog vs WaterLog) without conflict.
+        """
+        shared_key = 'idem-cross-scope-key'
+
+        # Alice logs 300 ml water
+        res_alice_water = self.client_alice.post(
+            '/api/v1/mobile/wellness/water-logs/',
+            {'logged_date': '2026-10-20', 'amount_ml': 300},
+            format='json',
+            HTTP_IDEMPOTENCY_KEY=shared_key
+        )
+        self.assertEqual(res_alice_water.status_code, status.HTTP_201_CREATED)
+
+        # Bob logs 500 ml water using the EXACT SAME key -> must succeed (user scoped)
+        res_bob_water = self.client_bob.post(
+            '/api/v1/mobile/wellness/water-logs/',
+            {'logged_date': '2026-10-20', 'amount_ml': 500},
+            format='json',
+            HTTP_IDEMPOTENCY_KEY=shared_key
+        )
+        self.assertEqual(res_bob_water.status_code, status.HTTP_201_CREATED)
+        self.assertNotEqual(res_alice_water.data['id'], res_bob_water.data['id'])
+
+        # Alice logs a meal using the EXACT SAME key -> must succeed (endpoint scoped)
+        food = FoodItem.objects.using(self.alias).filter(name__icontains='Plain Dosa').first()
+        res_alice_meal = self.client_alice.post(
+            '/api/v1/mobile/wellness/meal-logs/',
+            {
+                'logged_date': '2026-10-20',
+                'meal_type': 'BREAKFAST',
+                'items': [{'food_item_id': str(food.id), 'quantity': 1.0, 'unit_name': 'piece', 'consumed_grams': 80.0}],
+            },
+            format='json',
+            HTTP_IDEMPOTENCY_KEY=shared_key
+        )
+        self.assertEqual(res_alice_meal.status_code, status.HTTP_201_CREATED)
+
+    def test_idempotency_concurrent_in_progress_conflict(self):
+        """
+        Verify that when a request is currently PROCESSING under a given key,
+        a concurrent request with the same key returns 409 Conflict.
+        """
+        from apps.tenant_core.services_reliability import compute_request_hash
+
+        key = 'concurrent-processing-key'
+        scoped_key = f"u:{self.user_alice.id}:{key}"
+        payload = {'logged_date': '2026-10-20', 'amount_ml': 200}
+        req_hash = compute_request_hash(payload)
+
+        # Simulate an in-flight request by manually creating a PROCESSING record with matching payload hash
+        IdempotencyRecord.objects.using(self.alias).create(
+            organization=self.org,
+            operation_type='WELLNESS_WATER_LOG',
+            idempotency_key=scoped_key,
+            actor_user=self.user_alice,
+            request_hash=req_hash,
+            status='PROCESSING',
+            expires_at=timezone.now() + timedelta(minutes=5),
+        )
+
+        res = self.client_alice.post(
+            '/api/v1/mobile/wellness/water-logs/',
+            payload,
+            format='json',
+            HTTP_IDEMPOTENCY_KEY=key
+        )
+        self.assertEqual(res.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn('currently processing', res.data.get('error', '').lower())
+
+
+    def test_sleep_log_repeated_submission_and_upsert(self):
+        """
+        Verify that repeated submissions for the same member on the same date:
+        1. Gracefully updates the existing daily sleep record instead of creating duplicates.
+        2. Updates duration_minutes, start_time, end_time, quality_rating, and notes.
+        3. Returns HTTP 200 on update (HTTP 201 on initial create).
+        4. Exactly 1 SleepLog record exists for that user and date.
+        """
+        now = timezone.now()
+        start1 = now - timedelta(hours=8)
+        end1 = now
+
+        # 1. Initial Submission for 2026-10-20
+        res1 = self.client_alice.post('/api/v1/mobile/wellness/sleep-logs/', {
+            'logged_date': '2026-10-20',
+            'start_time': start1.isoformat(),
+            'end_time': end1.isoformat(),
+            'duration_minutes': 480,
+            'quality_rating': 3,
+            'notes': 'Initial log',
+        }, format='json')
+        self.assertEqual(res1.status_code, status.HTTP_201_CREATED)
+        sleep_id = res1.data['id']
+        self.assertEqual(res1.data['duration_minutes'], 480)
+        self.assertEqual(res1.data['quality_rating'], 3)
+        self.assertEqual(SleepLog.objects.using(self.alias).filter(user=self.user_alice, logged_date='2026-10-20').count(), 1)
+
+        # 2. Repeated Submission for SAME date: corrected times and rating
+        start2 = now - timedelta(hours=9)
+        end2 = now
+        res2 = self.client_alice.post('/api/v1/mobile/wellness/sleep-logs/', {
+            'logged_date': '2026-10-20',
+            'start_time': start2.isoformat(),
+            'end_time': end2.isoformat(),
+            'duration_minutes': 540,
+            'quality_rating': 5,
+            'notes': 'Updated after reviewing smart band',
+        }, format='json')
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+        self.assertEqual(res2.data['id'], sleep_id)
+        self.assertEqual(res2.data['duration_minutes'], 540)
+        self.assertEqual(res2.data['quality_rating'], 5)
+        self.assertEqual(res2.data['notes'], 'Updated after reviewing smart band')
+
+        # Verify only 1 record in DB
+        self.assertEqual(SleepLog.objects.using(self.alias).filter(user=self.user_alice, logged_date='2026-10-20').count(), 1)
+
+    def test_sleep_log_idempotency_retry_and_conflict(self):
+        """
+        Verify sleep logging idempotency with Idempotency-Key:
+        1. Initial POST returns 201 Created.
+        2. Exact retry returns 201 Created with cached response.
+        3. Different payload with same key returns 409 Conflict.
+        """
+        now = timezone.now()
+        start = now - timedelta(hours=8)
+        end = now
+        payload = {
+            'logged_date': '2026-10-19',
+            'start_time': start.isoformat(),
+            'end_time': end.isoformat(),
+            'duration_minutes': 480,
+            'quality_rating': 4,
+            'notes': 'Solid sleep',
+        }
+        headers = {'HTTP_IDEMPOTENCY_KEY': 'sleep-idem-key-01'}
+
+        # Initial
+        res1 = self.client_alice.post('/api/v1/mobile/wellness/sleep-logs/', payload, format='json', **headers)
+        self.assertEqual(res1.status_code, status.HTTP_201_CREATED)
+        sleep_id = res1.data['id']
+
+        # Retry with identical payload
+        res2 = self.client_alice.post('/api/v1/mobile/wellness/sleep-logs/', payload, format='json', **headers)
+        self.assertEqual(res2.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res2.data['id'], sleep_id)
+        self.assertEqual(SleepLog.objects.using(self.alias).filter(user=self.user_alice, logged_date='2026-10-19').count(), 1)
+
+        # Conflict with altered payload
+        conflict_payload = dict(payload)
+        conflict_payload['quality_rating'] = 2
+        res3 = self.client_alice.post('/api/v1/mobile/wellness/sleep-logs/', conflict_payload, format='json', **headers)
+        self.assertEqual(res3.status_code, status.HTTP_409_CONFLICT)
+
+    def test_sleep_log_detail_get_patch_put_and_boundaries(self):
+        """
+        Verify SleepLogDetailMobileView:
+        1. GET returns member's sleep log.
+        2. PATCH updates specific fields (rating, notes).
+        3. PUT updates full timing and recomputes duration.
+        4. Cross-member access (Bob trying to view/edit Alice's record) returns 404.
+        """
+        start = timezone.now() - timedelta(hours=8)
+        end = timezone.now()
+        res_create = self.client_alice.post('/api/v1/mobile/wellness/sleep-logs/', {
+            'logged_date': '2026-10-18',
+            'start_time': start.isoformat(),
+            'end_time': end.isoformat(),
+            'duration_minutes': 480,
+            'quality_rating': 3,
+            'notes': 'Normal night',
+        }, format='json')
+        self.assertEqual(res_create.status_code, status.HTTP_201_CREATED)
+        sleep_id = res_create.data['id']
+
+        # 1. GET Detail
+        res_get = self.client_alice.get(f'/api/v1/mobile/wellness/sleep-logs/{sleep_id}/')
+        self.assertEqual(res_get.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_get.data['id'], sleep_id)
+
+        # 2. PATCH Update
+        res_patch = self.client_alice.patch(f'/api/v1/mobile/wellness/sleep-logs/{sleep_id}/', {
+            'quality_rating': 5,
+            'notes': 'Felt amazing in the morning',
+        }, format='json')
+        self.assertEqual(res_patch.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_patch.data['quality_rating'], 5)
+        self.assertEqual(res_patch.data['notes'], 'Felt amazing in the morning')
+
+        # 3. PUT Update
+        new_start = timezone.now() - timedelta(hours=6)
+        new_end = timezone.now()
+        res_put = self.client_alice.put(f'/api/v1/mobile/wellness/sleep-logs/{sleep_id}/', {
+            'start_time': new_start.isoformat(),
+            'end_time': new_end.isoformat(),
+            'quality_rating': 4,
+        }, format='json')
+        self.assertEqual(res_put.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_put.data['duration_minutes'], 360)
+        self.assertEqual(res_put.data['quality_rating'], 4)
+
+        # 4. Privacy: Bob attempts to read or edit Alice's sleep log
+        res_bob_get = self.client_bob.get(f'/api/v1/mobile/wellness/sleep-logs/{sleep_id}/')
+        self.assertEqual(res_bob_get.status_code, status.HTTP_404_NOT_FOUND)
+
+        res_bob_patch = self.client_bob.patch(f'/api/v1/mobile/wellness/sleep-logs/{sleep_id}/', {'quality_rating': 1}, format='json')
+        self.assertEqual(res_bob_patch.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_sleep_and_logging_boundary_validations(self):
+        """
+        Verify validation rules and boundaries:
+        1. end_time <= start_time -> 400 Bad Request.
+        2. duration > 24 hours -> 400 Bad Request.
+        3. Future dates beyond tomorrow -> 400 Bad Request.
+        4. Quality rating outside 1..5 -> 400 Bad Request.
+        """
+        now = timezone.now()
+
+        # 1. Inverted times (end_time before start_time)
+        res_inverted = self.client_alice.post('/api/v1/mobile/wellness/sleep-logs/', {
+            'logged_date': '2026-10-20',
+            'start_time': now.isoformat(),
+            'end_time': (now - timedelta(hours=2)).isoformat(),
+        }, format='json')
+        self.assertEqual(res_inverted.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('end_time', res_inverted.data)
+
+        # 2. Exceeding 24 hours (e.g. 26 hours)
+        res_too_long = self.client_alice.post('/api/v1/mobile/wellness/sleep-logs/', {
+            'logged_date': '2026-10-20',
+            'start_time': (now - timedelta(hours=26)).isoformat(),
+            'end_time': now.isoformat(),
+        }, format='json')
+        self.assertEqual(res_too_long.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # 3. Far future date (e.g. 10 days in future)
+        future_date = (now.date() + timedelta(days=10)).isoformat()
+        res_future_sleep = self.client_alice.post('/api/v1/mobile/wellness/sleep-logs/', {
+            'logged_date': future_date,
+            'start_time': (now - timedelta(hours=7)).isoformat(),
+            'end_time': now.isoformat(),
+        }, format='json')
+        self.assertEqual(res_future_sleep.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('logged_date', res_future_sleep.data)
+
+        res_future_water = self.client_alice.post('/api/v1/mobile/wellness/water-logs/', {
+            'logged_date': future_date,
+            'amount_ml': 250,
+        }, format='json')
+        self.assertEqual(res_future_water.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('logged_date', res_future_water.data)
+
+        # 4. Invalid quality rating (0 or 6)
+        res_invalid_rating = self.client_alice.post('/api/v1/mobile/wellness/sleep-logs/', {
+            'logged_date': '2026-10-20',
+            'start_time': (now - timedelta(hours=7)).isoformat(),
+            'end_time': now.isoformat(),
+            'quality_rating': 6,
+        }, format='json')
+        self.assertEqual(res_invalid_rating.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('quality_rating', res_invalid_rating.data)
+
