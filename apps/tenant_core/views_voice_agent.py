@@ -2423,6 +2423,19 @@ class VoiceAgentRecordingAudioView(View):
                     if resp.status_code == 200 and resp.content:
                         with open(local_path, 'wb') as f:
                             f.write(resp.content)
+                        # Normalize telephony sample rates to 44.1kHz for universal browser/WASAPI playback
+                        try:
+                            from scipy.io import wavfile
+                            from scipy.signal import resample_poly
+                            import numpy as np
+                            sr, raw_data = wavfile.read(local_path)
+                            if sr in (8000, 11025, 16000, 22050):
+                                up_factor = 44100 // sr
+                                resampled = resample_poly(raw_data, up_factor, 1, axis=0)
+                                resampled = np.clip(resampled, -32768, 32767).astype(np.int16)
+                                wavfile.write(local_path, 44100, resampled)
+                        except Exception as resample_err:
+                            logger.warning("Audio resample fallback: %s", resample_err)
                 except Exception as dl_err:
                     logger.error("Failed to download recording from Sarvam: %s", dl_err)
 
