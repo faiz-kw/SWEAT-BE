@@ -56,8 +56,9 @@ def trigger_automated_sarvam_call_task(self, tenant_id: str, lead_id: str, **kwa
             from django.conf import settings
             start_hour = getattr(settings, 'VOICE_CALLING_HOURS_START', 9)
             end_hour = getattr(settings, 'VOICE_CALLING_HOURS_END', 21)
+            bypass_hours = kwargs.get('bypass_calling_hours', False) or getattr(settings, 'VOICE_CALLING_BYPASS_HOURS', False)
 
-            if not (start_hour <= current_hour < end_hour):
+            if not bypass_hours and not (start_hour <= current_hour < end_hour):
                 # Outside calling hours: schedule for next morning at start_hour:15 IST
                 if current_hour >= end_hour:
                     next_morning = (now_ist + timedelta(days=1)).replace(hour=start_hour, minute=15, second=0, microsecond=0)
@@ -106,6 +107,7 @@ def trigger_automated_sarvam_call_task(self, tenant_id: str, lead_id: str, **kwa
                 custom_metadata={
                     'source': 'AUTOMATED_LEAD_ACQUISITION',
                     'automated': True,
+                    'bypass_calling_hours': bypass_hours,
                 },
                 db_alias=db_alias,
             )
