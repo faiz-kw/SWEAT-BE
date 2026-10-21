@@ -17,6 +17,7 @@ from decimal import Decimal
 from datetime import date, datetime, time, timedelta
 from unittest.mock import patch, MagicMock
 
+from django.core.cache import cache
 from django.test import TestCase
 from django.utils import timezone
 from django.core.management import call_command
@@ -1096,5 +1097,54 @@ class WellnessCoreTests(TestCase):
         self.assertIsNotNone(roti_match)
         self.assertIsNotNone(roti_match['matched_catalog_item'])
         self.assertIn('Roti', roti_match['matched_catalog_item']['name'])
+
+    @patch('apps.tenant_core.views_wellness._resolve_mobile_tenant_and_db')
+    def test_food_image_analysis_production_rejects_mock_without_api_key(self, mock_resolve):
+        """FoodImageAnalysisMobileView: In production without API key, mock=true cannot bypass and returns 503."""
+        mock_resolve.return_value = ('tenant_prod_live', self.tenant)
+        payload = {
+            'image_base64': 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+            'mock': True,
+        }
+        with self.settings(DEBUG=False, _IS_TEST=False, DEPLOYMENT_ENVIRONMENT='production', GEMINI_API_KEY=''):
+            res = self.client_alice.post('/api/v1/mobile/wellness/foods/analyze-image/', payload, format='json')
+            self.assertEqual(res.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+            self.assertIn('AI vision service is not configured', res.data['error'])
+
+    @patch('apps.tenant_core.views_wellness._resolve_mobile_tenant_and_db')
+    def test_food_image_analysis_production_rejects_mock_with_api_key(self, mock_resolve):
+        """FoodImageAnalysisMobileView: In production with API key, client-requested mock=true is explicitly rejected (400)."""
+        mock_resolve.return_value = ('tenant_prod_live', self.tenant)
+        payload = {
+            'image_base64': 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+            'mock': True,
+        }
+        with self.settings(DEBUG=False, _IS_TEST=False, DEPLOYMENT_ENVIRONMENT='production', GEMINI_API_KEY='live_test_api_key'):
+            res = self.client_alice.post('/api/v1/mobile/wellness/foods/analyze-image/', payload, format='json')
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('Mock mode is disabled in production environments', res.data['error'])
+
+    def test_food_image_analysis_throttle_rate_limiting(self):
+        """FoodImageAnalysisMobileView: Enforces rate limiting per authenticated user and returns 429 when exceeded."""
+        from apps.tenant_core.views_wellness import FoodImageAnalysisThrottle
+        cache.clear()
+        payload = {
+            'image_base64': 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+            'mock': True,
+        }
+        # Simulate rate limit of 2 requests per minute
+        with patch.object(FoodImageAnalysisThrottle, 'get_rate', return_value='2/minute'):
+            res1 = self.client_alice.post('/api/v1/mobile/wellness/foods/analyze-image/', payload, format='json')
+            self.assertEqual(res1.status_code, status.HTTP_200_OK)
+
+            res2 = self.client_alice.post('/api/v1/mobile/wellness/foods/analyze-image/', payload, format='json')
+            self.assertEqual(res2.status_code, status.HTTP_200_OK)
+
+            # 3rd request trips the 2/minute throttle
+            res3 = self.client_alice.post('/api/v1/mobile/wellness/foods/analyze-image/', payload, format='json')
+            self.assertEqual(res3.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+            self.assertIn('throttled', res3.data['detail'].lower())
+        cache.clear()
+
 
 

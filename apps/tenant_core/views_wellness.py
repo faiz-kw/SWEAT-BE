@@ -35,6 +35,7 @@ from rest_framework import status, serializers
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.throttling import UserRateThrottle
 
 from .views_mobile import _resolve_mobile_tenant_and_db, _get_or_create_user_profile
 from .models_org import Organization
@@ -289,6 +290,20 @@ class FoodBarcodeMobileView(APIView):
         }, status=status.HTTP_404_NOT_FOUND)
 
 
+class FoodImageAnalysisThrottle(UserRateThrottle):
+    """
+    Per-authenticated-member rate limit for AI food image analysis endpoint.
+    Defaults to 10 requests per minute per member to safeguard Vision API quota.
+    """
+    scope = 'wellness_ai_vision'
+
+    def get_rate(self):
+        try:
+            return super().get_rate()
+        except Exception:
+            return '10/minute'
+
+
 class FoodImageAnalysisMobileView(APIView):
     """
     POST /api/v1/mobile/wellness/foods/analyze-image/
@@ -305,6 +320,7 @@ class FoodImageAnalysisMobileView(APIView):
     - Meal rollup totals (calories, protein, carbs, fat, fiber).
     """
     permission_classes = [IsAuthenticated]
+    throttle_classes = [FoodImageAnalysisThrottle]
 
     def post(self, request):
         alias, tenant = _resolve_mobile_tenant_and_db(request)
@@ -313,11 +329,37 @@ class FoodImageAnalysisMobileView(APIView):
 
         org = _get_active_organization(request, alias)
 
-        # Check mock parameter (useful for testing or frontend UI development)
-        is_mock = (
+        gemini_api_key = getattr(settings, 'GEMINI_API_KEY', '') or os.getenv('GEMINI_API_KEY', '').strip()
+
+        # Fix 1: Restrict AI mock mode to explicitly permitted dev/testing environments
+        is_mock_permitted = bool(
+            settings.DEBUG or
+            getattr(settings, '_IS_TEST', False) or
+            'test' in str(alias) or
+            getattr(settings, 'DEPLOYMENT_ENVIRONMENT', '').lower() in ('development', 'test', 'local')
+        )
+
+        client_requested_mock = (
             request.query_params.get('mock', '').lower() in ('true', '1') or
             (isinstance(request.data, dict) and request.data.get('mock') in (True, 'true', '1'))
         )
+
+        # In production (mock NOT permitted):
+        if not is_mock_permitted:
+            # 1. Do not allow mock=true to bypass a missing Gemini API key in production
+            if not gemini_api_key:
+                return Response({
+                    'error': 'AI vision service is not configured. Please set GEMINI_API_KEY in environment or contact support.',
+                }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+            # 2. Prevent ordinary clients from enabling mock responses in production
+            if client_requested_mock:
+                return Response({
+                    'error': 'Mock mode is disabled in production environments.',
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+        # In explicitly permitted dev/testing environment, allow explicit mock flag:
+        is_mock = is_mock_permitted and client_requested_mock
 
         image_data = None
         mime_type = 'image/jpeg'
@@ -351,12 +393,10 @@ class FoodImageAnalysisMobileView(APIView):
                 'error': 'No image provided. Upload an image file under key "image" or send base64 string under "image_base64".'
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        gemini_api_key = getattr(settings, 'GEMINI_API_KEY', '') or os.getenv('GEMINI_API_KEY', '').strip()
-
         detected_items = []
 
-        # If mock requested or (no API key in development/test mode)
-        if is_mock or (not gemini_api_key and (settings.DEBUG or 'test' in str(alias))):
+        # If in permitted dev/test mode and (mock requested or no API key configured with provided image)
+        if is_mock or (is_mock_permitted and not gemini_api_key):
             # Simulated Indian thali analysis for instant frontend/QA testing
             detected_items = [
                 {

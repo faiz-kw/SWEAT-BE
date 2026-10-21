@@ -260,6 +260,8 @@ REST_FRAMEWORK = {
         'auth_login':   os.getenv('THROTTLE_RATE_LOGIN',   '10/minute'),
         'auth_mfa':     os.getenv('THROTTLE_RATE_MFA',     '5/minute'),
         'auth_refresh': os.getenv('THROTTLE_RATE_REFRESH', '20/minute'),
+        # Wellness AI vision rate limit (per authenticated member)
+        'wellness_ai_vision': os.getenv('THROTTLE_RATE_WELLNESS_AI_VISION', '10/minute'),
         # General API throttles (authenticated vs anonymous)
         'user': os.getenv('THROTTLE_RATE_API_USER', '1000/minute'),
         'anon': os.getenv('THROTTLE_RATE_API_ANON', '60/minute'),
@@ -532,6 +534,7 @@ if 'test' in sys.argv:
         'auth_login':   '10000/minute',
         'auth_mfa':     '10000/minute',
         'auth_refresh': '10000/minute',
+        'wellness_ai_vision': '10000/minute',
         # Disable global API throttles in tests: all test requests share the same loopback IP.
         'user': '10000/minute',
         'anon': '10000/minute',
