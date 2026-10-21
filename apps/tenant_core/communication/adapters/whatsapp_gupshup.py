@@ -21,6 +21,7 @@ from typing import Dict, Any, Optional, List, Tuple
 from urllib.parse import parse_qs
 
 import requests
+from django.conf import settings
 from django.utils import timezone
 from .base import (
     BaseCommunicationAdapter,
@@ -55,21 +56,34 @@ class GupshupWhatsAppAdapter(BaseCommunicationAdapter):
                     pass
 
     def _get_api_key(self) -> str:
-        """Resolve API key safely from resolved secret credentials."""
+        """Resolve API key safely from resolved secret credentials or settings."""
+        from django.conf import settings
         return (
             self.credentials.get('api_key')
             or self.credentials.get('apikey')
             or self.credentials.get('api_token')
+            or self.config.get('api_key')
+            or getattr(settings, 'GUPSHUP_API_KEY', '')
             or ''
         )
 
     def _get_app_name(self) -> str:
-        """Resolve Gupshup app name from configuration."""
-        return self.config.get('app_name') or ''
+        """Resolve Gupshup app name from configuration or settings."""
+        from django.conf import settings
+        return self.config.get('app_name') or getattr(settings, 'GUPSHUP_APP_NAME', '') or ''
 
     def _get_source_number(self, sender_id: str = '') -> str:
         """Resolve and clean sender source phone number."""
-        raw_source = sender_id or self.config.get('source_number') or self.config.get('from_number') or self.config.get('sender_id') or ''
+        from django.conf import settings
+        raw_source = (
+            sender_id
+            or self.config.get('source_number')
+            or self.config.get('source_mobile')
+            or self.config.get('from_number')
+            or self.config.get('sender_id')
+            or getattr(settings, 'GUPSHUP_SOURCE_NUMBER', '')
+            or ''
+        )
         return self._normalize_phone(raw_source)
 
     def _normalize_phone(self, phone: Any) -> str:
@@ -109,8 +123,12 @@ class GupshupWhatsAppAdapter(BaseCommunicationAdapter):
                 error_message='Gupshup WhatsApp credentials or app_name not configured for this tenant.',
             )
 
-        from django.conf import settings
-        if self.config.get('sandbox') or getattr(settings, 'WHATSAPP_SANDBOX_MODE', False) or self.credentials.get('api_key') in ('sandbox', 'dev'):
+        api_key = self._get_api_key()
+        app_name = self._get_app_name()
+
+        # If explicit mock is requested or no real API key exists, use mock sandbox
+        is_real_key = bool(api_key and api_key not in ('sandbox', 'dev') and not api_key.startswith('mock'))
+        if not is_real_key:
             import uuid
             msg_id = f"wamid.mock.{uuid.uuid4().hex[:12]}"
             logger.info("Sandbox WhatsApp message dispatched to %s: %s", self._mask_phone(recipient), body[:60])
