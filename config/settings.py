@@ -659,3 +659,9 @@ if SENTRY_DSN:
     except ImportError:
         pass
 
+
+# ---------------------------------------------------------------------------
+# AI Vision Services (Google Gemini 1.5 Flash Vision - Free Tier)
+# ---------------------------------------------------------------------------
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '').strip()
+

@@ -19,11 +19,16 @@ Endpoints:
 15. GET  /api/v1/mobile/wellness/daily-summary/ — Consolidated daily nutrition, water & sleep rollup.
 """
 
+import os
+import base64
+import json
 import logging
 from decimal import Decimal
 from datetime import date, datetime, timedelta
 from typing import Optional, Dict, Any
 
+import requests
+from django.conf import settings
 from django.db import transaction, models, IntegrityError
 from django.utils import timezone
 from rest_framework import status, serializers
@@ -35,6 +40,8 @@ from .views_mobile import _resolve_mobile_tenant_and_db, _get_or_create_user_pro
 from .models_org import Organization
 from .models_wellness import (
     FoodItem,
+    FoodCategory,
+    FoodProvenance,
     NutritionTarget,
     MealLog,
     MealLogItem,
@@ -125,6 +132,422 @@ class FoodSearchMobileView(APIView):
             'count': len(serializer.data),
             'results': serializer.data,
         })
+
+
+class FoodBarcodeMobileView(APIView):
+    """
+    GET /api/v1/mobile/wellness/foods/barcode/<str:barcode>/
+    Lookup a food item by its UPC/EAN barcode.
+    Flow:
+    1. Check local tenant/system FoodItem catalog by barcode.
+    2. If not found locally, query OpenFoodFacts API (free, open crowdsourced database).
+    3. If found on OpenFoodFacts, normalize nutritional fields (calories, protein, carbs, fat, fiber)
+       per 100g and household serving sizes, persist into the tenant database, and return.
+    4. If not found on OpenFoodFacts, return clean 404 prompting member to create custom food.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, barcode: str):
+        alias, tenant = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            return Response({'error': 'Tenant database not found'}, status=status.HTTP_400_BAD_REQUEST)
+
+        clean_barcode = (barcode or '').strip()
+        if not clean_barcode or len(clean_barcode) < 3 or len(clean_barcode) > 64:
+            return Response({'error': 'Invalid barcode format.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        org = _get_active_organization(request, alias)
+
+        # 1. Search local tenant / system catalog
+        scope_q = models.Q(is_system=True)
+        if org:
+            scope_q |= models.Q(organization=org)
+
+        local_item = FoodItem.objects.using(alias).filter(
+            barcode=clean_barcode,
+            is_active=True
+        ).filter(scope_q).first()
+
+        if local_item:
+            return Response({
+                'found': True,
+                'source': 'local_catalog',
+                'food_item': FoodItemSerializer(local_item).data,
+            }, status=status.HTTP_200_OK)
+
+        # 2. Query OpenFoodFacts API
+        off_url = f"https://world.openfoodfacts.org/api/v0/product/{clean_barcode}.json"
+        headers = {
+            'User-Agent': 'SWEAT-FitnessApp/1.0 (dev@sweat.com)',
+            'Accept': 'application/json',
+        }
+
+        try:
+            resp = requests.get(off_url, headers=headers, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get('status') == 1 and 'product' in data:
+                    product = data['product']
+                    product_name = (
+                        product.get('product_name') or
+                        product.get('product_name_en') or
+                        product.get('generic_name') or
+                        f"Scanned Item ({clean_barcode})"
+                    ).strip()
+
+                    nutriments = product.get('nutriments', {})
+
+                    # Extract kcal (OpenFoodFacts provides energy-kcal_100g, or energy_100g in kJ)
+                    kcal = nutriments.get('energy-kcal_100g')
+                    if kcal is None:
+                        kcal = nutriments.get('energy-kcal')
+                    if kcal is None and nutriments.get('energy-kj_100g'):
+                        try:
+                            kcal = float(nutriments['energy-kj_100g']) / 4.184
+                        except (ValueError, TypeError):
+                            kcal = 0.0
+
+                    protein = nutriments.get('proteins_100g') or nutriments.get('proteins', 0.0)
+                    carbs = nutriments.get('carbohydrates_100g') or nutriments.get('carbohydrates', 0.0)
+                    fat = nutriments.get('fat_100g') or nutriments.get('fat', 0.0)
+                    fiber = nutriments.get('fiber_100g') or nutriments.get('fiber', 0.0)
+
+                    # Safe Decimal conversion
+                    def _to_dec(val, dec_pl=2, default='0.00'):
+                        try:
+                            d = Decimal(str(val if val is not None else 0))
+                            if d < 0:
+                                d = Decimal('0.00')
+                            return round(d, dec_pl)
+                        except Exception:
+                            return Decimal(default)
+
+                    dec_calories = _to_dec(kcal, default='0.00')
+                    dec_protein = _to_dec(protein, default='0.00')
+                    dec_carbs = _to_dec(carbs, default='0.00')
+                    dec_fat = _to_dec(fat, default='0.00')
+                    dec_fiber = _to_dec(fiber, default='0.00')
+
+                    # Household measures / serving size
+                    serving_size_str = (product.get('serving_size') or '').strip()
+                    serving_qty = product.get('serving_quantity')
+                    household_measures = []
+                    if serving_size_str:
+                        serving_weight = 100.0
+                        if serving_qty:
+                            try:
+                                serving_weight = float(serving_qty)
+                            except (ValueError, TypeError):
+                                pass
+                        household_measures.append({
+                            'name': f"1 serving ({serving_size_str})",
+                            'weight_g': serving_weight,
+                            'unit': 'serving',
+                        })
+
+                    # Persist newly discovered product in tenant database cache
+                    new_item = FoodItem.objects.using(alias).create(
+                        organization=org,
+                        is_system=False,
+                        name=product_name[:200],
+                        barcode=clean_barcode,
+                        category=FoodCategory.OTHER,
+                        serving_unit='g',
+                        serving_weight_grams=Decimal('100.00'),
+                        household_measures=household_measures,
+                        calories=dec_calories,
+                        protein_g=dec_protein,
+                        carbs_g=dec_carbs,
+                        fat_g=dec_fat,
+                        fiber_g=dec_fiber,
+                        provenance=FoodProvenance.OPEN_FOOD_FACTS,
+                        source_reference_id=f"OFF:{clean_barcode}",
+                        preparation_notes=f"Auto-imported from OpenFoodFacts (brand: {product.get('brands', 'Unknown')})",
+                        is_nutritionist_verified=False,
+                        is_active=True,
+                    )
+
+                    return Response({
+                        'found': True,
+                        'source': 'open_food_facts',
+                        'food_item': FoodItemSerializer(new_item).data,
+                    }, status=status.HTTP_200_OK)
+
+        except requests.RequestException as e:
+            logger.warning(f"OpenFoodFacts API error for barcode {clean_barcode}: {e}")
+            return Response({
+                'found': False,
+                'barcode': clean_barcode,
+                'detail': 'External barcode lookup service temporarily unreachable. You can add this item manually.',
+                'error': str(e),
+            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        return Response({
+            'found': False,
+            'barcode': clean_barcode,
+            'detail': 'Product not found for this barcode. You can log it as a custom food item.',
+        }, status=status.HTTP_404_NOT_FOUND)
+
+
+class FoodImageAnalysisMobileView(APIView):
+    """
+    POST /api/v1/mobile/wellness/foods/analyze-image/
+    AI-powered food photo recognition using Google Gemini 1.5 Flash Vision.
+
+    Accepts:
+    - Multipart file upload: `image`
+    - OR JSON payload with base64 string: `image_base64` or `image`
+    - Optional `mock=true` query param or JSON flag for offline/mock development.
+
+    Returns:
+    - Detected food items with estimated portions (grams) and nutrient breakdowns.
+    - Automatic fuzzy cross-reference matching against the gym's verified FoodItem catalog.
+    - Meal rollup totals (calories, protein, carbs, fat, fiber).
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        alias, tenant = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            return Response({'error': 'Tenant database not found'}, status=status.HTTP_400_BAD_REQUEST)
+
+        org = _get_active_organization(request, alias)
+
+        # Check mock parameter (useful for testing or frontend UI development)
+        is_mock = (
+            request.query_params.get('mock', '').lower() in ('true', '1') or
+            (isinstance(request.data, dict) and request.data.get('mock') in (True, 'true', '1'))
+        )
+
+        image_data = None
+        mime_type = 'image/jpeg'
+
+        # 1. Check for file upload
+        if 'image' in request.FILES:
+            uploaded_file = request.FILES['image']
+            if uploaded_file.size > 10 * 1024 * 1024:
+                return Response({'error': 'Image file exceeds maximum 10MB limit.'}, status=status.HTTP_400_BAD_REQUEST)
+            content_type = uploaded_file.content_type or 'image/jpeg'
+            if content_type in ('image/jpeg', 'image/png', 'image/webp', 'image/heic'):
+                mime_type = content_type
+            image_bytes = uploaded_file.read()
+            image_data = base64.b64encode(image_bytes).decode('utf-8')
+
+        # 2. Check for base64 in data
+        elif isinstance(request.data, dict) and ('image_base64' in request.data or 'image' in request.data):
+            raw_b64 = request.data.get('image_base64') or request.data.get('image')
+            if isinstance(raw_b64, str):
+                # Strip data URI prefix if present (e.g. data:image/jpeg;base64,...)
+                if ',' in raw_b64:
+                    header, raw_b64 = raw_b64.split(',', 1)
+                    if 'image/png' in header:
+                        mime_type = 'image/png'
+                    elif 'image/webp' in header:
+                        mime_type = 'image/webp'
+                image_data = raw_b64.strip()
+
+        if not image_data and not is_mock:
+            return Response({
+                'error': 'No image provided. Upload an image file under key "image" or send base64 string under "image_base64".'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        gemini_api_key = getattr(settings, 'GEMINI_API_KEY', '') or os.getenv('GEMINI_API_KEY', '').strip()
+
+        detected_items = []
+
+        # If mock requested or (no API key in development/test mode)
+        if is_mock or (not gemini_api_key and (settings.DEBUG or 'test' in str(alias))):
+            # Simulated Indian thali analysis for instant frontend/QA testing
+            detected_items = [
+                {
+                    "food_name": "Roti",
+                    "category": "GRAINS",
+                    "estimated_grams": 70.0,
+                    "calories": 208.0,
+                    "protein_g": 6.2,
+                    "carbs_g": 36.4,
+                    "fat_g": 7.4,
+                    "fiber_g": 4.6,
+                    "confidence": 0.94,
+                    "notes": "2 medium whole wheat chapatis with light ghee",
+                },
+                {
+                    "food_name": "Dal Tadka",
+                    "category": "PULSES_LEGUMES",
+                    "estimated_grams": 150.0,
+                    "calories": 180.0,
+                    "protein_g": 9.0,
+                    "carbs_g": 24.0,
+                    "fat_g": 5.5,
+                    "fiber_g": 4.0,
+                    "confidence": 0.89,
+                    "notes": "1 standard katori yellow lentil curry",
+                },
+                {
+                    "food_name": "Cucumber Salad",
+                    "category": "VEGETABLES",
+                    "estimated_grams": 80.0,
+                    "calories": 20.0,
+                    "protein_g": 0.8,
+                    "carbs_g": 3.2,
+                    "fat_g": 0.2,
+                    "fiber_g": 1.1,
+                    "confidence": 0.91,
+                    "notes": "Sliced cucumber and carrot slices",
+                }
+            ]
+        elif not gemini_api_key:
+            return Response({
+                'error': 'AI vision service is not configured. Please set GEMINI_API_KEY in environment or contact support.',
+            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        else:
+            # Call Google Gemini 1.5 Flash Vision API
+            gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_api_key}"
+            prompt_text = (
+                "You are an expert nutrition and fitness diet assistant. Analyze this food photo and identify the distinct food items visible on the plate or meal.\n"
+                "For each identified item, provide a realistic portion estimate in grams and estimated macronutrients.\n"
+                "Return strictly valid JSON array of objects with keys:\n"
+                "- food_name: string (name of dish or food item, e.g. 'Roti', 'Paneer Bhurji', 'Grilled Chicken Breast')\n"
+                "- category: string (one of: GRAINS, PULSES_LEGUMES, DAIRY, MEAT_POULTRY, VEGETABLES, FRUITS, OILS_FATS, NUTS_SEEDS, SNACKS_SWEETS, BEVERAGES, OTHER)\n"
+                "- estimated_grams: number (weight in grams)\n"
+                "- calories: number (energy in kcal)\n"
+                "- protein_g: number (grams)\n"
+                "- carbs_g: number (grams)\n"
+                "- fat_g: number (grams)\n"
+                "- fiber_g: number (grams)\n"
+                "- confidence: number (0.0 to 1.0 estimate)\n"
+                "- notes: string (short observation like 'approx. 2 pieces' or '1 medium bowl')\n"
+                "If no recognizable food is detected, return an empty array []."
+            )
+
+            payload = {
+                "contents": [
+                    {
+                        "parts": [
+                            {"text": prompt_text},
+                            {
+                                "inline_data": {
+                                    "mime_type": mime_type,
+                                    "data": image_data
+                                }
+                            }
+                        ]
+                    }
+                ],
+                "generationConfig": {
+                    "response_mime_type": "application/json",
+                    "temperature": 0.2,
+                }
+            }
+
+            try:
+                resp = requests.post(gemini_url, json=payload, timeout=12)
+                if resp.status_code == 200:
+                    resp_json = resp.json()
+                    candidates = resp_json.get('candidates', [])
+                    if candidates:
+                        content_parts = candidates[0].get('content', {}).get('parts', [])
+                        if content_parts:
+                            text_out = content_parts[0].get('text', '[]')
+                            raw_parsed = json.loads(text_out)
+                            if isinstance(raw_parsed, list):
+                                detected_items = raw_parsed
+                            elif isinstance(raw_parsed, dict) and 'items' in raw_parsed:
+                                detected_items = raw_parsed['items']
+                else:
+                    logger.error(f"Gemini Vision API error {resp.status_code}: {resp.text}")
+                    return Response({
+                        'error': f"AI vision provider error (HTTP {resp.status_code}). Please try again."
+                    }, status=status.HTTP_502_BAD_GATEWAY)
+            except requests.Timeout:
+                return Response({'error': 'AI vision service timed out. Please try again with a smaller image.'}, status=status.HTTP_504_GATEWAY_TIMEOUT)
+            except Exception as e:
+                logger.exception(f"Unexpected error in Gemini vision call: {e}")
+                return Response({'error': f"Failed to analyze food image: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        # 3. Post-process & Cross-reference against local FoodItem catalog
+        scope_q = models.Q(is_system=True)
+        if org:
+            scope_q |= models.Q(organization=org)
+
+        enhanced_items = []
+        total_cal = Decimal('0.00')
+        total_p = Decimal('0.00')
+        total_c = Decimal('0.00')
+        total_f = Decimal('0.00')
+        total_fib = Decimal('0.00')
+
+        for item in detected_items:
+            food_name = item.get('food_name', 'Unknown')
+            # Look up catalog match with prioritized matching:
+            # 1. Direct name match (e.g. "Roti" matches "Roti / Chapati")
+            # 2. Regional aliases match
+            # 3. First word match
+            catalog_match = None
+            first_word = food_name.split()[0] if food_name else ''
+            matched_food = FoodItem.objects.using(alias).filter(is_active=True).filter(scope_q).filter(
+                name__icontains=food_name
+            ).first()
+
+            if not matched_food:
+                matched_food = FoodItem.objects.using(alias).filter(is_active=True).filter(scope_q).filter(
+                    regional_aliases__icontains=food_name
+                ).first()
+
+            if not matched_food and first_word:
+                matched_food = FoodItem.objects.using(alias).filter(is_active=True).filter(scope_q).filter(
+                    name__icontains=first_word
+                ).first()
+
+            if matched_food:
+                catalog_match = FoodItemSerializer(matched_food).data
+
+            def _to_float(v):
+                try:
+                    return round(float(v), 2)
+                except (ValueError, TypeError):
+                    return 0.0
+
+            cal = _to_float(item.get('calories', 0))
+            p = _to_float(item.get('protein_g', 0))
+            c = _to_float(item.get('carbs_g', 0))
+            f = _to_float(item.get('fat_g', 0))
+            fib = _to_float(item.get('fiber_g', 0))
+
+            total_cal += Decimal(str(cal))
+            total_p += Decimal(str(p))
+            total_c += Decimal(str(c))
+            total_f += Decimal(str(f))
+            total_fib += Decimal(str(fib))
+
+            enhanced_items.append({
+                'food_name': food_name,
+                'category': item.get('category', 'OTHER'),
+                'estimated_grams': _to_float(item.get('estimated_grams', 100)),
+                'calories': cal,
+                'protein_g': p,
+                'carbs_g': c,
+                'fat_g': f,
+                'fiber_g': fib,
+                'confidence': _to_float(item.get('confidence', 0.8)),
+                'notes': item.get('notes', ''),
+                'matched_catalog_item': catalog_match,
+            })
+
+        return Response({
+            'status': 'success',
+            'model': 'gemini-1.5-flash',
+            'is_mock': is_mock or (not gemini_api_key),
+            'detected_count': len(enhanced_items),
+            'detected_items': enhanced_items,
+            'summary': {
+                'total_calories': float(total_cal),
+                'total_protein_g': float(total_p),
+                'total_carbs_g': float(total_c),
+                'total_fat_g': float(total_f),
+                'total_fiber_g': float(total_fib),
+            }
+        }, status=status.HTTP_200_OK)
 
 
 class NutritionTargetMobileView(APIView):

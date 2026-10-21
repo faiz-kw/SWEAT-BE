@@ -15,6 +15,7 @@ Covers:
 import uuid
 from decimal import Decimal
 from datetime import date, datetime, time, timedelta
+from unittest.mock import patch, MagicMock
 
 from django.test import TestCase
 from django.utils import timezone
@@ -995,5 +996,105 @@ class WellnessCoreTests(TestCase):
         # Verify record is now COMPLETED
         record.refresh_from_db(using=self.alias)
         self.assertEqual(record.status, 'COMPLETED')
+
+    def test_barcode_lookup_local_hit(self):
+        """FoodBarcodeMobileView: Returns local catalog food if barcode already exists."""
+        item = FoodItem.objects.using(self.alias).create(
+            organization=self.org,
+            name="Amul Butter 100g",
+            barcode="8901262010053",
+            category=FoodCategory.DAIRY,
+            serving_unit="g",
+            serving_weight_grams=Decimal("100.00"),
+            calories=Decimal("717.00"),
+            protein_g=Decimal("0.50"),
+            carbs_g=Decimal("0.00"),
+            fat_g=Decimal("81.00"),
+            provenance=FoodProvenance.CUSTOM_TENANT,
+            is_active=True,
+        )
+
+        res = self.client_alice.get('/api/v1/mobile/wellness/foods/barcode/8901262010053/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertTrue(res.data['found'])
+        self.assertEqual(res.data['source'], 'local_catalog')
+        self.assertEqual(res.data['food_item']['name'], 'Amul Butter 100g')
+        self.assertEqual(res.data['food_item']['barcode'], '8901262010053')
+
+    @patch('apps.tenant_core.views_wellness.requests.get')
+    def test_barcode_lookup_open_food_facts_success(self, mock_get):
+        """FoodBarcodeMobileView: Queries OpenFoodFacts, saves to DB, and returns food item."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            'status': 1,
+            'product': {
+                'product_name': 'Nutella Hazelnut Spread',
+                'brands': 'Ferrero',
+                'serving_size': '15g',
+                'serving_quantity': '15',
+                'nutriments': {
+                    'energy-kcal_100g': 539,
+                    'proteins_100g': 6.3,
+                    'carbohydrates_100g': 57.5,
+                    'fat_100g': 30.9,
+                    'fiber_100g': 3.0,
+                }
+            }
+        }
+        mock_get.return_value = mock_response
+
+        res = self.client_alice.get('/api/v1/mobile/wellness/foods/barcode/3017620422003/')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertTrue(res.data['found'])
+        self.assertEqual(res.data['source'], 'open_food_facts')
+        self.assertEqual(res.data['food_item']['name'], 'Nutella Hazelnut Spread')
+        self.assertEqual(Decimal(str(res.data['food_item']['calories'])), Decimal('539.00'))
+
+        # Verify cached in tenant DB
+        db_item = FoodItem.objects.using(self.alias).filter(barcode='3017620422003').first()
+        self.assertIsNotNone(db_item)
+        self.assertEqual(db_item.provenance, FoodProvenance.OPEN_FOOD_FACTS)
+
+    @patch('apps.tenant_core.views_wellness.requests.get')
+    def test_barcode_lookup_not_found(self, mock_get):
+        """FoodBarcodeMobileView: Returns 404 when product is not in local DB or OpenFoodFacts."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            'status': 0,
+            'status_verbose': 'product not found'
+        }
+        mock_get.return_value = mock_response
+
+        res = self.client_alice.get('/api/v1/mobile/wellness/foods/barcode/9999999999999/')
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertFalse(res.data['found'])
+
+    def test_food_image_analysis_missing_image(self):
+        """FoodImageAnalysisMobileView: Rejects request with missing image."""
+        res = self.client_alice.post('/api/v1/mobile/wellness/foods/analyze-image/', {}, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('No image provided', res.data['error'])
+
+    def test_food_image_analysis_mock_flow(self):
+        """FoodImageAnalysisMobileView: Analyzes meal image, matches catalog items, and calculates totals."""
+        payload = {
+            'image_base64': 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+            'mock': True,
+        }
+        res = self.client_alice.post('/api/v1/mobile/wellness/foods/analyze-image/', payload, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data['status'], 'success')
+        self.assertTrue(res.data['is_mock'])
+        self.assertGreaterEqual(res.data['detected_count'], 1)
+        self.assertIn('summary', res.data)
+        self.assertGreater(res.data['summary']['total_calories'], 0)
+
+        # Check that Roti matched with catalog item from seed catalog
+        roti_match = next((item for item in res.data['detected_items'] if 'Roti' in item['food_name']), None)
+        self.assertIsNotNone(roti_match)
+        self.assertIsNotNone(roti_match['matched_catalog_item'])
+        self.assertIn('Roti', roti_match['matched_catalog_item']['name'])
 
 

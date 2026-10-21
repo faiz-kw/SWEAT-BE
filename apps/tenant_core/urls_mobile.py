@@ -104,6 +104,8 @@ urlpatterns = [
 
     # 7. Nutrition & Wellness MVP (Milestone 1)
     path('wellness/foods/', views_wellness.FoodSearchMobileView.as_view(), name='mobile-wellness-foods'),
+    path('wellness/foods/barcode/<str:barcode>/', views_wellness.FoodBarcodeMobileView.as_view(), name='mobile-wellness-food-barcode'),
+    path('wellness/foods/analyze-image/', views_wellness.FoodImageAnalysisMobileView.as_view(), name='mobile-wellness-food-analyze-image'),
     path('wellness/targets/', views_wellness.NutritionTargetMobileView.as_view(), name='mobile-wellness-targets'),
     path('wellness/meal-logs/', views_wellness.MealLogListCreateMobileView.as_view(), name='mobile-wellness-meal-logs'),
     path('wellness/meal-logs/<uuid:pk>/', views_wellness.MealLogDetailMobileView.as_view(), name='mobile-wellness-meal-log-detail'),

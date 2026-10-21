@@ -26,6 +26,7 @@ class FoodItemSerializer(serializers.ModelSerializer):
         fields = [
             'id',
             'name',
+            'barcode',
             'regional_aliases',
             'category',
             'serving_unit',

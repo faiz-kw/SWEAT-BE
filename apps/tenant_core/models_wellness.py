@@ -39,6 +39,8 @@ class FoodProvenance(models.TextChoices):
     USDA_DIRECT = 'USDA_DIRECT', 'USDA Direct'
     RECIPE_ESTIMATE = 'RECIPE_ESTIMATE', 'Recipe Estimate'
     CUSTOM_TENANT = 'CUSTOM_TENANT', 'Custom Tenant Food'
+    OPEN_FOOD_FACTS = 'OPEN_FOOD_FACTS', 'Open Food Facts'
+    AI_VISION_ESTIMATE = 'AI_VISION_ESTIMATE', 'AI Vision Estimate'
 
 
 class MealType(models.TextChoices):
@@ -64,6 +66,13 @@ class FoodItem(models.Model):
     )
     is_system = models.BooleanField(default=True, db_index=True)
     name = models.CharField(max_length=200, db_index=True)
+    barcode = models.CharField(
+        max_length=64,
+        blank=True,
+        null=True,
+        db_index=True,
+        help_text='UPC / EAN / GTIN barcode identifier'
+    )
     regional_aliases = models.JSONField(
         default=list,
         blank=True,
