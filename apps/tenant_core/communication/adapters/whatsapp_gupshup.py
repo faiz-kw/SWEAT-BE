@@ -86,6 +86,9 @@ class GupshupWhatsAppAdapter(BaseCommunicationAdapter):
 
     def is_configured(self) -> bool:
         """Checks if required credentials and app parameters are present."""
+        from django.conf import settings
+        if self.config.get('sandbox') or getattr(settings, 'WHATSAPP_SANDBOX_MODE', False) or self.credentials.get('api_key') in ('sandbox', 'dev'):
+            return True
         return bool(self._get_api_key() and self._get_app_name())
 
     def send(
@@ -107,6 +110,17 @@ class GupshupWhatsAppAdapter(BaseCommunicationAdapter):
             )
 
         from django.conf import settings
+        if self.config.get('sandbox') or getattr(settings, 'WHATSAPP_SANDBOX_MODE', False) or self.credentials.get('api_key') in ('sandbox', 'dev'):
+            import uuid
+            msg_id = f"wamid.mock.{uuid.uuid4().hex[:12]}"
+            logger.info("Sandbox WhatsApp message dispatched to %s: %s", self._mask_phone(recipient), body[:60])
+            return ProviderSendResult(
+                success=True,
+                provider_message_id=msg_id,
+                status='DELIVERED',
+                raw_response={'status': 'delivered', 'sandbox': True, 'recipient': recipient},
+            )
+
         outbound_enabled = getattr(settings, 'COMMUNICATIONS_OUTBOUND_ENABLED', False)
         if outbound_enabled is not True:
             return ProviderSendResult(

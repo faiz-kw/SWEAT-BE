@@ -600,6 +600,7 @@ ZATA_S3_MAX_FILE_SIZE = int(os.getenv('ZATA_S3_MAX_FILE_SIZE', str(50 * 1024 * 1
 DEPLOYMENT_ENVIRONMENT = os.getenv('DEPLOYMENT_ENVIRONMENT', 'development' if DEBUG else 'production').lower()
 META_LEAD_SIMULATOR_ENABLED = os.getenv('META_LEAD_SIMULATOR_ENABLED', 'true' if DEBUG else 'false').lower() in ('true', '1', 't')
 COMMUNICATIONS_OUTBOUND_ENABLED = os.getenv('COMMUNICATIONS_OUTBOUND_ENABLED', 'false' if DEBUG else 'true').lower() in ('true', '1', 't')
+WHATSAPP_SANDBOX_MODE = os.getenv('WHATSAPP_SANDBOX_MODE', 'true' if DEBUG else 'false').lower() in ('true', '1', 't')
 VOICE_CALLING_ENABLED = os.getenv('VOICE_CALLING_ENABLED', 'false').lower() in ('true', '1', 't', 'yes')
 # Calling hours enforcement (IST / Asia/Kolkata). Calls outside the window are rejected.
 # VOICE_CALLING_ENFORCE_HOURS=false disables the check in staging/dev without changing production.

@@ -982,22 +982,33 @@ class VoiceAgentBookTrialView(View):
             if lead.phone_normalized:
                 try:
                     from apps.tenant_core.communication.service import CommunicationService
-                    addr_str = occurrence.branch.address or (
-                        f"{occurrence.branch.address_line_1}, {occurrence.branch.location.city}"
-                        if occurrence.branch.address_line_1 and occurrence.branch.location else occurrence.branch.name
-                    )
+                    full_addr = getattr(occurrence.branch, 'address_line_1', '') or occurrence.branch.address or branch_name
+                    city_str = occurrence.branch.location.city if (occurrence.branch.location and occurrence.branch.location.city) else 'Mumbai'
+                    maps_query = f"{branch_name}+{full_addr}+{city_str}".replace(' ', '+')
+                    maps_url = f"https://maps.google.com/?q={maps_query}"
                     prog_name = occurrence.class_template.program.name if (occurrence.class_template and occurrence.class_template.program) else occurrence.class_template.name
+                    instructor_name = getattr(occurrence.instructor, 'name', None) or getattr(occurrence.instructor, 'first_name', None) or 'Master Studio Trainer'
+                    pass_code = f"SWEAT-VIP-{str(trial.id).replace('-', '')[:6].upper()}"
+
                     wa_body = (
-                        f"Hi {lead.first_name}! 🎉 Your complimentary trial session at SWEAT is confirmed!\n\n"
-                        f"🏋️ Program: {prog_name}\n"
-                        f"🤸 Class: {occurrence.class_template.name}\n"
-                        f"📍 Branch: {branch_name} ({addr_str})\n"
-                        f"📅 Date & Time: {ist_dt.strftime('%A, %b %d at %I:%M %p')}\n\n"
-                        f"📋 Important Instructions for Your Visit:\n"
-                        f"💧 Stay Hydrated: Carry an empty bottle and get it filled at our studio.\n"
-                        f"👕 Comfy Clothes: Wear anything comfortable, such as shorts, tracks, leggings, pants, T-shirts, or tank tops.\n"
-                        f"👟 Carry a Fresh Pair of Grip Shoes: Please bring a fresh pair of shoes and socks to maintain hygiene at all times.\n\n"
-                        f"Please arrive 15 minutes early. If you need to reschedule or have questions, just reply to this message!"
+                        f"🎫 *SWEAT VIP TRIAL PASS*\n"
+                        f"━━━━━━━━━━━━━━━━━━━\n"
+                        f"Hi {lead.first_name}! Your complimentary workout pass at SWEAT is confirmed.\n\n"
+                        f"🏋️ *Program:* {prog_name}\n"
+                        f"🤸 *Class:* {occurrence.class_template.name}\n"
+                        f"📍 *Studio:* {branch_name}\n"
+                        f"🏢 *Address:* {full_addr}\n"
+                        f"🗺️ *Directions (Google Maps):* {maps_url}\n"
+                        f"📅 *Date & Time:* {ist_dt.strftime('%A, %b %d at %I:%M %p')}\n"
+                        f"👨‍🏫 *Instructor:* {instructor_name}\n"
+                        f"🎟️ *Pass ID:* #{pass_code}\n"
+                        f"━━━━━━━━━━━━━━━━━━━\n"
+                        f"📋 *Studio Visit Checklist:*\n"
+                        f"💧 *Hydration:* Carry a reusable bottle (pure alkaline water station inside).\n"
+                        f"👟 *Hygiene:* Clean grip shoes & socks required for studio reformer & turf.\n"
+                        f"👕 *Attire:* Comfortable athletic wear (stretch/breathable).\n"
+                        f"⏰ *Arrival:* Please arrive 15 minutes early for your biometric check-in & tour.\n\n"
+                        f"Questions or need to reschedule? Simply reply to this chat!"
                     )
                     CommunicationService.send_communication(
                         organization=lead.organization,
