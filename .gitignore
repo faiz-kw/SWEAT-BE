@@ -76,3 +76,8 @@ venv.bak/
 .DS_Store
 Thumbs.db
 *.dump
+
+# Celery & Media
+celerybeat-schedule*
+*.wav
+*.mp3

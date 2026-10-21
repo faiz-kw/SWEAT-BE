@@ -117,11 +117,13 @@ def execute_idempotent_operation(
                 )
                 return record.response_snapshot or {}
             elif record.status == 'PROCESSING':
-                # Check if expired
-                if record.expires_at and record.expires_at < now:
-                    logger.warning("Idempotency lock expired for key=%s op=%s. Overriding.", idempotency_key, operation_type)
+                # Check if expired or stuck in processing beyond 5 minutes (e.g. server crash during execution)
+                is_stuck = bool(record.updated_at and (now - record.updated_at).total_seconds() > 300)
+                if (record.expires_at and record.expires_at < now) or is_stuck:
+                    logger.warning("Idempotency lock expired or stuck for key=%s op=%s. Overriding.", idempotency_key, operation_type)
                     record.status = 'PROCESSING'
                     record.request_hash = req_hash
+                    record.expires_at = expires_at
                     record.save(using=alias)
                 else:
                     raise IdempotencyConflictError(

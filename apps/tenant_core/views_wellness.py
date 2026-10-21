@@ -24,7 +24,7 @@ from decimal import Decimal
 from datetime import date, datetime, timedelta
 from typing import Optional, Dict, Any
 
-from django.db import transaction, models
+from django.db import transaction, models, IntegrityError
 from django.utils import timezone
 from rest_framework import status, serializers
 from rest_framework.views import APIView
@@ -598,28 +598,76 @@ class SleepLogListCreateMobileView(APIView):
             quality_rating = data.get('quality_rating', 3)
             notes = data.get('notes', '')
 
-            with transaction.atomic(using=alias):
-                sleep_log, created = SleepLog.objects.using(alias).select_for_update().get_or_create(
+            sleep_log = None
+            created = False
+
+            # Concurrency race-resilient upsert:
+            # When two distinct concurrent requests arrive without an Idempotency-Key
+            # before any sleep record exists for (user, logged_date), one thread wins
+            # the INSERT while the second hits uq_sleep_log_user_date.
+            # We catch IntegrityError specifically for uq_sleep_log_user_date, roll back
+            # the inner savepoint cleanly, and acquire the row lock on the winner to update it.
+            for attempt in range(3):
+                try:
+                    with transaction.atomic(using=alias):
+                        existing = SleepLog.objects.using(alias).select_for_update().filter(
+                            user=request.user,
+                            logged_date=logged_date,
+                        ).first()
+
+                        if existing:
+                            existing.start_time = start_time
+                            existing.end_time = end_time
+                            existing.duration_minutes = duration_minutes
+                            existing.quality_rating = quality_rating
+                            if 'notes' in data:
+                                existing.notes = notes
+                            existing.save(using=alias)
+                            sleep_log = existing
+                            created = False
+                        else:
+                            try:
+                                with transaction.atomic(using=alias):
+                                    sleep_log = SleepLog.objects.using(alias).create(
+                                        organization=org,
+                                        user=request.user,
+                                        profile=profile,
+                                        logged_date=logged_date,
+                                        start_time=start_time,
+                                        end_time=end_time,
+                                        duration_minutes=duration_minutes,
+                                        quality_rating=quality_rating,
+                                        notes=notes,
+                                    )
+                                    created = True
+                            except IntegrityError as create_err:
+                                err_text = str(create_err).lower()
+                                if 'uq_sleep_log_user_date' in err_text or 'unique constraint' in err_text:
+                                    logger.info(
+                                        "Concurrent first-insert race on sleep log for user %s date %s; retrying via update.",
+                                        request.user.id, logged_date
+                                    )
+                                    continue
+                                else:
+                                    # Do not swallow unrelated integrity errors (e.g. FK, NOT NULL)
+                                    raise
+
+                    if sleep_log:
+                        break
+                except IntegrityError as outer_err:
+                    err_text = str(outer_err).lower()
+                    if ('uq_sleep_log_user_date' in err_text or 'unique constraint' in err_text) and attempt < 2:
+                        continue
+                    raise
+
+            if not sleep_log:
+                sleep_log = SleepLog.objects.using(alias).filter(
                     user=request.user,
                     logged_date=logged_date,
-                    defaults={
-                        'organization': org,
-                        'profile': profile,
-                        'start_time': start_time,
-                        'end_time': end_time,
-                        'duration_minutes': duration_minutes,
-                        'quality_rating': quality_rating,
-                        'notes': notes,
-                    }
-                )
-                if not created:
-                    sleep_log.start_time = start_time
-                    sleep_log.end_time = end_time
-                    sleep_log.duration_minutes = duration_minutes
-                    sleep_log.quality_rating = quality_rating
-                    if 'notes' in data:
-                        sleep_log.notes = notes
-                    sleep_log.save(using=alias)
+                ).first()
+                if not sleep_log:
+                    raise RuntimeError("Failed to resolve sleep log after concurrency retries.")
+                created = False
 
             out_serializer = SleepLogSerializer(sleep_log)
             res = dict(out_serializer.data)

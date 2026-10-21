@@ -849,3 +849,151 @@ class WellnessCoreTests(TestCase):
         self.assertEqual(res_invalid_rating.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn('quality_rating', res_invalid_rating.data)
 
+    def test_concurrent_first_insert_sleep_race_recovery(self):
+        """
+        Regression test: When two distinct concurrent requests without an Idempotency-Key
+        attempt to create a sleep log on the same date for the same member simultaneously,
+        an IntegrityError on uq_sleep_log_user_date is caught, the inner savepoint is rolled back,
+        and the winning record is locked and updated cleanly without a 500 error.
+        """
+        now = timezone.now()
+        target_date = '2026-10-15'
+        start = now - timedelta(hours=8)
+        end = now
+
+        from unittest.mock import patch
+        from django.db import IntegrityError
+
+        # 1. Winning record already committed in database by concurrent Thread A
+        winning_record = SleepLog.objects.using(self.alias).create(
+            organization=self.org,
+            user=self.user_alice,
+            profile=self.profile_alice,
+            logged_date=target_date,
+            start_time=start,
+            end_time=end,
+            duration_minutes=400,
+            quality_rating=2,
+            notes='From concurrent winner',
+        )
+
+        # 2. Simulate Thread B race condition:
+        # First lookup returns None (simulating Thread B checking right before Thread A commits).
+        # Thread B then proceeds to create(), which hits the real PostgreSQL UNIQUE constraint
+        # 'uq_sleep_log_user_date'.
+        # On attempt 2, the retry finds the real winning_record, locks it, and updates it cleanly.
+        orig_using = SleepLog.objects.using
+        attempt_tracker = {'count': 0}
+
+        def mock_using_race(alias_arg):
+            qs = orig_using(alias_arg)
+            orig_first = qs.first
+            def race_first(*args, **kwargs):
+                attempt_tracker['count'] += 1
+                if attempt_tracker['count'] == 1:
+                    # Simulate first check misses the record
+                    return None
+                return orig_first(*args, **kwargs)
+            qs.first = race_first
+            return qs
+
+        payload = {
+            'logged_date': target_date,
+            'start_time': start.isoformat(),
+            'end_time': end.isoformat(),
+            'duration_minutes': 480,
+            'quality_rating': 4,
+            'notes': 'Concurrent race update notes',
+        }
+
+        with patch.object(SleepLog.objects, 'using', side_effect=mock_using_race):
+            # Send request without Idempotency-Key
+            res = self.client_alice.post('/api/v1/mobile/wellness/sleep-logs/', payload, format='json')
+
+            # Must recover cleanly without a 500 error, returning 200 OK
+            self.assertEqual(res.status_code, status.HTTP_200_OK)
+            self.assertEqual(res.data['notes'], 'Concurrent race update notes')
+            self.assertEqual(res.data['quality_rating'], 4)
+            self.assertEqual(res.data['duration_minutes'], 480)
+
+        # Confirm exactly 1 record in database, updated with Thread B's payload
+        qs = SleepLog.objects.using(self.alias).filter(user=self.user_alice, logged_date=target_date)
+        self.assertEqual(qs.count(), 1)
+        self.assertEqual(qs.first().notes, 'Concurrent race update notes')
+
+    def test_unrelated_integrity_error_not_suppressed(self):
+        """
+        Verify that unrelated database integrity errors (e.g. foreign key or check constraint violations)
+        are NOT swallowed by the concurrency race handler and return 500 Internal Server Error.
+        """
+        now = timezone.now()
+        target_date = '2026-10-14'
+        start = now - timedelta(hours=7)
+        end = now
+
+        from unittest.mock import patch
+        from django.db import IntegrityError
+
+        orig_using = SleepLog.objects.using
+        def mock_using_error(alias_arg):
+            qs = orig_using(alias_arg)
+            def err_create(*args, **kwargs):
+                raise IntegrityError('insert or update on table "sleep_logs" violates foreign key constraint "sleep_logs_user_id_fk"')
+            qs.create = err_create
+            return qs
+
+        with patch.object(SleepLog.objects, 'using', side_effect=mock_using_error):
+            payload = {
+                'logged_date': target_date,
+                'start_time': start.isoformat(),
+                'end_time': end.isoformat(),
+                'duration_minutes': 420,
+            }
+            # Unrelated integrity error must not be suppressed; propagates as IntegrityError
+            with self.assertRaises(IntegrityError):
+                self.client_alice.post('/api/v1/mobile/wellness/sleep-logs/', payload, format='json')
+
+    def test_idempotency_stuck_processing_lock_override(self):
+        """
+        Verify that if an IdempotencyRecord is stuck in 'PROCESSING' state due to a crashed worker
+        (updated_at > 300 seconds ago), a retry with the same key safely overrides the dead lock
+        and executes rather than returning 409 Conflict forever.
+        """
+        from apps.tenant_core.services_reliability import compute_request_hash
+        now = timezone.now()
+        stuck_time = now - timedelta(minutes=10)
+        idem_key = 'stuck-test-key-999'
+        scoped_key = f"u:{self.user_alice.id}:{idem_key}"
+
+        payload = {
+            'logged_date': '2026-10-16',
+            'amount_ml': 500,
+        }
+        req_hash = compute_request_hash(payload)
+
+        # Manually seed a stuck PROCESSING record with matching hash
+        record = IdempotencyRecord.objects.using(self.alias).create(
+            organization=self.org,
+            operation_type='WELLNESS_WATER_LOG',
+            idempotency_key=scoped_key,
+            actor_user=self.user_alice,
+            request_hash=req_hash,
+            status='PROCESSING',
+            expires_at=now + timedelta(hours=24),
+        )
+        # Update updated_at in the past
+        IdempotencyRecord.objects.using(self.alias).filter(id=record.id).update(updated_at=stuck_time)
+
+        # Send request with the same idempotency key and matching payload
+        headers = {'HTTP_IDEMPOTENCY_KEY': idem_key}
+        res = self.client_alice.post('/api/v1/mobile/wellness/water-logs/', payload, format='json', **headers)
+
+        # Must succeed with 201 Created instead of 409 Conflict
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res.data['amount_ml'], 500)
+
+        # Verify record is now COMPLETED
+        record.refresh_from_db(using=self.alias)
+        self.assertEqual(record.status, 'COMPLETED')
+
+

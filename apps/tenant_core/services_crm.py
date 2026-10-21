@@ -936,9 +936,12 @@ class CRMLeadService:
         # 6. Activities
         # Pre-lookup latest CallSession for the lead to attach recording and transcript to call activities
         lead_latest_cs = None
+        has_call_sessions = False
         try:
             from .models_crm import CallSession
-            lead_latest_cs = CallSession.objects.using(alias).filter(lead=lead).order_by('-started_at').first()
+            call_sessions_qs = CallSession.objects.using(alias).filter(lead=lead)
+            has_call_sessions = call_sessions_qs.exists()
+            lead_latest_cs = call_sessions_qs.order_by('-started_at').first()
         except Exception:
             pass
 
@@ -955,9 +958,9 @@ class CRMLeadService:
                 or (act.outcome and 'call' in act.outcome.lower())
                 or (act.notes and 'call' in act.notes.lower() and 'summary' in act.notes.lower())
             )
-            if is_reminder_act:
+            if is_reminder_act and not has_call_sessions:
                 ev_type = 'REMINDER_CALL'
-            elif is_call_act:
+            elif is_call_act and not has_call_sessions:
                 ev_type = 'VOICE_CALL'
 
             act_metadata = {
@@ -966,14 +969,16 @@ class CRMLeadService:
                 'notes': act.notes,
                 'is_reminder': is_reminder_act,
             }
-            if is_call_act and lead_latest_cs:
+            # Only attach audio card metadata to generic LeadActivity if no CallSession exists,
+            # preventing duplicate audio players on the unified timeline.
+            if is_call_act and lead_latest_cs and not has_call_sessions:
                 cs_meta = lead_latest_cs.metadata if isinstance(lead_latest_cs.metadata, dict) else {}
                 act_metadata.update({
                     'call_session_id': str(lead_latest_cs.id),
                     'recording_url': cs_meta.get('recording_url') or f"/api/v1/voice-agent/recordings/{lead_latest_cs.id}/audio/",
                     'duration_seconds': lead_latest_cs.duration_seconds,
                     'transcript': lead_latest_cs.transcript or act.notes,
-                    'disposition': cs_meta.get('disposition') or 'TRIAL_BOOKED',
+                    'disposition': cs_meta.get('disposition') or 'CALL_COMPLETED',
                 })
 
             events.append({
@@ -1067,6 +1072,7 @@ class CRMLeadService:
         try:
             with transaction.atomic(using=alias):
                 call_sessions = list(CallSession.objects.using(alias).filter(lead=lead))
+            has_trial_booking = TrialBooking.objects.using(alias).filter(lead=lead).exists()
             for cs in call_sessions:
                 status_label = cs.status.replace('_', ' ').title()
                 call_meta = cs.metadata if isinstance(cs.metadata, dict) else {}
@@ -1076,7 +1082,7 @@ class CRMLeadService:
                 ev_type = 'REMINDER_CALL' if is_reminder else 'VOICE_CALL'
                 raw_transcript = cs.transcript or ""
                 call_summary = ""
-                disp = str(call_meta.get('disposition') or '')
+                disp = str(call_meta.get('disposition') or '').strip()
                 if isinstance(raw_transcript, str) and "Call Summary:" in raw_transcript:
                     for line in raw_transcript.splitlines():
                         if line.startswith("Call Summary:"):
@@ -1084,10 +1090,32 @@ class CRMLeadService:
                         elif line.startswith("Disposition:") and not disp:
                             disp = line.replace("Disposition:", "").strip()
 
+                # Determine accurate disposition
+                if has_trial_booking:
+                    disp = 'TRIAL_BOOKED'
+                elif not disp or disp == 'TRIAL_BOOKED':
+                    if cs.status in ('NO_ANSWER', 'MISSED', 'UNANSWERED'):
+                        disp = 'NO_ANSWER'
+                    elif cs.status == 'BUSY':
+                        disp = 'BUSY'
+                    elif cs.status in ('FAILED', 'REJECTED'):
+                        disp = 'CALL_FAILED'
+                    elif cs.duration_seconds and cs.duration_seconds < 25:
+                        disp = 'DISCONNECTED_EARLY'
+                    elif cs.status == 'COMPLETED':
+                        disp = 'CALL_COMPLETED'
+                    else:
+                        disp = cs.status
+
+                is_unanswered = cs.status in ('NO_ANSWER', 'MISSED', 'UNANSWERED', 'BUSY', 'FAILED', 'REJECTED')
+                rec_url = call_meta.get('recording_url') or call_meta.get('audio_url') or call_meta.get('recording')
+                if not rec_url and not is_unanswered and cs.status == 'COMPLETED':
+                    rec_url = f"/api/v1/voice-agent/recordings/{cs.id}/audio/"
+
                 desc = call_summary or (
-                    f"Duration: {int(cs.duration_seconds)}s • Provider: {cs.provider}" + (
+                    (f"Duration: {int(cs.duration_seconds)}s • Provider: {cs.provider}" + (
                         f" • Turns: {len(cs.transcript)}" if isinstance(cs.transcript, list) else ""
-                    )
+                    )) if not is_unanswered else f"Call outcome: {status_label}. No answer from recipient."
                 )
 
                 events.append({
@@ -1105,9 +1133,9 @@ class CRMLeadService:
                         'direction': cs.direction,
                         'duration_seconds': cs.duration_seconds,
                         'duration_formatted': f"{int(cs.duration_seconds // 60)}m {int(cs.duration_seconds % 60)}s" if cs.duration_seconds else "--",
-                        'recording_url': call_meta.get('recording_url') or call_meta.get('audio_url') or call_meta.get('recording') or f"/api/v1/voice-agent/recordings/{cs.id}/audio/",
+                        'recording_url': rec_url,
                         'transcript': cs.transcript,
-                        'disposition': disp or 'TRIAL_BOOKED',
+                        'disposition': disp,
                         'call_summary': call_summary,
                         'final_agent_variables': cs.final_agent_variables,
                         'started_at': cs.started_at.isoformat() if cs.started_at else None,

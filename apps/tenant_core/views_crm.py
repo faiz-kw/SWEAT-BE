@@ -746,7 +746,7 @@ class LeadViewSet(viewsets.ModelViewSet):
                     from apps.tenant_core.tasks_voice_calling import trigger_automated_sarvam_call_task
                     from apps.master.models_tenant import Tenant
                     tenant = getattr(self.request, 'tenant', None)
-                    tenant_id = str(tenant.id) if tenant else None
+                    tenant_id = str(tenant.id) if tenant else (getattr(self.request.user, '_tenant_id', None) or None)
                     if not tenant_id:
                         t = Tenant.objects.filter(slug='sweat', status='ACTIVE').first() or Tenant.objects.filter(status='ACTIVE').first()
                         tenant_id = str(t.id) if t else None
