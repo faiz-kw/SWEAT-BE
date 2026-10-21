@@ -1000,8 +1000,6 @@ class VoiceAgentBookTrialView(View):
                         f"🏢 *Address:* {full_addr}\n"
                         f"🗺️ *Directions (Google Maps):* {maps_url}\n"
                         f"📅 *Date & Time:* {ist_dt.strftime('%A, %b %d at %I:%M %p')}\n"
-                        f"👨‍🏫 *Instructor:* {instructor_name}\n"
-                        f"🎟️ *Pass ID:* #{pass_code}\n"
                         f"━━━━━━━━━━━━━━━━━━━\n"
                         f"📋 *Studio Visit Checklist:*\n"
                         f"💧 *Hydration:* Carry a reusable bottle (pure alkaline water station inside).\n"
