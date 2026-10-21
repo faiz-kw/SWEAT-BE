@@ -471,7 +471,8 @@ class CommunicationService:
         Scans active TrialBooking records ('BOOKED', 'CONFIRMED').
         Excludes cancelled, rescheduled, attended, or no-show trials.
         Calculates scheduled reminder intervals against tenant CRMTrialReminderPolicy.
-        Idempotency key: TRIAL_REMINDER:{trial.id}:{offset_hours}:{channel}.
+        Supports last-minute booking fast-track, dynamic minutes offsets, and optional AI voice reminders.
+        Idempotency key: TRIAL_REMINDER:{trial.id}:{offset_minutes}:{channel}.
         """
         from apps.tenant_core.context import get_current_tenant_db_alias
         from apps.tenant_core.models_crm import CRMTrialReminderPolicy
@@ -499,6 +500,26 @@ class CommunicationService:
             if not policy:
                 continue
 
+            start_time = trial.scheduled_start
+            booking_time = trial.created_at or now
+            minutes_until_class = (start_time - now).total_seconds() / 60
+            booking_lead_time_minutes = (start_time - booking_time).total_seconds() / 60
+
+            # -------------------------------------------------------------
+            # Scenario: Last-Minute Booking Fast-Track
+            # -------------------------------------------------------------
+            last_minute_threshold = getattr(policy, 'last_minute_threshold_minutes', 120) or 120
+            is_last_minute_booking = booking_lead_time_minutes <= last_minute_threshold
+
+            if is_last_minute_booking and getattr(policy, 'last_minute_auto_confirm', True):
+                if trial.confirmation_status != 'CONFIRMED':
+                    trial.confirmation_status = 'CONFIRMED'
+                    trial.save(using=alias, update_fields=['confirmation_status'])
+                    logger.info("Auto-confirmed last-minute trial booking %s (%s mins lead time)", trial.id, round(booking_lead_time_minutes))
+
+            # -------------------------------------------------------------
+            # Channels selection
+            # -------------------------------------------------------------
             channels = []
             if policy.immediate_whatsapp:
                 channels.append('WHATSAPP')
@@ -509,16 +530,60 @@ class CommunicationService:
             if not channels:
                 channels = ['WHATSAPP']
 
-            offsets = policy.reminder_offsets or [24]
-            start_time = trial.scheduled_start
+            # -------------------------------------------------------------
+            # Pre-Session Reminder Offsets (in minutes: 1440=24h, 120=2h, etc.)
+            # -------------------------------------------------------------
+            offsets = policy.reminder_offsets or [1440, 120]
 
-            for offset in offsets:
-                reminder_due_time = start_time - timedelta(hours=offset)
-                # If reminder point has passed, but we are within the delivery window before class start
+            for item in offsets:
+                if isinstance(item, dict):
+                    val = item.get('value', 0)
+                    unit = item.get('unit', 'MINUTES').upper()
+                    offset_mins = val * 60 if unit == 'HOURS' else val * 1440 if unit == 'DAYS' else val
+                else:
+                    val = int(item)
+                    offset_mins = val if val > 48 else val * 60
+
+                reminder_due_time = start_time - timedelta(minutes=offset_mins)
+
+                # Skip past reminders that elapsed before the booking was even created (e.g. for last-minute bookings)
+                if reminder_due_time < booking_time:
+                    continue
+
+                # If reminder point has arrived, but we are within delivery window before class start
                 if reminder_due_time <= now < start_time:
+                    # Format user-friendly time label
+                    if offset_mins >= 1440:
+                        days = round(offset_mins / 1440)
+                        time_label = f"{days} day{'s' if days > 1 else ''}"
+                    elif offset_mins >= 60:
+                        hrs = round(offset_mins / 60)
+                        time_label = f"{hrs} hour{'s' if hrs > 1 else ''}"
+                    else:
+                        time_label = f"{offset_mins} minutes"
+
+                    branch_name = trial.branch.name if trial.branch else 'SWEAT'
+                    full_addr = getattr(trial.branch, 'address_line_1', '') or getattr(trial.branch, 'address', '') or branch_name
+                    city_str = trial.branch.location.city if (trial.branch and trial.branch.location and trial.branch.location.city) else 'Mumbai'
+                    maps_query = f"{branch_name}+{full_addr}+{city_str}".replace(' ', '+')
+                    maps_url = f"https://maps.google.com/?q={maps_query}"
+
+                    is_confirmed = trial.confirmation_status == 'CONFIRMED'
+                    status_note = "Your spot is confirmed and ready!" if is_confirmed else "Please reply to confirm your attendance."
+
+                    body = (
+                        f"⏰ *SWEAT Workout Reminder*\n"
+                        f"━━━━━━━━━━━━━━━━━━━\n"
+                        f"Hi {trial.lead.first_name}! Your trial session at {branch_name} starts in *{time_label}* ({start_time.strftime('%I:%M %p')}).\n\n"
+                        f"📍 *Studio:* {branch_name}\n"
+                        f"🗺️ *Directions:* {maps_url}\n"
+                        f"👟 *Reminder:* Grip shoes/socks required for reformer & turf.\n"
+                        f"✨ *Status:* {status_note}\n\n"
+                        f"Need directions or help? Simply reply to this message!"
+                    )
+
                     for ch in channels:
-                        idempotency_key = f"TRIAL_REMINDER:{trial.id}:{offset}:{ch.upper()}"
-                        # Check if already sent
+                        idempotency_key = f"TRIAL_REMINDER:{trial.id}:{offset_mins}:{ch.upper()}"
                         if CommunicationMessage.objects.using(alias).filter(
                             organization=org,
                             idempotency_key=idempotency_key,
@@ -529,19 +594,13 @@ class CommunicationService:
                         if not recipient:
                             continue
 
-                        branch_name = trial.branch.name if trial.branch else 'Sweat'
-                        body = (
-                            f"Reminder: Hi {trial.lead.first_name}, your trial at {branch_name} "
-                            f"starts in {offset} hours ({start_time.strftime('%I:%M %p')}). See you soon!"
-                        )
-
                         try:
                             msg = cls.send_communication(
                                 organization=org,
                                 channel=ch,
                                 recipient=recipient,
                                 lead=trial.lead,
-                                subject=f"Trial Reminder: {offset} hours to class",
+                                subject=f"SWEAT Reminder: {time_label} to class",
                                 body=body,
                                 purpose='TRANSACTIONAL',
                                 idempotency_key=idempotency_key,
@@ -550,7 +609,37 @@ class CommunicationService:
                             )
                             dispatched_messages.append(msg)
                         except Exception as exc:
-                            logger.error("Failed to dispatch trial reminder: %s", exc)
+                            logger.error("Failed to dispatch trial reminder for trial %s: %s", trial.id, exc)
+
+            # -------------------------------------------------------------
+            # AI Voice Reminder Calling (Sarvam Voice Agent)
+            # -------------------------------------------------------------
+            if getattr(policy, 'ai_calling_enabled', False):
+                voice_offset_mins = getattr(policy, 'ai_calling_offset_minutes', 1440) or 1440
+                voice_due_time = start_time - timedelta(minutes=voice_offset_mins)
+
+                # Skip if booking lead time was shorter than voice window or due time not yet reached
+                if voice_due_time >= booking_time and voice_due_time <= now < start_time:
+                    skip_if_confirmed = getattr(policy, 'ai_calling_skip_if_confirmed', True)
+                    if not (skip_if_confirmed and trial.confirmation_status == 'CONFIRMED'):
+                        voice_idempotency = f"VOICE_REMINDER_TRIAL_{trial.id}:{voice_offset_mins}"
+                        try:
+                            from apps.tenant_core.services_voice_calling import VoiceCallingService
+                            VoiceCallingService.initiate_outbound_call(
+                                lead=trial.lead,
+                                actor_user=None,
+                                idempotency_key=voice_idempotency,
+                                custom_metadata={
+                                    'source': 'TRIAL_REMINDER_AI_VOICE',
+                                    'trial_id': str(trial.id),
+                                    'scheduled_start': start_time.isoformat(),
+                                    'branch_name': trial.branch.name if trial.branch else 'SWEAT',
+                                },
+                                db_alias=alias,
+                            )
+                            logger.info("Placed AI Voice reminder call for trial %s", trial.id)
+                        except Exception as call_err:
+                            logger.warning("AI voice reminder call could not be placed for trial %s: %s", trial.id, call_err)
 
         return dispatched_messages
 

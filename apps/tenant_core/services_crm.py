@@ -2706,11 +2706,15 @@ class CRMLeadService:
                 mins = val * 60 if unit == 'HOURS' else val * 1440 if unit == 'DAYS' else val
                 target_dt = trial.scheduled_start - timedelta(minutes=mins)
                 is_past = now >= target_dt
+                booking_time = trial.created_at or now
+                is_suppressed_last_minute = target_dt < booking_time
 
                 if is_superseded:
                     point_status = 'CANCELLED' if trial.status == 'CANCELLED' else 'SUPERSEDED'
                 elif is_concluded:
                     point_status = 'PAST' if is_past else 'CANCELLED'
+                elif is_suppressed_last_minute:
+                    point_status = 'SKIPPED_LAST_MINUTE'
                 else:
                     point_status = 'PAST' if is_past else 'PENDING'
 
@@ -2722,6 +2726,31 @@ class CRMLeadService:
                     'channel': ch,
                     'scheduled_at': target_dt.isoformat(),
                     'status': point_status,
+                })
+
+            # AI Voice Agent Reminder point
+            if getattr(policy, 'ai_calling_enabled', False):
+                voice_offset = getattr(policy, 'ai_calling_offset_minutes', 1440) or 1440
+                voice_dt = trial.scheduled_start - timedelta(minutes=voice_offset)
+                is_past_v = now >= voice_dt
+                booking_time = trial.created_at or now
+                if voice_dt < booking_time:
+                    v_status = 'SKIPPED_LAST_MINUTE'
+                elif is_superseded:
+                    v_status = 'CANCELLED'
+                elif is_concluded:
+                    v_status = 'PAST' if is_past_v else 'CANCELLED'
+                else:
+                    v_status = 'PAST' if is_past_v else 'PENDING'
+
+                schedule.append({
+                    'id': f"rem-{trial.id}-ai-voice",
+                    'type': 'AI_VOICE_REMINDER',
+                    'offset_value': voice_offset,
+                    'offset_unit': 'MINUTES',
+                    'channel': 'VOICE',
+                    'scheduled_at': voice_dt.isoformat(),
+                    'status': v_status,
                 })
 
         schedule.sort(key=lambda s: s['scheduled_at'])

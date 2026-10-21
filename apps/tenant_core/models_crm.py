@@ -1145,7 +1145,11 @@ class CRMTrialReminderPolicy(models.Model):
     no_show_followup_enabled = models.BooleanField(default=False)
     no_show_followup_delay_value = models.PositiveIntegerField(null=True, blank=True)
     no_show_followup_delay_unit = models.CharField(max_length=20, default='MINUTES')
-    ai_calling_enabled = models.BooleanField(default=False, help_text="AI calling integration status (unavailable in current phase)")
+    ai_calling_enabled = models.BooleanField(default=False, help_text="AI calling integration status")
+    ai_calling_offset_minutes = models.PositiveIntegerField(default=1440, help_text="Minutes before session to place AI reminder call (e.g. 1440 = 24h)")
+    ai_calling_skip_if_confirmed = models.BooleanField(default=True, help_text="Suppress voice reminder call if attendance already confirmed")
+    last_minute_threshold_minutes = models.PositiveIntegerField(default=120, help_text="Threshold in minutes to treat a booking as last-minute")
+    last_minute_auto_confirm = models.BooleanField(default=True, help_text="Auto-confirm attendance immediately for last-minute bookings")
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
