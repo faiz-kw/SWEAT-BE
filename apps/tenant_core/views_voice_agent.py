@@ -2048,15 +2048,41 @@ class VoiceAgentCallOutcomeView(View):
                         lead.first_name = clean_name
                     lead.save(using=alias, update_fields=['first_name', 'last_name', 'updated_at'])
 
-            # Intelligent fallback for disposition and summary if unpopulated or template placeholders
+            # 1. Match active or recent CallSession to know true duration & telephony state
+            recent_sess = None
+            cs_id = data.get('call_session_id')
+            if cs_id:
+                try:
+                    recent_sess = CallSession.objects.using(alias).filter(id=uuid.UUID(str(cs_id))).first()
+                except Exception:
+                    pass
+            if not recent_sess and data.get('attempt_id'):
+                recent_sess = CallSession.objects.using(alias).filter(provider_attempt_id=str(data.get('attempt_id'))).first()
+            if not recent_sess and lead:
+                recent_sess = CallSession.objects.using(alias).filter(lead=lead).order_by('-created_at').first()
+
+            call_dur = 0.0
+            if recent_sess and recent_sess.duration_seconds:
+                call_dur = float(recent_sess.duration_seconds)
+            elif active_cs and active_cs.duration_seconds:
+                call_dur = float(active_cs.duration_seconds)
+
             recent_trial = TrialBooking.objects.using(alias).filter(lead=lead).order_by('-created_at').first() if lead else None
             is_recent_trial = bool(recent_trial and (timezone.now() - recent_trial.created_at).total_seconds() < 900)
 
+            first_name = lead.first_name if lead else 'the lead'
+
             if not disposition:
-                disposition = 'TRIAL_BOOKED' if is_recent_trial else 'CALL_COMPLETED'
+                if is_recent_trial:
+                    disposition = 'TRIAL_BOOKED'
+                elif call_dur > 0 and call_dur < 25:
+                    disposition = 'HUNG_UP'
+                elif call_dur >= 25:
+                    disposition = 'INQUIRY_ONLY'
+                else:
+                    disposition = 'CALL_COMPLETED'
 
             if not call_summary:
-                first_name = lead.first_name if lead else 'the lead'
                 if is_recent_trial:
                     cls_title = 'workout session'
                     if recent_trial and recent_trial.class_occurrence_id:
@@ -2069,14 +2095,16 @@ class VoiceAgentCallOutcomeView(View):
                             pass
                     br_title = recent_trial.branch.name if recent_trial.branch else 'studio'
                     call_summary = (
-                        f"Spoke with {first_name}. Introduced SWEAT workout philosophy and scheduled a complimentary "
-                        f"trial for {cls_title} at our {br_title} studio. Confirmed attendance and shared arrival guidelines."
+                        f"Spoke with {first_name}. Scheduled a complimentary trial for {cls_title} at our {br_title} studio. Confirmed attendance and shared arrival guidelines."
                     )
-                else:
+                elif disposition in ('HUNG_UP', 'DISCONNECTED_EARLY') or (call_dur > 0 and call_dur < 25):
                     call_summary = (
-                        f"Spoke with {first_name} regarding SWEAT programs, workout philosophy, and available studio locations. "
-                        f"Shared complimentary VIP trial options."
+                        f"Call connected ({int(call_dur)}s). Agent delivered greeting, but {first_name} hung up before any conversation or trial booking."
                     )
+                elif disposition in ('NO_ANSWER', 'MISSED'):
+                    call_summary = f"Outbound call placed to {first_name}, but was not answered."
+                else:
+                    call_summary = f"Call connected with {first_name} ({int(call_dur)}s). Inquired about programs; no trial booked."
 
             # Format activity notes
             notes_lines = [f"Call Summary: {call_summary}"]

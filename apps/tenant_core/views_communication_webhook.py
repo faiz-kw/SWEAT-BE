@@ -83,7 +83,12 @@ class CommunicationWebhookView(APIView):
 
         # Step 2: Switch into Tenant's Dedicated Database Context
         with tenant_database_context(tenant.id) as db_alias:
-            org = Organization.objects.first()
+            org = (
+                Organization.objects.filter(code__icontains=tenant.code, status='ACTIVE').first()
+                or Organization.objects.filter(status='ACTIVE', branches__isnull=False).distinct().first()
+                or Organization.objects.filter(status='ACTIVE').first()
+                or Organization.objects.first()
+            )
             if not org:
                 return Response({'error': 'Tenant organization not found'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
