@@ -101,6 +101,10 @@ class Order(models.Model):
     tax_amount = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal('0.00'))
     total_amount = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal('0.00'))
     currency = models.CharField(max_length=3, default='INR')
+    gateway_order_id = models.CharField(
+        max_length=100, null=True, blank=True, db_index=True,
+        help_text="External payment gateway order ID (e.g. Razorpay order_...)"
+    )
     source = models.CharField(max_length=30, choices=SOURCE_CHOICES, default='FRONT_DESK')
     notes = models.TextField(null=True, blank=True)
     created_at = models.DateTimeField(default=timezone.now)

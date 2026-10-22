@@ -1026,6 +1026,28 @@ class AccessEventViewSet(viewsets.ModelViewSet):
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
+def _validate_edge_service_request(request) -> bool:
+    import os
+    import secrets
+    from django.conf import settings
+    expected_key = getattr(settings, 'EDGE_SERVICE_API_KEY', None) or os.getenv('EDGE_SERVICE_API_KEY')
+    is_debug = getattr(settings, 'DEBUG', False)
+
+    # In production (DEBUG=False), the edge API key is strictly MANDATORY.
+    # Fail-closed immediately if unconfigured or empty.
+    if not is_debug:
+        if not expected_key or not str(expected_key).strip():
+            return False
+
+    if expected_key and str(expected_key).strip():
+        api_key = request.headers.get('X-Edge-Api-Key') or request.META.get('HTTP_X_EDGE_API_KEY')
+        if not api_key:
+            return False
+        return secrets.compare_digest(str(api_key).strip(), str(expected_key).strip())
+
+    return True
+
+
 class AccessControlBulkIngestView(APIView):
     """
     POST /api/v1/access-control/events/bulk/
@@ -1035,6 +1057,9 @@ class AccessControlBulkIngestView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
+        if not _validate_edge_service_request(request):
+            return Response({'error': 'Unauthorized: Missing or invalid X-Edge-Api-Key header.'}, status=status.HTTP_401_UNAUTHORIZED)
+
         alias = _get_db(request)
         from .services_access_control import hash_qr_token
         from .models_attendance import AccessPass
@@ -1149,6 +1174,9 @@ class AccessControlSyncPassesView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request):
+        if not _validate_edge_service_request(request):
+            return Response({'error': 'Unauthorized: Missing or invalid X-Edge-Api-Key header.'}, status=status.HTTP_401_UNAUTHORIZED)
+
         alias = _get_db(request)
         from .models_attendance import AccessPass
         from .models_org import Branch

@@ -20,6 +20,7 @@ Endpoints:
 """
 
 import os
+import time
 import base64
 import json
 import logging
@@ -358,7 +359,15 @@ class FoodImageAnalysisMobileView(APIView):
 
         org = _get_active_organization(request, alias)
 
-        gemini_api_key = getattr(settings, 'GEMINI_API_KEY', '') or os.getenv('GEMINI_API_KEY', '').strip()
+        if hasattr(settings, 'GEMINI_API_KEY') and settings.GEMINI_API_KEY is not None:
+            gemini_api_key = str(settings.GEMINI_API_KEY).strip()
+        else:
+            gemini_api_key = os.getenv('GEMINI_API_KEY', '').strip()
+
+        if hasattr(settings, 'GEMINI_MODEL') and settings.GEMINI_MODEL:
+            gemini_model = str(settings.GEMINI_MODEL).strip()
+        else:
+            gemini_model = os.getenv('GEMINI_MODEL', '').strip() or 'gemini-3.5-flash'
 
         # Fix 1: Restrict AI mock mode to explicitly permitted dev/testing environments
         is_mock_permitted = bool(
@@ -470,8 +479,12 @@ class FoodImageAnalysisMobileView(APIView):
                 'error': 'AI vision service is not configured. Please set GEMINI_API_KEY in environment or contact support.',
             }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         else:
-            # Call Google Gemini 1.5 Flash Vision API
-            gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_api_key}"
+            # Call Google Gemini Vision API via secure header auth
+            gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent"
+            gemini_headers = {
+                'x-goog-api-key': gemini_api_key,
+                'Content-Type': 'application/json',
+            }
             prompt_text = (
                 "You are an expert nutrition and fitness diet assistant. Analyze this food photo and identify the distinct food items visible on the plate or meal.\n"
                 "For each identified item, provide a realistic portion estimate in grams and estimated macronutrients.\n"
@@ -510,8 +523,20 @@ class FoodImageAnalysisMobileView(APIView):
             }
 
             try:
-                resp = requests.post(gemini_url, json=payload, timeout=12)
-                if resp.status_code == 200:
+                gemini_timeout = int(getattr(settings, 'GEMINI_TIMEOUT_SECONDS', 45))
+                resp = None
+                max_attempts = 3
+                for attempt in range(max_attempts):
+                    resp = requests.post(gemini_url, headers=gemini_headers, json=payload, timeout=gemini_timeout)
+                    if resp.status_code == 200:
+                        break
+                    # If Google returns 503 (temporary high demand) or 429, retry after short backoff
+                    if resp.status_code in (503, 429) and attempt < max_attempts - 1:
+                        time.sleep(1.5)
+                        continue
+                    break
+
+                if resp is not None and resp.status_code == 200:
                     resp_json = resp.json()
                     candidates = resp_json.get('candidates', [])
                     if candidates:
@@ -524,9 +549,11 @@ class FoodImageAnalysisMobileView(APIView):
                             elif isinstance(raw_parsed, dict) and 'items' in raw_parsed:
                                 detected_items = raw_parsed['items']
                 else:
-                    logger.error(f"Gemini Vision API error {resp.status_code}: {resp.text}")
+                    status_code = resp.status_code if resp is not None else 500
+                    resp_text = resp.text if resp is not None else 'No response'
+                    logger.error(f"Gemini Vision API error {status_code}: {resp_text}")
                     return Response({
-                        'error': f"AI vision provider error (HTTP {resp.status_code}). Please try again."
+                        'error': f"AI vision provider error (HTTP {status_code}). Please try again."
                     }, status=status.HTTP_502_BAD_GATEWAY)
             except requests.Timeout:
                 return Response({'error': 'AI vision service timed out. Please try again with a smaller image.'}, status=status.HTTP_504_GATEWAY_TIMEOUT)
@@ -603,19 +630,31 @@ class FoodImageAnalysisMobileView(APIView):
                 'matched_catalog_item': catalog_match,
             })
 
+        summary_data = {
+            'total_calories': float(total_cal),
+            'total_protein_g': float(total_p),
+            'total_carbs_g': float(total_c),
+            'total_fat_g': float(total_f),
+            'total_fiber_g': float(total_fib),
+        }
+        totals_data = {
+            'calories': float(total_cal),
+            'protein_g': float(total_p),
+            'carbs_g': float(total_c),
+            'fat_g': float(total_f),
+            'fiber_g': float(total_fib),
+        }
+
         return Response({
             'status': 'success',
-            'model': 'gemini-1.5-flash',
+            'model': gemini_model,
+            'model_used': gemini_model,
             'is_mock': is_mock or (not gemini_api_key),
             'detected_count': len(enhanced_items),
+            'item_count': len(enhanced_items),
             'detected_items': enhanced_items,
-            'summary': {
-                'total_calories': float(total_cal),
-                'total_protein_g': float(total_p),
-                'total_carbs_g': float(total_c),
-                'total_fat_g': float(total_f),
-                'total_fiber_g': float(total_fib),
-            }
+            'summary': summary_data,
+            'totals': totals_data,
         }, status=status.HTTP_200_OK)
 
 

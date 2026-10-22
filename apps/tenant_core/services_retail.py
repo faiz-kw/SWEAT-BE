@@ -29,13 +29,14 @@ from typing import Dict, Any, List, Optional, Tuple
 from django.db import transaction, models
 from django.utils import timezone
 from django.core.exceptions import ValidationError
+from django.conf import settings
 
 from .models_org import Branch, Organization
 from .models_users import TenantUser
 from .models_workforce import UserProfile
 from .models_inventory import Product, StockReservation, InventoryMovement
 from .models_commerce import Order, OrderItem, PaymentTransaction, MemberInvoice
-from .services_razorpay import RazorpayService, RazorpayVerificationError
+from .services_razorpay import RazorpayService, RazorpayVerificationError, RazorpayConfigError
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,8 @@ class RetailCommerceService:
         notes: Optional[str] = None,
         db_alias: str = 'default',
         sold_by_user: Optional[TenantUser] = None,
+        initiate_gateway: bool = False,
+        gateway_order_id: Optional[str] = None,
     ) -> Tuple[Order, List[StockReservation]]:
         """
         Atomically creates a pending retail order and reserves stock for line items.
@@ -91,6 +94,7 @@ class RetailCommerceService:
         2. Locks relevant Product rows with select_for_update() to prevent race conditions.
         3. Authoritatively calculates prices and totals from Product records.
         4. Creates durable StockReservation records with 15-minute expiry.
+        5. Optionally initializes Razorpay gateway order if initiate_gateway is True.
         """
         if not items:
             raise ValidationError("Order must contain at least one product item.")
@@ -188,6 +192,7 @@ class RetailCommerceService:
                 tax_amount=Decimal('0.00'),
                 total_amount=subtotal,
                 currency='INR',
+                gateway_order_id=gateway_order_id,
                 source=source,
                 notes=notes or f"Retail order for {user_profile.first_name_snapshot or 'Member'}",
             )
@@ -230,11 +235,107 @@ class RetailCommerceService:
                     notes=f"Reserved {qty_int} unit(s) for Order {order.order_number}",
                 )
 
+        # External Gateway order creation is executed outside the atomic DB transaction
+        # to prevent holding database locks across external network I/O calls.
+        if initiate_gateway:
+            cls.initiate_gateway_order(order=order, db_alias=db_alias)
+
         logger.info(
             "Created retail order %s (%s INR) with %d reservations.",
             order.order_number, order.total_amount, len(created_reservations)
         )
         return order, created_reservations
+
+    @classmethod
+    def initiate_gateway_order(
+        cls,
+        order: Order,
+        db_alias: str = 'default',
+    ) -> Dict[str, Any]:
+        """
+        Creates a Razorpay gateway order for an unpaid retail order and associates it.
+        1. Resolves tenant-aware Razorpay credentials (public Key ID).
+        2. Calculates the exact amount in integer paise and verifies positive amount.
+        3. Calls RazorpayService.create_order without holding long database locks.
+        4. On success: persists order.gateway_order_id and creates an INITIATED PaymentTransaction.
+        5. On failure: safely cancels the internal order and releases its reservations without masking the error.
+        """
+        if order.gateway_order_id:
+            key_id, _ = RazorpayService.get_credentials(db_alias=db_alias)
+            amount_paise = RazorpayService.convert_inr_to_paise(order.total_amount)
+            gateway_data = {
+                'razorpay_order_id': order.gateway_order_id,
+                'razorpay_key_id': key_id,
+                'amount_paise': amount_paise,
+                'amount': float(order.total_amount),
+                'currency': order.currency,
+            }
+            order._gateway_checkout_data = gateway_data
+            return gateway_data
+
+        key_id, _ = RazorpayService.get_credentials(db_alias=db_alias)
+        amount_paise = RazorpayService.convert_inr_to_paise(order.total_amount)
+
+        try:
+            rzp_order = RazorpayService.create_order(
+                amount_paise=amount_paise,
+                receipt=order.order_number,
+                currency=order.currency,
+                notes={
+                    'internal_order_id': str(order.id),
+                    'user_id': str(order.user_profile.user_id) if order.user_profile and order.user_profile.user_id else '',
+                    'order_number': order.order_number,
+                },
+                db_alias=db_alias,
+            )
+        except Exception as exc:
+            logger.error(
+                "Razorpay order creation failed for retail order %s: %s",
+                order.order_number, exc
+            )
+            # Safely cancel the newly created unpaid order and release its reservations
+            try:
+                cls.release_retail_reservation(
+                    order_id=order.id,
+                    reason='GATEWAY_CREATION_FAILED',
+                    db_alias=db_alias,
+                )
+            except Exception as rel_err:
+                logger.error(
+                    "Failed to release reservations on gateway order creation failure for order %s: %s",
+                    order.order_number, rel_err
+                )
+            raise
+
+        rzp_order_id = rzp_order['id']
+        order.gateway_order_id = rzp_order_id
+        order.save(using=db_alias, update_fields=['gateway_order_id', 'updated_at'])
+
+        PaymentTransaction.objects.using(db_alias).update_or_create(
+            order=order,
+            provider='RAZORPAY',
+            status='INITIATED',
+            defaults={
+                'user_profile': order.user_profile,
+                'amount': order.total_amount,
+                'currency': order.currency,
+                'idempotency_key': f"rzp_order_{rzp_order_id}",
+                'metadata': {
+                    'razorpay_order_id': rzp_order_id,
+                    'receipt': order.order_number,
+                },
+            },
+        )
+
+        gateway_data = {
+            'razorpay_order_id': rzp_order_id,
+            'razorpay_key_id': key_id,
+            'amount_paise': amount_paise,
+            'amount': float(order.total_amount),
+            'currency': order.currency,
+        }
+        order._gateway_checkout_data = gateway_data
+        return gateway_data
 
     @classmethod
     def confirm_retail_payment(
@@ -258,6 +359,10 @@ class RetailCommerceService:
             raise ValidationError("order_id is required.")
         if not payment_id:
             raise ValidationError("payment_id is required.")
+        if not razorpay_order_id:
+            raise ValidationError("razorpay_order_id is required.")
+        if is_sandbox_simulation and not getattr(settings, 'DEBUG', False):
+            raise ValidationError("Payment simulation is strictly forbidden when DEBUG is False.")
 
         with transaction.atomic(using=db_alias):
             try:
@@ -268,6 +373,22 @@ class RetailCommerceService:
                 )
             except Order.DoesNotExist:
                 raise ValidationError(f"Order with ID '{order_id}' does not exist.")
+
+            # Strict Enforcement: Internal-to-Gateway Order Association
+            # Submitted razorpay_order_id must match the gateway order ID persisted for this exact order
+            if not order.gateway_order_id:
+                raise ValidationError(
+                    f"Order '{order.order_number}' does not have an associated gateway order ID."
+                )
+
+            if str(razorpay_order_id).strip() != str(order.gateway_order_id).strip():
+                logger.warning(
+                    "Gateway order mismatch for retail order %s: expected=%s submitted=%s",
+                    order.order_number, order.gateway_order_id, razorpay_order_id
+                )
+                raise ValidationError(
+                    "Submitted razorpay_order_id does not match the gateway order ID for this order."
+                )
 
             # Idempotency check: Order already marked PAID
             if order.status == 'PAID':
@@ -304,8 +425,9 @@ class RetailCommerceService:
                 if existing_txn.order_id != order.id:
                     raise ValidationError("Payment transaction ID was already used for a different order.")
 
-            # Server-side verification via RazorpayService
-            if not is_sandbox_simulation:
+            # Server-side verification via RazorpayService (simulation only permitted if DEBUG is True)
+            effective_simulation = bool(is_sandbox_simulation and getattr(settings, 'DEBUG', False))
+            if not effective_simulation:
                 if not signature or not razorpay_order_id:
                     raise ValidationError("razorpay_order_id and signature are required for payment verification.")
 
@@ -334,6 +456,8 @@ class RetailCommerceService:
                         expected_currency=order.currency,
                         db_alias=db_alias,
                     )
+                except RazorpayVerificationError:
+                    raise
                 except Exception as e:
                     logger.warning("Gateway API verification notice (proceeding if signature valid): %s", e)
 
@@ -464,7 +588,210 @@ class RetailCommerceService:
         }
 
     @classmethod
+    def confirm_retail_payment_from_gateway(
+        cls,
+        order_id: uuid.UUID,
+        payment_id: str,
+        razorpay_order_id: str,
+        db_alias: str = 'default',
+    ) -> Dict[str, Any]:
+        """
+        Idempotently confirms payment for a retail order received via asynchronous gateway webhook
+        (e.g., payment.captured or order.paid events).
+        Uses server-side Razorpay API verification and atomic order status mutation.
+        """
+        if not order_id:
+            raise ValidationError("order_id is required.")
+        if not payment_id:
+            raise ValidationError("payment_id is required.")
+        if not razorpay_order_id:
+            raise ValidationError("razorpay_order_id is required.")
+
+        with transaction.atomic(using=db_alias):
+            try:
+                order = (
+                    Order.objects.using(db_alias)
+                    .select_for_update()
+                    .get(id=order_id)
+                )
+            except Order.DoesNotExist:
+                raise ValidationError(f"Order with ID '{order_id}' does not exist.")
+
+            # Strict Enforcement: Internal-to-Gateway Order Association
+            if not order.gateway_order_id:
+                raise ValidationError(
+                    f"Order '{order.order_number}' does not have an associated gateway order ID."
+                )
+
+            if str(razorpay_order_id).strip() != str(order.gateway_order_id).strip():
+                logger.warning(
+                    "Gateway order mismatch for retail order %s: expected=%s submitted=%s",
+                    order.order_number, order.gateway_order_id, razorpay_order_id
+                )
+                raise ValidationError(
+                    "Submitted razorpay_order_id does not match the gateway order ID for this order."
+                )
+
+            # Idempotency check: Order already marked PAID
+            if order.status == 'PAID':
+                logger.info(
+                    "Duplicate webhook confirmation ignored for already PAID order %s.",
+                    order.order_number
+                )
+                existing_txn = (
+                    PaymentTransaction.objects.using(db_alias)
+                    .filter(order=order, provider_transaction_id=payment_id)
+                    .first()
+                )
+                return {
+                    'success': True,
+                    'already_processed': True,
+                    'order_id': str(order.id),
+                    'order_number': order.order_number,
+                    'status': 'PAID',
+                    'fulfillment_status': order.fulfillment_status,
+                    'payment_id': existing_txn.provider_transaction_id if existing_txn else payment_id,
+                }
+
+            # Optional Server-side Gateway API cross-check if credentials are configured
+            if RazorpayService.is_configured(db_alias=db_alias):
+                expected_paise = RazorpayService.convert_inr_to_paise(order.total_amount)
+                try:
+                    RazorpayService.fetch_and_verify_payment(
+                        razorpay_payment_id=payment_id,
+                        expected_order_id=razorpay_order_id,
+                        expected_amount_paise=expected_paise,
+                        expected_currency=order.currency,
+                        db_alias=db_alias,
+                    )
+                except RazorpayVerificationError:
+                    raise
+                except Exception as e:
+                    logger.warning("Gateway API verification notice for webhook (proceeding): %s", e)
+
+            # Process stock conversion: Reservation -> Confirmed Sale
+            reservations = list(
+                StockReservation.objects.using(db_alias)
+                .select_for_update()
+                .filter(order=order)
+            )
+
+            now = timezone.now()
+            late_payment_oversell_prevented = False
+
+            for res in reservations:
+                prod = Product.objects.using(db_alias).select_for_update().get(id=res.product_id)
+
+                if res.status == 'PENDING':
+                    res.status = 'CONFIRMED'
+                    res.save(using=db_alias)
+
+                    prod.stock_quantity = max(0, prod.stock_quantity - res.quantity)
+                    if prod.stock_quantity == 0:
+                        prod.status = 'Out of Stock'
+                    elif prod.stock_quantity <= 5:
+                        prod.status = 'Low Stock'
+                    prod.save(using=db_alias)
+
+                    InventoryMovement.objects.using(db_alias).create(
+                        product=prod,
+                        order=order,
+                        movement_type='SALE',
+                        quantity_change=-res.quantity,
+                        balance_after=prod.stock_quantity,
+                        notes=f"Confirmed retail purchase (Webhook) for order {order.order_number}",
+                    )
+                elif res.status in ('EXPIRED', 'RELEASED'):
+                    if prod.stock_quantity >= res.quantity:
+                        prod.stock_quantity = max(0, prod.stock_quantity - res.quantity)
+                        prod.save(using=db_alias)
+                        InventoryMovement.objects.using(db_alias).create(
+                            product=prod,
+                            order=order,
+                            movement_type='SALE',
+                            quantity_change=-res.quantity,
+                            balance_after=prod.stock_quantity,
+                            notes=f"Confirmed late retail payment (Webhook) for order {order.order_number} (re-claimed stock)",
+                        )
+                        res.status = 'CONFIRMED'
+                        res.save(using=db_alias)
+                    else:
+                        late_payment_oversell_prevented = True
+                        logger.error(
+                            "Oversell prevented for order %s: webhook received after reservation release, "
+                            "but physical stock (%d) < requested (%d).",
+                            order.order_number, prod.stock_quantity, res.quantity
+                        )
+
+            # Record PaymentTransaction
+            PaymentTransaction.objects.using(db_alias).update_or_create(
+                order=order,
+                provider='RAZORPAY',
+                provider_transaction_id=payment_id,
+                defaults={
+                    'user_profile': order.user_profile,
+                    'amount': order.total_amount,
+                    'currency': order.currency,
+                    'payment_method': 'RAZORPAY',
+                    'idempotency_key': f"RZP-WEBHOOK-{razorpay_order_id}-{payment_id}",
+                    'status': 'SUCCESS',
+                    'paid_at': now,
+                    'metadata': {
+                        'razorpay_order_id': razorpay_order_id,
+                        'razorpay_payment_id': payment_id,
+                        'source': 'WEBHOOK',
+                    },
+                },
+            )
+
+            # Update order state
+            order.status = 'PAID'
+            if late_payment_oversell_prevented:
+                order.fulfillment_status = 'CANCELLED'
+                order.notes = (
+                    (order.notes or '') +
+                    " [OVERSELL_PREVENTED: Late payment webhook received after stock reservation released. "
+                    "Insufficient physical stock to fulfill. Requires manual refund.]"
+                ).strip()
+            else:
+                order.fulfillment_status = 'UNFULFILLED'
+
+            order.save(using=db_alias)
+
+            # Generate invoice for member
+            invoice_num = f"INV-{order.order_number}"
+            MemberInvoice.objects.using(db_alias).get_or_create(
+                order=order,
+                defaults={
+                    'invoice_number': invoice_num,
+                    'user_profile': order.user_profile,
+                    'branch': order.branch,
+                    'subtotal': order.subtotal,
+                    'discount_amount': order.discount_amount,
+                    'reward_amount': order.reward_amount,
+                    'tax_amount': order.tax_amount,
+                    'total_amount': order.total_amount,
+                    'currency': order.currency,
+                    'status': 'PAID',
+                    'issued_at': now,
+                }
+            )
+
+        logger.info("Successfully confirmed payment via webhook for retail order %s.", order.order_number)
+        return {
+            'success': True,
+            'already_processed': False,
+            'order_id': str(order.id),
+            'order_number': order.order_number,
+            'status': order.status,
+            'fulfillment_status': order.fulfillment_status,
+            'late_payment_exception': late_payment_oversell_prevented,
+            'payment_id': payment_id,
+        }
+
+    @classmethod
     def release_retail_reservation(
+
         cls,
         order_id: uuid.UUID,
         reason: str = 'PAYMENT_FAILED',

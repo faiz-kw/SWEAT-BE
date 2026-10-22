@@ -8,7 +8,7 @@ from decimal import Decimal
 from datetime import timedelta
 from unittest.mock import patch
 
-from django.test import TestCase, TransactionTestCase
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 from django.core.exceptions import ValidationError
 from rest_framework.test import APIClient
@@ -31,7 +31,7 @@ from apps.tenant_core.services_retail import (
     OrderStateError,
     FulfillmentTransitionError,
 )
-from apps.tenant_core.services_razorpay import RazorpayVerificationError
+from apps.tenant_core.services_razorpay import RazorpayVerificationError, RazorpayService
 
 
 class RetailCommerceTests(TestCase):
@@ -367,12 +367,15 @@ class RetailCommerceTests(TestCase):
         self.assertEqual(res2['released_count'], 0)  # 0 released again
         self.assertEqual(self.prod_whey.get_available_stock(using=self.alias), 10)  # Still 10, not 12!
 
+    @override_settings(DEBUG=True)
     def test_08_successful_payment_converts_reservation_and_decrements_stock_once(self):
         """13-14: Successful payment converts reservation to sale and decrements physical stock exactly once."""
+        rzp_order_id = f"order_{uuid.uuid4().hex[:14]}"
         order, _ = RetailCommerceService.create_retail_order(
             user_profile=self.member_profile,
             branch=self.branch_a,
             items=[{'product_id': self.prod_whey.id, 'quantity': 4}],
+            gateway_order_id=rzp_order_id,
             db_alias=self.alias,
         )
 
@@ -380,7 +383,7 @@ class RetailCommerceTests(TestCase):
         confirm_res = RetailCommerceService.confirm_retail_payment(
             order_id=order.id,
             payment_id=payment_id,
-            razorpay_order_id=f"order_{uuid.uuid4().hex[:14]}",
+            razorpay_order_id=rzp_order_id,
             signature='test_signature',
             db_alias=self.alias,
             is_sandbox_simulation=True,
@@ -415,16 +418,18 @@ class RetailCommerceTests(TestCase):
     # Group 3: Payment Idempotency
     # =========================================================================
 
+    @override_settings(DEBUG=True)
     def test_09_duplicate_payment_callback_idempotency(self):
         """18: Process same successful callback twice; verify one payment and one stock deduction."""
+        rzp_order_id = f"order_{uuid.uuid4().hex[:14]}"
         order, _ = RetailCommerceService.create_retail_order(
             user_profile=self.member_profile,
             branch=self.branch_a,
             items=[{'product_id': self.prod_whey.id, 'quantity': 3}],
+            gateway_order_id=rzp_order_id,
             db_alias=self.alias,
         )
         payment_id = f"pay_{uuid.uuid4().hex[:14]}"
-        rzp_order_id = f"order_{uuid.uuid4().hex[:14]}"
 
         # Callback 1
         res1 = RetailCommerceService.confirm_retail_payment(
@@ -460,31 +465,174 @@ class RetailCommerceTests(TestCase):
             1
         )
 
-    def test_10_reject_invalid_signature(self):
+    @override_settings(DEBUG=False)
+    @patch.object(RazorpayService, 'verify_payment_signature', return_value=False)
+    def test_10_reject_invalid_signature(self, mock_verify_sig):
         """15: Reject invalid payment signatures."""
+        rzp_order_id = 'order_invalid_456'
         order, _ = RetailCommerceService.create_retail_order(
             user_profile=self.member_profile,
             branch=self.branch_a,
             items=[{'product_id': self.prod_whey.id, 'quantity': 1}],
+            gateway_order_id=rzp_order_id,
             db_alias=self.alias,
         )
-        with patch.object(RetailCommerceService, 'confirm_retail_payment', wraps=RetailCommerceService.confirm_retail_payment):
-            with self.assertRaises(RazorpayVerificationError):
-                RetailCommerceService.confirm_retail_payment(
-                    order_id=order.id,
-                    payment_id='pay_invalid_123',
-                    razorpay_order_id='order_invalid_456',
-                    signature='forged_bad_signature',
-                    db_alias=self.alias,
-                    is_sandbox_simulation=False,  # Enforces signature check
-                )
+        with self.assertRaises(RazorpayVerificationError):
+            RetailCommerceService.confirm_retail_payment(
+                order_id=order.id,
+                payment_id='pay_invalid_123',
+                razorpay_order_id=rzp_order_id,
+                signature='forged_bad_signature',
+                db_alias=self.alias,
+                is_sandbox_simulation=False,  # Enforces signature check
+            )
 
+        # Ensure order is not paid and stock is not deducted
+        order.refresh_from_db(using=self.alias)
+        self.assertEqual(order.status, 'PENDING_PAYMENT')
+        self.prod_whey.refresh_from_db(using=self.alias)
+        self.assertEqual(self.prod_whey.stock_quantity, 10)
+        self.assertEqual(self.prod_whey.get_available_stock(using=self.alias), 9)
+
+        # API endpoint call rejects invalid signature
+        res = self.client.post(
+            f'/api/v1/tenant/retail-orders/{order.id}/confirm-payment/',
+            {
+                'payment_id': 'pay_invalid_123',
+                'razorpay_order_id': rzp_order_id,
+                'razorpay_signature': 'forged_bad_signature',
+                'is_sandbox_simulation': False,
+            },
+            format='json',
+        )
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(res.data.get('code'), 'PAYMENT_VERIFICATION_FAILED')
+
+    @override_settings(DEBUG=False)
+    def test_10b_simulation_rejected_when_debug_false(self):
+        """Verify simulation is strictly rejected when DEBUG is False, at both service and API levels."""
+        rzp_order_id = 'order_sim_exploit_001'
+        order, _ = RetailCommerceService.create_retail_order(
+            user_profile=self.member_profile,
+            branch=self.branch_a,
+            items=[{'product_id': self.prod_whey.id, 'quantity': 2}],
+            gateway_order_id=rzp_order_id,
+            db_alias=self.alias,
+        )
+        initial_stock = self.prod_whey.stock_quantity  # 10
+        initial_avail = self.prod_whey.get_available_stock(using=self.alias)  # 8
+
+        # 1. Direct Service Call with simulation must raise ValidationError
+        with self.assertRaises(ValidationError) as ctx:
+            RetailCommerceService.confirm_retail_payment(
+                order_id=order.id,
+                payment_id='pay_sim_exploit_001',
+                razorpay_order_id=rzp_order_id,
+                signature='fake_sig',
+                db_alias=self.alias,
+                is_sandbox_simulation=True,
+            )
+        self.assertIn("Payment simulation is strictly forbidden when DEBUG is False.", str(ctx.exception))
+
+        # State must remain untouched: order unpaid, stock not decremented
+        order.refresh_from_db(using=self.alias)
+        self.assertEqual(order.status, 'PENDING_PAYMENT')
+        self.prod_whey.refresh_from_db(using=self.alias)
+        self.assertEqual(self.prod_whey.stock_quantity, initial_stock)
+        self.assertEqual(self.prod_whey.get_available_stock(using=self.alias), initial_avail)
+        self.assertEqual(PaymentTransaction.objects.using(self.alias).filter(order=order).count(), 0)
+
+        # 2. View/API Endpoint Call with simulation must return HTTP 403 Forbidden
+        res = self.client.post(
+            f'/api/v1/tenant/retail-orders/{order.id}/confirm-payment/',
+            {
+                'payment_id': 'pay_sim_exploit_002',
+                'razorpay_order_id': rzp_order_id,
+                'razorpay_signature': 'fake_sig',
+                'is_sandbox_simulation': True,
+            },
+            format='json',
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(res.data.get('code'), 'SIMULATION_NOT_ALLOWED')
+
+        # State must still remain untouched
+        order.refresh_from_db(using=self.alias)
+        self.assertEqual(order.status, 'PENDING_PAYMENT')
+        self.prod_whey.refresh_from_db(using=self.alias)
+        self.assertEqual(self.prod_whey.stock_quantity, initial_stock)
+
+    @override_settings(DEBUG=False)
+    @patch.object(RazorpayService, 'fetch_and_verify_payment')
+    @patch.object(RazorpayService, 'verify_payment_signature', return_value=True)
+    def test_10c_genuine_payment_verification_success(self, mock_verify_sig, mock_fetch_verify):
+        """Genuine payment path with valid Razorpay HMAC signature succeeds when DEBUG is False."""
+        payment_id = f"pay_{uuid.uuid4().hex[:14]}"
+        rzp_order_id = f"order_{uuid.uuid4().hex[:14]}"
+        signature = "valid_hmac_sha256_signature_hex"
+        order, _ = RetailCommerceService.create_retail_order(
+            user_profile=self.member_profile,
+            branch=self.branch_a,
+            items=[{'product_id': self.prod_whey.id, 'quantity': 3}],
+            gateway_order_id=rzp_order_id,
+            db_alias=self.alias,
+        )
+
+        mock_fetch_verify.return_value = {
+            'id': payment_id,
+            'order_id': rzp_order_id,
+            'status': 'captured',
+            'amount': 1050000,
+            'currency': 'INR',
+        }
+
+        # 1. API endpoint call with valid signature and NO simulation flag
+        res = self.client.post(
+            f'/api/v1/tenant/retail-orders/{order.id}/confirm-payment/',
+            {
+                'payment_id': payment_id,
+                'razorpay_order_id': rzp_order_id,
+                'razorpay_signature': signature,
+                'is_sandbox_simulation': False,
+            },
+            format='json',
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertTrue(res.data['success'])
+
+        mock_verify_sig.assert_called_once_with(
+            razorpay_order_id=rzp_order_id,
+            razorpay_payment_id=payment_id,
+            razorpay_signature=signature,
+            db_alias=self.alias,
+        )
+        mock_fetch_verify.assert_called_once()
+
+        # State verification: Order PAID, stock decremented exactly once
+        set_tenant_db_alias(self.alias)
+        order.refresh_from_db(using=self.alias)
+        self.assertEqual(order.status, 'PAID')
+        self.assertEqual(order.fulfillment_status, 'UNFULFILLED')
+
+        self.prod_whey.refresh_from_db(using=self.alias)
+        self.assertEqual(self.prod_whey.stock_quantity, 7)
+        self.assertEqual(self.prod_whey.get_available_stock(using=self.alias), 7)
+
+        # PaymentTransaction recorded
+        txns = list(PaymentTransaction.objects.using(self.alias).filter(order=order))
+        self.assertEqual(len(txns), 1)
+        self.assertEqual(txns[0].provider_transaction_id, payment_id)
+        self.assertEqual(txns[0].status, 'SUCCESS')
+
+    @override_settings(DEBUG=True)
     def test_11_late_payment_oversell_protection(self):
         """20: Safe recovery policy when late payment succeeds after reservation released."""
+        rzp_order_id = f"order_late_{uuid.uuid4().hex[:10]}"
         order, _ = RetailCommerceService.create_retail_order(
             user_profile=self.member_profile,
             branch=self.branch_a,
             items=[{'product_id': self.prod_whey.id, 'quantity': 5}],
+            gateway_order_id=rzp_order_id,
             db_alias=self.alias,
         )
         # Reservation released
@@ -498,7 +646,7 @@ class RetailCommerceTests(TestCase):
         confirm_res = RetailCommerceService.confirm_retail_payment(
             order_id=order.id,
             payment_id=f"pay_late_{uuid.uuid4().hex[:10]}",
-            razorpay_order_id=f"order_late_{uuid.uuid4().hex[:10]}",
+            razorpay_order_id=rzp_order_id,
             signature='test_sig',
             db_alias=self.alias,
             is_sandbox_simulation=True,
@@ -542,18 +690,21 @@ class RetailCommerceTests(TestCase):
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn('must be PAID', res.data.get('detail', ''))
 
+    @override_settings(DEBUG=True)
     def test_13_staff_fulfillment_workflow(self):
         """Authorized staff marks paid order as READY_FOR_PICKUP, then FULFILLED."""
+        rzp_order_id = f"order_{uuid.uuid4().hex[:12]}"
         order, _ = RetailCommerceService.create_retail_order(
             user_profile=self.member_profile,
             branch=self.branch_a,
             items=[{'product_id': self.prod_whey.id, 'quantity': 1}],
+            gateway_order_id=rzp_order_id,
             db_alias=self.alias,
         )
         RetailCommerceService.confirm_retail_payment(
             order_id=order.id,
             payment_id=f"pay_{uuid.uuid4().hex[:12]}",
-            razorpay_order_id=f"order_{uuid.uuid4().hex[:12]}",
+            razorpay_order_id=rzp_order_id,
             signature='test_sig',
             db_alias=self.alias,
             is_sandbox_simulation=True,
@@ -599,3 +750,226 @@ class RetailCommerceTests(TestCase):
         # Request to view Tenant A's order from Tenant B fails closed or returns empty
         res = client_b.get(f'/api/v1/tenant/retail-orders/{order.id}/')
         self.assertIn(res.status_code, [status.HTTP_404_NOT_FOUND, status.HTTP_403_FORBIDDEN, status.HTTP_503_SERVICE_UNAVAILABLE])
+
+    # =========================================================================
+    # Group 5: Razorpay Checkout Connection & Association Safety (Sprint 2.3)
+    # =========================================================================
+
+    @patch.object(RazorpayService, 'create_order')
+    def test_15_retail_order_creation_returns_gateway_order_and_key(self, mock_create_order):
+        """Sprint 2.3: Order creation generates Razorpay gateway order with server-calculated amount and returns client-safe checkout fields."""
+        rzp_order_id = f"order_{uuid.uuid4().hex[:14]}"
+        mock_create_order.return_value = {
+            'id': rzp_order_id,
+            'amount': 700000,
+            'currency': 'INR',
+            'status': 'created',
+        }
+
+        # 2 x Gold Standard Whey Protein @ 3500.00 each = 7000.00 INR (700000 paise)
+        res = self.client.post(
+            '/api/v1/tenant/retail-orders/',
+            {
+                'user_profile_id': str(self.member_profile.id),
+                'branch_id': str(self.branch_a.id),
+                'items': [{'product_id': str(self.prod_whey.id), 'quantity': 2}],
+                'notes': 'Mobile App genuine checkout',
+            },
+            format='json',
+        )
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+        # 1. Response contains client-safe checkout fields
+        self.assertEqual(res.data['razorpay_order_id'], rzp_order_id)
+        self.assertTrue(res.data['razorpay_key_id'].startswith('rzp_test_'))
+        self.assertNotIn('secret', res.data)
+        self.assertNotIn('key_secret', res.data)
+        self.assertEqual(res.data['amount'], 7000.0)
+        self.assertEqual(res.data['amount_paise'], 700000)
+        self.assertEqual(res.data['currency'], 'INR')
+
+        # 2. Server calculates authoritative amount and passes integer paise to gateway
+        order_id = res.data['id']
+        order = Order.objects.using(self.alias).get(id=order_id)
+        self.assertEqual(order.total_amount, Decimal('7000.00'))
+        mock_create_order.assert_called_once_with(
+            amount_paise=700000,
+            receipt=order.order_number,
+            currency='INR',
+            notes={
+                'internal_order_id': str(order.id),
+                'user_id': str(self.member_profile.user_id),
+                'order_number': order.order_number,
+            },
+            db_alias=self.alias,
+        )
+
+        # 3. External gateway order ID is persisted on the Order model
+        self.assertEqual(order.gateway_order_id, rzp_order_id)
+
+        # 4. INITIATED PaymentTransaction recorded
+        txn = PaymentTransaction.objects.using(self.alias).filter(order=order, status='INITIATED').first()
+        self.assertIsNotNone(txn)
+        self.assertEqual(txn.idempotency_key, f"rzp_order_{rzp_order_id}")
+        self.assertEqual(txn.metadata.get('razorpay_order_id'), rzp_order_id)
+
+    @patch.object(RazorpayService, 'create_order')
+    def test_16_gateway_order_creation_failure_releases_stock_reservations(self, mock_create_order):
+        """Sprint 2.3: Gateway order creation failure safely cancels order and releases held stock reservations."""
+        mock_create_order.side_effect = RazorpayVerificationError("Gateway order creation failed: network error")
+
+        initial_available = self.prod_whey.get_available_stock(using=self.alias)  # 10
+
+        res = self.client.post(
+            '/api/v1/tenant/retail-orders/',
+            {
+                'user_profile_id': str(self.member_profile.id),
+                'branch_id': str(self.branch_a.id),
+                'items': [{'product_id': str(self.prod_whey.id), 'quantity': 3}],
+            },
+            format='json',
+        )
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Gateway order creation failed', res.data.get('detail', ''))
+
+        # Restore tenant DB context after client API call
+        set_tenant_db_alias(self.alias)
+
+        # Reservations released, stock fully restored
+        self.assertEqual(self.prod_whey.get_available_stock(using=self.alias), initial_available)
+        self.assertEqual(self.prod_whey.stock_quantity, 10)
+
+        # Verify the created order was cancelled and not left pending
+        failed_order = Order.objects.using(self.alias).filter(
+            user_profile=self.member_profile,
+            order_type='RETAIL_PURCHASE',
+        ).latest('created_at')
+        self.assertEqual(failed_order.status, 'CANCELLED')
+        self.assertEqual(failed_order.fulfillment_status, 'CANCELLED')
+        reservations = StockReservation.objects.using(self.alias).filter(order=failed_order)
+        self.assertTrue(all(r.status == 'RELEASED' for r in reservations))
+
+    @override_settings(DEBUG=True)
+    def test_17_reject_mismatched_gateway_order_id(self):
+        """Sprint 2.3: Reject payment confirmation if submitted razorpay_order_id does not match persisted gateway order ID."""
+        rzp_order_1 = 'order_rzp_correct_111'
+        rzp_order_2 = 'order_rzp_other_222'
+
+        order_1, _ = RetailCommerceService.create_retail_order(
+            user_profile=self.member_profile,
+            branch=self.branch_a,
+            items=[{'product_id': self.prod_whey.id, 'quantity': 2}],
+            gateway_order_id=rzp_order_1,
+            db_alias=self.alias,
+        )
+
+        initial_stock = self.prod_whey.stock_quantity  # 10
+        initial_avail = self.prod_whey.get_available_stock(using=self.alias)  # 8
+
+        # 1. Direct service call with mismatched gateway order ID must raise ValidationError
+        with self.assertRaises(ValidationError) as ctx:
+            RetailCommerceService.confirm_retail_payment(
+                order_id=order_1.id,
+                payment_id='pay_some_payment_123',
+                razorpay_order_id=rzp_order_2,  # Mismatched!
+                signature='some_sig',
+                db_alias=self.alias,
+                is_sandbox_simulation=True,
+            )
+        self.assertIn("Submitted razorpay_order_id does not match the gateway order ID", str(ctx.exception))
+
+        # 2. API endpoint call with mismatched gateway order ID returns HTTP 400
+        res = self.client.post(
+            f'/api/v1/tenant/retail-orders/{order_1.id}/confirm-payment/',
+            {
+                'payment_id': 'pay_some_payment_123',
+                'razorpay_order_id': rzp_order_2,  # Mismatched!
+                'razorpay_signature': 'some_sig',
+                'is_sandbox_simulation': True,
+            },
+            format='json',
+        )
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Submitted razorpay_order_id does not match the gateway order ID", res.data.get('detail', ''))
+
+        # State must remain untouched: order unpaid, stock not deducted, no invoice
+        set_tenant_db_alias(self.alias)
+        order_1.refresh_from_db(using=self.alias)
+        self.assertEqual(order_1.status, 'PENDING_PAYMENT')
+        self.prod_whey.refresh_from_db(using=self.alias)
+        self.assertEqual(self.prod_whey.stock_quantity, initial_stock)
+        self.assertEqual(self.prod_whey.get_available_stock(using=self.alias), initial_avail)
+        self.assertEqual(MemberInvoice.objects.using(self.alias).filter(order=order_1).count(), 0)
+
+    @override_settings(DEBUG=True)
+    def test_18_reject_missing_gateway_order_id(self):
+        """Sprint 2.3: Reject payment confirmation when order has no associated gateway order ID or submitted ID is missing."""
+        # Order created without gateway order ID
+        order, _ = RetailCommerceService.create_retail_order(
+            user_profile=self.member_profile,
+            branch=self.branch_a,
+            items=[{'product_id': self.prod_whey.id, 'quantity': 1}],
+            gateway_order_id=None,
+            db_alias=self.alias,
+        )
+
+        with self.assertRaises(ValidationError) as ctx:
+            RetailCommerceService.confirm_retail_payment(
+                order_id=order.id,
+                payment_id='pay_test_123',
+                razorpay_order_id='order_test_123',
+                signature='test_sig',
+                db_alias=self.alias,
+                is_sandbox_simulation=True,
+            )
+        self.assertIn("does not have an associated gateway order ID", str(ctx.exception))
+
+        # Rejects missing razorpay_order_id parameter
+        order.gateway_order_id = 'order_test_valid'
+        order.save(using=self.alias)
+        with self.assertRaises(ValidationError) as ctx2:
+            RetailCommerceService.confirm_retail_payment(
+                order_id=order.id,
+                payment_id='pay_test_123',
+                razorpay_order_id='',
+                signature='test_sig',
+                db_alias=self.alias,
+                is_sandbox_simulation=True,
+            )
+        self.assertIn("razorpay_order_id is required", str(ctx2.exception))
+
+    @override_settings(DEBUG=False)
+    @patch.object(RazorpayService, 'verify_payment_signature', return_value=True)
+    @patch.object(RazorpayService, 'fetch_and_verify_payment')
+    def test_19_invalid_gateway_fetch_verification_fails_closed(self, mock_fetch, mock_verify_sig):
+        """Sprint 2.3: Gateway fetch_and_verify_payment mismatch strictly fails closed and does not mark order paid."""
+        rzp_order_id = f"order_{uuid.uuid4().hex[:14]}"
+        order, _ = RetailCommerceService.create_retail_order(
+            user_profile=self.member_profile,
+            branch=self.branch_a,
+            items=[{'product_id': self.prod_whey.id, 'quantity': 1}],
+            gateway_order_id=rzp_order_id,
+            db_alias=self.alias,
+        )
+
+        # Mock gateway verification raising RAZORPAY_ORDER_MISMATCH
+        mock_fetch.side_effect = RazorpayVerificationError(
+            "Payment order mismatch: payment belongs to order order_foreign_999, not expected order.",
+            code="RAZORPAY_ORDER_MISMATCH"
+        )
+
+        with self.assertRaises(RazorpayVerificationError):
+            RetailCommerceService.confirm_retail_payment(
+                order_id=order.id,
+                payment_id='pay_fake_999',
+                razorpay_order_id=rzp_order_id,
+                signature='valid_sig',
+                db_alias=self.alias,
+                is_sandbox_simulation=False,
+            )
+
+        order.refresh_from_db(using=self.alias)
+        self.assertEqual(order.status, 'PENDING_PAYMENT')
+        self.prod_whey.refresh_from_db(using=self.alias)
+        self.assertEqual(self.prod_whey.stock_quantity, 10)
+        self.assertEqual(self.prod_whey.get_available_stock(using=self.alias), 9)
