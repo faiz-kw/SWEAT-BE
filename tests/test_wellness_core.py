@@ -1146,5 +1146,157 @@ class WellnessCoreTests(TestCase):
             self.assertIn('throttled', res3.data['detail'].lower())
         cache.clear()
 
+    # =========================================================================
+    # Custom Food Scaling & Contract Regression Tests
+    # =========================================================================
+
+    def test_custom_food_portion_scaling_and_nutrient_snapshots(self):
+        """
+        Verify custom-food contract:
+        Base nutrients per 100g scaled to 200g portion yields exactly 300 kcal (150 kcal/100g * 2.0),
+        and scales protein, carbs, fat, and fiber proportionally.
+        """
+        payload = {
+            'logged_date': '2026-10-21',
+            'meal_type': 'LUNCH',
+            'notes': 'Homemade high-protein bowl',
+            'items': [{
+                'custom_food_name': 'High-Protein Lentil Bowl',
+                'portion_grams': 200.0,
+                'calories_per_100g': 150.0,
+                'protein_per_100g': 12.5,
+                'carbs_per_100g': 20.0,
+                'fat_per_100g': 2.5,
+                'fiber_per_100g': 4.0,
+            }],
+        }
+        res = self.client_alice.post('/api/v1/mobile/wellness/meal-logs/', payload, format='json')
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        meal_id = res.data['id']
+
+        item = MealLogItem.objects.using(self.alias).select_related('food_item').get(meal_log_id=meal_id)
+        # 150.0 kcal / 100g * 200g = 300.00 kcal (NOT double-scaled to 600)
+        self.assertEqual(item.consumed_grams, Decimal('200.00'))
+        self.assertEqual(item.snapshot_calories, Decimal('300.00'))
+        self.assertEqual(item.snapshot_protein_g, Decimal('25.00'))
+        self.assertEqual(item.snapshot_carbs_g, Decimal('40.00'))
+        self.assertEqual(item.snapshot_fat_g, Decimal('5.00'))
+        self.assertEqual(item.snapshot_fiber_g, Decimal('8.00'))
+
+        # Verify underlying custom FoodItem created in DB stores base per-100g values
+        food = FoodItem.objects.using(self.alias).get(id=item.food_item_id)
+        self.assertEqual(food.name, 'High-Protein Lentil Bowl')
+        self.assertEqual(food.serving_weight_grams, Decimal('100.00'))
+        self.assertEqual(food.calories, Decimal('150.00'))
+        self.assertEqual(food.protein_g, Decimal('12.50'))
+        self.assertEqual(food.carbs_g, Decimal('20.00'))
+        self.assertEqual(food.fat_g, Decimal('2.50'))
+        self.assertEqual(food.fiber_g, Decimal('4.00'))
+        self.assertEqual(food.provenance, FoodProvenance.CUSTOM_TENANT)
+
+    def test_catalog_backed_food_scaling_ignores_client_spoofed_nutrients(self):
+        """
+        Verify catalog-backed food snapshot remains server-calculated from authoritative catalog values.
+        Even if client supplies spoofed calorie values, server calculates based on catalog per-100g rate.
+        """
+        food = FoodItem.objects.using(self.alias).filter(name__icontains='Khichdi').first()
+        expected_ratio = Decimal('200.00') / food.serving_weight_grams
+        expected_calories = round(food.calories * expected_ratio, 2)
+        expected_protein = round(food.protein_g * expected_ratio, 2)
+
+        payload = {
+            'logged_date': '2026-10-21',
+            'meal_type': 'DINNER',
+            'items': [{
+                'food_item_id': str(food.id),
+                'portion_grams': 200.0,
+                'calories': 9999.0,  # Spoofed value
+                'protein_g': 888.0,   # Spoofed value
+            }],
+        }
+        res = self.client_alice.post('/api/v1/mobile/wellness/meal-logs/', payload, format='json')
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        item = MealLogItem.objects.using(self.alias).get(meal_log_id=res.data['id'])
+
+        # Server-calculated, client spoofing ignored
+        self.assertEqual(item.snapshot_calories, expected_calories)
+        self.assertEqual(item.snapshot_protein_g, expected_protein)
+
+    def test_custom_food_invalid_and_missing_nutrient_inputs(self):
+        """
+        Verify input contract validation:
+        1. Custom food without base calories fails with 400 Bad Request.
+        2. Negative base calories fails with 400 Bad Request.
+        3. Negative portion grams fails with 400 Bad Request.
+        """
+        # 1. Missing base calories
+        p_missing = {
+            'logged_date': '2026-10-21',
+            'meal_type': 'SNACK',
+            'items': [{
+                'custom_food_name': 'Mystery Smoothie',
+                'portion_grams': 250.0,
+            }],
+        }
+        res_missing = self.client_alice.post('/api/v1/mobile/wellness/meal-logs/', p_missing, format='json')
+        self.assertEqual(res_missing.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('calories_per_100g', str(res_missing.data))
+
+        # 2. Negative base calories
+        p_neg_cals = {
+            'logged_date': '2026-10-21',
+            'meal_type': 'SNACK',
+            'items': [{
+                'custom_food_name': 'Zero Calorie Soup',
+                'portion_grams': 250.0,
+                'calories_per_100g': -150.0,
+            }],
+        }
+        res_neg_cals = self.client_alice.post('/api/v1/mobile/wellness/meal-logs/', p_neg_cals, format='json')
+        self.assertEqual(res_neg_cals.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # 3. Negative portion grams
+        p_neg_portion = {
+            'logged_date': '2026-10-21',
+            'meal_type': 'SNACK',
+            'items': [{
+                'custom_food_name': 'Diet Salad',
+                'portion_grams': -50.0,
+                'calories_per_100g': 80.0,
+            }],
+        }
+        res_neg_portion = self.client_alice.post('/api/v1/mobile/wellness/meal-logs/', p_neg_portion, format='json')
+        self.assertEqual(res_neg_portion.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_custom_food_idempotency_retry_does_not_double_count(self):
+        """
+        Verify that retrying a custom food log with an Idempotency-Key
+        replays the original response and does NOT create duplicate items or double calories.
+        """
+        payload = {
+            'logged_date': '2026-10-21',
+            'meal_type': 'BREAKFAST',
+            'items': [{
+                'custom_food_name': 'Idempotent Oatmeal Bowl',
+                'portion_grams': 200.0,
+                'calories_per_100g': 150.0,
+                'protein_per_100g': 10.0,
+            }],
+        }
+        headers = {'HTTP_IDEMPOTENCY_KEY': 'custom-idemp-key-001'}
+        res1 = self.client_alice.post('/api/v1/mobile/wellness/meal-logs/', payload, format='json', **headers)
+        self.assertEqual(res1.status_code, status.HTTP_201_CREATED)
+        meal_id = res1.data['id']
+
+        # Replay with same key
+        res2 = self.client_alice.post('/api/v1/mobile/wellness/meal-logs/', payload, format='json', **headers)
+        self.assertEqual(res2.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res2.data['id'], meal_id)
+
+        # Confirm exactly 1 MealLog and 1 MealLogItem in DB with exactly 300 kcal
+        items = MealLogItem.objects.using(self.alias).filter(meal_log_id=meal_id)
+        self.assertEqual(items.count(), 1)
+        self.assertEqual(items.first().snapshot_calories, Decimal('300.00'))
+
 
 
