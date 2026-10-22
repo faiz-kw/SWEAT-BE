@@ -173,7 +173,21 @@ class FoodBarcodeMobileView(APIView):
             return Response({
                 'found': True,
                 'source': 'local_catalog',
+                'barcode': clean_barcode,
                 'food_item': FoodItemSerializer(local_item).data,
+                'product': {
+                    'barcode': local_item.barcode,
+                    'product_name': local_item.name,
+                    'brand': 'SWEAT Catalog',
+                    'serving_size': f"{local_item.serving_weight_grams}g",
+                    'serving_quantity_g': float(local_item.serving_weight_grams),
+                    'calories_100g': float(local_item.calories),
+                    'protein_100g': float(local_item.protein_g),
+                    'carbs_100g': float(local_item.carbs_g),
+                    'fat_100g': float(local_item.fat_g),
+                    'fiber_100g': float(local_item.fiber_g),
+                    'food_item_id': str(local_item.id),
+                }
             }, status=status.HTTP_200_OK)
 
         # 2. Query OpenFoodFacts API
@@ -271,7 +285,22 @@ class FoodBarcodeMobileView(APIView):
                     return Response({
                         'found': True,
                         'source': 'open_food_facts',
+                        'barcode': clean_barcode,
                         'food_item': FoodItemSerializer(new_item).data,
+                        'product': {
+                            'barcode': new_item.barcode,
+                            'product_name': new_item.name,
+                            'brand': product.get('brands', '') or 'Packaged Item',
+                            'serving_size': serving_size_str or f"{new_item.serving_weight_grams}g",
+                            'serving_quantity_g': float(new_item.serving_weight_grams),
+                            'calories_100g': float(new_item.calories),
+                            'protein_100g': float(new_item.protein_g),
+                            'carbs_100g': float(new_item.carbs_g),
+                            'fat_100g': float(new_item.fat_g),
+                            'fiber_100g': float(new_item.fiber_g),
+                            'image_url': product.get('image_front_url') or product.get('image_url') or '',
+                            'food_item_id': str(new_item.id),
+                        }
                     }, status=status.HTTP_200_OK)
 
         except requests.RequestException as e:
@@ -744,14 +773,46 @@ class MealLogListCreateMobileView(APIView):
                 meal_log.save(using=alias)
 
                 for item_in in items_data:
-                    food_id = item_in['food_item_id']
+                    food_id = item_in.get('food_item_id')
+                    custom_name = (item_in.get('custom_food_name') or '').strip()
                     quantity = Decimal(str(item_in.get('quantity') or '1.00'))
                     unit_name = (item_in.get('unit_name') or 'g').strip()
-                    consumed_grams_raw = item_in.get('consumed_grams')
+                    consumed_grams_raw = item_in.get('consumed_grams') or item_in.get('portion_grams')
 
-                    food = FoodItem.objects.using(alias).filter(id=food_id, is_active=True).first()
+                    food = None
+                    if food_id:
+                        food = FoodItem.objects.using(alias).filter(id=food_id, is_active=True).first()
+                    elif custom_name:
+                        food = FoodItem.objects.using(alias).filter(
+                            organization=org, name__iexact=custom_name, is_active=True
+                        ).first()
+                        if not food:
+                            base_cals = item_in.get('calories_per_100g') if item_in.get('calories_per_100g') is not None else item_in.get('calories')
+                            base_p = item_in.get('protein_per_100g') if item_in.get('protein_per_100g') is not None else item_in.get('protein_g')
+                            base_c = item_in.get('carbs_per_100g') if item_in.get('carbs_per_100g') is not None else item_in.get('carbs_g')
+                            base_f = item_in.get('fat_per_100g') if item_in.get('fat_per_100g') is not None else item_in.get('fat_g')
+                            base_fib = item_in.get('fiber_per_100g') if item_in.get('fiber_per_100g') is not None else item_in.get('fiber_g')
+
+                            if base_cals is None:
+                                raise serializers.ValidationError({'calories_per_100g': 'Base calories per 100g must be provided for custom food.'})
+
+                            food = FoodItem.objects.using(alias).create(
+                                organization=org,
+                                is_system=False,
+                                name=custom_name[:200],
+                                category=FoodCategory.OTHER,
+                                serving_unit='g',
+                                serving_weight_grams=Decimal('100.00'),
+                                calories=Decimal(str(base_cals)),
+                                protein_g=Decimal(str(base_p or '0.00')),
+                                carbs_g=Decimal(str(base_c or '0.00')),
+                                fat_g=Decimal(str(base_f or '0.00')),
+                                fiber_g=Decimal(str(base_fib or '0.00')),
+                                provenance=FoodProvenance.CUSTOM_TENANT,
+                                is_active=True,
+                            )
                     if not food:
-                        raise serializers.ValidationError({'food_item_id': f'Food item {food_id} does not exist.'})
+                        raise serializers.ValidationError({'food_item_id': f'Food item {food_id or custom_name} does not exist.'})
 
                     # Portion & gram resolution
                     if consumed_grams_raw is not None and Decimal(str(consumed_grams_raw)) > 0:
@@ -1351,23 +1412,60 @@ class DailySummaryMobileView(APIView):
 
         sleep_duration = sleep_log.duration_minutes if sleep_log else 0
         sleep_rating = sleep_log.quality_rating if sleep_log else None
+        cal_prog = round((float(total_calories) / float(target_cals or 1) * 100), 1)
+
+        meals_by_type = {
+            'BREAKFAST': [],
+            'LUNCH': [],
+            'DINNER': [],
+            'SNACK': [],
+        }
+        for m in meals:
+            m_type = m.meal_type
+            if m_type == 'EVENING_SNACK':
+                m_type = 'SNACK'
+            m_data = MealLogSerializer(m).data
+            if m_type in meals_by_type:
+                meals_by_type[m_type].append(m_data)
+            else:
+                meals_by_type['SNACK'].append(m_data)
 
         return Response({
             'date': str(target_date),
             'targets': {
                 'calories': float(target_cals),
+                'daily_calories': float(target_cals),
                 'protein_g': float(target_protein),
+                'daily_protein_g': float(target_protein),
                 'carbs_g': float(target_carbs),
+                'daily_carbs_g': float(target_carbs),
                 'fat_g': float(target_fat),
+                'daily_fat_g': float(target_fat),
                 'water_ml': target_water,
+                'daily_water_ml': target_water,
                 'sleep_target_minutes': target_sleep,
+                'daily_sleep_hours': round(target_sleep / 60, 1),
             },
             'consumed': {
                 'calories': float(total_calories),
+                'total_calories': float(total_calories),
                 'protein_g': float(total_protein),
+                'total_protein_g': float(total_protein),
                 'carbs_g': float(total_carbs),
+                'total_carbs_g': float(total_carbs),
                 'fat_g': float(total_fat),
+                'total_fat_g': float(total_fat),
                 'fiber_g': float(total_fiber),
+                'total_fiber_g': float(total_fiber),
+            },
+            'nutrition': {
+                'total_calories': float(total_calories),
+                'total_protein_g': float(total_protein),
+                'total_carbs_g': float(total_carbs),
+                'total_fat_g': float(total_fat),
+                'total_fiber_g': float(total_fiber),
+                'calories_remaining': float(rem_cals),
+                'calorie_progress_pct': min(cal_prog, 100.0),
             },
             'remaining': {
                 'calories': float(rem_cals),
@@ -1377,13 +1475,21 @@ class DailySummaryMobileView(APIView):
             },
             'water': {
                 'consumed_ml': total_water_ml,
+                'total_ml': total_water_ml,
                 'target_ml': target_water,
                 'percentage': water_pct,
+                'progress_pct': min(water_pct, 100.0),
             },
             'sleep': {
                 'duration_minutes': sleep_duration,
+                'duration_hours': round(sleep_duration / 60, 1),
+                'total_hours': round(sleep_duration / 60, 1),
                 'target_minutes': target_sleep,
+                'target_hours': round(target_sleep / 60, 1),
+                'progress_pct': round((sleep_duration / target_sleep * 100), 1) if target_sleep else 0.0,
                 'quality_rating': sleep_rating,
             },
             'meals': meals_breakdown,
+            'meals_by_type': meals_by_type,
+            'meals_breakdown': meals_breakdown,
         })

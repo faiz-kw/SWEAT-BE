@@ -69,10 +69,46 @@ class MealLogItemSerializer(serializers.ModelSerializer):
 
 
 class MealLogItemInputSerializer(serializers.Serializer):
-    food_item_id = serializers.UUIDField(required=True)
+    food_item_id = serializers.UUIDField(required=False, allow_null=True)
+    custom_food_name = serializers.CharField(max_length=200, required=False, allow_blank=True)
     quantity = serializers.DecimalField(max_digits=6, decimal_places=2, required=False, default=Decimal('1.00'))
     unit_name = serializers.CharField(max_length=50, required=False, default='g')
     consumed_grams = serializers.DecimalField(max_digits=7, decimal_places=2, required=False, allow_null=True)
+    portion_grams = serializers.DecimalField(max_digits=7, decimal_places=2, required=False, allow_null=True)
+    calories = serializers.DecimalField(max_digits=7, decimal_places=2, required=False, allow_null=True)
+    calories_per_100g = serializers.DecimalField(max_digits=7, decimal_places=2, required=False, allow_null=True)
+    protein_g = serializers.DecimalField(max_digits=6, decimal_places=2, required=False, allow_null=True)
+    protein_per_100g = serializers.DecimalField(max_digits=6, decimal_places=2, required=False, allow_null=True)
+    carbs_g = serializers.DecimalField(max_digits=6, decimal_places=2, required=False, allow_null=True)
+    carbs_per_100g = serializers.DecimalField(max_digits=6, decimal_places=2, required=False, allow_null=True)
+    fat_g = serializers.DecimalField(max_digits=6, decimal_places=2, required=False, allow_null=True)
+    fat_per_100g = serializers.DecimalField(max_digits=6, decimal_places=2, required=False, allow_null=True)
+    fiber_g = serializers.DecimalField(max_digits=6, decimal_places=2, required=False, allow_null=True)
+    fiber_per_100g = serializers.DecimalField(max_digits=6, decimal_places=2, required=False, allow_null=True)
+
+    def validate(self, attrs):
+        food_id = attrs.get('food_item_id')
+        custom_name = (attrs.get('custom_food_name') or '').strip()
+        if not food_id and not custom_name:
+            raise serializers.ValidationError("Either food_item_id or custom_food_name must be provided.")
+
+        if not food_id and custom_name:
+            grams = attrs.get('consumed_grams') or attrs.get('portion_grams')
+            if grams is not None and grams <= 0:
+                raise serializers.ValidationError({"portion_grams": "Portion grams must be greater than zero."})
+
+            base_cal = attrs.get('calories_per_100g') if attrs.get('calories_per_100g') is not None else attrs.get('calories')
+            if base_cal is None:
+                raise serializers.ValidationError({"calories_per_100g": "Base calories per 100g must be provided for custom food items."})
+            if base_cal < 0:
+                raise serializers.ValidationError({"calories_per_100g": "Base calories cannot be negative."})
+
+            for field in ('protein_g', 'protein_per_100g', 'carbs_g', 'carbs_per_100g', 'fat_g', 'fat_per_100g', 'fiber_g', 'fiber_per_100g'):
+                val = attrs.get(field)
+                if val is not None and val < 0:
+                    raise serializers.ValidationError({field: f"{field} cannot be negative."})
+
+        return attrs
 
 
 class MealLogSerializer(serializers.ModelSerializer):
@@ -129,16 +165,19 @@ class MealLogSerializer(serializers.ModelSerializer):
 
 
 class CreateMealLogSerializer(serializers.Serializer):
-    logged_date = serializers.DateField(required=True)
+    logged_date = serializers.DateField(required=False)
+    date = serializers.DateField(required=False)
     logged_time = serializers.TimeField(required=False)
     meal_type = serializers.ChoiceField(choices=MealType.choices, required=True)
     notes = serializers.CharField(required=False, allow_blank=True, default='')
     items = MealLogItemInputSerializer(many=True, required=True)
 
-    def validate_logged_date(self, value):
-        if value > timezone.now().date() + timedelta(days=1):
+    def validate(self, attrs):
+        target_date = attrs.get('logged_date') or attrs.get('date') or timezone.now().date()
+        if target_date > timezone.now().date() + timedelta(days=1):
             raise serializers.ValidationError("Cannot log meals for future dates.")
-        return value
+        attrs['logged_date'] = target_date
+        return attrs
 
     def validate_items(self, value):
         if not value:
@@ -160,14 +199,17 @@ class WaterLogSerializer(serializers.ModelSerializer):
 
 
 class CreateWaterLogSerializer(serializers.Serializer):
-    logged_date = serializers.DateField(required=True)
+    logged_date = serializers.DateField(required=False)
+    date = serializers.DateField(required=False)
     amount_ml = serializers.IntegerField(min_value=1, max_value=5000, required=True)
     logged_at = serializers.DateTimeField(required=False)
 
-    def validate_logged_date(self, value):
-        if value > timezone.now().date() + timedelta(days=1):
-            raise serializers.ValidationError("Cannot log water for future dates.")
-        return value
+    def validate(self, attrs):
+        target_date = attrs.get('logged_date') or attrs.get('date') or timezone.now().date()
+        if target_date > timezone.now().date() + timedelta(days=1):
+            raise serializers.ValidationError({"logged_date": "Cannot log water for future dates."})
+        attrs['logged_date'] = target_date
+        return attrs
 
 
 class SleepLogSerializer(serializers.ModelSerializer):
