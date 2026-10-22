@@ -576,6 +576,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'apps.master.tasks.process_all_tenants_booking_auto_cancellations_async',
         'schedule': float(os.getenv('CELERY_SCHEDULE_BOOKING_AUTOCANCEL_SECONDS', '120.0')),  # every 2 min
     },
+    'tenant-process-trial-voice-reminders': {
+        'task': 'apps.tenant_core.tasks_voice_calling.process_trial_voice_reminders_task',
+        'schedule': float(os.getenv('CELERY_SCHEDULE_VOICE_REMINDERS_SECONDS', '1800.0')),  # every 30 min
+    },
 }
 
 

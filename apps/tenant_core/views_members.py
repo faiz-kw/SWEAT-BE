@@ -1666,6 +1666,20 @@ class MemberViewSet(viewsets.ViewSet):
                     if not user.is_login_allowed:
                         user.is_login_allowed = True
                         ufields.append('is_login_allowed')
+                    if getattr(user, 'user_type', None) != 'STAFF':
+                        if first_name and user.first_name != first_name:
+                            user.first_name = first_name
+                            ufields.append('first_name')
+                        if last_name and user.last_name != last_name:
+                            user.last_name = last_name
+                            ufields.append('last_name')
+                        full_disp = name or f"{first_name} {last_name}".strip()
+                        if full_disp and user.display_name != full_disp:
+                            user.display_name = full_disp
+                            ufields.append('display_name')
+                        if user.user_type != 'MEMBER':
+                            user.user_type = 'MEMBER'
+                            ufields.append('user_type')
                     if ufields:
                         user.save(using=alias, update_fields=ufields)
 
@@ -1700,6 +1714,15 @@ class MemberViewSet(viewsets.ViewSet):
                 if not profile.acquisition_source:
                     profile.acquisition_source = 'MANUAL_CREATE'
                     updated_fields.append('acquisition_source')
+                if first_name and profile.first_name_snapshot != first_name:
+                    profile.first_name_snapshot = first_name
+                    updated_fields.append('first_name_snapshot')
+                if last_name and profile.last_name_snapshot != last_name:
+                    profile.last_name_snapshot = last_name
+                    updated_fields.append('last_name_snapshot')
+                if profile.member_type != 'MEMBER':
+                    profile.member_type = 'MEMBER'
+                    updated_fields.append('member_type')
                 if branch and not profile.preferred_branch:
                     profile.preferred_branch = branch
                     updated_fields.append('preferred_branch')
@@ -1748,8 +1771,13 @@ class MemberViewSet(viewsets.ViewSet):
             if profile.user:
                 profile.user.first_name = profile.first_name_snapshot
                 profile.user.last_name = profile.last_name_snapshot
-                profile.user.full_name = full
+                profile.user.display_name = full
                 profile.user.save(using=alias)
+                try:
+                    from apps.master.services_auth_directory import sync_tenant_user_identity
+                    sync_tenant_user_identity(profile.user, tenant_id=org.id, db=alias)
+                except Exception as ex:
+                    logger.warning("Failed to sync identity for member user %s: %s", profile.user.id, ex)
         if 'phone' in data and profile.user:
             profile.user.phone = data['phone']
             profile.user.save(using=alias)
@@ -1761,9 +1789,12 @@ class MemberViewSet(viewsets.ViewSet):
             if profile.user:
                 profile.user.gender = data['gender']
                 profile.user.save(using=alias)
-        if 'date_of_birth' in data and profile.user:
-            profile.user.date_of_birth = data['date_of_birth']
-            profile.user.save(using=alias)
+        if 'date_of_birth' in data:
+            dob = data.get('date_of_birth') or None
+            profile.date_of_birth = dob
+            if profile.user:
+                profile.user.date_of_birth = dob
+                profile.user.save(using=alias)
         if 'status' in data:
             st = str(data['status']).upper()
             profile.member_status = 'ACTIVE' if 'ACT' in st else ('FROZEN' if 'FROZ' in st else 'INACTIVE')

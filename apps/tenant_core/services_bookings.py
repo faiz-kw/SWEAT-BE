@@ -1,4 +1,5 @@
 import uuid
+from datetime import timedelta
 from decimal import Decimal
 from django.db import models, transaction
 from django.utils import timezone
@@ -18,7 +19,7 @@ from .models_bookings import (
     BookingCancellation,
     BookingWaitlistEvent,
 )
-from .models_attendance import AttendanceRecord, AccessEvent
+from .models_attendance import AttendanceRecord, AccessEvent, AccessPass
 from .models_classes import ClassOccurrence
 from .models_crm import UserProfile
 from .models_memberships import Membership, MembershipEntitlement
@@ -140,11 +141,53 @@ class BookingWaitlistAttendanceService:
             if policy:
                 return policy
 
-        policy = AttendancePolicySet.objects.using(alias).filter(branch=occurrence.branch, status='ACTIVE').first()
+        policy = AttendancePolicySet.objects.using(alias).filter(organization=org, status='ACTIVE').first()
         if policy:
             return policy
 
-        return AttendancePolicySet.objects.using(alias).filter(organization=org, status='ACTIVE').first()
+        # Auto-initialize active default organization AttendancePolicySet if none exists
+        if org:
+            policy, created = AttendancePolicySet.objects.using(alias).get_or_create(
+                organization=org,
+                name=f"{org.name} Standard Attendance Policy",
+                defaults={
+                    'rule_behavior': 'OPERATIONAL',
+                    'normal_max_advance_bookings': 3,
+                    'restricted_max_advance_bookings': 1,
+                    'restriction_threshold': 2,
+                    'reset_on_successful_attendance': True,
+                    'no_show_mark_after_minutes': 0,
+                    'status': 'ACTIVE',
+                }
+            )
+            if created:
+                AttendancePenaltyRule.objects.using(alias).create(
+                    attendance_policy_set=policy,
+                    rule_code='FIRST_NO_SHOW',
+                    base_session_units=Decimal('1.00'),
+                    additional_penalty_units=Decimal('0.00'),
+                    priority=10,
+                    status='ACTIVE',
+                )
+                AttendancePenaltyRule.objects.using(alias).create(
+                    attendance_policy_set=policy,
+                    rule_code='CONSECUTIVE_NO_SHOW',
+                    base_session_units=Decimal('1.00'),
+                    additional_penalty_units=Decimal('0.00'),
+                    priority=20,
+                    status='ACTIVE',
+                )
+                AttendancePenaltyRule.objects.using(alias).create(
+                    attendance_policy_set=policy,
+                    rule_code='RESTRICTED_NO_SHOW',
+                    base_session_units=Decimal('1.00'),
+                    additional_penalty_units=Decimal('1.00'),
+                    priority=30,
+                    status='ACTIVE',
+                )
+            return policy
+
+        return None
 
     @classmethod
     def can_member_book(cls, user_profile: UserProfile, organization, occurrence: ClassOccurrence = None, db_alias: str = None) -> tuple:
@@ -518,16 +561,22 @@ class BookingWaitlistAttendanceService:
                 }
         else:
             if enrolled_count >= occurrence.capacity:
-                allow_waitlist = (
-                    occurrence.class_template.allow_waitlist
-                    if (occurrence.class_template and occurrence.class_template.allow_waitlist is not None)
-                    else True
-                )
-                waitlist_cap = (
-                    occurrence.waitlist_capacity
-                    if occurrence.waitlist_capacity is not None
-                    else (occurrence.class_template.default_waitlist_capacity if occurrence.class_template else 5)
-                )
+                booking_policy = cls.resolve_booking_policy(occurrence, db_alias=alias) if occurrence else None
+                if booking_policy and booking_policy.allow_waitlist is not None:
+                    allow_waitlist = booking_policy.allow_waitlist
+                elif occurrence.class_template and occurrence.class_template.allow_waitlist is not None:
+                    allow_waitlist = occurrence.class_template.allow_waitlist
+                else:
+                    allow_waitlist = True
+
+                if booking_policy and booking_policy.waitlist_capacity is not None:
+                    waitlist_cap = booking_policy.waitlist_capacity
+                elif occurrence.waitlist_capacity is not None:
+                    waitlist_cap = occurrence.waitlist_capacity
+                elif occurrence.class_template and occurrence.class_template.default_waitlist_capacity is not None:
+                    waitlist_cap = occurrence.class_template.default_waitlist_capacity
+                else:
+                    waitlist_cap = 5
                 if not allow_waitlist or waitlist_cap <= 0:
                     return {
                         'eligible': False,
@@ -705,8 +754,9 @@ class BookingWaitlistAttendanceService:
                 ).exists():
                     raise ValidationError("Cannot book class occurring during an active or scheduled membership freeze window.")
 
-                # Gate: Verify PAR-Q completed and digitally signed for this specific membership
-                if getattr(membership, 'parq_status', 'PENDING') != 'COMPLETED':
+                # Gate: Verify PAR-Q completed and digitally signed for this specific membership if required by policy
+                parq_enforced = bool(booking_policy and booking_policy.require_parq)
+                if parq_enforced and getattr(membership, 'parq_status', 'PENDING') != 'COMPLETED':
                     if not membership.parq_form:
                         from .models_crm import IntakeForm
                         org = (
@@ -914,20 +964,21 @@ class BookingWaitlistAttendanceService:
                 if booking_type == 'TRIAL':
                     raise ValidationError("Trial capacity reached for this session. This trial session is now full. Please select another slot.")
 
-                allow_waitlist = (
-                    occurrence.class_template.allow_waitlist
-                    if (occurrence.class_template and occurrence.class_template.allow_waitlist is not None)
-                    else (booking_policy.allow_waitlist if booking_policy else True)
-                )
-                waitlist_cap = (
-                    occurrence.waitlist_capacity
-                    if occurrence.waitlist_capacity is not None
-                    else (
-                        occurrence.class_template.default_waitlist_capacity
-                        if (occurrence.class_template and occurrence.class_template.default_waitlist_capacity is not None)
-                        else (booking_policy.waitlist_capacity if (booking_policy and booking_policy.waitlist_capacity) else 20)
-                    )
-                )
+                if booking_policy and booking_policy.allow_waitlist is not None:
+                    allow_waitlist = booking_policy.allow_waitlist
+                elif occurrence.class_template and occurrence.class_template.allow_waitlist is not None:
+                    allow_waitlist = occurrence.class_template.allow_waitlist
+                else:
+                    allow_waitlist = True
+
+                if booking_policy and booking_policy.waitlist_capacity is not None:
+                    waitlist_cap = booking_policy.waitlist_capacity
+                elif occurrence.waitlist_capacity is not None:
+                    waitlist_cap = occurrence.waitlist_capacity
+                elif occurrence.class_template and occurrence.class_template.default_waitlist_capacity is not None:
+                    waitlist_cap = occurrence.class_template.default_waitlist_capacity
+                else:
+                    waitlist_cap = 20
 
                 current_waitlist_count = Booking.objects.using(alias).filter(occurrence=occurrence, status='WAITLISTED').count()
                 if not allow_waitlist or current_waitlist_count >= waitlist_cap:
@@ -1258,8 +1309,10 @@ class BookingWaitlistAttendanceService:
                         )
                         continue
 
-                    # Revalidate PAR-Q requirement at promotion time
-                    if getattr(membership, 'parq_status', 'PENDING') != 'COMPLETED':
+                    # Revalidate PAR-Q requirement at promotion time if required by policy
+                    bp = cls.resolve_booking_policy(occurrence, db_alias=alias)
+                    parq_enforced = bool(bp and bp.require_parq)
+                    if parq_enforced and getattr(membership, 'parq_status', 'PENDING') != 'COMPLETED':
                         candidate.status = 'CANCELLED'
                         candidate.waitlist_position = None
                         candidate.save(using=alias, update_fields=['status', 'waitlist_position', 'updated_at'])
@@ -1483,7 +1536,8 @@ class BookingWaitlistAttendanceService:
 
             # 5. Check Package Class Access for new occurrence
             if booking.membership:
-                if getattr(booking.membership, 'parq_status', 'PENDING') != 'COMPLETED':
+                parq_enforced = bool(policy and policy.require_parq)
+                if parq_enforced and getattr(booking.membership, 'parq_status', 'PENDING') != 'COMPLETED':
                     raise ParqRequiredValidationError(
                         f"A completed and digitally signed PAR-Q is required before rescheduling under membership {booking.membership.membership_number}.",
                         code='PARQ_REQUIRED',
@@ -1821,41 +1875,248 @@ class BookingWaitlistAttendanceService:
         device_reference: str = None,
         booking: Booking = None,
         provider_reference: str = None,
+        event_id: uuid.UUID = None,
+        scanned_at = None,
+        direction: str = None,
+        reconciliation_status: str = 'NORMAL',
+        token_hash: str = None,
         db_alias: str = None,
     ) -> AccessEvent:
         alias = db_alias or get_current_tenant_db_alias() or 'default'
+        dir_value = direction or ('EXIT' if event_type == 'EXIT' else 'ENTRY')
+
         with transaction.atomic(using=alias):
             now = timezone.now()
-            event = AccessEvent.objects.using(alias).create(
-                user_profile=user_profile,
-                booking=booking,
-                branch=branch,
-                event_type=event_type,
-                device_reference=device_reference,
-                provider_reference=provider_reference,
-                event_at=now,
-                created_at=now
-            )
+            scan_time = scanned_at or now
 
-            # If ENTRY and valid booking exists today for this member, auto-check in
-            if event_type == 'ENTRY':
-                if not booking:
-                    today = now.date()
-                    booking = Booking.objects.using(alias).filter(
-                        user_profile=user_profile,
-                        branch=branch,
-                        status='CONFIRMED',
-                        occurrence__start_at__date=today
-                    ).first()
+            # 1. Idempotency Check: if event_id is supplied and already recorded, return immediately
+            if event_id:
+                existing_event = AccessEvent.objects.using(alias).filter(id=event_id).first()
+                if existing_event:
+                    return existing_event
+
+            # 2. Resolve booking if not explicitly provided
+            if not booking:
+                today = scan_time.date() if hasattr(scan_time, 'date') else now.date()
+                booking = Booking.objects.using(alias).filter(
+                    user_profile=user_profile,
+                    branch=branch,
+                    status='CONFIRMED',
+                    occurrence__start_at__date=today
+                ).first()
+
+            # 3. Single-Use and Anti-Replay Check for ENTRY
+            effective_event_type = event_type
+            effective_reconciliation = reconciliation_status
+
+            if dir_value == 'ENTRY':
                 if booking:
+                    already_present = AttendanceRecord.objects.using(alias).filter(
+                        booking=booking,
+                        status__in=['PRESENT', 'LATE', 'LATE_SHOW', 'ATTENDED']
+                    ).exists()
+                    if already_present:
+                        effective_event_type = 'DENIED'
+                        effective_reconciliation = 'REPLAY_ATTEMPT'
+
+            event_kwargs = {
+                'user_profile': user_profile,
+                'booking': booking,
+                'branch': branch,
+                'event_type': effective_event_type,
+                'direction': dir_value,
+                'reconciliation_status': effective_reconciliation,
+                'token_hash': token_hash,
+                'device_reference': device_reference,
+                'provider_reference': provider_reference,
+                'event_at': scan_time,
+                'created_at': now,
+            }
+            if event_id:
+                event_kwargs['id'] = event_id
+
+            event = AccessEvent.objects.using(alias).create(**event_kwargs)
+
+            # 4. Handle ENTRY Auto-Attendance
+            if dir_value == 'ENTRY' and effective_event_type == 'ENTRY':
+                if booking:
+                    occ = booking.occurrence
+                    start_time = occ.start_at if occ else None
+                    end_time = occ.end_at if occ else None
+
+                    att_status = 'PRESENT'
+                    if start_time and end_time:
+                        booking_policy = cls.resolve_booking_policy(occ, db_alias=alias) if occ else None
+                        late_mins = booking_policy.late_entry_minutes if (booking_policy and booking_policy.late_entry_minutes is not None) else 20
+
+                        late_threshold = start_time + timedelta(minutes=late_mins)
+                        if scan_time <= late_threshold:
+                            att_status = 'PRESENT'
+                        elif scan_time <= end_time:
+                            att_status = 'LATE'
+                        else:
+                            att_status = 'LATE_SHOW'
+
                     cls.record_attendance(
                         booking=booking,
-                        status='PRESENT',
-                        check_in_method='ACCESS_DEVICE',
+                        status=att_status,
+                        check_in_method='QR' if (provider_reference or '').lower().find('qr') >= 0 else 'ACCESS_DEVICE',
                         db_alias=alias,
+                    )
+                    # Mark local AccessPass consumed if one exists
+                    AccessPass.objects.using(alias).filter(booking=booking, status='ACTIVE').update(
+                        status='CONSUMED_ENTERED',
+                        consumed_at=scan_time,
+                        updated_at=now
+                    )
+
+            # 5. Handle EXIT Auto-Checkout
+            elif dir_value == 'EXIT' and effective_event_type == 'EXIT':
+                att_record = AttendanceRecord.objects.using(alias).filter(
+                    user_profile=user_profile,
+                    branch=branch,
+                    status__in=['PRESENT', 'LATE'],
+                    check_out_at__isnull=True,
+                ).order_by('-check_in_at').first()
+
+                if att_record:
+                    att_record.check_out_at = scan_time
+                    att_record.attendance_completed = True
+                    att_record.completion_verified_at = now
+                    att_record.updated_at = now
+                    att_record.save(
+                        update_fields=['check_out_at', 'attendance_completed', 'completion_verified_at', 'updated_at'],
+                        using=alias
+                    )
+
+                if booking:
+                    AccessPass.objects.using(alias).filter(booking=booking, status='CONSUMED_ENTERED').update(
+                        status='CONSUMED_EXITED',
+                        updated_at=now
                     )
 
             return event
 
+    @classmethod
+    def reconcile_past_occurrences_attendance(
+        cls,
+        branch=None,
+        target_date=None,
+        occurrence_id=None,
+        user_profile=None,
+        db_alias: str = None,
+    ) -> dict:
+        """
+        Automated Attendance Lifecycle & Reconciliation:
+        Evaluates past class occurrences where the session has ended (occurrence.end_at <= now).
+        Calculates and applies attendance policies, criteria, and discipline rules:
+        - If a member checked in: synchronizes booking status to COMPLETED/ATTENDED.
+        - If a member NEVER checked in and class has ended:
+          * Automatically marks booking as NO_SHOW.
+          * Creates AttendanceRecord(status='NO_SHOW', check_in_status='NOT_ATTEMPTED', check_in_method='SYSTEM').
+          * Evaluates AttendancePenaltyRule and updates MemberAttendanceState.
+          * Applies restrictions (SINGLE_BOOKING) if restriction_threshold reached.
+          * Logs AttendancePolicyEvent and BookingStatusHistory.
+        - Synchronizes un-attended past TrialBookings to NO_SHOW.
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        now = timezone.now()
+
+        bookings_qs = (
+            Booking.objects.using(alias)
+            .filter(
+                occurrence__end_at__lte=now,
+                status__in=['CONFIRMED', 'RESERVED'],
+            )
+            .select_related(
+                'occurrence',
+                'occurrence__class_template',
+                'occurrence__class_template__category__organization',
+                'branch',
+                'user_profile',
+                'membership',
+                'entitlement',
+            )
+        )
+
+        if branch:
+            if isinstance(branch, (str, uuid.UUID)):
+                bookings_qs = bookings_qs.filter(branch_id=branch)
+            else:
+                bookings_qs = bookings_qs.filter(branch=branch)
+
+        if occurrence_id:
+            bookings_qs = bookings_qs.filter(occurrence_id=occurrence_id)
+
+        if user_profile:
+            bookings_qs = bookings_qs.filter(user_profile=user_profile)
+
+        if target_date:
+            bookings_qs = bookings_qs.filter(occurrence__occurrence_date=target_date)
+
+        reconciled_no_show = 0
+        reconciled_attended = 0
+
+        for b in list(bookings_qs):
+            occ = b.occurrence
+            if not occ or not occ.end_at:
+                continue
+
+            policy = cls.resolve_attendance_policy(occ, db_alias=alias)
+            grace_mins = policy.no_show_mark_after_minutes if policy else 0
+            cutoff_time = occ.end_at + timedelta(minutes=grace_mins)
+
+            if now < cutoff_time:
+                continue
+
+            # Check if an attendance record exists
+            att = AttendanceRecord.objects.using(alias).filter(booking=b).first()
+            if att and att.check_in_status == 'SUCCESSFUL':
+                if b.status != 'COMPLETED':
+                    b.status = 'COMPLETED'
+                    b.completed_at = att.check_in_at or now
+                    b.save(using=alias, update_fields=['status', 'completed_at', 'updated_at'])
+                reconciled_attended += 1
+            else:
+                # Mark as NO_SHOW automatically
+                cls.record_attendance(
+                    booking=b,
+                    status='NO_SHOW',
+                    check_in_method='SYSTEM',
+                    db_alias=alias,
+                )
+                reconciled_no_show += 1
+
+        # Reconcile un-attended past TrialBookings
+        from .models_crm import TrialBooking
+        from .services_crm import CRMLeadService
+
+        trials_qs = (
+            TrialBooking.objects.using(alias)
+            .filter(
+                scheduled_end__lte=now,
+                status__in=['BOOKED', 'CONFIRMED'],
+            )
+            .select_related('branch', 'lead')
+        )
+        if branch:
+            if isinstance(branch, (str, uuid.UUID)):
+                trials_qs = trials_qs.filter(branch_id=branch)
+            else:
+                trials_qs = trials_qs.filter(branch=branch)
+
+        for t in list(trials_qs):
+            try:
+                CRMLeadService.mark_trial_no_show(trial=t, actor_user=None, db_alias=alias)
+                reconciled_no_show += 1
+            except Exception:
+                pass
+
+        return {
+            'reconciled_no_show': reconciled_no_show,
+            'reconciled_attended': reconciled_attended,
+        }
+
 
 BookingAttendanceService = BookingWaitlistAttendanceService
+

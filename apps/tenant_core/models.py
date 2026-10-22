@@ -212,11 +212,13 @@ __all__ += [
 from .models_attendance import (
     AttendanceRecord,
     AccessEvent,
+    AccessPass,
 )
 
 __all__ += [
     'AttendanceRecord',
     'AccessEvent',
+    'AccessPass',
 ]
 
 from .models_referrals import (

@@ -1994,6 +1994,16 @@ class MobileMyBookingsView(APIView):
         profile = _get_or_create_user_profile(user, alias)
         now = timezone.now()
 
+        # Trigger automatic attendance lifecycle reconciliation
+        try:
+            from .services_bookings import BookingWaitlistAttendanceService
+            BookingWaitlistAttendanceService.reconcile_past_occurrences_attendance(
+                user_profile=profile,
+                db_alias=alias,
+            )
+        except Exception:
+            pass
+
         bookings = (
             Booking.objects.using(alias)
             .filter(user_profile=profile)
@@ -2003,6 +2013,7 @@ class MobileMyBookingsView(APIView):
                 'branch',
             )
             .prefetch_related(
+                'attendance_records',
                 'occurrence__trainer_assignments__trainer_profile__employee_profile__user_profile__user'
             )
             .order_by('-occurrence__start_at')
@@ -2037,11 +2048,22 @@ class MobileMyBookingsView(APIView):
             is_late_cancel = diff_minutes < (cutoff_hours * 60)
             is_past_reschedule_cutoff = diff_minutes < (reschedule_cutoff_hours * 60)
 
+            att_rec = b.attendance_records.first()
+            effective_status = b.status
+            if b.status in ['COMPLETED', 'CONFIRMED']:
+                if att_rec and att_rec.check_in_status == 'SUCCESSFUL':
+                    effective_status = 'LATE' if att_rec.status in ['LATE', 'LATE_ENTRY', 'LATE_SHOW'] else 'ATTENDED'
+                elif occ and occ.end_at and occ.end_at <= now:
+                    effective_status = 'NO_SHOW'
+
             item = {
                 'id': str(b.id),
                 'booking_number': b.booking_number,
                 'occurrence_id': str(occ.id) if occ else None,
-                'status': b.status,
+                'status': effective_status,
+                'attendance_status': att_rec.status if att_rec else effective_status,
+                'check_in_at': att_rec.check_in_at.isoformat() if att_rec and att_rec.check_in_at else None,
+                'check_out_at': att_rec.check_out_at.isoformat() if att_rec and att_rec.check_out_at else None,
                 'payment_status': getattr(b, 'payment_status', 'PAID'),
                 'confirmation_status': getattr(b, 'confirmation_status', 'CONFIRMED'),
                 'booking_type': b.booking_type,
@@ -2241,48 +2263,91 @@ class MobileQRPassView(APIView):
             alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
         profile = _get_or_create_user_profile(user, alias)
 
-        if not booking_id:
-            # General Member Digital Turnstile Access Pass
-            valid_until_ts = int(timezone.now().timestamp()) + 86400
-            pass_data = {
-                'uid': str(user.id),
-                'mno': profile.member_number or 'MEM-1CCA18',
-                'name': f"{user.first_name} {user.last_name}".strip(),
-                'branch': user.home_branch.name if getattr(user, 'home_branch', None) else 'All SWEAT Studios',
-                'type': 'STUDIO_TURNSTILE_ACCESS',
-                'exp': valid_until_ts,
-            }
-            raw_str = json.dumps(pass_data, separators=(',', ':'))
-            sig = hmac.new(settings.SECRET_KEY.encode('utf-8'), raw_str.encode('utf-8'), hashlib.sha256).hexdigest()[:16]
-            token = f"{base64.urlsafe_b64encode(raw_str.encode()).decode().rstrip('=')}.{sig}"
-            return Response({
-                'pass_id': str(uuid.uuid4()),
-                'qr_token': token,
-                'qr_payload': token,
-                'member_name': pass_data['name'],
-                'membership_number': pass_data['mno'],
-                'branch_name': pass_data['branch'],
-                'valid_until': datetime.fromtimestamp(valid_until_ts).isoformat(),
-            })
+        from .services_access_control import (
+            generate_compact_qr_token,
+            generate_booking_qr_token,
+            hash_qr_token,
+        )
+        from .models_attendance import AccessPass
 
-        try:
-            booking = (
+        if not booking_id:
+            now = timezone.now()
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            today_end = today_start + timedelta(days=1)
+            active_booking = (
                 Booking.objects.using(alias)
                 .select_related('occurrence__class_template', 'branch', 'user_profile')
-                .get(id=booking_id)
+                .filter(
+                    user_profile=profile,
+                    status='CONFIRMED',
+                    occurrence__start_at__gte=now - timedelta(hours=2),
+                    occurrence__start_at__lte=today_end,
+                )
+                .order_by('occurrence__start_at')
+                .first()
             )
-        except Booking.DoesNotExist:
-            return Response({'detail': 'Booking not found.'}, status=status.HTTP_404_NOT_FOUND)
+            if not active_booking:
+                active_booking = (
+                    Booking.objects.using(alias)
+                    .select_related('occurrence__class_template', 'branch', 'user_profile')
+                    .filter(
+                        user_profile=profile,
+                        status='CONFIRMED',
+                        occurrence__start_at__gte=today_start,
+                        occurrence__start_at__lte=today_end,
+                    )
+                    .order_by('occurrence__start_at')
+                    .first()
+                )
 
-        if booking.user_profile_id != profile.id:
-            return Response({'detail': 'Access denied.'}, status=status.HTTP_403_FORBIDDEN)
+            if not active_booking:
+                return Response({
+                    'has_booking': False,
+                    'detail': 'No confirmed class booking found for today. Please reserve a class session to generate your turnstile access key.',
+                }, status=status.HTTP_404_NOT_FOUND)
+
+            booking = active_booking
+        else:
+            try:
+                booking = (
+                    Booking.objects.using(alias)
+                    .select_related('occurrence__class_template', 'branch', 'user_profile')
+                    .get(id=booking_id)
+                )
+            except Booking.DoesNotExist:
+                return Response({'detail': 'Booking not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+            if booking.user_profile_id != profile.id:
+                return Response({'detail': 'Access denied.'}, status=status.HTTP_403_FORBIDDEN)
 
         occ = booking.occurrence
-        start_ts = int(occ.start_at.timestamp()) if occ and occ.start_at else int(timezone.now().timestamp())
+        now = timezone.now()
+        start_ts = int(occ.start_at.timestamp()) if occ and occ.start_at else int(now.timestamp())
         # Valid from 60 minutes before class until 60 minutes after class ends
         valid_until_ts = start_ts + 7200
+        valid_from_dt = (occ.start_at - timedelta(minutes=60)) if occ and occ.start_at else now
+        valid_until_dt = (occ.end_at + timedelta(minutes=60)) if (occ and getattr(occ, 'end_at', None)) else (valid_from_dt + timedelta(hours=2))
 
-        # Construct signed payload
+        # Deterministic compact 22-char token bound to booking & SECRET_KEY
+        compact_token = generate_booking_qr_token(booking.id, settings.SECRET_KEY)
+        t_hash = hash_qr_token(compact_token)
+
+        # Upsert active AccessPass bound to this booking
+        pass_obj, _ = AccessPass.objects.using(alias).update_or_create(
+            booking=booking,
+            defaults={
+                'user_profile': profile,
+                'branch': booking.branch,
+                'token_hash': t_hash,
+                'pass_type': 'CLASS_BOOKING',
+                'valid_from': valid_from_dt,
+                'valid_until': valid_until_dt,
+                'status': 'ACTIVE' if booking.status == 'CONFIRMED' else 'CANCELLED',
+                'updated_at': now,
+            }
+        )
+
+        # Construct legacy signed payload for backwards compatibility
         pass_data = {
             'bid': str(booking.id),
             'bno': booking.booking_number,
@@ -2300,15 +2365,23 @@ class MobileQRPassView(APIView):
         token = f"{base64.urlsafe_b64encode(raw_str.encode()).decode().rstrip('=')}.{sig}"
 
         return Response({
-            'qr_token': token,
+            'has_booking': True,
+            'pass_id': str(pass_obj.id),
+            'booking_id': str(booking.id),
             'booking_number': booking.booking_number,
+            'qr_token': compact_token,
+            'compact_token': compact_token,
+            'qr_payload': compact_token,
+            'legacy_signed_token': token,
             'member_name': f"{user.first_name} {user.last_name}".strip(),
             'member_number': profile.member_number,
             'class_name': pass_data['class'],
             'branch_name': pass_data['branch'],
             'start_at': occ.start_at.isoformat() if occ and occ.start_at else None,
             'status': booking.status,
-            'valid_until': datetime.fromtimestamp(valid_until_ts).isoformat(),
+            'valid_from': valid_from_dt.isoformat(),
+            'valid_until': valid_until_dt.isoformat(),
+            'pass_type': 'CLASS_BOOKING',
         })
 
 

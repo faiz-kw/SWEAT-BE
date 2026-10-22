@@ -3470,6 +3470,23 @@ class LeadConversionService:
                 if not existing_user.home_branch and branch:
                     existing_user.home_branch = branch
                     user_updated_fields.append('home_branch')
+
+                # Propagate lead's genuine customer name and promote to MEMBER user_type
+                if getattr(existing_user, 'user_type', None) != 'STAFF':
+                    if lead.first_name and existing_user.first_name != lead.first_name:
+                        existing_user.first_name = lead.first_name
+                        user_updated_fields.append('first_name')
+                    if lead.last_name and existing_user.last_name != lead.last_name:
+                        existing_user.last_name = lead.last_name
+                        user_updated_fields.append('last_name')
+                    lead_full = f"{lead.first_name or ''} {lead.last_name or ''}".strip()
+                    if lead_full and existing_user.display_name != lead_full:
+                        existing_user.display_name = lead_full
+                        user_updated_fields.append('display_name')
+                    if existing_user.user_type != 'MEMBER':
+                        existing_user.user_type = 'MEMBER'
+                        user_updated_fields.append('user_type')
+
                 if user_updated_fields:
                     existing_user.save(using=alias, update_fields=user_updated_fields)
 
@@ -3489,14 +3506,26 @@ class LeadConversionService:
                 if not profile.acquisition_source:
                     profile.acquisition_source = 'CRM_CONVERSION'
                     updated_fields.append('acquisition_source')
+                if lead.first_name and profile.first_name_snapshot != lead.first_name:
+                    profile.first_name_snapshot = lead.first_name
+                    updated_fields.append('first_name_snapshot')
+                if lead.last_name and profile.last_name_snapshot != lead.last_name:
+                    profile.last_name_snapshot = lead.last_name
+                    updated_fields.append('last_name_snapshot')
+                if profile.member_type != 'MEMBER':
+                    profile.member_type = 'MEMBER'
+                    updated_fields.append('member_type')
+                if profile.member_status != 'ACTIVE':
+                    profile.member_status = 'ACTIVE'
+                    updated_fields.append('member_status')
                 if updated_fields:
                     profile.save(using=alias, update_fields=updated_fields)
             except UserProfile.DoesNotExist:
                 profile = UserProfile.objects.using(alias).create(
                     user=existing_user,
                     member_number=f"MEM-{uuid.uuid4().hex[:6].upper()}",
-                    first_name_snapshot=existing_user.first_name,
-                    last_name_snapshot=existing_user.last_name,
+                    first_name_snapshot=lead.first_name or existing_user.first_name,
+                    last_name_snapshot=lead.last_name or existing_user.last_name,
                     preferred_branch=branch,
                     joining_date=timezone.now().date(),
                     member_type='MEMBER',

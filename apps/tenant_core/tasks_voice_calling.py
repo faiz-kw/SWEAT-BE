@@ -153,16 +153,27 @@ def process_trial_voice_reminders_task(self, tenant_id: str = None, **kwargs):
 
     try:
         with tenant_database_context(tenant_id) as db_alias:
-            from apps.tenant_core.models_crm import TrialBooking
+            from apps.tenant_core.models_crm import TrialBooking, CRMTrialReminderPolicy
             from apps.tenant_core.services_voice_calling import VoiceCallingService
 
+            policy = CRMTrialReminderPolicy.objects.using(db_alias).first()
+            if policy and getattr(policy, 'ai_calling_enabled', False) is False:
+                logger.info("AI calling disabled for tenant %s in CRMTrialReminderPolicy. Skipping reminders.", tenant_id)
+                return {'status': 'DISABLED', 'tenant_id': str(tenant_id), 'reason': 'AI voice reminder calling is disabled in trial policy'}
+
+            offset_minutes = getattr(policy, 'ai_calling_offset_minutes', 1440) or 1440
+            skip_confirmed = getattr(policy, 'ai_calling_skip_confirmed', False) or False
+
             now = timezone.now()
-            start_window = now + timedelta(hours=23)
-            end_window = now + timedelta(hours=25)
+            target_time = now + timedelta(minutes=offset_minutes)
+            start_window = target_time - timedelta(minutes=60)
+            end_window = target_time + timedelta(minutes=60)
+
+            status_filters = ['PENDING'] if skip_confirmed else ['CONFIRMED', 'PENDING']
 
             trials = TrialBooking.objects.using(db_alias).filter(
                 status='CONFIRMED',
-                confirmation_status__in=['CONFIRMED', 'PENDING'],
+                confirmation_status__in=status_filters,
                 scheduled_start__gte=start_window,
                 scheduled_start__lte=end_window,
             ).select_related('lead', 'branch', 'lead__organization')

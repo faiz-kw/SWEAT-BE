@@ -159,6 +159,8 @@ from .views_bookings import (
     MemberAttendanceStateViewSet,
     AttendanceRecordViewSet,
     AccessEventViewSet,
+    AccessControlBulkIngestView,
+    AccessControlSyncPassesView,
 )
 from .views_rewards import (
     ReferralProgramViewSet,
@@ -360,5 +362,7 @@ urlpatterns = [
     path('voice-agent/cancel-trial/', VoiceAgentCancelTrialView.as_view(), name='tenant-voice-agent-cancel-trial'),
     path('voice-agent/callback/', VoiceAgentCallbackView.as_view(), name='tenant-voice-agent-callback'),
     path('voice-agent/call-outcome/', VoiceAgentCallOutcomeView.as_view(), name='tenant-voice-agent-call-outcome'),
+    path('access-control/events/bulk/', AccessControlBulkIngestView.as_view(), name='access-control-bulk-ingest'),
+    path('access-control/sync/', AccessControlSyncPassesView.as_view(), name='access-control-sync-passes'),
     path('', include(router.urls)),
 ]

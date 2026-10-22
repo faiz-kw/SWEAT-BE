@@ -33,7 +33,7 @@ from apps.tenant_core.views_voice_agent import (
 # Django admin branding
 admin.site.site_header = "PerformanceOS • Platform Control Panel"
 admin.site.site_title = "PerformanceOS Admin"
-admin.site.index_title = "Phase 1 Layer 1 — Master Control Panel"
+admin.site.index_title = "Platform Administration"
 
 urlpatterns = [
     path('', RedirectView.as_view(url='/admin/', permanent=False)),

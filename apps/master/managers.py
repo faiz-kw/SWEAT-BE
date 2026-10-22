@@ -23,3 +23,8 @@ class PlatformUserManager(BaseUserManager):
         extra_fields.setdefault('status', 'ACTIVE')
         extra_fields.setdefault('is_active', True)
         return self.create_user(email, password, **extra_fields)
+
+    def get_by_natural_key(self, username):
+        from django.db.models import Q
+        return self.get(Q(email__iexact=username) | Q(username__iexact=username))
+

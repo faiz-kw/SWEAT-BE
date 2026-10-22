@@ -97,6 +97,26 @@ class AccessEvent(models.Model):
             ('DENIED', 'DENIED'),
         ]
     )
+    direction = models.CharField(
+        max_length=10,
+        default='ENTRY',
+        choices=[
+            ('ENTRY', 'ENTRY'),
+            ('EXIT', 'EXIT'),
+        ]
+    )
+    reconciliation_status = models.CharField(
+        max_length=40,
+        default='NORMAL',
+        choices=[
+            ('NORMAL', 'NORMAL'),
+            ('OFFLINE_OVERRIDE', 'OFFLINE_OVERRIDE'),
+            ('REPLAY_ATTEMPT', 'REPLAY_ATTEMPT'),
+            ('UNAUTHORIZED', 'UNAUTHORIZED'),
+            ('EXPIRED', 'EXPIRED'),
+        ]
+    )
+    token_hash = models.CharField(max_length=64, null=True, blank=True, db_index=True)
     device_reference = models.CharField(max_length=255, null=True, blank=True)
     event_at = models.DateTimeField(default=timezone.now)
     provider_reference = models.CharField(max_length=255, null=True, blank=True)
@@ -110,7 +130,53 @@ class AccessEvent(models.Model):
             models.Index(fields=['user_profile', 'event_at']),
             models.Index(fields=['branch', 'event_at']),
             models.Index(fields=['provider_reference']),
+            models.Index(fields=['token_hash']),
+            models.Index(fields=['reconciliation_status']),
         ]
 
     def __str__(self):
-        return f"Access {self.event_type} - {self.user_profile} at {self.event_at}"
+        return f"Access {self.event_type} ({self.direction}) - {self.user_profile} at {self.event_at}"
+
+
+class AccessPass(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user_profile = models.ForeignKey(UserProfile, on_delete=models.PROTECT, related_name='access_passes')
+    booking = models.OneToOneField(Booking, on_delete=models.CASCADE, null=True, blank=True, related_name='access_pass')
+    branch = models.ForeignKey(Branch, on_delete=models.PROTECT, related_name='access_passes')
+    token_hash = models.CharField(max_length=64, db_index=True)
+    pass_type = models.CharField(
+        max_length=30,
+        default='CLASS_BOOKING',
+        choices=[
+            ('CLASS_BOOKING', 'CLASS_BOOKING'),
+            ('STUDIO_ACCESS', 'STUDIO_ACCESS'),
+        ]
+    )
+    valid_from = models.DateTimeField(default=timezone.now)
+    valid_until = models.DateTimeField()
+    status = models.CharField(
+        max_length=30,
+        default='ACTIVE',
+        choices=[
+            ('ACTIVE', 'ACTIVE'),
+            ('CONSUMED_ENTERED', 'CONSUMED_ENTERED'),
+            ('CONSUMED_EXITED', 'CONSUMED_EXITED'),
+            ('CANCELLED', 'CANCELLED'),
+            ('EXPIRED', 'EXPIRED'),
+        ]
+    )
+    consumed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = 'access_passes'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['branch', 'status', 'valid_from']),
+            models.Index(fields=['token_hash', 'status']),
+            models.Index(fields=['user_profile', 'status']),
+        ]
+
+    def __str__(self):
+        return f"AccessPass {self.pass_type} ({self.status}) for {self.user_profile}"
