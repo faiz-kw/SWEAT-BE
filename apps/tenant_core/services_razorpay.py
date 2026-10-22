@@ -499,6 +499,9 @@ class RazorpayPaymentFinalizerService:
             order = Order.objects.using(alias).filter(id=order_id).first()
 
         if not order and razorpay_order_id:
+            order = Order.objects.using(alias).filter(gateway_order_id=razorpay_order_id).first()
+
+        if not order and razorpay_order_id:
             # Check by PaymentTransaction metadata
             tx = PaymentTransaction.objects.using(alias).filter(
                 metadata__razorpay_order_id=razorpay_order_id
@@ -528,6 +531,29 @@ class RazorpayPaymentFinalizerService:
                 f"Internal order not found for Razorpay order {razorpay_order_id}",
                 code="ORDER_NOT_FOUND"
             )
+
+        # Route retail purchases to RetailCommerceService
+        if order.order_type == 'RETAIL_PURCHASE':
+            from .services_retail import RetailCommerceService
+            logger.info("Routing webhook finalization to RetailCommerceService for retail order %s (rzp_order=%s)", order.order_number, razorpay_order_id)
+            retail_result = RetailCommerceService.confirm_retail_payment_from_gateway(
+                order_id=order.id,
+                payment_id=razorpay_payment_id,
+                razorpay_order_id=razorpay_order_id,
+                db_alias=alias,
+            )
+            return {
+                'status': 'SUCCESS',
+                'order_id': str(order.id),
+                'order_number': order.order_number,
+                'order_type': 'RETAIL_PURCHASE',
+                'membership_id': None,
+                'membership_status': None,
+                'membership_activated': False,
+                'source': source,
+                'retail_result': retail_result,
+            }
+
 
         # 3. Server-side API cross-check when credentials configured
         if RazorpayService.is_configured(db_alias=alias):

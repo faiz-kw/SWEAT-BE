@@ -5,8 +5,10 @@ Supports full CRUD, search, category filtering, multi-image storage, and multi-t
 
 from rest_framework import viewsets, permissions, status
 from rest_framework.response import Response
+from rest_framework.decorators import action
 from rest_framework.pagination import PageNumberPagination
 from django.db.models import Q
+from django.conf import settings
 
 from .context import get_tenant_db_alias
 from .models_inventory import Product
@@ -78,6 +80,20 @@ class ProductViewSet(viewsets.ModelViewSet):
         if in_stock in ['true', '1']:
             qs = qs.filter(stock_quantity__gt=0)
 
+        auto_sync = self.request.query_params.get('auto_sync')
+        if auto_sync in ['true', '1'] and qs.count() == 0:
+            from .services_catalog_sync import ShopCatalogSyncService
+            try:
+                ShopCatalogSyncService.sync_to_database(
+                    db_alias=alias,
+                    organization_id=str(org.id) if org else None,
+                )
+                qs = Product.objects.using(alias).all()
+                if org:
+                    qs = qs.filter(organization=org)
+            except Exception:
+                pass
+
         return qs.order_by('-created_at')
 
     def perform_create(self, serializer):
@@ -94,8 +110,36 @@ class ProductViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         instance.delete()
 
+    @action(detail=False, methods=['get', 'post'], url_path='sync-catalog')
+    def sync_catalog(self, request):
+        """
+        Synchronizes live products dynamically from sweatfitwellness.com into this tenant's catalog.
+        """
+        alias = _get_db(request)
+        org = _get_org(request)
+        source_url = request.data.get('source_url') if isinstance(getattr(request, 'data', None), dict) else None
+        if not source_url:
+            source_url = request.query_params.get('source_url')
 
-from rest_framework.decorators import action
+        from .services_catalog_sync import ShopCatalogSyncService
+        try:
+            result = ShopCatalogSyncService.sync_to_database(
+                db_alias=alias,
+                organization_id=str(org.id) if org else None,
+                source_url=source_url,
+            )
+            return Response({
+                'success': True,
+                'message': f"Catalog synced successfully. Total: {result['total']}, Created: {result['created']}, Updated: {result['updated']}",
+                'result': result,
+            }, status=status.HTTP_200_OK)
+        except Exception as exc:
+            return Response({
+                'success': False,
+                'error': str(exc),
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
 from django.core.exceptions import ValidationError
 from .models_commerce import Order
 from .serializers_commerce import OrderSerializer
@@ -105,7 +149,7 @@ from .services_retail import (
     OrderStateError,
     FulfillmentTransitionError,
 )
-from .services_razorpay import RazorpayVerificationError
+from .services_razorpay import RazorpayService, RazorpayVerificationError
 
 
 class RetailOrderViewSet(viewsets.ModelViewSet):
@@ -199,10 +243,20 @@ class RetailOrderViewSet(viewsets.ModelViewSet):
                 source=data.get('source', 'MOBILE_APP'),
                 notes=notes,
                 db_alias=alias,
+                initiate_gateway=True,
             )
-            return Response(OrderSerializer(order).data, status=status.HTTP_201_CREATED)
+            key_id, _ = RazorpayService.get_credentials(db_alias=alias)
+            amount_paise = RazorpayService.convert_inr_to_paise(order.total_amount)
+
+            order_data = OrderSerializer(order).data
+            order_data['razorpay_order_id'] = order.gateway_order_id
+            order_data['razorpay_key_id'] = key_id
+            order_data['amount'] = float(order.total_amount)
+            order_data['amount_paise'] = amount_paise
+            order_data['currency'] = order.currency
+            return Response(order_data, status=status.HTTP_201_CREATED)
         except (InsufficientStockError, ValidationError) as e:
-            return Response({'detail': str(e), 'code': 'ORDER_CREATION_FAILED'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'detail': str(e), 'code': getattr(e, 'code', 'ORDER_CREATION_FAILED')}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=True, methods=['post'], url_path='fulfill')
     def fulfill(self, request, pk=None):
@@ -227,7 +281,17 @@ class RetailOrderViewSet(viewsets.ModelViewSet):
         payment_id = data.get('payment_id') or data.get('razorpay_payment_id')
         rzp_order_id = data.get('razorpay_order_id')
         signature = data.get('razorpay_signature')
-        is_sandbox = data.get('is_sandbox_simulation', False)
+        # Treat is_sandbox_simulation as untrusted input. If requested when DEBUG is False, reject immediately.
+        is_sandbox_requested = bool(data.get('is_sandbox_simulation') in (True, 'true', 'True', '1', 1))
+        if is_sandbox_requested and not getattr(settings, 'DEBUG', False):
+            return Response(
+                {
+                    'detail': 'Payment simulation is strictly forbidden when DEBUG is False.',
+                    'code': 'SIMULATION_NOT_ALLOWED',
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        is_sandbox = is_sandbox_requested and getattr(settings, 'DEBUG', False)
 
         try:
             result = RetailCommerceService.confirm_retail_payment(
