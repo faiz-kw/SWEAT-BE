@@ -338,8 +338,9 @@ from .views_wod import WorkoutContentItemViewSet, WorkoutTagViewSet
 router.register(r'wod/content-items', WorkoutContentItemViewSet, basename='wod-content-item')
 router.register(r'wod/tags', WorkoutTagViewSet, basename='wod-tag')
 
-from .views_inventory import ProductViewSet
+from .views_inventory import ProductViewSet, RetailOrderViewSet
 router.register(r'products', ProductViewSet, basename='product')
+router.register(r'retail-orders', RetailOrderViewSet, basename='retail-order')
 
 app_name = 'tenant_core'
 

@@ -140,10 +140,35 @@ class OrderViewSet(viewsets.ModelViewSet):
                 Q(lead__last_name__icontains=term)
             )
 
+        order_type_param = self.request.query_params.get('order_type')
+        if order_type_param:
+            qs = qs.filter(order_type=order_type_param)
+        fulfillment_status_param = self.request.query_params.get('fulfillment_status')
+        if fulfillment_status_param:
+            qs = qs.filter(fulfillment_status=fulfillment_status_param)
+
         if has_join_filter:
             qs = qs.distinct()
 
         return qs.select_related('branch', 'user_profile', 'lead').prefetch_related('items', 'payments', 'invoices').order_by('-created_at')
+
+    @action(detail=True, methods=['post'], url_path='fulfill')
+    def fulfill(self, request, pk=None):
+        from .services_retail import RetailCommerceService, FulfillmentTransitionError
+        alias = _get_db(request)
+        new_status = request.data.get('fulfillment_status') or request.data.get('status') or 'FULFILLED'
+        staff_user = request.user if getattr(request.user, 'is_authenticated', False) and hasattr(request.user, 'id') else None
+        try:
+            order = RetailCommerceService.update_fulfillment_status(
+                order_id=pk,
+                new_status=new_status,
+                staff_user=staff_user,
+                db_alias=alias,
+            )
+            serializer = self.get_serializer(order)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        except (FulfillmentTransitionError, ValidationError) as e:
+            return Response({'detail': str(e), 'code': 'INVALID_FULFILLMENT_TRANSITION'}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=False, methods=['get'], url_path='summary')
     def summary(self, request):

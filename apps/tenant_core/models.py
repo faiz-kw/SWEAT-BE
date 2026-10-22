@@ -311,10 +311,12 @@ __all__ += [
     'WorkoutContentTag',
 ]
 
-from .models_inventory import Product
+from .models_inventory import Product, StockReservation, InventoryMovement
 
 __all__ += [
     'Product',
+    'StockReservation',
+    'InventoryMovement',
 ]
 
 from .models_wellness import (

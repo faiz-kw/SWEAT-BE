@@ -45,6 +45,7 @@ class Order(models.Model):
         ('REJOIN', 'Rejoin Membership'),
         ('CLASS_PURCHASE', 'Class Session Purchase'),
         ('APPOINTMENT_PURCHASE', 'Appointment Service Purchase'),
+        ('RETAIL_PURCHASE', 'Retail Product Purchase'),
         ('OTHER', 'Other Commercial Purchase'),
     ]
     STATUS_CHOICES = [
@@ -54,6 +55,12 @@ class Order(models.Model):
         ('PAID', 'Paid / Completed'),
         ('CANCELLED', 'Cancelled'),
         ('REFUNDED', 'Refunded'),
+    ]
+    FULFILLMENT_STATUS_CHOICES = [
+        ('UNFULFILLED', 'Unfulfilled'),
+        ('READY_FOR_PICKUP', 'Ready for Pickup'),
+        ('FULFILLED', 'Fulfilled / Collected'),
+        ('CANCELLED', 'Cancelled'),
     ]
     SOURCE_CHOICES = [
         ('WEB', 'Web Checkout'),
@@ -81,6 +88,13 @@ class Order(models.Model):
     )
     order_type = models.CharField(max_length=40, choices=ORDER_TYPE_CHOICES, default='NEW_MEMBERSHIP')
     status = models.CharField(max_length=30, choices=STATUS_CHOICES, default='DRAFT')
+    fulfillment_status = models.CharField(
+        max_length=30, choices=FULFILLMENT_STATUS_CHOICES, default='UNFULFILLED', db_index=True
+    )
+    fulfilled_at = models.DateTimeField(null=True, blank=True)
+    fulfilled_by_user = models.ForeignKey(
+        TenantUser, on_delete=models.SET_NULL, null=True, blank=True, related_name='fulfilled_orders'
+    )
     subtotal = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal('0.00'))
     discount_amount = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal('0.00'))
     reward_amount = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal('0.00'))
@@ -100,6 +114,8 @@ class Order(models.Model):
             models.Index(fields=['user_profile', 'status', 'created_at'], name='idx_orders_uprof_st_dt'),
             models.Index(fields=['lead', 'status'], name='idx_orders_lead_st'),
             models.Index(fields=['branch', 'created_at'], name='idx_orders_br_dt'),
+            models.Index(fields=['order_type', 'status'], name='idx_orders_type_st'),
+            models.Index(fields=['fulfillment_status'], name='idx_orders_fulfill_st'),
         ]
         constraints = [
             models.CheckConstraint(
@@ -109,7 +125,7 @@ class Order(models.Model):
         ]
 
     def __str__(self):
-        return f"Order {self.order_number} ({self.total_amount} {self.currency}) [{self.status}]"
+        return f"Order {self.order_number} ({self.total_amount} {self.currency}) [{self.status}/{self.fulfillment_status}]"
 
 
 class OrderItem(models.Model):
@@ -120,6 +136,7 @@ class OrderItem(models.Model):
         ('PACKAGE', 'Package Version'),
         ('CLASS', 'Group Class'),
         ('APPOINTMENT', 'Appointment Service'),
+        ('RETAIL', 'Retail Product'),
         ('OTHER', 'Other Product / Service'),
     ]
 
@@ -146,6 +163,10 @@ class OrderItem(models.Model):
     appointment_type = models.ForeignKey(
         AppointmentType, on_delete=models.PROTECT, null=True, blank=True, related_name='order_items'
     )
+    product = models.ForeignKey(
+        'Product', on_delete=models.SET_NULL, null=True, blank=True, related_name='order_items'
+    )
+    sku_snapshot = models.CharField(max_length=100, null=True, blank=True)
     item_name_snapshot = models.CharField(max_length=250)
     quantity = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('1.00'))
     unit_price_snapshot = models.DecimalField(max_digits=14, decimal_places=2)
@@ -163,6 +184,7 @@ class OrderItem(models.Model):
             models.Index(fields=['order'], name='idx_orditem_order'),
             models.Index(fields=['package_version'], name='idx_orditem_pkgver'),
             models.Index(fields=['class_template'], name='idx_orditem_clstpl'),
+            models.Index(fields=['product'], name='idx_orditem_prod'),
         ]
 
     def __str__(self):

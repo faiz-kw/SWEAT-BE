@@ -71,5 +71,95 @@ class Product(models.Model):
             models.Index(fields=['category', 'status'], name='idx_prod_cat_status'),
         ]
 
+    def get_available_stock(self, using=None):
+        from django.db.models import Sum
+        qs = self.reservations.all()
+        if using:
+            qs = qs.using(using)
+        active_reserved = qs.filter(
+            status='PENDING',
+            expires_at__gt=timezone.now()
+        ).aggregate(total=Sum('quantity'))['total'] or 0
+        return max(0, self.stock_quantity - active_reserved)
+
     def __str__(self):
         return f"{self.name} ({self.category} - ₹{self.price})"
+
+
+class StockReservation(models.Model):
+    """
+    Durable stock reservation held for active pending retail orders.
+    Prevents overselling during the checkout and payment verification window.
+    """
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending Payment'),
+        ('CONFIRMED', 'Confirmed Sale'),
+        ('RELEASED', 'Released / Expired / Cancelled'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    product = models.ForeignKey(
+        Product, on_delete=models.PROTECT, related_name='reservations'
+    )
+    order = models.ForeignKey(
+        'Order', on_delete=models.CASCADE, related_name='stock_reservations'
+    )
+    quantity = models.PositiveIntegerField(default=1)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING', db_index=True)
+    reserved_at = models.DateTimeField(default=timezone.now)
+    expires_at = models.DateTimeField(db_index=True)
+    released_at = models.DateTimeField(null=True, blank=True)
+    release_reason = models.CharField(max_length=100, null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'inventory_stock_reservations'
+        indexes = [
+            models.Index(fields=['product', 'status', 'expires_at'], name='idx_stkres_prod_st_exp'),
+            models.Index(fields=['order', 'status'], name='idx_stkres_ord_st'),
+        ]
+
+    def __str__(self):
+        return f"Reservation {self.id}: {self.quantity}x {self.product.name} [{self.status}]"
+
+
+class InventoryMovement(models.Model):
+    """
+    Authoritative audit ledger for physical and reserved stock lifecycle movements.
+    """
+    MOVEMENT_TYPE_CHOICES = [
+        ('RESERVATION', 'Stock Reserved'),
+        ('RESERVATION_RELEASE', 'Reservation Released'),
+        ('SALE', 'Sale Deducted'),
+        ('RESTOCK', 'Manual Restock'),
+        ('ADJUSTMENT', 'Stock Adjustment'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    product = models.ForeignKey(
+        Product, on_delete=models.PROTECT, related_name='movements'
+    )
+    order = models.ForeignKey(
+        'Order', on_delete=models.SET_NULL, null=True, blank=True, related_name='inventory_movements'
+    )
+    movement_type = models.CharField(max_length=30, choices=MOVEMENT_TYPE_CHOICES, db_index=True)
+    quantity_change = models.IntegerField(help_text="Negative for deductions/sales, positive for restocks/releases")
+    balance_after = models.IntegerField(help_text="Stock quantity after movement")
+    notes = models.CharField(max_length=255, null=True, blank=True)
+    actor_user = models.ForeignKey(
+        'TenantUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='inventory_movements'
+    )
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        db_table = 'inventory_movements'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['product', 'created_at'], name='idx_invmov_prod_dt'),
+            models.Index(fields=['order'], name='idx_invmov_order'),
+        ]
+
+    def __str__(self):
+        return f"{self.movement_type}: {self.product.name} ({self.quantity_change:+d}) -> {self.balance_after}"
+
