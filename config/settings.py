@@ -35,6 +35,9 @@ if not DEBUG:
             'Set a strong, unique SECRET_KEY in production.'
         )
 
+# TimeWatch / Turnstile Edge Service Integration
+EDGE_SERVICE_API_KEY = os.getenv('EDGE_SERVICE_API_KEY', '')
+
 if not DEBUG:
     # Production security defaults (enforced when DEBUG is False)
     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
@@ -314,6 +317,7 @@ CORS_ALLOWED_ORIGINS = [
 if DEBUG:
     CORS_ALLOWED_ORIGIN_REGEXES = [
         r"^http://(localhost|127\.0\.0\.1)(:\d+)?$",
+        r"^http://(192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)(:\d+)?$",
     ]
 
 from corsheaders.defaults import default_headers

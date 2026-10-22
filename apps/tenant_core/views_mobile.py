@@ -3651,8 +3651,10 @@ class MobilePTAppointmentsView(APIView):
         data = request.data
         trainer_id = data.get('trainer_id')
         start_at_str = data.get('start_at')
+        if not start_at_str and data.get('appointment_date') and data.get('start_time'):
+            start_at_str = f"{data.get('appointment_date')}T{data.get('start_time')}:00"
         duration_minutes = int(data.get('duration_minutes', 60))
-        focus = data.get('focus', 'Pilates Core & Athletic Conditioning')
+        focus = data.get('focus') or data.get('focus_area') or 'Pilates Core & Athletic Conditioning'
         notes = data.get('notes', f"Focus: {focus}")
 
         if not start_at_str:

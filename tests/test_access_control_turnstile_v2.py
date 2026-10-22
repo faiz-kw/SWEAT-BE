@@ -1,6 +1,6 @@
 import uuid
 from datetime import timedelta
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIRequestFactory, force_authenticate
 
@@ -36,12 +36,14 @@ from apps.tenant_core.views_bookings import AccessControlBulkIngestView, AccessC
 from apps.tenant_core.views_mobile import MobileQRPassView
 
 
+@override_settings(EDGE_SERVICE_API_KEY='test-edge-service-key-xyz')
 class TimeWatchTurnstileV2Tests(TestCase):
     databases = {'default', 'tenant_test'}
 
     def setUp(self):
         set_tenant_db_alias('tenant_test')
         self.db = 'tenant_test'
+        self.edge_api_key = 'test-edge-service-key-xyz'
         self.factory = APIRequestFactory()
 
         # 0. Master Tenant for auth directory identity sync
@@ -215,7 +217,12 @@ class TimeWatchTurnstileV2Tests(TestCase):
         }
 
         view = AccessControlBulkIngestView.as_view()
-        req1 = self.factory.post('/api/v1/access-control/events/bulk/', payload, format='json')
+        req1 = self.factory.post(
+            '/api/v1/access-control/events/bulk/',
+            payload,
+            format='json',
+            HTTP_X_EDGE_API_KEY=self.edge_api_key,
+        )
         req1._tenant_alias = self.db
         res1 = view(req1)
 
@@ -233,7 +240,12 @@ class TimeWatchTurnstileV2Tests(TestCase):
         self.assertEqual(pass_obj.status, 'CONSUMED_ENTERED')
 
         # IDEMPOTENCY TEST: Post identical event_id again
-        req2 = self.factory.post('/api/v1/access-control/events/bulk/', payload, format='json')
+        req2 = self.factory.post(
+            '/api/v1/access-control/events/bulk/',
+            payload,
+            format='json',
+            HTTP_X_EDGE_API_KEY=self.edge_api_key,
+        )
         req2._tenant_alias = self.db
         res2 = view(req2)
         self.assertEqual(res2.status_code, 200)
@@ -264,7 +276,12 @@ class TimeWatchTurnstileV2Tests(TestCase):
             'token_hash': t_hash,
             'device_reference': 'TURNSTILE-ENTRY-01'
         }
-        r1 = self.factory.post('/api/v1/access-control/events/bulk/', {'events': [ev1]}, format='json')
+        r1 = self.factory.post(
+            '/api/v1/access-control/events/bulk/',
+            {'events': [ev1]},
+            format='json',
+            HTTP_X_EDGE_API_KEY=self.edge_api_key,
+        )
         r1._tenant_alias = self.db
         view(r1)
 
@@ -275,7 +292,12 @@ class TimeWatchTurnstileV2Tests(TestCase):
             'token_hash': t_hash,
             'device_reference': 'TURNSTILE-ENTRY-02'
         }
-        r2 = self.factory.post('/api/v1/access-control/events/bulk/', {'events': [ev2]}, format='json')
+        r2 = self.factory.post(
+            '/api/v1/access-control/events/bulk/',
+            {'events': [ev2]},
+            format='json',
+            HTTP_X_EDGE_API_KEY=self.edge_api_key,
+        )
         r2._tenant_alias = self.db
         res2 = view(r2)
 
@@ -314,7 +336,12 @@ class TimeWatchTurnstileV2Tests(TestCase):
             'device_reference': 'TURNSTILE-EXIT-01',
             'scanned_at': timezone.now().isoformat()
         }
-        req = self.factory.post('/api/v1/access-control/events/bulk/', {'events': [exit_event]}, format='json')
+        req = self.factory.post(
+            '/api/v1/access-control/events/bulk/',
+            {'events': [exit_event]},
+            format='json',
+            HTTP_X_EDGE_API_KEY=self.edge_api_key,
+        )
         req._tenant_alias = self.db
         res = view(req)
 
@@ -341,7 +368,10 @@ class TimeWatchTurnstileV2Tests(TestCase):
         )
 
         view = AccessControlSyncPassesView.as_view()
-        req = self.factory.get(f'/api/v1/access-control/sync/?branch_id={self.branch.id}')
+        req = self.factory.get(
+            f'/api/v1/access-control/sync/?branch_id={self.branch.id}',
+            HTTP_X_EDGE_API_KEY=self.edge_api_key,
+        )
         req._tenant_alias = self.db
         res = view(req)
 
@@ -411,4 +441,61 @@ class TimeWatchTurnstileV2Tests(TestCase):
         # Tokens from both calls must be 100% IDENTICAL!
         self.assertEqual(res1.data['compact_token'], res2.data['compact_token'])
         self.assertEqual(res2.data['compact_token'], expected_token)
+
+    @override_settings(DEBUG=False, EDGE_SERVICE_API_KEY=None)
+    def test_edge_endpoints_fail_closed_in_production_when_unconfigured(self):
+        """When DEBUG=False and EDGE_SERVICE_API_KEY is not set, endpoints must return 401 Unauthorized."""
+        sync_view = AccessControlSyncPassesView.as_view()
+        req_sync = self.factory.get(f'/api/v1/access-control/sync/?branch_id={self.branch.id}')
+        req_sync._tenant_alias = self.db
+        res_sync = sync_view(req_sync)
+        self.assertEqual(res_sync.status_code, 401)
+        self.assertIn('Unauthorized', res_sync.data.get('error', ''))
+
+        bulk_view = AccessControlBulkIngestView.as_view()
+        req_bulk = self.factory.post('/api/v1/access-control/events/bulk/', {'events': []}, format='json')
+        req_bulk._tenant_alias = self.db
+        res_bulk = bulk_view(req_bulk)
+        self.assertEqual(res_bulk.status_code, 401)
+        self.assertIn('Unauthorized', res_bulk.data.get('error', ''))
+
+    @override_settings(DEBUG=False, EDGE_SERVICE_API_KEY='')
+    def test_edge_endpoints_fail_closed_in_production_when_empty_key(self):
+        """When DEBUG=False and EDGE_SERVICE_API_KEY is empty string, endpoints must return 401."""
+        sync_view = AccessControlSyncPassesView.as_view()
+        req_sync = self.factory.get(f'/api/v1/access-control/sync/?branch_id={self.branch.id}')
+        req_sync._tenant_alias = self.db
+        res_sync = sync_view(req_sync)
+        self.assertEqual(res_sync.status_code, 401)
+
+    @override_settings(DEBUG=False, EDGE_SERVICE_API_KEY='production-test-key-999')
+    def test_edge_endpoints_fail_closed_when_key_invalid(self):
+        """When EDGE_SERVICE_API_KEY is set, requests with missing or invalid key return 401."""
+        sync_view = AccessControlSyncPassesView.as_view()
+
+        # 1. Missing header
+        req_no_header = self.factory.get(f'/api/v1/access-control/sync/?branch_id={self.branch.id}')
+        req_no_header._tenant_alias = self.db
+        res1 = sync_view(req_no_header)
+        self.assertEqual(res1.status_code, 401)
+
+        # 2. Invalid header
+        req_bad_key = self.factory.get(f'/api/v1/access-control/sync/?branch_id={self.branch.id}', HTTP_X_EDGE_API_KEY='wrong-secret')
+        req_bad_key._tenant_alias = self.db
+        res2 = sync_view(req_bad_key)
+        self.assertEqual(res2.status_code, 401)
+
+    @override_settings(DEBUG=False, EDGE_SERVICE_API_KEY='production-test-key-999')
+    def test_edge_endpoints_succeed_with_valid_key(self):
+        """When valid X-Edge-Api-Key is provided, endpoints return 200 OK."""
+        sync_view = AccessControlSyncPassesView.as_view()
+        req_valid = self.factory.get(
+            f'/api/v1/access-control/sync/?branch_id={self.branch.id}',
+            HTTP_X_EDGE_API_KEY='production-test-key-999'
+        )
+        req_valid._tenant_alias = self.db
+        res = sync_view(req_valid)
+        self.assertEqual(res.status_code, 200)
+        self.assertIn('passes', res.data)
+
 
