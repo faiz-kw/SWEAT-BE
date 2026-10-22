@@ -62,7 +62,19 @@ class ProductViewSet(viewsets.ModelViewSet):
 
         branch_id = self.request.query_params.get('branch')
         if branch_id and branch_id != 'all':
-            qs = qs.filter(Q(branch_id=branch_id) | Q(branch__isnull=True))
+            import uuid
+            from .models_org import Branch
+            try:
+                b_uuid = uuid.UUID(str(branch_id).strip())
+                qs = qs.filter(Q(branch_id=b_uuid) | Q(branch__isnull=True))
+            except (ValueError, TypeError):
+                branch_obj = Branch.objects.using(alias).filter(
+                    Q(code__iexact=branch_id) | Q(name__iexact=branch_id)
+                ).first()
+                if branch_obj:
+                    qs = qs.filter(Q(branch=branch_obj) | Q(branch__isnull=True))
+                else:
+                    qs = qs.filter(branch__isnull=True)
 
         category = self.request.query_params.get('category')
         if category and category != 'all':
@@ -109,6 +121,20 @@ class ProductViewSet(viewsets.ModelViewSet):
 
     def perform_destroy(self, instance):
         instance.delete()
+
+    @action(detail=True, methods=['post', 'patch'], url_path='toggle-active')
+    def toggle_active(self, request, pk=None):
+        """
+        Toggles product between Active and Inactive states.
+        """
+        instance = self.get_object()
+        instance.is_active = not instance.is_active
+        if not instance.is_active and instance.status == 'In Stock':
+            instance.status = 'Discontinued'
+        elif instance.is_active and instance.status == 'Discontinued':
+            instance.status = 'In Stock' if instance.stock_quantity > 0 else 'Out of Stock'
+        instance.save(update_fields=['is_active', 'status', 'updated_at'])
+        return Response(ProductSerializer(instance).data, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get', 'post'], url_path='sync-catalog')
     def sync_catalog(self, request):
