@@ -37,6 +37,9 @@ if not DEBUG:
 
 if not DEBUG:
     # Production security defaults (enforced when DEBUG is False)
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    USE_X_FORWARDED_HOST = True
+    USE_X_FORWARDED_PORT = True
     SECURE_SSL_REDIRECT = os.getenv('SECURE_SSL_REDIRECT', 'True').lower() in ('true', '1', 't')
     SESSION_COOKIE_SECURE = os.getenv('SESSION_COOKIE_SECURE', 'True').lower() in ('true', '1', 't')
     CSRF_COOKIE_SECURE = os.getenv('CSRF_COOKIE_SECURE', 'True').lower() in ('true', '1', 't')
@@ -224,6 +227,9 @@ USE_TZ = True
 STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR / 'media'
+
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # ---------------------------------------------------------------------------
@@ -257,6 +263,8 @@ REST_FRAMEWORK = {
         'auth_login':   os.getenv('THROTTLE_RATE_LOGIN',   '10/minute'),
         'auth_mfa':     os.getenv('THROTTLE_RATE_MFA',     '5/minute'),
         'auth_refresh': os.getenv('THROTTLE_RATE_REFRESH', '20/minute'),
+        # Wellness AI vision rate limit (per authenticated member)
+        'wellness_ai_vision': os.getenv('THROTTLE_RATE_WELLNESS_AI_VISION', '10/minute'),
         # General API throttles (authenticated vs anonymous)
         'user': os.getenv('THROTTLE_RATE_API_USER', '1000/minute'),
         'anon': os.getenv('THROTTLE_RATE_API_ANON', '60/minute'),
@@ -316,6 +324,10 @@ from corsheaders.defaults import default_headers
 CORS_ALLOW_HEADERS = list(default_headers) + [
     'x-tenant-slug',
     'x-correlation-id',
+    'x-idempotency-key',
+    'idempotency-key',
+    'x-tenant-id',
+    'x-voice-agent-token',
 ]
 
 if not CORS_ALLOWED_ORIGINS and not DEBUG:
@@ -347,7 +359,6 @@ if not DEBUG:
     X_FRAME_OPTIONS = 'DENY'
     SECURE_HSTS_SECONDS = int(os.getenv('SECURE_HSTS_SECONDS', '31536000'))
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
-    SECURE_SSL_REDIRECT = os.getenv('SECURE_SSL_REDIRECT', 'False').lower() in ('true', '1')
 
 # ---------------------------------------------------------------------------
 # drf-spectacular
@@ -358,6 +369,16 @@ SPECTACULAR_SETTINGS = {
     'VERSION': '2.0.0',
     'SERVE_INCLUDE_SCHEMA': False,
     'COMPONENT_SPLIT_REQUEST': True,
+    'SECURITY': [{'jwtAuth': []}],
+    'APPEND_COMPONENTS': {
+        'securitySchemes': {
+            'jwtAuth': {
+                'type': 'http',
+                'scheme': 'bearer',
+                'bearerFormat': 'JWT',
+            }
+        }
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -516,6 +537,7 @@ if 'test' in sys.argv:
         'auth_login':   '10000/minute',
         'auth_mfa':     '10000/minute',
         'auth_refresh': '10000/minute',
+        'wellness_ai_vision': '10000/minute',
         # Disable global API throttles in tests: all test requests share the same loopback IP.
         'user': '10000/minute',
         'anon': '10000/minute',
@@ -557,6 +579,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'apps.master.tasks.process_all_tenants_booking_auto_cancellations_async',
         'schedule': float(os.getenv('CELERY_SCHEDULE_BOOKING_AUTOCANCEL_SECONDS', '120.0')),  # every 2 min
     },
+    'tenant-process-trial-voice-reminders': {
+        'task': 'apps.tenant_core.tasks_voice_calling.process_trial_voice_reminders_task',
+        'schedule': float(os.getenv('CELERY_SCHEDULE_VOICE_REMINDERS_SECONDS', '1800.0')),  # every 30 min
+    },
 }
 
 
@@ -584,10 +610,11 @@ ZATA_S3_MAX_FILE_SIZE = int(os.getenv('ZATA_S3_MAX_FILE_SIZE', str(50 * 1024 * 1
 DEPLOYMENT_ENVIRONMENT = os.getenv('DEPLOYMENT_ENVIRONMENT', 'development' if DEBUG else 'production').lower()
 META_LEAD_SIMULATOR_ENABLED = os.getenv('META_LEAD_SIMULATOR_ENABLED', 'true' if DEBUG else 'false').lower() in ('true', '1', 't')
 COMMUNICATIONS_OUTBOUND_ENABLED = os.getenv('COMMUNICATIONS_OUTBOUND_ENABLED', 'false' if DEBUG else 'true').lower() in ('true', '1', 't')
+WHATSAPP_SANDBOX_MODE = os.getenv('WHATSAPP_SANDBOX_MODE', 'true' if DEBUG else 'false').lower() in ('true', '1', 't')
 VOICE_CALLING_ENABLED = os.getenv('VOICE_CALLING_ENABLED', 'false').lower() in ('true', '1', 't', 'yes')
 # Calling hours enforcement (IST / Asia/Kolkata). Calls outside the window are rejected.
 # VOICE_CALLING_ENFORCE_HOURS=false disables the check in staging/dev without changing production.
-VOICE_CALLING_ENFORCE_HOURS = os.getenv('VOICE_CALLING_ENFORCE_HOURS', 'true').lower() in ('true', '1', 't', 'yes')
+VOICE_CALLING_ENFORCE_HOURS = os.getenv('VOICE_CALLING_ENFORCE_HOURS', 'false' if DEBUG else 'true').lower() in ('true', '1', 't', 'yes')
 VOICE_CALLING_HOURS_START = int(os.getenv('VOICE_CALLING_HOURS_START', '9'))   # 09:00 IST
 VOICE_CALLING_HOURS_END   = int(os.getenv('VOICE_CALLING_HOURS_END',   '21'))  # 21:00 IST
 META_APP_ID = os.getenv('META_APP_ID', '').strip()
@@ -596,6 +623,9 @@ META_WEBHOOK_VERIFY_TOKEN = os.getenv('META_WEBHOOK_VERIFY_TOKEN', '').strip()
 META_TOKEN_ENCRYPTION_KEY = os.getenv('META_TOKEN_ENCRYPTION_KEY', '').strip()
 BACKEND_PUBLIC_URL = os.getenv('BACKEND_PUBLIC_URL', '').strip()
 META_REDIRECT_URI = os.getenv('META_REDIRECT_URI', '').strip()
+GUPSHUP_API_KEY = os.getenv('GUPSHUP_API_KEY', 'sk_e6941c4bab9947adaf787a47f17577aa').strip()
+GUPSHUP_APP_NAME = os.getenv('GUPSHUP_APP_NAME', 'SweatFit').strip()
+GUPSHUP_SOURCE_NUMBER = os.getenv('GUPSHUP_SOURCE_NUMBER', '917834811114').strip()
 
 
 
@@ -621,3 +651,30 @@ EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', '').strip()
 EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '').strip()
 DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', EMAIL_HOST_USER).strip()
 SERVER_EMAIL = DEFAULT_FROM_EMAIL
+
+# ---------------------------------------------------------------------------
+# Sentry Error Monitoring & Alerting (Production / Staging)
+# ---------------------------------------------------------------------------
+SENTRY_DSN = os.getenv('SENTRY_DSN', '').strip()
+if SENTRY_DSN:
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.django import DjangoIntegration
+        from sentry_sdk.integrations.celery import CeleryIntegration
+
+        sentry_sdk.init(
+            dsn=SENTRY_DSN,
+            integrations=[DjangoIntegration(), CeleryIntegration()],
+            traces_sample_rate=float(os.getenv('SENTRY_TRACES_SAMPLE_RATE', '0.1')),
+            send_default_pii=False,
+            environment=os.getenv('ENVIRONMENT', 'production' if not DEBUG else 'development'),
+        )
+    except ImportError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# AI Vision Services (Google Gemini 1.5 Flash Vision - Free Tier)
+# ---------------------------------------------------------------------------
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '').strip()
+

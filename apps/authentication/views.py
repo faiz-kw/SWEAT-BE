@@ -1028,6 +1028,7 @@ class MeView(APIView):
                     .filter(user=user, is_active=True)
                     .select_related('role', 'branch', 'branch__location')
                 )
+                is_org_admin = False
                 role_ids = []
                 for ra in assignments:
                     active_roles.append({
@@ -1038,7 +1039,10 @@ class MeView(APIView):
                         'branch_name': ra.branch.name if ra.branch else None,
                     })
                     role_ids.append(ra.role_id)
-                    if ra.role.scope == 'ORG' or ra.role.code in ('ORG_ADMIN', 'TENANT_ADMIN'):
+                    if ra.role.code in ('ORG_ADMIN', 'TENANT_ADMIN', 'TENANT_OWNER'):
+                        is_org_admin = True
+                        is_org_wide = True
+                    elif ra.role.scope == 'ORG':
                         is_org_wide = True
                     elif ra.branch and ra.branch.status == 'ACTIVE':
                         loc = ra.branch.location
@@ -1090,7 +1094,7 @@ class MeView(APIView):
                                 perm_codes.add(p_code)
 
                     # Calculate role-permitted modules/submodules
-                    if is_org_wide:
+                    if is_org_admin:
                         # Org Admin gets all tenant-enabled modules and submodules + all catalog permissions
                         user_accessible_modules = list(enabled_modules)
                         for p in Permission.objects.using(db_alias).all():
@@ -1133,7 +1137,7 @@ class MeView(APIView):
 
                         user_accessible_modules = sorted(list(accessible))
                 else:
-                    if is_org_wide:
+                    if is_org_admin:
                         user_accessible_modules = list(enabled_modules)
                         user_permissions = ['*']
                     else:
@@ -1163,6 +1167,12 @@ class MeView(APIView):
             pass
 
         effective_enabled_modules = user_accessible_modules if user_accessible_modules is not None else enabled_modules
+        is_member_user = (
+            primary_role_code == 'MEMBER' or
+            'MEMBER' in primary_role_code.upper() or
+            'MEMBER' in primary_role.upper() or
+            getattr(user, 'user_type', '').upper() == 'MEMBER'
+        )
 
         return Response({
             'id': str(user.id),
@@ -1173,6 +1183,7 @@ class MeView(APIView):
             'user_type': 'tenant',
             'role': primary_role,
             'role_code': primary_role_code,
+            'is_member': is_member_user,
             'roles': active_roles,                     # Real role assignments from DB
             'permissions': user_permissions,           # Real granted permissions from RBAC
             'is_org_wide': is_org_wide,

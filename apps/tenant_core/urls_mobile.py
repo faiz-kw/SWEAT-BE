@@ -1,5 +1,6 @@
 from django.urls import path
 from apps.authentication.views_otp import SendOTPView, VerifyOTPView
+from . import views_wellness
 from .views_mobile import (
     MobileRegisterView,
     MobileLeadCaptureView,
@@ -103,4 +104,17 @@ urlpatterns = [
     path('onboarding/survey/', MobileOnboardingSurveyView.as_view(), name='mobile-onboarding-survey'),
     path('onboarding-survey/', MobileOnboardingSurveyView.as_view(), name='mobile-onboarding-survey-direct'),
     path('onboarding/submit/', MobileOnboardingSubmitView.as_view(), name='mobile-onboarding-submit'),
+
+    # 7. Nutrition & Wellness MVP (Milestone 1)
+    path('wellness/foods/', views_wellness.FoodSearchMobileView.as_view(), name='mobile-wellness-foods'),
+    path('wellness/foods/barcode/<str:barcode>/', views_wellness.FoodBarcodeMobileView.as_view(), name='mobile-wellness-food-barcode'),
+    path('wellness/foods/analyze-image/', views_wellness.FoodImageAnalysisMobileView.as_view(), name='mobile-wellness-food-analyze-image'),
+    path('wellness/targets/', views_wellness.NutritionTargetMobileView.as_view(), name='mobile-wellness-targets'),
+    path('wellness/meal-logs/', views_wellness.MealLogListCreateMobileView.as_view(), name='mobile-wellness-meal-logs'),
+    path('wellness/meal-logs/<uuid:pk>/', views_wellness.MealLogDetailMobileView.as_view(), name='mobile-wellness-meal-log-detail'),
+    path('wellness/water-logs/', views_wellness.WaterLogListCreateMobileView.as_view(), name='mobile-wellness-water-logs'),
+    path('wellness/water-logs/<uuid:pk>/', views_wellness.WaterLogDetailMobileView.as_view(), name='mobile-wellness-water-log-detail'),
+    path('wellness/sleep-logs/', views_wellness.SleepLogListCreateMobileView.as_view(), name='mobile-wellness-sleep-logs'),
+    path('wellness/sleep-logs/<uuid:pk>/', views_wellness.SleepLogDetailMobileView.as_view(), name='mobile-wellness-sleep-log-detail'),
+    path('wellness/daily-summary/', views_wellness.DailySummaryMobileView.as_view(), name='mobile-wellness-daily-summary'),
 ]

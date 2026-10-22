@@ -112,6 +112,31 @@ class SarvamVoiceAdapter(BaseCommunicationAdapter):
             },
         }
 
+        # Seed dynamic agent variables into Sarvam session so LLM and prompt tools have real caller data
+        lead_name = (metadata or {}).get('lead_name') or (metadata or {}).get('name') or (metadata or {}).get('caller_name') or ''
+        branch_name = (metadata or {}).get('branch') or (metadata or {}).get('branch_name') or ''
+        lead_id = (metadata or {}).get('lead_id') or ''
+        
+        agent_vars = {
+            "user_phone_number": str(recipient_phone),
+            "phone_number": str(recipient_phone),
+            "phone": str(recipient_phone),
+            "salesRepPhone": str(recipient_phone),
+            "lead_name": str(lead_name),
+            "customer_name": str(lead_name),
+            "userName": str(lead_name),
+            "name": str(lead_name),
+            "lead_id": str(lead_id),
+            "branch": str(branch_name),
+            "preferred_branch": str(branch_name),
+        }
+        if metadata and isinstance(metadata, dict):
+            for k, v in metadata.items():
+                if isinstance(v, (str, int, float, bool)):
+                    agent_vars[k] = v
+
+        payload["agent_variables"] = agent_vars
+
         if webhook_url:
             payload["webhook_config"] = {
                 "url": webhook_url,

@@ -27,12 +27,13 @@ from apps.tenant_core.views_voice_agent import (
     VoiceAgentCancelTrialView,
     VoiceAgentCallOutcomeView,
     VoiceAgentCallbackView,
+    VoiceAgentRecordingAudioView,
 )
 
 # Django admin branding
 admin.site.site_header = "PerformanceOS • Platform Control Panel"
 admin.site.site_title = "PerformanceOS Admin"
-admin.site.index_title = "Phase 1 Layer 1 — Master Control Panel"
+admin.site.index_title = "Platform Administration"
 
 urlpatterns = [
     path('', RedirectView.as_view(url='/admin/', permanent=False)),
@@ -64,6 +65,9 @@ urlpatterns = [
     path('api/v1/voice-agent/cancel-trial/', VoiceAgentCancelTrialView.as_view(), name='voice-agent-cancel-trial'),
     path('api/v1/voice-agent/callback/', VoiceAgentCallbackView.as_view(), name='voice-agent-callback'),
     path('api/v1/voice-agent/call-outcome/', VoiceAgentCallOutcomeView.as_view(), name='voice-agent-call-outcome'),
+    path('api/v1/voice-agent/recordings/<uuid:session_id>/audio/', VoiceAgentRecordingAudioView.as_view(), name='voice-agent-recording-audio'),
+    path('api/v1/voice-agent/recordings/<uuid:session_id>/audio.wav', VoiceAgentRecordingAudioView.as_view(), name='voice-agent-recording-audio-wav'),
+    path('api/v1/voice-agent/recordings/<uuid:session_id>/audio', VoiceAgentRecordingAudioView.as_view(), name='voice-agent-recording-audio-bare'),
 
     # Tenant Admin — Org/Branch/User/RBAC management (scoped to tenant DB)
     path('api/v1/admin/', include('apps.tenant_core.urls')),
@@ -77,4 +81,12 @@ urlpatterns = [
     path('api/schema/', SpectacularAPIView.as_view(), name='schema'),
     path('api/docs/', SpectacularSwaggerView.as_view(url_name='schema'), name='swagger-ui'),
     path('api/redoc/', SpectacularRedocView.as_view(url_name='schema'), name='redoc'),
+]
+
+from django.conf import settings
+from django.views.static import serve
+from django.urls import re_path
+
+urlpatterns += [
+    re_path(r'^media/(?P<path>.*)$', serve, {'document_root': settings.MEDIA_ROOT}),
 ]

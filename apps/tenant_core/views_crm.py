@@ -352,7 +352,11 @@ class LeadViewSet(viewsets.ModelViewSet):
         lead = serializer.instance
         alias = _get_db(request)
 
-        response_data = dict(serializer.data)
+        response_data = dict(LeadSerializer(lead).data)
+        is_duplicate = getattr(lead, 'is_duplicate_intake', False)
+        if is_duplicate:
+            response_data['is_duplicate'] = True
+            response_data['deduplicated'] = True
 
         # Auto-provision TenantUser & UserProfile for this lead and return JWT tokens for seamless checkout
         try:
@@ -407,53 +411,44 @@ class LeadViewSet(viewsets.ModelViewSet):
                         defaults={'branch': lead.branch, 'is_active': True}
                     )
 
-            if user:
+            if user and not user_created:
                 profile = UserProfile.objects.using(alias).filter(user=user).first()
-                if not profile:
-                    profile = UserProfile.objects.using(alias).create(
-                        user=user,
-                        member_number=None,
-                        preferred_branch=user.home_branch or lead.branch,
-                        first_name_snapshot=user.first_name,
-                        last_name_snapshot=user.last_name,
-                        member_type='TRIAL',
-                        member_status='ACTIVE',
-                        acquisition_source='CRM_LEAD',
-                    )
-                lead.converted_user_profile = profile
-                lead.save(using=alias, update_fields=['converted_user_profile'])
+                if profile and not lead.converted_user_profile_id:
+                    lead.converted_user_profile = profile
+                    lead.save(using=alias, update_fields=['converted_user_profile'])
 
-                # START [SEC-LEAD-TOKEN]
-                # WHY: LeadViewSet.create() is AllowAny; returning tokens for pre-existing TenantUsers allows unauthenticated token harvesting for staff/member accounts.
-                # FIXES: Restricts token issuance strictly to newly created TenantUsers provisioned in this request.
-                # IMPACT: Pre-existing users matched during intake do not receive auth tokens in the 201 response.
-                if user and user_created:
-                    req_slug = getattr(request, 'tenant_slug', None) or 'sweat'
-                    tenant = Tenant.objects.using('default').filter(slug=req_slug, status='ACTIVE').first()
-                    if not tenant and 'test' in sys.argv:
-                        tenant = Tenant.objects.using('default').filter(status='ACTIVE').first()
+            # START [SEC-LEAD-TOKEN]
+            # WHY: LeadViewSet.create() is AllowAny; returning tokens for pre-existing TenantUsers allows unauthenticated token harvesting for staff/member accounts.
+            # FIXES: Restricts token issuance strictly to newly created TenantUsers provisioned in this request.
+            # IMPACT: Pre-existing users matched during intake do not receive auth tokens in the 201 response.
+            if user and user_created:
+                req_slug = getattr(request, 'tenant_slug', None) or 'sweat'
+                tenant = getattr(request, 'tenant', None) or Tenant.objects.using('default').filter(slug=req_slug, status='ACTIVE').first()
+                if not tenant and 'test' in sys.argv:
+                    tenant = Tenant.objects.using('default').filter(status='ACTIVE').first()
 
-                    if tenant:
-                        tokens = _build_tenant_token(user, tenant, alias)
-                        auth_dict = {
-                            'access': str(tokens.access_token),
-                            'refresh': str(tokens),
-                        }
-                        response_data['auth'] = auth_dict
-                        response_data['tokens'] = auth_dict
-                        response_data['user'] = {
-                            'id': str(user.id),
-                            'email': user.email,
-                            'user_type': user.user_type,
-                            'role_code': user.user_type,
-                        }
-                elif user:
-                    logger.info("Matched existing TenantUser for lead %s; withholding tokens on intake.", getattr(lead, 'id', None))
-                # END [SEC-LEAD-TOKEN]
+                if tenant:
+                    tokens = _build_tenant_token(user, tenant, alias)
+                    auth_dict = {
+                        'access': str(tokens.access_token),
+                        'refresh': str(tokens),
+                    }
+                    response_data['auth'] = auth_dict
+                    response_data['tokens'] = auth_dict
+                    response_data['user'] = {
+                        'id': str(user.id),
+                        'email': user.email,
+                        'user_type': user.user_type,
+                        'role_code': user.user_type,
+                    }
+            elif user:
+                logger.info("Matched existing TenantUser for lead %s; withholding tokens on intake.", getattr(lead, 'id', None))
+            # END [SEC-LEAD-TOKEN]
         except Exception as e:
             logger.warning("Could not auto-provision JWT for lead %s: %s", getattr(lead, 'id', None), e)
 
-        return Response(response_data, status=status.HTTP_201_CREATED, headers=headers)
+        status_code = status.HTTP_200_OK if is_duplicate else status.HTTP_201_CREATED
+        return Response(response_data, status=status_code, headers=headers)
 
     def get_permissions(self):
         if self.action == 'create':
@@ -696,6 +691,70 @@ class LeadViewSet(viewsets.ModelViewSet):
             db_alias=alias,
         )
         serializer.instance = lead
+
+        # Check if caller requested automated AI call trigger, provided voice consent,
+        # or if lead registered via self-service mobile app / portal signup
+        is_self_signup = not (hasattr(self.request, 'user') and getattr(self.request.user, 'is_authenticated', False))
+        is_app_source = (
+            getattr(lead_source, 'source_type', None) == 'MOBILE_APP'
+            or getattr(lead_source, 'code', None) in ('MOBILE_APP', 'APP_SIGNUP')
+        )
+        trigger_call = self.request.data.get('trigger_ai_call') or self.request.data.get('trigger_call')
+        consent_voice = self.request.data.get('consent_voice')
+
+        should_record_consent = trigger_call or consent_voice or (is_self_signup and is_app_source)
+        should_trigger_call = trigger_call or (is_self_signup and is_app_source)
+
+        if should_record_consent:
+            consent_src = 'APP_SIGNUP' if is_self_signup else 'STAFF_VERIFIED'
+            try:
+                from .models_privacy import ProcessingPurpose, ConsentRecord
+                from .models_users import TenantUser
+                purpose = ProcessingPurpose.objects.using(alias).filter(code='VOICE_CALL').first()
+                if not purpose:
+                    purpose = ProcessingPurpose.objects.using(alias).create(
+                        code='VOICE_CALL',
+                        name='AI Voice Calling',
+                        description='Consent to receive automated AI voice calls regarding trial bookings and schedule inquiries.',
+                        status='ACTIVE',
+                    )
+                actor = self.request.user if (hasattr(self.request, 'user') and getattr(self.request.user, 'is_authenticated', False)) else None
+                consent_user = actor if isinstance(actor, TenantUser) else (lead.assigned_sales_user or TenantUser.objects.using(alias).first())
+                if consent_user:
+                    ConsentRecord.objects.using(alias).create(
+                        user=consent_user,
+                        purpose=purpose,
+                        subject_type='lead',
+                        subject_id=lead.id,
+                        status='GRANTED',
+                        capture_source=consent_src,
+                        consent_method=consent_src,
+                        notes=f"Voice calling consent granted during lead creation ({consent_src})",
+                        recorded_at=timezone.now(),
+                    )
+            except Exception as e:
+                logger.warning("Could not persist ConsentRecord on lead creation: %s", e)
+
+            lead.consent_voice = True
+            lead.consent_voice_source = consent_src
+            lead.consent_voice_recorded_at = timezone.now()
+            if hasattr(lead, '_cached_voice_consent'):
+                delattr(lead, '_cached_voice_consent')
+
+            if should_trigger_call:
+                try:
+                    from apps.tenant_core.tasks_voice_calling import trigger_automated_sarvam_call_task
+                    from apps.master.models_tenant import Tenant
+                    tenant = getattr(self.request, 'tenant', None)
+                    tenant_id = str(tenant.id) if tenant else (getattr(self.request.user, '_tenant_id', None) or None)
+                    if not tenant_id:
+                        t = Tenant.objects.filter(slug='sweat', status='ACTIVE').first() or Tenant.objects.filter(status='ACTIVE').first()
+                        tenant_id = str(t.id) if t else None
+                    if tenant_id:
+                        trigger_automated_sarvam_call_task.delay(tenant_id=tenant_id, lead_id=str(lead.id))
+                        logger.info("Dispatched automated Sarvam call task on lead creation (source=%s) for lead %s", consent_src, lead.id)
+                except Exception as call_err:
+                    logger.warning("Could not queue automated Sarvam call on lead creation: %s", call_err)
 
     def perform_update(self, serializer):
         lead = self.get_object()
@@ -1379,10 +1438,12 @@ class LeadViewSet(viewsets.ModelViewSet):
                 db_alias=alias,
             )
         except ValueError as val_err:
+            err_msg = str(val_err)
+            err_code = 'OUTSIDE_CALLING_HOURS' if 'permitted between' in err_msg.lower() else 'INVALID_RECIPIENT_OR_CONSENT'
             return Response(
                 {
-                    'error': str(val_err),
-                    'code': 'INVALID_RECIPIENT_OR_CONSENT',
+                    'error': err_msg,
+                    'code': err_code,
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )

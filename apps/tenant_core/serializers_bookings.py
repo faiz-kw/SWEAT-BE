@@ -131,6 +131,10 @@ class BookingListSerializer(serializers.ModelSerializer):
     """Lightweight list serializer — no nested prefetch, fast for table views."""
     user_profile_name = serializers.SerializerMethodField()
     user_profile_email = serializers.SerializerMethodField()
+    member_name = serializers.SerializerMethodField()
+    member_email = serializers.SerializerMethodField()
+    member_number = serializers.CharField(source='user_profile.member_number', read_only=True)
+    member_phone = serializers.SerializerMethodField()
     occurrence_title = serializers.CharField(source='occurrence.class_template.name', read_only=True)
     occurrence_date = serializers.DateField(source='occurrence.occurrence_date', read_only=True)
     occurrence_start_at = serializers.DateTimeField(source='occurrence.start_at', read_only=True)
@@ -146,7 +150,7 @@ class BookingListSerializer(serializers.ModelSerializer):
             'id', 'booking_number', 'status', 'booking_type', 'booking_source',
             'payment_status', 'confirmation_status', 'confirmed_at',
             'waitlist_position', 'booked_at', 'cancelled_at', 'completed_at',
-            'user_profile', 'user_profile_name', 'user_profile_email',
+            'user_profile', 'user_profile_name', 'user_profile_email', 'member_name', 'member_email', 'member_number', 'member_phone',
             'occurrence', 'occurrence_title', 'occurrence_date', 'occurrence_start_at', 'occurrence_end_at',
             'branch', 'branch_name',
             'membership', 'package_name',
@@ -166,6 +170,18 @@ class BookingListSerializer(serializers.ModelSerializer):
 
     def get_user_profile_email(self, obj):
         return obj.user_profile.user.email if (obj.user_profile and obj.user_profile.user) else None
+
+    def get_member_name(self, obj):
+        return self.get_user_profile_name(obj)
+
+    def get_member_email(self, obj):
+        return self.get_user_profile_email(obj)
+
+    def get_member_phone(self, obj):
+        up = getattr(obj, 'user_profile', None)
+        if up and getattr(up, 'user', None):
+            return getattr(up.user, 'phone', None) or getattr(up.user, 'phone_number', None)
+        return None
 
     def get_parq_status(self, obj):
         if getattr(obj, 'has_parq_submission', None) is not None:
@@ -193,6 +209,8 @@ class BookingListSerializer(serializers.ModelSerializer):
             'check_in_status': att.check_in_status,
             'check_in_method': att.check_in_method,
             'check_in_at': att.check_in_at.isoformat() if att.check_in_at else None,
+            'check_out_at': att.check_out_at.isoformat() if att.check_out_at else None,
+            'attendance_completed': att.attendance_completed,
             'face_verified': att.face_verified,
             'is_within_geofence': att.is_within_geofence,
             'trainer_selfie_url': att.trainer_selfie_url,
@@ -261,6 +279,8 @@ class BookingSerializer(serializers.ModelSerializer):
             'check_in_status': att.check_in_status,
             'check_in_method': att.check_in_method,
             'check_in_at': att.check_in_at.isoformat() if att.check_in_at else None,
+            'check_out_at': att.check_out_at.isoformat() if att.check_out_at else None,
+            'attendance_completed': att.attendance_completed,
             'face_verified': att.face_verified,
             'is_within_geofence': att.is_within_geofence,
             'trainer_selfie_url': att.trainer_selfie_url,

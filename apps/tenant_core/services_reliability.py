@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import uuid
+from decimal import Decimal
 from typing import Any, Callable, Dict, Optional
 from datetime import timedelta
 from django.utils import timezone
@@ -25,7 +26,7 @@ SENSITIVE_KEYS = {
 
 def sanitize_payload(data: Any) -> Any:
     """
-    Recursively strip or mask sensitive keys from audit payloads.
+    Recursively strip or mask sensitive keys from audit payloads and ensure JSON-safe primitives.
     """
     if isinstance(data, dict):
         sanitized = {}
@@ -37,7 +38,14 @@ def sanitize_payload(data: Any) -> Any:
         return sanitized
     elif isinstance(data, list):
         return [sanitize_payload(item) for item in data]
+    elif isinstance(data, Decimal):
+        return float(data)
+    elif isinstance(data, uuid.UUID):
+        return str(data)
+    elif hasattr(data, 'isoformat'):
+        return data.isoformat()
     return data
+
 
 
 def compute_request_hash(data: Any) -> str:
@@ -109,11 +117,13 @@ def execute_idempotent_operation(
                 )
                 return record.response_snapshot or {}
             elif record.status == 'PROCESSING':
-                # Check if expired
-                if record.expires_at and record.expires_at < now:
-                    logger.warning("Idempotency lock expired for key=%s op=%s. Overriding.", idempotency_key, operation_type)
+                # Check if expired or stuck in processing beyond 5 minutes (e.g. server crash during execution)
+                is_stuck = bool(record.updated_at and (now - record.updated_at).total_seconds() > 300)
+                if (record.expires_at and record.expires_at < now) or is_stuck:
+                    logger.warning("Idempotency lock expired or stuck for key=%s op=%s. Overriding.", idempotency_key, operation_type)
                     record.status = 'PROCESSING'
                     record.request_hash = req_hash
+                    record.expires_at = expires_at
                     record.save(using=alias)
                 else:
                     raise IdempotencyConflictError(

@@ -159,6 +159,8 @@ from .views_bookings import (
     MemberAttendanceStateViewSet,
     AttendanceRecordViewSet,
     AccessEventViewSet,
+    AccessControlBulkIngestView,
+    AccessControlSyncPassesView,
 )
 from .views_rewards import (
     ReferralProgramViewSet,
@@ -338,6 +340,10 @@ from .views_wod import WorkoutContentItemViewSet, WorkoutTagViewSet
 router.register(r'wod/content-items', WorkoutContentItemViewSet, basename='wod-content-item')
 router.register(r'wod/tags', WorkoutTagViewSet, basename='wod-tag')
 
+from .views_inventory import ProductViewSet, RetailOrderViewSet
+router.register(r'products', ProductViewSet, basename='product')
+router.register(r'retail-orders', RetailOrderViewSet, basename='retail-order')
+
 app_name = 'tenant_core'
 
 urlpatterns = [
@@ -356,5 +362,7 @@ urlpatterns = [
     path('voice-agent/cancel-trial/', VoiceAgentCancelTrialView.as_view(), name='tenant-voice-agent-cancel-trial'),
     path('voice-agent/callback/', VoiceAgentCallbackView.as_view(), name='tenant-voice-agent-callback'),
     path('voice-agent/call-outcome/', VoiceAgentCallOutcomeView.as_view(), name='tenant-voice-agent-call-outcome'),
+    path('access-control/events/bulk/', AccessControlBulkIngestView.as_view(), name='access-control-bulk-ingest'),
+    path('access-control/sync/', AccessControlSyncPassesView.as_view(), name='access-control-sync-passes'),
     path('', include(router.urls)),
 ]

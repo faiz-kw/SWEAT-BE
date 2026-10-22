@@ -71,6 +71,7 @@ if not member_user:
         )
 
 # 3. Reset password for ALL Tenant Users in 'sweat'
+from apps.master.services_auth_directory import compute_lookup_hash, normalize_identifier
 tenant_users = list(TenantUser.objects.using(alias).all())
 print(f"\nResetting passwords for {len(tenant_users)} Tenant Users in '{t.name}'...")
 for u in tenant_users:
@@ -78,22 +79,84 @@ for u in tenant_users:
     u.status = 'ACTIVE'
     u.is_login_allowed = True
     u.save(using=alias)
-    sync_tenant_user_identity(u, tenant_id=t.id, db=alias)
+    
+    # Align identity record
+    if u.email:
+        h = compute_lookup_hash(normalize_identifier(u.email))
+        ai = AuthenticationIdentity.objects.using('default').filter(lookup_hash=h, account_type='TENANT', tenant_id=t.id).first()
+        if ai:
+            ai.subject_id = u.id
+            ai.status = 'ACTIVE'
+            ai.save(using='default')
+        else:
+            try:
+                sync_tenant_user_identity(u, tenant_id=t.id, db=alias)
+            except Exception as e:
+                print(f"  [WARN] identity sync error for {u.email}: {e}")
     
     # Test that check_password works
     pw_ok = u.check_password(NEW_PASSWORD)
     print(f"  [OK] {u.email.ljust(26)} ({u.user_type}) -> Password Verified: {pw_ok}")
 
-# 4. Reset password for Platform Superadmin Users (Master DB)
-platform_users = list(PlatformUser.objects.using('default').all())
-print(f"\nResetting passwords for {len(platform_users)} Platform Users in Master DB...")
-for pu in platform_users:
-    pu.set_password(NEW_PASSWORD)
+# 4. Configure Super Admin & Tenant Admin with requested credentials: admin / 123
+SUPERADMIN_PW = '123'
+print(f"\nSetting Super Admin credentials: Username 'admin', Password '{SUPERADMIN_PW}'...")
+
+# Master DB: Platform Super Admin
+pu = PlatformUser.objects.using('default').filter(email='admin.local@platform.local').first() or PlatformUser.objects.using('default').filter(username='admin').first()
+if pu:
+    pu.username = 'admin'
+    pu.set_password(SUPERADMIN_PW)
     pu.status = 'ACTIVE'
     pu.is_active = True
+    pu.is_staff = True
+    pu.is_superuser = True
     pu.save(using='default')
-    sync_platform_user_identity(pu)
-    pw_ok = pu.check_password(NEW_PASSWORD)
-    print(f"  [OK] {pu.email.ljust(30)} (Platform Superadmin) -> Password Verified: {pw_ok}")
+    for ident_val in ['admin', pu.email]:
+        h = compute_lookup_hash(normalize_identifier(ident_val))
+        ai = AuthenticationIdentity.objects.using('default').filter(lookup_hash=h, account_type='PLATFORM', tenant_id=None).first()
+        if not ai:
+            ai = AuthenticationIdentity(lookup_hash=h, account_type='PLATFORM', identifier=ident_val, subject_id=pu.id, status='ACTIVE', identifier_type='USERNAME')
+        ai.subject_id = pu.id
+        ai.status = 'ACTIVE'
+        ai.save(using='default')
+    print(f"  [OK] Platform Superadmin '{pu.username}' / '{pu.email}' -> Password '123' Verified: {pu.check_password(SUPERADMIN_PW)}")
 
-print(f"\n=== ALL PASSWORDS SUCCESSFULLY RESET TO: {NEW_PASSWORD} ===")
+# Also set Master DB admin@sweat.com if exists
+pu_sweat = PlatformUser.objects.using('default').filter(email='admin@sweat.com').first()
+if pu_sweat:
+    pu_sweat.set_password(SUPERADMIN_PW)
+    pu_sweat.is_superuser = True
+    pu_sweat.is_staff = True
+    pu_sweat.save(using='default')
+    h = compute_lookup_hash(normalize_identifier(pu_sweat.email))
+    ai = AuthenticationIdentity.objects.using('default').filter(lookup_hash=h, account_type='PLATFORM', tenant_id=None).first()
+    if not ai:
+        ai = AuthenticationIdentity(lookup_hash=h, account_type='PLATFORM', identifier=pu_sweat.email, subject_id=pu_sweat.id, status='ACTIVE', identifier_type='EMAIL')
+    ai.subject_id = pu_sweat.id
+    ai.status = 'ACTIVE'
+    ai.save(using='default')
+    print(f"  [OK] Platform User '{pu_sweat.email}' -> Password '123' Verified: {pu_sweat.check_password(SUPERADMIN_PW)}")
+
+# Tenant DB: admin@sweat.com
+tu_admin = TenantUser.objects.using(alias).filter(email='admin@sweat.com').first()
+if tu_admin:
+    tu_admin.username = 'admin'
+    tu_admin.set_password(SUPERADMIN_PW)
+    tu_admin.status = 'ACTIVE'
+    tu_admin.is_login_allowed = True
+    tu_admin.save(using=alias)
+    for ident_val in ['admin', 'admin@sweat.com']:
+        h = compute_lookup_hash(normalize_identifier(ident_val))
+        ai = AuthenticationIdentity.objects.using('default').filter(lookup_hash=h, account_type='TENANT', tenant_id=t.id).first()
+        if not ai:
+            ai = AuthenticationIdentity(lookup_hash=h, account_type='TENANT', tenant_id=t.id, identifier=ident_val, subject_id=tu_admin.id, status='ACTIVE', identifier_type='USERNAME')
+        ai.subject_id = tu_admin.id
+        ai.status = 'ACTIVE'
+        ai.save(using='default')
+    print(f"  [OK] Tenant Admin '{tu_admin.email}' (username '{tu_admin.username}') -> Password '123' Verified: {tu_admin.check_password(SUPERADMIN_PW)}")
+
+print(f"\n=== CREDENTIALS CONFIGURED ===")
+print("Super Admin / Django Admin: admin / 123")
+print("SWEAT Tenant Admin: admin (or admin@sweat.com) / 123 (Org Code: sweat)")
+

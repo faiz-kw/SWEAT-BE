@@ -991,3 +991,15 @@ admin.site.register(PrivacyRequest, TenantModelAdmin)
 admin.site.register(Integration, TenantModelAdmin)
 admin.site.register(LegacyEntityMap, TenantModelAdmin)
 admin.site.register(PackageBranchAvailability, TenantModelAdmin)
+
+from .models_inventory import Product
+
+@admin.register(Product)
+class ProductAdmin(TenantModelAdmin):
+    list_display = ['name', 'category', 'product_type', 'sku', 'price', 'cost_price', 'stock_quantity', 'status', 'is_active', 'created_at']
+    list_filter = ['category', 'product_type', 'status', 'is_active', 'branch']
+    search_fields = ['name', 'sku', 'description']
+    list_select_related = ['organization', 'branch']
+    readonly_fields = ['id', 'created_at', 'updated_at']
+    list_per_page = 25
+

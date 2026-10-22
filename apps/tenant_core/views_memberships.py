@@ -631,9 +631,17 @@ class MembershipViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Drawn digital signature verification
+        # Drawn digital signature verification (supports uploaded file or base64)
+        uploaded_sig = request.FILES.get('signature') or request.FILES.get('signature_file') or request.FILES.get('signature_data')
         signature_data = request.data.get('signature_data') or request.data.get('signature')
-        if not signature_data or not str(signature_data).startswith('data:image/') or len(str(signature_data)) < 100:
+        has_valid_signature = bool(uploaded_sig) or (
+            bool(signature_data) and (
+                str(signature_data).startswith('data:image/') or
+                str(signature_data).startswith('/media/') or
+                len(str(signature_data)) >= 100
+            )
+        )
+        if not has_valid_signature:
             return Response(
                 {'detail': 'A valid drawn digital signature is required. Typed names or empty signatures are not accepted.'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -641,6 +649,12 @@ class MembershipViewSet(viewsets.ModelViewSet):
 
         # Validate answers
         raw_answers = request.data.get('answers', [])
+        if isinstance(raw_answers, str):
+            try:
+                import json
+                raw_answers = json.loads(raw_answers)
+            except Exception:
+                pass
         if not isinstance(raw_answers, list):
             return Response({'detail': 'Answers must be provided as a list.'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -702,6 +716,10 @@ class MembershipViewSet(viewsets.ModelViewSet):
             signer_user_agent = request.META.get('HTTP_USER_AGENT', '')
             signer_identity = getattr(user, 'email', '') or getattr(user, 'username', 'Member')
 
+            from .services_storage import save_compressed_signature
+            sig_input = uploaded_sig if uploaded_sig else signature_data
+            stored_signature = save_compressed_signature(sig_input, tenant_slug=alias)
+
             submission = IntakeSubmission.objects.using(alias).create(
                 intake_form=form,
                 user_profile=user_profile,
@@ -729,7 +747,7 @@ class MembershipViewSet(viewsets.ModelViewSet):
                     'submission_type': 'REVISION' if parq_decision == 'EDIT' else ('NEW_ASSESSMENT' if parq_decision == 'NEW' else 'INITIAL'),
                     'parq_decision': parq_decision or 'INITIAL',
                 },
-                signature_data=signature_data,
+                signature_data=stored_signature,
                 signature_date=now_dt,
                 signer_identity=signer_identity,
                 signer_ip=signer_ip,

@@ -20,6 +20,7 @@ class OrderItemSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'order', 'item_type', 'package', 'package_version',
             'package_price', 'class_template', 'class_price', 'appointment_type',
+            'product', 'sku_snapshot',
             'item_name_snapshot', 'quantity', 'unit_price_snapshot',
             'tax_percent_snapshot', 'discount_amount', 'tax_amount',
             'total_amount', 'created_at', 'updated_at',
@@ -157,19 +158,27 @@ class OrderSerializer(serializers.ModelSerializer):
     paid_amount = serializers.SerializerMethodField()
     outstanding_balance = serializers.SerializerMethodField()
     item_summary = serializers.SerializerMethodField()
+    fulfilled_by_name = serializers.SerializerMethodField()
 
     class Meta:
         model = Order
         fields = [
             'id', 'order_number', 'lead', 'lead_name', 'user_profile',
             'member_name', 'branch', 'branch_name', 'sold_by_user',
-            'order_type', 'status', 'subtotal', 'discount_amount',
+            'order_type', 'status', 'fulfillment_status', 'fulfilled_at',
+            'fulfilled_by_user', 'fulfilled_by_name',
+            'subtotal', 'discount_amount',
             'reward_amount', 'tax_amount', 'total_amount', 'currency',
             'paid_amount', 'outstanding_balance', 'item_summary',
             'source', 'notes', 'items', 'payments', 'invoices',
             'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'order_number', 'created_at', 'updated_at']
+
+    def get_fulfilled_by_name(self, obj):
+        if obj.fulfilled_by_user:
+            return getattr(obj.fulfilled_by_user, 'display_name', '') or obj.fulfilled_by_user.email
+        return ''
 
     def get_member_name(self, obj):
         if obj.user_profile:

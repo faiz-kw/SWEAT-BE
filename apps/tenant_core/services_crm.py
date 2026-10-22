@@ -224,6 +224,7 @@ class CRMLeadService:
         actor_user: Optional[TenantUser] = None,
         extra_fields: Optional[Dict[str, Any]] = None,
         attribution_data: Optional[Dict[str, Any]] = None,
+        deduplicate: bool = True,
         db_alias: Optional[str] = None,
     ) -> Lead:
         alias = db_alias or get_tenant_db_alias() or 'default'
@@ -237,6 +238,192 @@ class CRMLeadService:
             pan_number = extra.pop('pan_number', None)
             attribution_from_extra = extra.pop('attribution', None)
             assignment_mode = extra.pop('assignment_mode', None)
+
+            if email:
+                email = validate_lead_email(email, required=False)
+            if phone:
+                phone = validate_lead_phone(phone, required=False)
+
+            # --- LEAD DEDUPLICATION ON INTAKE START ---
+            # Rule: When an existing phone number or email submits a new inquiry, do NOT create a new row in Leads;
+            # instead, update the existing Lead and log a new activity/touchpoint in their timeline.
+            existing_lead = None
+            if deduplicate and (phone or email):
+                contact_q = Q()
+                if phone:
+                    contact_q |= Q(phone_normalized=phone)
+                    clean_digits = re.sub(r'\D', '', str(phone))
+                    if len(clean_digits) == 10:
+                        contact_q |= Q(phone_normalized=f"+91{clean_digits}") | Q(phone_normalized=clean_digits)
+                if email:
+                    contact_q |= Q(email_normalized__iexact=email)
+
+                existing_lead = (
+                    Lead.objects.using(alias)
+                    .filter(organization=organization)
+                    .filter(contact_q)
+                    .order_by('-created_at')
+                    .first()
+                )
+
+            if existing_lead:
+                existing_lead.is_duplicate_intake = True
+                update_fields = set()
+
+                if not existing_lead.last_name and last_name:
+                    existing_lead.last_name = last_name
+                    update_fields.add('last_name')
+
+                source_label = (
+                    getattr(lead_source, 'name', None)
+                    or getattr(lead_source, 'code', None)
+                    or (attribution_data.get('platform') if attribution_data else None)
+                    or 'Direct Inquiry'
+                )
+                existing_lead.latest_touch_source = source_label
+                update_fields.add('latest_touch_source')
+
+                if not existing_lead.first_touch_source:
+                    existing_lead.first_touch_source = source_label
+                    update_fields.add('first_touch_source')
+
+                camp_ref = None
+                if attribution_data:
+                    camp_ref = attribution_data.get('campaign_name') or attribution_data.get('campaign_id')
+                if not camp_ref and extra.get('campaign_reference'):
+                    camp_ref = extra.get('campaign_reference')
+                if camp_ref:
+                    existing_lead.campaign_reference = str(camp_ref)[:200]
+                    update_fields.add('campaign_reference')
+
+                if extra.get('interested_program') and not existing_lead.interested_program_id:
+                    existing_lead.interested_program = extra['interested_program']
+                    update_fields.add('interested_program')
+
+                if extra.get('fitness_goal') and not existing_lead.fitness_goal:
+                    existing_lead.fitness_goal = extra['fitness_goal']
+                    update_fields.add('fitness_goal')
+
+                if not existing_lead.branch_id and branch:
+                    existing_lead.branch = branch
+                    update_fields.add('branch')
+
+                if phone and not existing_lead.phone_normalized:
+                    existing_lead.phone_normalized = phone
+                    update_fields.add('phone_normalized')
+                if email and not existing_lead.email_normalized:
+                    existing_lead.email_normalized = email
+                    update_fields.add('email_normalized')
+
+                # Re-activate lost or not interested leads on repeat inquiry
+                if existing_lead.current_status in ('LOST', 'NOT_INTERESTED'):
+                    old_status = existing_lead.current_status
+                    existing_lead.current_status = 'INTERESTED'
+                    update_fields.add('current_status')
+                    LeadStatusHistory.objects.using(alias).create(
+                        lead=existing_lead,
+                        from_status=old_status,
+                        to_status='INTERESTED',
+                        reason_code='REPEAT_INQUIRY_REACTIVATION',
+                        reason_text='Lead re-engaged via repeat inquiry submission',
+                        changed_by_user=actor_user,
+                    )
+
+                if update_fields:
+                    update_fields.add('updated_at')
+                    existing_lead.save(using=alias, update_fields=list(update_fields))
+                else:
+                    existing_lead.save(using=alias, update_fields=['updated_at'])
+
+                if billing_name or gst_number or pan_number:
+                    cp, created_cp = LeadCommercialProfile.objects.using(alias).get_or_create(
+                        lead=existing_lead,
+                        defaults={
+                            'billing_name': billing_name,
+                            'gst_number': gst_number,
+                            'pan_number': pan_number,
+                        }
+                    )
+                    if not created_cp:
+                        cp_changed = False
+                        if billing_name and not cp.billing_name:
+                            cp.billing_name = billing_name
+                            cp_changed = True
+                        if gst_number and not cp.gst_number:
+                            cp.gst_number = gst_number
+                            cp_changed = True
+                        if pan_number and not cp.pan_number:
+                            cp.pan_number = pan_number
+                            cp_changed = True
+                        if cp_changed:
+                            cp.save(using=alias)
+
+                notes_parts = [f"Repeat inquiry received via {source_label}."]
+                if extra.get('fitness_goal'):
+                    notes_parts.append(f"Goal: {extra.get('fitness_goal')}")
+                if extra.get('interested_program'):
+                    prog_name = getattr(extra.get('interested_program'), 'name', str(extra.get('interested_program')))
+                    notes_parts.append(f"Program: {prog_name}")
+                if camp_ref:
+                    notes_parts.append(f"Campaign: {camp_ref}")
+
+                cls.record_lead_activity(
+                    lead=existing_lead,
+                    activity_type='OTHER',
+                    outcome='Repeat Inquiry',
+                    notes=' | '.join(notes_parts),
+                    performed_by_user=actor_user,
+                    activity_at=timezone.now(),
+                    external_reference=attribution_data.get('external_lead_id') if attribution_data else None,
+                    actor_user=actor_user,
+                    db_alias=alias,
+                )
+
+                attr_payload = attribution_data or attribution_from_extra
+                if attr_payload and isinstance(attr_payload, dict):
+                    has_meaningful_data = any(
+                        bool(str(v).strip()) for k, v in attr_payload.items()
+                        if k not in ('touch_type', 'raw_metadata') and v is not None
+                    )
+                    if has_meaningful_data:
+                        payload_copy = dict(attr_payload)
+                        payload_copy.setdefault('touch_type', 'ASSISTED_TOUCH')
+                        cls.record_lead_attribution(
+                            lead=existing_lead,
+                            attribution_data=payload_copy,
+                            actor_user=actor_user,
+                            db_alias=alias,
+                        )
+
+                record_business_audit(
+                    organization=organization,
+                    branch=existing_lead.branch,
+                    actor_type='EMPLOYEE' if actor_user else 'SYSTEM',
+                    actor_user=actor_user,
+                    module='crm',
+                    action_code='LEAD_REPEAT_INQUIRY',
+                    entity_type='Lead',
+                    entity_id=existing_lead.id,
+                    event_description=f"Repeat inquiry logged for lead {existing_lead.first_name} {existing_lead.last_name}",
+                    after_data={'lead_id': str(existing_lead.id), 'status': existing_lead.current_status, 'source': source_label},
+                    db_alias=alias,
+                )
+
+                enqueue_outbox_event(
+                    organization=organization,
+                    event_type='LEAD_REPEAT_INQUIRY',
+                    aggregate_type='Lead',
+                    aggregate_id=existing_lead.id,
+                    payload={
+                        'lead_id': str(existing_lead.id),
+                        'branch_id': str(existing_lead.branch_id) if existing_lead.branch_id else None,
+                        'is_duplicate': True,
+                    },
+                    db_alias=alias,
+                )
+
+                return existing_lead
+            # --- LEAD DEDUPLICATION ON INTAKE END ---
 
             from .models_crm import CRMAgentAssignmentConfig
             from .services_lead_assignment import (
@@ -303,11 +490,6 @@ class CRMLeadService:
                 assigned_sales_user = None
                 assignment_source = 'MANUAL'
                 assignment_reason = 'Created unassigned (Manual assignment required)'
-
-            if email:
-                email = validate_lead_email(email, required=False)
-            if phone:
-                phone = validate_lead_phone(phone, required=False)
 
             lead = Lead.objects.using(alias).create(
                 organization=organization,
@@ -752,6 +934,17 @@ class CRMLeadService:
                 })
 
         # 6. Activities
+        # Pre-lookup latest CallSession for the lead to attach recording and transcript to call activities
+        lead_latest_cs = None
+        has_call_sessions = False
+        try:
+            from .models_crm import CallSession
+            call_sessions_qs = CallSession.objects.using(alias).filter(lead=lead)
+            has_call_sessions = call_sessions_qs.exists()
+            lead_latest_cs = call_sessions_qs.order_by('-started_at').first()
+        except Exception:
+            pass
+
         for act in LeadActivity.objects.using(alias).filter(lead=lead).select_related('performed_by_user'):
             act_user = f"{act.performed_by_user.first_name} {act.performed_by_user.last_name}".strip() if act.performed_by_user else 'Staff'
             ev_type = 'LEAD_ACTIVITY'
@@ -760,8 +953,34 @@ class CRMLeadService:
                 or (act.notes and 'Reminder Call' in act.notes)
                 or act.activity_type == 'REMINDER_CALL'
             )
-            if is_reminder_act:
+            is_call_act = (
+                act.activity_type == 'CALL'
+                or (act.outcome and 'call' in act.outcome.lower())
+                or (act.notes and 'call' in act.notes.lower() and 'summary' in act.notes.lower())
+            )
+            if is_reminder_act and not has_call_sessions:
                 ev_type = 'REMINDER_CALL'
+            elif is_call_act and not has_call_sessions:
+                ev_type = 'VOICE_CALL'
+
+            act_metadata = {
+                'activity_type': act.activity_type,
+                'outcome': act.outcome,
+                'notes': act.notes,
+                'is_reminder': is_reminder_act,
+            }
+            # Only attach audio card metadata to generic LeadActivity if no CallSession exists,
+            # preventing duplicate audio players on the unified timeline.
+            if is_call_act and lead_latest_cs and not has_call_sessions:
+                cs_meta = lead_latest_cs.metadata if isinstance(lead_latest_cs.metadata, dict) else {}
+                act_metadata.update({
+                    'call_session_id': str(lead_latest_cs.id),
+                    'recording_url': cs_meta.get('recording_url') or f"/api/v1/voice-agent/recordings/{lead_latest_cs.id}/audio/",
+                    'duration_seconds': lead_latest_cs.duration_seconds,
+                    'transcript': lead_latest_cs.transcript or act.notes,
+                    'disposition': cs_meta.get('disposition') or 'CALL_COMPLETED',
+                })
+
             events.append({
                 'id': f"act-{act.id}",
                 'event_type': ev_type,
@@ -770,7 +989,7 @@ class CRMLeadService:
                 'description': act.outcome or act.notes or '',
                 'actor': act_user,
                 'channel': act.activity_type,
-                'metadata': {'activity_type': act.activity_type, 'outcome': act.outcome, 'notes': act.notes, 'is_reminder': is_reminder_act},
+                'metadata': act_metadata,
             })
 
         # 7. Notes
@@ -853,6 +1072,7 @@ class CRMLeadService:
         try:
             with transaction.atomic(using=alias):
                 call_sessions = list(CallSession.objects.using(alias).filter(lead=lead))
+            has_trial_booking = TrialBooking.objects.using(alias).filter(lead=lead).exists()
             for cs in call_sessions:
                 status_label = cs.status.replace('_', ' ').title()
                 call_meta = cs.metadata if isinstance(cs.metadata, dict) else {}
@@ -860,15 +1080,51 @@ class CRMLeadService:
                 is_reminder = 'REMINDER' in call_type or 'reminder' in str(call_meta).lower()
                 title = f"AI Reminder Call: {status_label}" if is_reminder else f"AI Call: {status_label}"
                 ev_type = 'REMINDER_CALL' if is_reminder else 'VOICE_CALL'
+                raw_transcript = cs.transcript or ""
+                call_summary = ""
+                disp = str(call_meta.get('disposition') or '').strip()
+                if isinstance(raw_transcript, str) and "Call Summary:" in raw_transcript:
+                    for line in raw_transcript.splitlines():
+                        if line.startswith("Call Summary:"):
+                            call_summary = line.replace("Call Summary:", "").strip()
+                        elif line.startswith("Disposition:") and not disp:
+                            disp = line.replace("Disposition:", "").strip()
+
+                # Determine accurate disposition
+                if has_trial_booking:
+                    disp = 'TRIAL_BOOKED'
+                elif not disp or disp == 'TRIAL_BOOKED':
+                    if cs.status in ('NO_ANSWER', 'MISSED', 'UNANSWERED'):
+                        disp = 'NO_ANSWER'
+                    elif cs.status == 'BUSY':
+                        disp = 'BUSY'
+                    elif cs.status in ('FAILED', 'REJECTED'):
+                        disp = 'CALL_FAILED'
+                    elif cs.duration_seconds and cs.duration_seconds < 25:
+                        disp = 'DISCONNECTED_EARLY'
+                    elif cs.status == 'COMPLETED':
+                        disp = 'CALL_COMPLETED'
+                    else:
+                        disp = cs.status
+
+                is_unanswered = cs.status in ('NO_ANSWER', 'MISSED', 'UNANSWERED', 'BUSY', 'FAILED', 'REJECTED')
+                rec_url = call_meta.get('recording_url') or call_meta.get('audio_url') or call_meta.get('recording')
+                if not rec_url and not is_unanswered and cs.status == 'COMPLETED':
+                    rec_url = f"/api/v1/voice-agent/recordings/{cs.id}/audio/"
+
+                desc = call_summary or (
+                    (f"Duration: {int(cs.duration_seconds)}s • Provider: {cs.provider}" + (
+                        f" • Turns: {len(cs.transcript)}" if isinstance(cs.transcript, list) else ""
+                    )) if not is_unanswered else f"Call outcome: {status_label}. No answer from recipient."
+                )
+
                 events.append({
                     'id': f"call-{cs.id}",
                     'event_type': ev_type,
                     'occurred_at': (cs.started_at or cs.created_at).isoformat(),
                     'title': title,
-                    'description': f"Duration: {int(cs.duration_seconds)}s • Provider: {cs.provider}" + (
-                        f" • Turns: {len(cs.transcript)}" if cs.transcript else ""
-                    ),
-                    'actor': f"{cs.provider.title()} Voice Agent",
+                    'description': desc,
+                    'actor': f"{cs.provider.title()} Voice Agent (Mahek)",
                     'channel': 'VOICE',
                     'metadata': {
                         'call_session_id': str(cs.id),
@@ -876,7 +1132,11 @@ class CRMLeadService:
                         'status': cs.status,
                         'direction': cs.direction,
                         'duration_seconds': cs.duration_seconds,
+                        'duration_formatted': f"{int(cs.duration_seconds // 60)}m {int(cs.duration_seconds % 60)}s" if cs.duration_seconds else "--",
+                        'recording_url': rec_url,
                         'transcript': cs.transcript,
+                        'disposition': disp,
+                        'call_summary': call_summary,
                         'final_agent_variables': cs.final_agent_variables,
                         'started_at': cs.started_at.isoformat() if cs.started_at else None,
                         'ended_at': cs.ended_at.isoformat() if cs.ended_at else None,
@@ -2446,11 +2706,15 @@ class CRMLeadService:
                 mins = val * 60 if unit == 'HOURS' else val * 1440 if unit == 'DAYS' else val
                 target_dt = trial.scheduled_start - timedelta(minutes=mins)
                 is_past = now >= target_dt
+                booking_time = trial.created_at or now
+                is_suppressed_last_minute = target_dt < booking_time
 
                 if is_superseded:
                     point_status = 'CANCELLED' if trial.status == 'CANCELLED' else 'SUPERSEDED'
                 elif is_concluded:
                     point_status = 'PAST' if is_past else 'CANCELLED'
+                elif is_suppressed_last_minute:
+                    point_status = 'SKIPPED_LAST_MINUTE'
                 else:
                     point_status = 'PAST' if is_past else 'PENDING'
 
@@ -2462,6 +2726,31 @@ class CRMLeadService:
                     'channel': ch,
                     'scheduled_at': target_dt.isoformat(),
                     'status': point_status,
+                })
+
+            # AI Voice Agent Reminder point
+            if getattr(policy, 'ai_calling_enabled', False):
+                voice_offset = getattr(policy, 'ai_calling_offset_minutes', 1440) or 1440
+                voice_dt = trial.scheduled_start - timedelta(minutes=voice_offset)
+                is_past_v = now >= voice_dt
+                booking_time = trial.created_at or now
+                if voice_dt < booking_time:
+                    v_status = 'SKIPPED_LAST_MINUTE'
+                elif is_superseded:
+                    v_status = 'CANCELLED'
+                elif is_concluded:
+                    v_status = 'PAST' if is_past_v else 'CANCELLED'
+                else:
+                    v_status = 'PAST' if is_past_v else 'PENDING'
+
+                schedule.append({
+                    'id': f"rem-{trial.id}-ai-voice",
+                    'type': 'AI_VOICE_REMINDER',
+                    'offset_value': voice_offset,
+                    'offset_unit': 'MINUTES',
+                    'channel': 'VOICE',
+                    'scheduled_at': voice_dt.isoformat(),
+                    'status': v_status,
                 })
 
         schedule.sort(key=lambda s: s['scheduled_at'])
@@ -3181,6 +3470,23 @@ class LeadConversionService:
                 if not existing_user.home_branch and branch:
                     existing_user.home_branch = branch
                     user_updated_fields.append('home_branch')
+
+                # Propagate lead's genuine customer name and promote to MEMBER user_type
+                if getattr(existing_user, 'user_type', None) != 'STAFF':
+                    if lead.first_name and existing_user.first_name != lead.first_name:
+                        existing_user.first_name = lead.first_name
+                        user_updated_fields.append('first_name')
+                    if lead.last_name and existing_user.last_name != lead.last_name:
+                        existing_user.last_name = lead.last_name
+                        user_updated_fields.append('last_name')
+                    lead_full = f"{lead.first_name or ''} {lead.last_name or ''}".strip()
+                    if lead_full and existing_user.display_name != lead_full:
+                        existing_user.display_name = lead_full
+                        user_updated_fields.append('display_name')
+                    if existing_user.user_type != 'MEMBER':
+                        existing_user.user_type = 'MEMBER'
+                        user_updated_fields.append('user_type')
+
                 if user_updated_fields:
                     existing_user.save(using=alias, update_fields=user_updated_fields)
 
@@ -3200,14 +3506,26 @@ class LeadConversionService:
                 if not profile.acquisition_source:
                     profile.acquisition_source = 'CRM_CONVERSION'
                     updated_fields.append('acquisition_source')
+                if lead.first_name and profile.first_name_snapshot != lead.first_name:
+                    profile.first_name_snapshot = lead.first_name
+                    updated_fields.append('first_name_snapshot')
+                if lead.last_name and profile.last_name_snapshot != lead.last_name:
+                    profile.last_name_snapshot = lead.last_name
+                    updated_fields.append('last_name_snapshot')
+                if profile.member_type != 'MEMBER':
+                    profile.member_type = 'MEMBER'
+                    updated_fields.append('member_type')
+                if profile.member_status != 'ACTIVE':
+                    profile.member_status = 'ACTIVE'
+                    updated_fields.append('member_status')
                 if updated_fields:
                     profile.save(using=alias, update_fields=updated_fields)
             except UserProfile.DoesNotExist:
                 profile = UserProfile.objects.using(alias).create(
                     user=existing_user,
                     member_number=f"MEM-{uuid.uuid4().hex[:6].upper()}",
-                    first_name_snapshot=existing_user.first_name,
-                    last_name_snapshot=existing_user.last_name,
+                    first_name_snapshot=lead.first_name or existing_user.first_name,
+                    last_name_snapshot=lead.last_name or existing_user.last_name,
                     preferred_branch=branch,
                     joining_date=timezone.now().date(),
                     member_type='MEMBER',

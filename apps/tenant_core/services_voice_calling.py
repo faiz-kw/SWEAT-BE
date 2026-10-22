@@ -203,7 +203,7 @@ class VoiceCallingService:
         return res
 
     @classmethod
-    def _check_calling_hours(cls) -> None:
+    def _check_calling_hours(cls, bypass: bool = False) -> None:
         """
         Enforces outbound voice calling hours in IST (Asia/Kolkata).
 
@@ -212,8 +212,11 @@ class VoiceCallingService:
             VOICE_CALLING_HOURS_START  (int, 0-23, default 9)
             VOICE_CALLING_HOURS_END    (int, 0-23, default 21)
 
-        Bypass in tests/dev with: VOICE_CALLING_ENFORCE_HOURS=false
+        Bypass in tests/dev with: VOICE_CALLING_ENFORCE_HOURS=false or bypass=True
         """
+        if bypass:
+            return
+
         from django.conf import settings
         if not getattr(settings, 'VOICE_CALLING_ENFORCE_HOURS', True):
             return
@@ -245,8 +248,9 @@ class VoiceCallingService:
         """
         alias = db_alias or 'default'
 
-        # 0. Calling hours gate (IST 9am-9pm) — fail closed
-        cls._check_calling_hours()
+        # 0. Calling hours gate (IST 9am-9pm) — fail closed unless bypass explicitly permitted
+        bypass = bool(custom_metadata and custom_metadata.get('bypass_calling_hours'))
+        cls._check_calling_hours(bypass=bypass)
 
         # 1. Check explicit invocation metadata denial
         if custom_metadata and custom_metadata.get('has_voice_consent') is False:
@@ -405,8 +409,8 @@ class VoiceCallingService:
             'name': lead.first_name,
             'phone': recipient_phone,
             'user_phone_number': recipient_phone,
-            'program': lead.interested_program or '',
-            'interested_program': lead.interested_program or '',
+            'program': lead.interested_program.name if getattr(lead, 'interested_program', None) else '',
+            'interested_program': lead.interested_program.name if getattr(lead, 'interested_program', None) else '',
             'branch': lead.branch.name if lead.branch else '',
             'branch_name': lead.branch.name if lead.branch else '',
             'fitness_goal': lead.fitness_goal or '',

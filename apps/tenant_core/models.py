@@ -212,11 +212,13 @@ __all__ += [
 from .models_attendance import (
     AttendanceRecord,
     AccessEvent,
+    AccessPass,
 )
 
 __all__ += [
     'AttendanceRecord',
     'AccessEvent',
+    'AccessPass',
 ]
 
 from .models_referrals import (
@@ -310,6 +312,39 @@ __all__ += [
     'WorkoutTag',
     'WorkoutContentTag',
 ]
+
+from .models_inventory import Product, StockReservation, InventoryMovement
+
+__all__ += [
+    'Product',
+    'StockReservation',
+    'InventoryMovement',
+]
+
+from .models_wellness import (
+    FoodCategory,
+    FoodProvenance,
+    MealType,
+    FoodItem,
+    NutritionTarget,
+    MealLog,
+    MealLogItem,
+    WaterLog,
+    SleepLog,
+)
+
+__all__ += [
+    'FoodCategory',
+    'FoodProvenance',
+    'MealType',
+    'FoodItem',
+    'NutritionTarget',
+    'MealLog',
+    'MealLogItem',
+    'WaterLog',
+    'SleepLog',
+]
+
 
 
 

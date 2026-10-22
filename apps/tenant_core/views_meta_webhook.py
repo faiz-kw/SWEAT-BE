@@ -179,7 +179,11 @@ class MetaLeadWebhookView(APIView):
 
                 try:
                     with tenant_database_context(tenant.id) as alias:
-                        org = Organization.objects.using(alias).filter(status='ACTIVE').order_by('-created_at').first()
+                        org = (
+                            Organization.objects.using(alias).filter(code__icontains=tenant.code, status='ACTIVE').first()
+                            or Organization.objects.using(alias).filter(status='ACTIVE', branches__isnull=False).distinct().first()
+                            or Organization.objects.using(alias).filter(status='ACTIVE').order_by('created_at').first()
+                        )
                         if not org:
                             logger.error("Active organization not found for tenant %s", tenant.slug)
                             continue

@@ -55,9 +55,13 @@ def trigger_automated_sarvam_call_task(self, tenant_id: str, lead_id: str, **kwa
 
             from django.conf import settings
             start_hour = getattr(settings, 'VOICE_CALLING_HOURS_START', 9)
-            end_hour = getattr(settings, 'VOICE_CALLING_HOURS_END', 21)
+            bypass_hours = (
+                kwargs.get('bypass_calling_hours', False)
+                or getattr(settings, 'VOICE_CALLING_BYPASS_HOURS', False)
+                or not getattr(settings, 'VOICE_CALLING_ENFORCE_HOURS', True)
+            )
 
-            if not (start_hour <= current_hour < end_hour):
+            if not bypass_hours and not (start_hour <= current_hour < end_hour):
                 # Outside calling hours: schedule for next morning at start_hour:15 IST
                 if current_hour >= end_hour:
                     next_morning = (now_ist + timedelta(days=1)).replace(hour=start_hour, minute=15, second=0, microsecond=0)
@@ -106,6 +110,7 @@ def trigger_automated_sarvam_call_task(self, tenant_id: str, lead_id: str, **kwa
                 custom_metadata={
                     'source': 'AUTOMATED_LEAD_ACQUISITION',
                     'automated': True,
+                    'bypass_calling_hours': bypass_hours,
                 },
                 db_alias=db_alias,
             )
@@ -148,16 +153,27 @@ def process_trial_voice_reminders_task(self, tenant_id: str = None, **kwargs):
 
     try:
         with tenant_database_context(tenant_id) as db_alias:
-            from apps.tenant_core.models_crm import TrialBooking
+            from apps.tenant_core.models_crm import TrialBooking, CRMTrialReminderPolicy
             from apps.tenant_core.services_voice_calling import VoiceCallingService
 
+            policy = CRMTrialReminderPolicy.objects.using(db_alias).first()
+            if policy and getattr(policy, 'ai_calling_enabled', False) is False:
+                logger.info("AI calling disabled for tenant %s in CRMTrialReminderPolicy. Skipping reminders.", tenant_id)
+                return {'status': 'DISABLED', 'tenant_id': str(tenant_id), 'reason': 'AI voice reminder calling is disabled in trial policy'}
+
+            offset_minutes = getattr(policy, 'ai_calling_offset_minutes', 1440) or 1440
+            skip_confirmed = getattr(policy, 'ai_calling_skip_confirmed', False) or False
+
             now = timezone.now()
-            start_window = now + timedelta(hours=23)
-            end_window = now + timedelta(hours=25)
+            target_time = now + timedelta(minutes=offset_minutes)
+            start_window = target_time - timedelta(minutes=60)
+            end_window = target_time + timedelta(minutes=60)
+
+            status_filters = ['PENDING'] if skip_confirmed else ['CONFIRMED', 'PENDING']
 
             trials = TrialBooking.objects.using(db_alias).filter(
                 status='CONFIRMED',
-                confirmation_status__in=['CONFIRMED', 'PENDING'],
+                confirmation_status__in=status_filters,
                 scheduled_start__gte=start_window,
                 scheduled_start__lte=end_window,
             ).select_related('lead', 'branch', 'lead__organization')

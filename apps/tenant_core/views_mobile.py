@@ -48,6 +48,7 @@ from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 
 from config.routers import set_tenant_db_alias, get_tenant_db_alias
 from apps.master.models_tenant import Tenant
@@ -1994,6 +1995,16 @@ class MobileMyBookingsView(APIView):
         profile = _get_or_create_user_profile(user, alias)
         now = timezone.now()
 
+        # Trigger automatic attendance lifecycle reconciliation
+        try:
+            from .services_bookings import BookingWaitlistAttendanceService
+            BookingWaitlistAttendanceService.reconcile_past_occurrences_attendance(
+                user_profile=profile,
+                db_alias=alias,
+            )
+        except Exception:
+            pass
+
         bookings = (
             Booking.objects.using(alias)
             .filter(user_profile=profile)
@@ -2003,6 +2014,7 @@ class MobileMyBookingsView(APIView):
                 'branch',
             )
             .prefetch_related(
+                'attendance_records',
                 'occurrence__trainer_assignments__trainer_profile__employee_profile__user_profile__user'
             )
             .order_by('-occurrence__start_at')
@@ -2037,11 +2049,22 @@ class MobileMyBookingsView(APIView):
             is_late_cancel = diff_minutes < (cutoff_hours * 60)
             is_past_reschedule_cutoff = diff_minutes < (reschedule_cutoff_hours * 60)
 
+            att_rec = b.attendance_records.first()
+            effective_status = b.status
+            if b.status in ['COMPLETED', 'CONFIRMED']:
+                if att_rec and att_rec.check_in_status == 'SUCCESSFUL':
+                    effective_status = 'LATE' if att_rec.status in ['LATE', 'LATE_ENTRY', 'LATE_SHOW'] else 'ATTENDED'
+                elif occ and occ.end_at and occ.end_at <= now:
+                    effective_status = 'NO_SHOW'
+
             item = {
                 'id': str(b.id),
                 'booking_number': b.booking_number,
                 'occurrence_id': str(occ.id) if occ else None,
-                'status': b.status,
+                'status': effective_status,
+                'attendance_status': att_rec.status if att_rec else effective_status,
+                'check_in_at': att_rec.check_in_at.isoformat() if att_rec and att_rec.check_in_at else None,
+                'check_out_at': att_rec.check_out_at.isoformat() if att_rec and att_rec.check_out_at else None,
                 'payment_status': getattr(b, 'payment_status', 'PAID'),
                 'confirmation_status': getattr(b, 'confirmation_status', 'CONFIRMED'),
                 'booking_type': b.booking_type,
@@ -2241,48 +2264,91 @@ class MobileQRPassView(APIView):
             alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
         profile = _get_or_create_user_profile(user, alias)
 
-        if not booking_id:
-            # General Member Digital Turnstile Access Pass
-            valid_until_ts = int(timezone.now().timestamp()) + 86400
-            pass_data = {
-                'uid': str(user.id),
-                'mno': profile.member_number or 'MEM-1CCA18',
-                'name': f"{user.first_name} {user.last_name}".strip(),
-                'branch': user.home_branch.name if getattr(user, 'home_branch', None) else 'All SWEAT Studios',
-                'type': 'STUDIO_TURNSTILE_ACCESS',
-                'exp': valid_until_ts,
-            }
-            raw_str = json.dumps(pass_data, separators=(',', ':'))
-            sig = hmac.new(settings.SECRET_KEY.encode('utf-8'), raw_str.encode('utf-8'), hashlib.sha256).hexdigest()[:16]
-            token = f"{base64.urlsafe_b64encode(raw_str.encode()).decode().rstrip('=')}.{sig}"
-            return Response({
-                'pass_id': str(uuid.uuid4()),
-                'qr_token': token,
-                'qr_payload': token,
-                'member_name': pass_data['name'],
-                'membership_number': pass_data['mno'],
-                'branch_name': pass_data['branch'],
-                'valid_until': datetime.fromtimestamp(valid_until_ts).isoformat(),
-            })
+        from .services_access_control import (
+            generate_compact_qr_token,
+            generate_booking_qr_token,
+            hash_qr_token,
+        )
+        from .models_attendance import AccessPass
 
-        try:
-            booking = (
+        if not booking_id:
+            now = timezone.now()
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            today_end = today_start + timedelta(days=1)
+            active_booking = (
                 Booking.objects.using(alias)
                 .select_related('occurrence__class_template', 'branch', 'user_profile')
-                .get(id=booking_id)
+                .filter(
+                    user_profile=profile,
+                    status='CONFIRMED',
+                    occurrence__start_at__gte=now - timedelta(hours=2),
+                    occurrence__start_at__lte=today_end,
+                )
+                .order_by('occurrence__start_at')
+                .first()
             )
-        except Booking.DoesNotExist:
-            return Response({'detail': 'Booking not found.'}, status=status.HTTP_404_NOT_FOUND)
+            if not active_booking:
+                active_booking = (
+                    Booking.objects.using(alias)
+                    .select_related('occurrence__class_template', 'branch', 'user_profile')
+                    .filter(
+                        user_profile=profile,
+                        status='CONFIRMED',
+                        occurrence__start_at__gte=today_start,
+                        occurrence__start_at__lte=today_end,
+                    )
+                    .order_by('occurrence__start_at')
+                    .first()
+                )
 
-        if booking.user_profile_id != profile.id:
-            return Response({'detail': 'Access denied.'}, status=status.HTTP_403_FORBIDDEN)
+            if not active_booking:
+                return Response({
+                    'has_booking': False,
+                    'detail': 'No confirmed class booking found for today. Please reserve a class session to generate your turnstile access key.',
+                }, status=status.HTTP_404_NOT_FOUND)
+
+            booking = active_booking
+        else:
+            try:
+                booking = (
+                    Booking.objects.using(alias)
+                    .select_related('occurrence__class_template', 'branch', 'user_profile')
+                    .get(id=booking_id)
+                )
+            except Booking.DoesNotExist:
+                return Response({'detail': 'Booking not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+            if booking.user_profile_id != profile.id:
+                return Response({'detail': 'Access denied.'}, status=status.HTTP_403_FORBIDDEN)
 
         occ = booking.occurrence
-        start_ts = int(occ.start_at.timestamp()) if occ and occ.start_at else int(timezone.now().timestamp())
+        now = timezone.now()
+        start_ts = int(occ.start_at.timestamp()) if occ and occ.start_at else int(now.timestamp())
         # Valid from 60 minutes before class until 60 minutes after class ends
         valid_until_ts = start_ts + 7200
+        valid_from_dt = (occ.start_at - timedelta(minutes=60)) if occ and occ.start_at else now
+        valid_until_dt = (occ.end_at + timedelta(minutes=60)) if (occ and getattr(occ, 'end_at', None)) else (valid_from_dt + timedelta(hours=2))
 
-        # Construct signed payload
+        # Deterministic compact 22-char token bound to booking & SECRET_KEY
+        compact_token = generate_booking_qr_token(booking.id, settings.SECRET_KEY)
+        t_hash = hash_qr_token(compact_token)
+
+        # Upsert active AccessPass bound to this booking
+        pass_obj, _ = AccessPass.objects.using(alias).update_or_create(
+            booking=booking,
+            defaults={
+                'user_profile': profile,
+                'branch': booking.branch,
+                'token_hash': t_hash,
+                'pass_type': 'CLASS_BOOKING',
+                'valid_from': valid_from_dt,
+                'valid_until': valid_until_dt,
+                'status': 'ACTIVE' if booking.status == 'CONFIRMED' else 'CANCELLED',
+                'updated_at': now,
+            }
+        )
+
+        # Construct legacy signed payload for backwards compatibility
         pass_data = {
             'bid': str(booking.id),
             'bno': booking.booking_number,
@@ -2300,15 +2366,23 @@ class MobileQRPassView(APIView):
         token = f"{base64.urlsafe_b64encode(raw_str.encode()).decode().rstrip('=')}.{sig}"
 
         return Response({
-            'qr_token': token,
+            'has_booking': True,
+            'pass_id': str(pass_obj.id),
+            'booking_id': str(booking.id),
             'booking_number': booking.booking_number,
+            'qr_token': compact_token,
+            'compact_token': compact_token,
+            'qr_payload': compact_token,
+            'legacy_signed_token': token,
             'member_name': f"{user.first_name} {user.last_name}".strip(),
             'member_number': profile.member_number,
             'class_name': pass_data['class'],
             'branch_name': pass_data['branch'],
             'start_at': occ.start_at.isoformat() if occ and occ.start_at else None,
             'status': booking.status,
-            'valid_until': datetime.fromtimestamp(valid_until_ts).isoformat(),
+            'valid_from': valid_from_dt.isoformat(),
+            'valid_until': valid_until_dt.isoformat(),
+            'pass_type': 'CLASS_BOOKING',
         })
 
 
@@ -3112,6 +3186,7 @@ class MobileOnboardingSurveyView(APIView):
     Fetches onboarding and PAR-Q questions dynamically from the authoritative IntakeForm definition.
     """
     permission_classes = [AllowAny]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get(self, request):
         alias, _ = _resolve_mobile_tenant_and_db(request)
@@ -3119,8 +3194,14 @@ class MobileOnboardingSurveyView(APIView):
         from .models_crm import IntakeForm, IntakeSubmission, IntakeAnswer
         from .models_workforce import UserProfile
 
-        # Authoritative lookup for active PAR-Q form
-        form = IntakeForm.objects.using(alias).filter(form_type='PAR_Q', status='ACTIVE').order_by('-version_number').first()
+        # Authoritative lookup for active form (supports ?form_type=ONBOARDING or ?form_type=PAR_Q)
+        requested_type = request.query_params.get('form_type') or request.query_params.get('type')
+        if requested_type:
+            form = IntakeForm.objects.using(alias).filter(form_type__iexact=requested_type, status='ACTIVE').order_by('-version_number').first()
+        else:
+            form = IntakeForm.objects.using(alias).filter(form_type='ONBOARDING', status='ACTIVE').order_by('-version_number').first()
+            if not form:
+                form = IntakeForm.objects.using(alias).filter(form_type='PAR_Q', status='ACTIVE').order_by('-version_number').first()
         if not form:
             form = IntakeForm.objects.using(alias).filter(status='ACTIVE').order_by('-version_number').first()
 
@@ -3139,10 +3220,39 @@ class MobileOnboardingSurveyView(APIView):
         if form:
             qs = form.questions.filter(status='ACTIVE').order_by('display_order', 'created_at')
             for q in qs:
-                opts = [
-                    {'label': o.label, 'value': o.value, 'order': o.display_order}
-                    for o in q.options.filter(status='ACTIVE').order_by('display_order')
-                ]
+                opts = []
+                for o in q.options.filter(status='ACTIVE').order_by('display_order'):
+                    opt_item = {
+                        'id': str(o.id),
+                        'label': o.label,
+                        'value': o.value,
+                        'order': o.display_order,
+                    }
+                    if '///' in o.label:
+                        parts = [p.strip() for p in o.label.split('///')]
+                        opt_item['title'] = parts[0]
+                        opt_item['label'] = parts[0]
+                        if len(parts) > 1 and parts[1]:
+                            opt_item['subtitle'] = parts[1]
+                            opt_item['description'] = parts[1]
+                        for extra_part in parts[2:]:
+                            if extra_part.startswith('icon:'):
+                                opt_item['icon'] = extra_part.split(':', 1)[1]
+                            elif extra_part.startswith('img:'):
+                                opt_item['image'] = extra_part.split(':', 1)[1]
+                            elif extra_part.startswith('bars:'):
+                                try:
+                                    opt_item['bars'] = int(extra_part.split(':', 1)[1])
+                                except ValueError:
+                                    opt_item['bars'] = extra_part.split(':', 1)[1]
+                            elif extra_part == 'EXCLUSIVE':
+                                opt_item['is_exclusive'] = True
+                            elif extra_part == 'RECOMMENDED':
+                                opt_item['is_recommended'] = True
+                                opt_item['badge'] = 'RECOMMENDED'
+                            else:
+                                opt_item['badge'] = extra_part
+                    opts.append(opt_item)
                 q_item = {
                     'id': str(q.id),
                     'text': q.question_text,
@@ -3289,8 +3399,10 @@ class MobileOnboardingSubmitView(APIView):
     """
     POST /api/v1/mobile/onboarding/submit/
     Authoritatively saves member onboarding and PAR-Q responses to IntakeSubmission & IntakeAnswer.
+    Accepts application/json and multipart/form-data.
     """
     permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def post(self, request):
         user = request.user
@@ -3302,14 +3414,25 @@ class MobileOnboardingSubmitView(APIView):
         profile = _get_or_create_user_profile(user, alias)
         data = request.data or {}
 
-        # 1. Authoritative active form
-        form = IntakeForm.objects.using(alias).filter(form_type='PAR_Q', status='ACTIVE').order_by('-version_number').first()
+        # 1. Authoritative active form (supports form_type in payload or query params)
+        requested_type = data.get('form_type') or request.query_params.get('form_type')
+        if requested_type:
+            form = IntakeForm.objects.using(alias).filter(form_type__iexact=requested_type, status='ACTIVE').order_by('-version_number').first()
+        else:
+            form = IntakeForm.objects.using(alias).filter(form_type='ONBOARDING', status='ACTIVE').order_by('-version_number').first()
+            if not form:
+                form = IntakeForm.objects.using(alias).filter(form_type='PAR_Q', status='ACTIVE').order_by('-version_number').first()
         if not form:
             form = IntakeForm.objects.using(alias).filter(status='ACTIVE').order_by('-version_number').first()
 
         now = timezone.now()
-        signature_data = data.get('signature_data') or ''
+
+        # Support both multipart file upload (request.FILES) and base64 string (request.data)
+        uploaded_sig = request.FILES.get('signature') or request.FILES.get('signature_file') or request.FILES.get('signature_data')
+        signature_data = data.get('signature_data') or data.get('signature') or ''
         agreement_accepted = data.get('agreement_accepted', True)
+        if isinstance(agreement_accepted, str):
+            agreement_accepted = agreement_accepted.lower() in ('true', '1', 't', 'yes')
 
         # Check existing submissions for lifecycle & revision decision
         prior_subs = IntakeSubmission.objects.using(alias).filter(user_profile=profile).order_by('-submitted_at')
@@ -3351,11 +3474,19 @@ class MobileOnboardingSubmitView(APIView):
                 'is_reused': True,
             }, status=status.HTTP_200_OK)
 
+        has_valid_signature = bool(uploaded_sig) or (
+            bool(signature_data) and (
+                str(signature_data).startswith('data:image/') or
+                str(signature_data).startswith('/media/') or
+                len(str(signature_data)) >= 100
+            )
+        )
+
         # OPTION B: EDIT EXISTING PAR-Q (Create audited revision with new signature)
         if parq_decision == 'EDIT' or allow_revision:
             is_edit = True
             rev_num = prior_count + 1
-            if not signature_data or len(str(signature_data)) < 100 or not str(signature_data).startswith('data:image/'):
+            if not has_valid_signature:
                 return Response({
                     'detail': 'A newly drawn digital signature is required when creating a revised PAR-Q assessment.',
                     'code': 'NEW_SIGNATURE_REQUIRED',
@@ -3365,7 +3496,7 @@ class MobileOnboardingSubmitView(APIView):
         elif parq_decision == 'NEW':
             is_edit = False
             rev_num = prior_count + 1
-            if not signature_data or len(str(signature_data)) < 100 or not str(signature_data).startswith('data:image/'):
+            if not has_valid_signature:
                 return Response({
                     'detail': 'A newly drawn digital signature is required when completing a new PAR-Q assessment.',
                     'code': 'SIGNATURE_REQUIRED',
@@ -3375,7 +3506,7 @@ class MobileOnboardingSubmitView(APIView):
         else:
             is_edit = False
             rev_num = 1
-            if not signature_data or len(str(signature_data)) < 100 or not str(signature_data).startswith('data:image/'):
+            if not has_valid_signature:
                 return Response({
                     'detail': 'A valid drawn digital signature is required to complete the health assessment.',
                     'code': 'SIGNATURE_REQUIRED',
@@ -3392,7 +3523,11 @@ class MobileOnboardingSubmitView(APIView):
             'parq_decision': parq_decision or ('INITIAL' if prior_count == 0 else 'EDIT'),
         }
 
-        # 2. Persist authoritative IntakeSubmission
+        # 2. Persist authoritative IntakeSubmission (compress signature to disk if file/Base64)
+        from .services_storage import save_compressed_signature
+        sig_input = uploaded_sig if uploaded_sig else (signature_data if signature_data else None)
+        stored_signature = save_compressed_signature(sig_input, tenant_slug=alias) if sig_input else None
+
         submission = IntakeSubmission(
             intake_form=form,
             user_profile=profile,
@@ -3402,8 +3537,8 @@ class MobileOnboardingSubmitView(APIView):
             agreement_text_snapshot=form.agreement_text if form else '',
             form_snapshot={'name': form.name, 'version': form.version_number} if form else {},
             metadata=meta_info,
-            signature_data=signature_data if signature_data else None,
-            signature_date=now if signature_data else None,
+            signature_data=stored_signature,
+            signature_date=now if sig_input else None,
             signer_identity=f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip() or user.email,
             signer_ip=request.META.get('REMOTE_ADDR'),
             signer_user_agent=request.META.get('HTTP_USER_AGENT', '')[:500],
@@ -3414,6 +3549,11 @@ class MobileOnboardingSubmitView(APIView):
 
         # 3. Save answers with full question snapshots & revision carryover
         answers_dict = data.get('answers') or data.get('par_q') or data.get('responses') or data
+        if isinstance(answers_dict, str):
+            try:
+                answers_dict = json.loads(answers_dict)
+            except Exception:
+                pass
         snapshot_questions = []
 
         if form:
@@ -4300,8 +4440,10 @@ class MobileMembershipRenewView(APIView):
             sig_data = request.data.get('signature_data')
             if sig_data or answers:
                 from .models_crm import IntakeForm
+                from .services_storage import save_compressed_signature
                 form = active_m.parq_form or IntakeForm.objects.using(alias).filter(status='ACTIVE', form_type__in=['PAR_Q', 'PARQ']).order_by('-version_number').first()
                 if form:
+                    stored_sig = save_compressed_signature(sig_data, tenant_slug=alias) if sig_data else ''
                     new_sub = IntakeSubmission.objects.using(alias).create(
                         organization=branch.organization if branch else None,
                         intake_form=form,
@@ -4310,7 +4452,7 @@ class MobileMembershipRenewView(APIView):
                         channel='MEMBER_PORTAL',
                         status='COMPLETED',
                         is_cleared=True,
-                        signature_data=sig_data or '',
+                        signature_data=stored_sig,
                         signed_at=timezone.now(),
                     )
                     parq_submission_id = str(new_sub.id)

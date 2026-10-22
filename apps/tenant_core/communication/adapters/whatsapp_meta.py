@@ -22,6 +22,9 @@ class MetaWhatsAppAdapter(BaseCommunicationAdapter):
     capabilities = ['OUTBOUND', 'INBOUND_WEBHOOK', 'TEMPLATES', 'DELIVERY_RECEIPTS', 'READ_RECEIPTS']
 
     def is_configured(self) -> bool:
+        from django.conf import settings
+        if self.config.get('sandbox') or getattr(settings, 'WHATSAPP_SANDBOX_MODE', False) or self.credentials.get('api_token') in ('sandbox', 'dev'):
+            return True
         access_token = self.credentials.get('access_token') or self.credentials.get('api_token')
         phone_number_id = self.config.get('phone_number_id')
         return bool(access_token and phone_number_id)
@@ -42,6 +45,17 @@ class MetaWhatsAppAdapter(BaseCommunicationAdapter):
                 status='FAILED',
                 error_code='UNCONFIGURED_PROVIDER',
                 error_message='Meta WhatsApp credentials or phone_number_id not configured for this tenant.',
+            )
+
+        from django.conf import settings
+        if self.config.get('sandbox') or getattr(settings, 'WHATSAPP_SANDBOX_MODE', False) or self.credentials.get('api_token') in ('sandbox', 'dev'):
+            import uuid
+            msg_id = f"wamid.sandbox.{uuid.uuid4().hex[:12]}"
+            return ProviderSendResult(
+                success=True,
+                provider_message_id=msg_id,
+                status='DELIVERED',
+                raw_response={'messaging_product': 'whatsapp', 'messages': [{'id': msg_id}], 'sandbox': True},
             )
 
         # In production this executes requests.post to graph.facebook.com/v19.0/{phone_number_id}/messages

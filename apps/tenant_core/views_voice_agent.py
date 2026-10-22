@@ -31,6 +31,20 @@ logger = logging.getLogger(__name__)
 IST = zoneinfo.ZoneInfo('Asia/Kolkata')
 
 
+def _is_placeholder_phone(val: Any) -> bool:
+    if not val:
+        return True
+    s = str(val).strip()
+    if s.startswith('{{') and s.endswith('}}'):
+        return True
+    if 'X' in s or 'x' in s:
+        return True
+    digits = ''.join(c for c in s if c.isdigit())
+    if len(digits) < 10 or len(set(digits)) <= 1:
+        return True
+    return False
+
+
 def _authenticate_request(request, enforce_token: bool = False) -> Tuple[Optional[Tenant], Optional[Any], Optional[JsonResponse]]:
     """
     Validates token and resolves Tenant.
@@ -583,22 +597,22 @@ class VoiceAgentBookTrialView(View):
         )
         notes = body_json.get('notes', 'Trial booked and confirmed via Sarvam AI Voice Agent (Mahek)')
 
-        if not phone_number and not lead_id:
-            return JsonResponse({
-                'status': 'error',
-                'error_code': 'MISSING_LEAD',
-                'message': 'Lead phone number or lead ID is required to book a trial.',
-                'spoken_apology': "I didn't catch your contact details. Could you please share your phone number?",
-            }, status=400)
+        if _is_placeholder_phone(phone_number):
+            phone_number = None
+        if lead_id and (str(lead_id).startswith('{{') or not str(lead_id).strip()):
+            lead_id = None
 
         with tenant_database_context(tenant.id):
             alias = get_tenant_db_alias()
             from apps.tenant_core.models_org import Branch, Organization
-            from apps.tenant_core.models_crm import Lead, TrialBooking, TrialStatusHistory, LeadActivity, LeadStatusHistory, LeadSource
+            from apps.tenant_core.models_crm import Lead, TrialBooking, TrialStatusHistory, LeadActivity, LeadStatusHistory, LeadSource, CallSession
             from apps.tenant_core.models_classes import ClassOccurrence, ClassBranchAvailability
             from apps.tenant_core.models_bookings import Booking
             from apps.tenant_core.services_voice_calling import VoiceCallingService
             from apps.tenant_core.services_reliability import record_business_audit, enqueue_outbox_event
+
+            resolved_br = _resolve_branch(alias, None, branch_param) if branch_param else None
+            org = _resolve_tenant_org(alias, resolved_br)
 
             # 1. Resolve Lead
             lead = None
@@ -611,8 +625,32 @@ class VoiceAgentBookTrialView(View):
             if not lead and phone_number:
                 lead = _lookup_lead_by_phone(alias, phone_number)
 
-            resolved_br = _resolve_branch(alias, None, branch_param) if branch_param else None
-            org = _resolve_tenant_org(alias, resolved_br)
+            # Fallback: Correlate with active or recent CallSession within last 25 minutes
+            if not lead:
+                recent_cutoff = timezone.now() - timedelta(minutes=25)
+                active_cs = (
+                    CallSession.objects.using(alias)
+                    .filter(organization=org, created_at__gte=recent_cutoff)
+                    .exclude(status='FAILED')
+                    .order_by('-created_at')
+                    .first()
+                )
+                if active_cs and active_cs.lead:
+                    lead = active_cs.lead
+                    if not phone_number:
+                        phone_number = active_cs.user_phone_number or active_cs.lead.phone_normalized
+                    logger.info(
+                        "Resolved lead %s (%s, %s) from active CallSession %s for voice agent trial booking",
+                        lead.id, lead.first_name, phone_number, active_cs.id
+                    )
+
+            if not lead and not phone_number:
+                return JsonResponse({
+                    'status': 'error',
+                    'error_code': 'MISSING_LEAD',
+                    'message': 'Lead phone number or lead ID is required to book a trial.',
+                    'spoken_apology': "I didn't catch your contact details. Could you please share your phone number?",
+                }, status=400)
 
             # If lead exists, update caller details if previously Guest or missing name
             if lead:
@@ -802,19 +840,25 @@ class VoiceAgentBookTrialView(View):
 
                 if existing_for_slot:
                     ist_dt = occurrence.start_at.astimezone(IST)
+                    prog_name = occurrence.class_template.program.name if (occurrence.class_template and occurrence.class_template.program) else occurrence.class_template.name
                     arrival_instructions = (
-                        "Please arrive at least 30 minutes before your class starts, and remember "
-                        "to bring your water bottle, appropriate shoes, and any other required items."
+                        "Stay Hydrated: Carry an empty bottle and get it filled at our studio. "
+                        "Comfy Clothes: Wear anything comfortable, such as shorts, tracks, leggings, pants, T-shirts, or tank tops. "
+                        "Carry a Fresh Pair of Grip Shoes: Please bring a fresh pair of shoes and socks to maintain hygiene at all times."
                     )
                     spoken_conf = (
-                        f"Good news, {lead.first_name}! You are already booked for this session of "
-                        f"{occurrence.class_template.name} at our {branch_short} studio on "
-                        f"{ist_dt.strftime('%A at %I:%M %p')}. {arrival_instructions} We look forward to seeing you!"
+                        f"Good news, {lead.first_name}! You are already booked for {prog_name} ({occurrence.class_template.name}) "
+                        f"at our {branch_short} studio on {ist_dt.strftime('%A at %I:%M %p')}. "
+                        f"As a reminder: Stay Hydrated — carry an empty bottle and get it filled at our studio. "
+                        f"Comfy Clothes — wear anything comfortable like shorts, tracks, or leggings. "
+                        f"Carry a Fresh Pair of Grip Shoes — please bring a fresh pair of shoes and socks to maintain hygiene at all times. "
+                        f"We look forward to seeing you!"
                     )
                     return JsonResponse({
                         'status': 'success',
                         'already_booked': True,
                         'booking_id': str(existing_for_slot.id),
+                        'program_name': prog_name,
                         'class_name': occurrence.class_template.name,
                         'branch_name': branch_name,
                         'date': ist_dt.strftime('%A, %b %d'),
@@ -938,16 +982,31 @@ class VoiceAgentBookTrialView(View):
             if lead.phone_normalized:
                 try:
                     from apps.tenant_core.communication.service import CommunicationService
-                    addr_str = occurrence.branch.address or (
-                        f"{occurrence.branch.address_line_1}, {occurrence.branch.location.city}"
-                        if occurrence.branch.address_line_1 and occurrence.branch.location else occurrence.branch.name
-                    )
+                    full_addr = getattr(occurrence.branch, 'address_line_1', '') or occurrence.branch.address or branch_name
+                    city_str = occurrence.branch.location.city if (occurrence.branch.location and occurrence.branch.location.city) else 'Mumbai'
+                    maps_query = f"{branch_name}+{full_addr}+{city_str}".replace(' ', '+')
+                    maps_url = f"https://maps.google.com/?q={maps_query}"
+                    prog_name = occurrence.class_template.program.name if (occurrence.class_template and occurrence.class_template.program) else occurrence.class_template.name
+                    instructor_name = getattr(occurrence.instructor, 'name', None) or getattr(occurrence.instructor, 'first_name', None) or 'Master Studio Trainer'
+                    pass_code = f"SWEAT-VIP-{str(trial.id).replace('-', '')[:6].upper()}"
+
                     wa_body = (
-                        f"Hi {lead.first_name}! 🎉 Your complimentary trial session at SWEAT is confirmed!\n\n"
-                        f"🏋️ Class: {occurrence.class_template.name}\n"
-                        f"📍 Branch: {branch_name} ({addr_str})\n"
-                        f"📅 Date & Time: {ist_dt.strftime('%A, %b %d at %I:%M %p')}\n\n"
-                        f"Please arrive 10 minutes early in comfortable workout gear. If you need to reschedule or have questions, just reply to this message!"
+                        f"🎫 *SWEAT VIP TRIAL PASS*\n"
+                        f"━━━━━━━━━━━━━━━━━━━\n"
+                        f"Hi {lead.first_name}! Your complimentary workout pass at SWEAT is confirmed.\n\n"
+                        f"🏋️ *Program:* {prog_name}\n"
+                        f"🤸 *Class:* {occurrence.class_template.name}\n"
+                        f"📍 *Studio:* {branch_name}\n"
+                        f"🏢 *Address:* {full_addr}\n"
+                        f"🗺️ *Directions (Google Maps):* {maps_url}\n"
+                        f"📅 *Date & Time:* {ist_dt.strftime('%A, %b %d at %I:%M %p')}\n"
+                        f"━━━━━━━━━━━━━━━━━━━\n"
+                        f"📋 *Studio Visit Checklist:*\n"
+                        f"💧 *Hydration:* Carry a reusable bottle (pure alkaline water station inside).\n"
+                        f"👟 *Hygiene:* Clean grip shoes & socks required for studio reformer & turf.\n"
+                        f"👕 *Attire:* Comfortable athletic wear (stretch/breathable).\n"
+                        f"⏰ *Arrival:* Please arrive 15 minutes early for your biometric check-in & tour.\n\n"
+                        f"Questions or need to reschedule? Simply reply to this chat!"
                     )
                     CommunicationService.send_communication(
                         organization=lead.organization,
@@ -964,22 +1023,27 @@ class VoiceAgentBookTrialView(View):
                 except Exception as wa_err:
                     logger.warning("Could not dispatch automated WhatsApp booking confirmation: %s", wa_err)
 
+            prog_name = occurrence.class_template.program.name if (occurrence.class_template and occurrence.class_template.program) else occurrence.class_template.name
+
             arrival_instructions = (
-                "Please arrive at least 30 minutes before your class starts, and remember "
-                "to bring your water bottle, appropriate shoes, and any other required items."
+                "Stay Hydrated: Carry an empty bottle and get it filled at our studio. "
+                "Comfy Clothes: Wear anything comfortable, such as shorts, tracks, leggings, pants, T-shirts, or tank tops. "
+                "Carry a Fresh Pair of Grip Shoes: Please bring a fresh pair of shoes and socks to maintain hygiene at all times."
             )
             spoken_conf = (
-                f"You're all set, {lead.first_name}! I have booked your complimentary trial for "
-                f"{occurrence.class_template.name} at our {branch_short} branch on "
-                f"{ist_dt.strftime('%A at %I:%M %p')}. "
-                f"{arrival_instructions} "
+                f"You're all set, {lead.first_name}! Before we wrap up, let me reconfirm all your details: "
+                f"Your complimentary trial is booked for {prog_name} ({occurrence.class_template.name}) "
+                f"at our {branch_short} branch on {ist_dt.strftime('%A at %I:%M %p')}. "
+                f"Please keep these instructions in mind before visiting: "
+                f"First, Stay Hydrated: Carry an empty bottle and get it filled at our studio. "
+                f"Second, Comfy Clothes: Wear anything comfortable, such as shorts, tracks, leggings, pants, T-shirts, or tank tops. "
+                f"Third, Carry a Fresh Pair of Grip Shoes: Please bring a fresh pair of shoes and socks to maintain hygiene at all times. "
                 f"I've also sent the confirmation and location details to your WhatsApp. "
                 f"We are excited to see you at SWEAT!"
             )
 
             logger.info("Voice Agent successfully booked trial: lead=%s trial=%s occurrence=%s branch=%s", lead.id, trial.id, occurrence.id, branch_name)
 
-            prog_name = occurrence.class_template.program.name if (occurrence.class_template and occurrence.class_template.program) else occurrence.class_template.name
             return JsonResponse({
                 'status': 'success',
                 'booking_id': str(trial.id),
@@ -1036,7 +1100,7 @@ class VoiceAgentLeadContextView(View):
             lead = None
 
             # 1. Resolve by lead_id
-            if lead_id_param:
+            if lead_id_param and not str(lead_id_param).startswith('{{'):
                 try:
                     lead_uuid = uuid.UUID(str(lead_id_param).strip())
                     lead = Lead.objects.using(alias).filter(id=lead_uuid).select_related('branch', 'branch__location').first()
@@ -1044,7 +1108,7 @@ class VoiceAgentLeadContextView(View):
                     pass
 
             # 2. Resolve by call_session_id
-            if not lead and session_id_param:
+            if not lead and session_id_param and not str(session_id_param).startswith('{{'):
                 try:
                     sess_uuid = uuid.UUID(str(session_id_param).strip())
                     session = CallSession.objects.using(alias).filter(id=sess_uuid).select_related('lead', 'lead__branch', 'lead__branch__location').first()
@@ -1054,8 +1118,22 @@ class VoiceAgentLeadContextView(View):
                     pass
 
             # 3. Resolve by phone number
-            if not lead and phone_param:
+            if not lead and phone_param and not _is_placeholder_phone(phone_param):
                 lead = _lookup_lead_by_phone(alias, phone_param)
+
+            # 4. Resolve by active recent CallSession
+            if not lead:
+                recent_cutoff = timezone.now() - timedelta(minutes=25)
+                active_cs = (
+                    CallSession.objects.using(alias)
+                    .filter(created_at__gte=recent_cutoff)
+                    .exclude(status='FAILED')
+                    .order_by('-created_at')
+                    .first()
+                )
+                if active_cs and active_cs.lead:
+                    lead = active_cs.lead
+                    logger.info("Resolved lead %s from active CallSession %s for voice agent context", lead.id, active_cs.id)
 
             if not lead:
                 clean_caller_name = (
@@ -1386,12 +1464,18 @@ class VoiceAgentRescheduleTrialView(View):
                             f"{target_occ.branch.address_line_1}, {target_occ.branch.location.city}"
                             if target_occ.branch.address_line_1 and target_occ.branch.location else target_occ.branch.name
                         )
+                        prog_name = target_occ.class_template.program.name if (target_occ.class_template and target_occ.class_template.program) else target_occ.class_template.name
                         wa_body = (
                             f"Hi {lead.first_name}! 🔄 Your SWEAT trial session has been successfully rescheduled.\n\n"
-                            f"🏋️ Class: {target_occ.class_template.name}\n"
+                            f"🏋️ Program: {prog_name}\n"
+                            f"🤸 Class: {target_occ.class_template.name}\n"
                             f"📍 Branch: {branch_name} ({addr_str})\n"
                             f"📅 New Date & Time: {new_ist_dt.strftime('%A, %b %d at %I:%M %p')}\n\n"
-                            f"Please arrive 10 minutes early in workout gear. Reply here if you need any further assistance!"
+                            f"📋 Important Instructions for Your Visit:\n"
+                            f"💧 Stay Hydrated: Carry an empty bottle and get it filled at our studio.\n"
+                            f"👕 Comfy Clothes: Wear anything comfortable, such as shorts, tracks, leggings, pants, T-shirts, or tank tops.\n"
+                            f"👟 Carry a Fresh Pair of Grip Shoes: Please bring a fresh pair of shoes and socks to maintain hygiene at all times.\n\n"
+                            f"Please arrive 15 minutes early. Reply here if you need any further assistance!"
                         )
                         CommunicationService.send_communication(
                             organization=lead.organization,
@@ -1407,10 +1491,14 @@ class VoiceAgentRescheduleTrialView(View):
                     except Exception as wa_err:
                         logger.warning("Could not dispatch automated WhatsApp reschedule notification: %s", wa_err)
 
+                prog_name = target_occ.class_template.program.name if (target_occ.class_template and target_occ.class_template.program) else target_occ.class_template.name
                 spoken_conf = (
                     f"You're all set, {lead.first_name}! I have rescheduled your trial session for "
-                    f"{target_occ.class_template.name} at our {branch_short} branch to "
+                    f"{prog_name} ({target_occ.class_template.name}) at our {branch_short} branch to "
                     f"{new_ist_dt.strftime('%A, %b %d at %I:%M %p')}. "
+                    f"As a reminder: Stay Hydrated — carry an empty bottle and get it filled at our studio. "
+                    f"Comfy Clothes — wear anything comfortable like shorts, tracks, or leggings. "
+                    f"Carry a Fresh Pair of Grip Shoes — please bring a fresh pair of shoes and socks to maintain hygiene. "
                     f"I've also sent the updated details to your WhatsApp. See you on the mat!"
                 )
 
@@ -1869,8 +1957,16 @@ class VoiceAgentCallOutcomeView(View):
             except Exception:
                 pass
 
+        def _clean_val(val: Any) -> str:
+            if not val:
+                return ''
+            s = str(val).strip()
+            if s.startswith('{{') and s.endswith('}}'):
+                return ''
+            return s
+
         # Extract identifiers & outcome details (supports both SWEAT & default Sarvam field names)
-        phone = (
+        phone = _clean_val(
             data.get('phone')
             or data.get('user_phone_number')
             or data.get('user_identifier')
@@ -1878,13 +1974,13 @@ class VoiceAgentCallOutcomeView(View):
             or data.get('caller_phone')
             or data.get('userName', '')
         )
-        lead_id = data.get('lead_id')
-        disposition = data.get('disposition') or data.get('primary_disposition') or 'CALL_COMPLETED'
-        call_summary = data.get('callSummary') or data.get('call_summary') or data.get('summary') or 'Call completed via Sarvam AI Voice Agent.'
-        fitness_goals = data.get('painPointsMentioned') or data.get('fitness_goals') or data.get('pain_points') or ''
-        chosen_next_step = data.get('chosenNextStep') or data.get('next_step') or ''
-        next_step_dt = data.get('nextStepDateTime') or data.get('next_step_date_time') or ''
-        branch_name = data.get('branch') or data.get('preferred_branch') or ''
+        lead_id = _clean_val(data.get('lead_id'))
+        disposition = _clean_val(data.get('disposition') or data.get('primary_disposition'))
+        call_summary = _clean_val(data.get('callSummary') or data.get('call_summary') or data.get('summary'))
+        fitness_goals = _clean_val(data.get('painPointsMentioned') or data.get('fitness_goals') or data.get('pain_points'))
+        chosen_next_step = _clean_val(data.get('chosenNextStep') or data.get('next_step'))
+        next_step_dt = _clean_val(data.get('nextStepDateTime') or data.get('next_step_date_time'))
+        branch_name = _clean_val(data.get('branch') or data.get('preferred_branch'))
 
         with tenant_database_context(tenant.id):
             alias = get_tenant_db_alias()
@@ -1901,11 +1997,25 @@ class VoiceAgentCallOutcomeView(View):
                 except Exception:
                     pass
 
-            norm_phone = VoiceCallingService.normalize_phone(str(phone)) if phone else ''
-            if not lead and (norm_phone or phone):
+            norm_phone = VoiceCallingService.normalize_phone(str(phone)) if phone and not _is_placeholder_phone(phone) else ''
+            if not lead and (norm_phone or phone) and not _is_placeholder_phone(phone):
                 lead = _lookup_lead_by_phone(alias, phone)
 
-            caller_name_param = (
+            # Fallback to active CallSession if lead still not resolved
+            if not lead:
+                recent_cutoff = timezone.now() - timedelta(minutes=25)
+                active_cs = (
+                    CallSession.objects.using(alias)
+                    .filter(created_at__gte=recent_cutoff)
+                    .exclude(status='FAILED')
+                    .order_by('-created_at')
+                    .first()
+                )
+                if active_cs and active_cs.lead:
+                    lead = active_cs.lead
+                    logger.info("Resolved lead %s from active CallSession %s for call outcome", lead.id, active_cs.id)
+
+            caller_name_param = _clean_val(
                 data.get('lead_name')
                 or data.get('name')
                 or data.get('caller_name')
@@ -1946,6 +2056,64 @@ class VoiceAgentCallOutcomeView(View):
                     else:
                         lead.first_name = clean_name
                     lead.save(using=alias, update_fields=['first_name', 'last_name', 'updated_at'])
+
+            # 1. Match active or recent CallSession to know true duration & telephony state
+            recent_sess = None
+            cs_id = data.get('call_session_id')
+            if cs_id:
+                try:
+                    recent_sess = CallSession.objects.using(alias).filter(id=uuid.UUID(str(cs_id))).first()
+                except Exception:
+                    pass
+            if not recent_sess and data.get('attempt_id'):
+                recent_sess = CallSession.objects.using(alias).filter(provider_attempt_id=str(data.get('attempt_id'))).first()
+            if not recent_sess and lead:
+                recent_sess = CallSession.objects.using(alias).filter(lead=lead).order_by('-created_at').first()
+
+            call_dur = 0.0
+            if recent_sess and recent_sess.duration_seconds:
+                call_dur = float(recent_sess.duration_seconds)
+            elif active_cs and active_cs.duration_seconds:
+                call_dur = float(active_cs.duration_seconds)
+
+            recent_trial = TrialBooking.objects.using(alias).filter(lead=lead).order_by('-created_at').first() if lead else None
+            is_recent_trial = bool(recent_trial and (timezone.now() - recent_trial.created_at).total_seconds() < 900)
+
+            first_name = lead.first_name if lead else 'the lead'
+
+            if not disposition:
+                if is_recent_trial:
+                    disposition = 'TRIAL_BOOKED'
+                elif call_dur > 0 and call_dur < 25:
+                    disposition = 'HUNG_UP'
+                elif call_dur >= 25:
+                    disposition = 'INQUIRY_ONLY'
+                else:
+                    disposition = 'CALL_COMPLETED'
+
+            if not call_summary:
+                if is_recent_trial:
+                    cls_title = 'workout session'
+                    if recent_trial and recent_trial.class_occurrence_id:
+                        try:
+                            from apps.tenant_core.models_scheduling import ClassOccurrence
+                            occ = ClassOccurrence.objects.using(alias).filter(id=recent_trial.class_occurrence_id).select_related('class_template').first()
+                            if occ and occ.class_template:
+                                cls_title = occ.class_template.name
+                        except Exception:
+                            pass
+                    br_title = recent_trial.branch.name if recent_trial.branch else 'studio'
+                    call_summary = (
+                        f"Spoke with {first_name}. Scheduled a complimentary trial for {cls_title} at our {br_title} studio. Confirmed attendance and shared arrival guidelines."
+                    )
+                elif disposition in ('HUNG_UP', 'DISCONNECTED_EARLY') or (call_dur > 0 and call_dur < 25):
+                    call_summary = (
+                        f"Call connected ({int(call_dur)}s). Agent delivered greeting, but {first_name} hung up before any conversation or trial booking."
+                    )
+                elif disposition in ('NO_ANSWER', 'MISSED'):
+                    call_summary = f"Outbound call placed to {first_name}, but was not answered."
+                else:
+                    call_summary = f"Call connected with {first_name} ({int(call_dur)}s). Inquired about programs; no trial booked."
 
             # Format activity notes
             notes_lines = [f"Call Summary: {call_summary}"]
@@ -2010,13 +2178,28 @@ class VoiceAgentCallOutcomeView(View):
                     recent_sess = CallSession.objects.using(alias).filter(lead=lead).order_by('-created_at').first()
 
                 if recent_sess:
+                    fields_to_save = ['transcript', 'metadata', 'updated_at']
                     if is_reminder:
                         if not isinstance(recent_sess.metadata, dict):
                             recent_sess.metadata = {}
                         recent_sess.metadata['call_type'] = 'REMINDER'
                     if not recent_sess.transcript:
                         recent_sess.transcript = full_notes
-                    recent_sess.save(using=alias, update_fields=['transcript', 'metadata', 'updated_at'])
+                    recent_sess.status = 'COMPLETED'
+                    fields_to_save.append('status')
+                    if not recent_sess.ended_at:
+                        recent_sess.ended_at = timezone.now()
+                        fields_to_save.append('ended_at')
+                    if (not recent_sess.duration_seconds or recent_sess.duration_seconds <= 0) and recent_sess.started_at:
+                        diff = (recent_sess.ended_at - recent_sess.started_at).total_seconds()
+                        recent_sess.duration_seconds = max(1.0, round(diff, 1))
+                        fields_to_save.append('duration_seconds')
+                    rec_url_input = data.get('recording_url') or data.get('recording') or data.get('audio_url')
+                    if rec_url_input:
+                        if not isinstance(recent_sess.metadata, dict):
+                            recent_sess.metadata = {}
+                        recent_sess.metadata['recording_url'] = str(rec_url_input).strip()
+                    recent_sess.save(using=alias, update_fields=fields_to_save)
                 else:
                     CallSession.objects.using(alias).create(
                         organization=lead.organization,
@@ -2139,5 +2322,173 @@ class VoiceAgentCallOutcomeView(View):
                 'disposition': disposition,
                 'recorded_notes': full_notes,
             }, status=200)
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class VoiceAgentRecordingAudioView(View):
+    """
+    Streams the raw audio recording (WAV) for an AI voice CallSession.
+    Fetches and caches the audio from Sarvam Analytics Recordings API if not already cached.
+    Supports browser HTML5 audio playback, scrub-seeking, and byte ranges.
+    """
+
+    def get(self, request, session_id, *args, **kwargs):
+        import os
+        import requests
+        from datetime import timedelta
+        from django.conf import settings
+        from django.utils import timezone
+        from apps.master.models import Tenant, TenantDataSource
+        from config.tenant_middleware import _register_tenant_connection
+        from config.routers import build_tenant_db_alias, set_tenant_db_alias
+        from apps.tenant_core.models_crm import CallSession
+        from django.http import FileResponse, Http404, HttpResponse
+
+        def _serve_audio(path):
+            file_size = os.path.getsize(path)
+            http_range = request.META.get('HTTP_RANGE', '')
+            start = 0
+            end = file_size - 1
+            status_code = 200
+
+            if http_range:
+                import re
+                match = re.match(r'bytes=(\d+)-(\d*)', http_range)
+                if match:
+                    status_code = 206
+                    start = int(match.group(1))
+                    if match.group(2):
+                        end = min(int(match.group(2)), file_size - 1)
+
+            length = end - start + 1
+
+            def stream_chunks():
+                with open(path, 'rb') as f:
+                    f.seek(start)
+                    remaining = length
+                    while remaining > 0:
+                        chunk_size = min(65536, remaining)
+                        data = f.read(chunk_size)
+                        if not data:
+                            break
+                        remaining -= len(data)
+                        yield data
+
+            from django.http import StreamingHttpResponse
+            resp = StreamingHttpResponse(
+                stream_chunks(),
+                status=status_code,
+                content_type='audio/wav'
+            )
+            resp['Accept-Ranges'] = 'bytes'
+            resp['Content-Length'] = str(length)
+            if status_code == 206:
+                resp['Content-Range'] = f'bytes {start}-{end}/{file_size}'
+            resp['Content-Disposition'] = f'inline; filename="call_{session_id}.wav"'
+            resp['Access-Control-Allow-Origin'] = '*'
+            resp['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+            resp['Access-Control-Allow-Headers'] = 'Range, Content-Type, Accept'
+            resp['Access-Control-Expose-Headers'] = 'Content-Range, Content-Length, Accept-Ranges'
+            return resp
+
+        # 1. Immediate Disk Cache Check (Zero DB queries if already cached)
+        cache_dir = os.path.join(settings.BASE_DIR, 'media', 'recordings')
+        os.makedirs(cache_dir, exist_ok=True)
+        local_path = os.path.join(cache_dir, f"{session_id}.wav")
+
+        if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+            return _serve_audio(local_path)
+
+        # 2. Locate CallSession across tenants to fetch from Sarvam if not cached
+        cs = None
+        target_alias = None
+        for t in Tenant.objects.all():
+            try:
+                ds = TenantDataSource.objects.filter(tenant=t).first()
+                if not ds:
+                    continue
+                alias = build_tenant_db_alias(t.id)
+                _register_tenant_connection(alias, db_name=ds.db_name, data_source=ds, tenant_id=t.id)
+                found = CallSession.objects.using(alias).filter(id=session_id).first()
+                if found:
+                    cs = found
+                    target_alias = alias
+                    break
+            except Exception:
+                continue
+
+        if not cs:
+            raise Http404("Call session recording not found.")
+
+        if not os.path.exists(local_path) or os.path.getsize(local_path) == 0:
+            api_key = os.getenv('SARVAM_API_KEY', '')
+            org_id = os.getenv('SARVAM_ORG_ID', '')
+            workspace_id = os.getenv('SARVAM_WORKSPACE_ID', '')
+            app_id = os.getenv('SARVAM_APP_ID', '')
+
+            inter_id = cs.metadata.get('interaction_id') if isinstance(cs.metadata, dict) else None
+
+            # If no interaction_id in metadata, look it up via interactions list
+            if not inter_id and api_key and org_id and workspace_id and app_id:
+                try:
+                    now = timezone.now()
+                    list_url = f"https://apps.sarvam.ai/api/analytics/v1/{org_id}/{workspace_id}/{app_id}/interactions"
+                    params = {
+                        'start_datetime': (now - timedelta(days=2)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                        'end_datetime': (now + timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                        'include_transcript': 'true',
+                    }
+                    lr = requests.get(list_url, headers={'X-API-Key': api_key}, params=params, timeout=12)
+                    if lr.status_code == 200:
+                        items = lr.json().get('items', [])
+                        if items:
+                            latest_item = items[-1]
+                            inter_id = latest_item.get('interaction_id')
+                            if isinstance(cs.metadata, dict):
+                                cs.metadata['interaction_id'] = inter_id
+                                if latest_item.get('original_transcript') and not cs.transcript:
+                                    cs.transcript = latest_item.get('original_transcript')
+                                cs.save(using=target_alias, update_fields=['metadata', 'transcript', 'updated_at'])
+                except Exception as list_err:
+                    logger.warning("Failed to lookup interaction ID from Sarvam: %s", list_err)
+
+            if inter_id and api_key and org_id and workspace_id and app_id:
+                encoded_inter = str(inter_id).replace('/', '%2F')
+                rec_url = f"https://apps.sarvam.ai/api/analytics/v1/{org_id}/{workspace_id}/{app_id}/recordings/{encoded_inter}"
+                try:
+                    resp = requests.get(rec_url, headers={'X-API-Key': api_key}, timeout=25)
+                    if resp.status_code == 200 and resp.content:
+                        with open(local_path, 'wb') as f:
+                            f.write(resp.content)
+                        # Normalize telephony sample rates to 44.1kHz for universal browser/WASAPI playback
+                        try:
+                            from scipy.io import wavfile
+                            from scipy.signal import resample_poly
+                            import numpy as np
+                            sr, raw_data = wavfile.read(local_path)
+                            if sr in (8000, 11025, 16000, 22050):
+                                up_factor = 44100 // sr
+                                resampled = resample_poly(raw_data, up_factor, 1, axis=0)
+                                resampled = np.clip(resampled, -32768, 32767).astype(np.int16)
+                                wavfile.write(local_path, 44100, resampled)
+                        except Exception as resample_err:
+                            logger.warning("Audio resample fallback: %s", resample_err)
+                except Exception as dl_err:
+                    logger.error("Failed to download recording from Sarvam: %s", dl_err)
+
+        if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+            return _serve_audio(local_path)
+
+        return HttpResponse("Audio recording is being processed by Sarvam telephony.", status=404)
+
+    def options(self, request, *args, **kwargs):
+        from django.http import HttpResponse
+        response = HttpResponse()
+        response['Access-Control-Allow-Origin'] = '*'
+        response['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+        response['Access-Control-Allow-Headers'] = 'Range, Content-Type, Accept'
+        response['Access-Control-Expose-Headers'] = 'Content-Range, Content-Length, Accept-Ranges'
+        return response
+
 
 

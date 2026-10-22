@@ -1,7 +1,9 @@
 import uuid
+from datetime import datetime, timedelta
 from typing import Optional, Set
 from django.db import models
 from rest_framework import viewsets, status, permissions
+from rest_framework.views import APIView
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.core.exceptions import ValidationError
@@ -153,6 +155,7 @@ class BookingViewSet(viewsets.ModelViewSet):
         'cancel': 'ops.bookings.edit',
         'reschedule': 'ops.bookings.edit',
         'record_attendance': 'ops.bookings.edit',
+        'reconcile_attendance': 'ops.bookings.view',
         'promote_waitlist': 'ops.bookings.edit',
     }
 
@@ -165,6 +168,19 @@ class BookingViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         from .models_crm import IntakeSubmission
         alias = _get_db(self.request)
+
+        # Trigger automatic attendance lifecycle reconciliation for past occurrences
+        if getattr(self, 'action', 'list') == 'list':
+            try:
+                b_id = self.request.query_params.get('branch_id')
+                BookingWaitlistAttendanceService.reconcile_past_occurrences_attendance(
+                    branch=b_id if b_id and b_id != 'all' else None,
+                    occurrence_id=self.request.query_params.get('occurrence_id'),
+                    target_date=self.request.query_params.get('occurrence_date'),
+                    db_alias=alias,
+                )
+            except Exception:
+                pass
 
         base_select = [
             'user_profile', 'user_profile__user', 'occurrence',
@@ -226,7 +242,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                 total_count=models.Count('id'),
                 confirmed_count=models.Count('id', filter=models.Q(status='CONFIRMED')),
                 waitlisted_count=models.Count('id', filter=models.Q(status='WAITLISTED')),
-                attended_count=models.Count('id', filter=models.Q(status='ATTENDED')),
+                attended_count=models.Count('id', filter=models.Q(status__in=['ATTENDED', 'COMPLETED', 'LATE', 'LATE_ENTRY'])),
                 no_show_count=models.Count('id', filter=models.Q(status='NO_SHOW')),
                 cancelled_count=models.Count('id', filter=models.Q(status__in=['CANCELLED', 'LATE_CANCELLED'])),
             )
@@ -695,6 +711,21 @@ class BookingViewSet(viewsets.ModelViewSet):
         except Exception as e:
             return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
+    @action(detail=False, methods=['post'], url_path='reconcile-attendance')
+    def reconcile_attendance(self, request):
+        alias = _get_db(request)
+        branch_id = request.data.get('branch_id') or request.query_params.get('branch_id')
+        res = BookingWaitlistAttendanceService.reconcile_past_occurrences_attendance(
+            branch=branch_id if branch_id and branch_id != 'all' else None,
+            target_date=request.data.get('occurrence_date'),
+            db_alias=alias,
+        )
+        return Response({
+            'success': True,
+            'message': 'Past occurrences attendance reconciled successfully.',
+            **res,
+        }, status=status.HTTP_200_OK)
+
     @action(detail=True, methods=['post'], url_path='confirm')
     def confirm(self, request, pk=None):
         alias = _get_db(request)
@@ -921,6 +952,16 @@ class AttendanceRecordViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         alias = _get_db(self.request)
+        if getattr(self, 'action', 'list') == 'list':
+            try:
+                b_id = self.request.query_params.get('branch_id')
+                BookingWaitlistAttendanceService.reconcile_past_occurrences_attendance(
+                    branch=b_id if b_id and b_id != 'all' else None,
+                    occurrence_id=self.request.query_params.get('occurrence_id') or self.request.query_params.get('occurrence'),
+                    db_alias=alias,
+                )
+            except Exception:
+                pass
         qs = AttendanceRecord.objects.using(alias).select_related(
             'user_profile', 'user_profile__user', 'occurrence', 'occurrence__class_template', 'branch', 'booking'
         ).all()
@@ -983,6 +1024,172 @@ class AccessEventViewSet(viewsets.ModelViewSet):
         )
         serializer = self.get_serializer(event)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class AccessControlBulkIngestView(APIView):
+    """
+    POST /api/v1/access-control/events/bulk/
+    Receives batched scan events from the on-site Edge Service outbox.
+    Guarantees idempotency: retrying the same event_id produces no duplicate attendance.
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        alias = _get_db(request)
+        from .services_access_control import hash_qr_token
+        from .models_attendance import AccessPass
+        from .models_org import Branch
+        from .models_crm import UserProfile
+
+        branch_id = request.data.get('branch_id')
+        branch = Branch.objects.using(alias).filter(id=branch_id).first() if branch_id else None
+        if not branch:
+            branch = Branch.objects.using(alias).filter(status='ACTIVE').first() or Branch.objects.using(alias).first()
+
+        events_data = request.data.get('events', [])
+        if isinstance(request.data, list):
+            events_data = request.data
+
+        results = []
+        synced_count = 0
+
+        for item in events_data:
+            event_id_raw = item.get('event_id')
+            event_id = uuid.UUID(str(event_id_raw)) if event_id_raw else uuid.uuid4()
+            raw_token = item.get('raw_token') or item.get('token')
+            token_hash = item.get('token_hash')
+            if not token_hash and raw_token:
+                token_hash = hash_qr_token(raw_token)
+
+            direction = item.get('direction', 'ENTRY').upper()
+            device_ref = item.get('device_reference') or item.get('device_id', 'TURNSTILE-01')
+            scanned_at_str = item.get('scanned_at')
+            scanned_at = timezone.now()
+            if scanned_at_str:
+                try:
+                    scanned_at = datetime.fromisoformat(scanned_at_str.replace('Z', '+00:00'))
+                except Exception:
+                    pass
+
+            reconciliation = item.get('reconciliation_status', 'NORMAL')
+
+            # Lookup AccessPass by token_hash
+            access_pass = None
+            if token_hash:
+                access_pass = AccessPass.objects.using(alias).filter(token_hash=token_hash).select_related('user_profile', 'booking', 'branch').first()
+
+            if access_pass:
+                target_user = access_pass.user_profile
+                target_booking = access_pass.booking
+                target_branch = access_pass.branch or branch
+
+                event = BookingWaitlistAttendanceService.log_access_event(
+                    user_profile=target_user,
+                    branch=target_branch,
+                    event_type=direction,
+                    direction=direction,
+                    device_reference=device_ref,
+                    booking=target_booking,
+                    provider_reference='TIMEWATCH_TURNSTILE',
+                    event_id=event_id,
+                    scanned_at=scanned_at,
+                    reconciliation_status=reconciliation,
+                    token_hash=token_hash,
+                    db_alias=alias,
+                )
+                results.append({
+                    'event_id': str(event.id),
+                    'status': 'PROCESSED',
+                    'event_type': event.event_type,
+                    'reconciliation_status': event.reconciliation_status,
+                })
+                synced_count += 1
+            else:
+                fallback_user = UserProfile.objects.using(alias).first()
+                if fallback_user and branch:
+                    event = BookingWaitlistAttendanceService.log_access_event(
+                        user_profile=fallback_user,
+                        branch=branch,
+                        event_type='DENIED',
+                        direction=direction,
+                        device_reference=device_ref,
+                        provider_reference='TIMEWATCH_TURNSTILE',
+                        event_id=event_id,
+                        scanned_at=scanned_at,
+                        reconciliation_status='UNAUTHORIZED',
+                        token_hash=token_hash,
+                        db_alias=alias,
+                    )
+                    results.append({
+                        'event_id': str(event.id),
+                        'status': 'DENIED_UNAUTHORIZED',
+                        'reconciliation_status': 'UNAUTHORIZED',
+                    })
+                    synced_count += 1
+                else:
+                    results.append({
+                        'event_id': str(event_id),
+                        'status': 'FAILED_NO_TARGET',
+                    })
+
+        return Response({
+            'success': True,
+            'synced_count': synced_count,
+            'total_received': len(events_data),
+            'results': results,
+        }, status=status.HTTP_200_OK)
+
+
+class AccessControlSyncPassesView(APIView):
+    """
+    GET /api/v1/access-control/sync/
+    Provides the on-site Edge Service with today's active pass hashes for the branch.
+    Allows Edge Service to make sub-50ms local gate decisions completely offline.
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        alias = _get_db(request)
+        from .models_attendance import AccessPass
+        from .models_org import Branch
+
+        branch_id = request.query_params.get('branch_id')
+        now = timezone.now()
+        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_of_day = start_of_day + timedelta(hours=28)  # Today + 4 hours into tomorrow
+
+        qs = AccessPass.objects.using(alias).filter(
+            valid_from__gte=start_of_day,
+            valid_from__lte=end_of_day,
+        ).select_related('booking', 'user_profile')
+
+        if branch_id:
+            qs = qs.filter(branch_id=branch_id)
+
+        passes_data = []
+        for p in qs:
+            passes_data.append({
+                'pass_id': str(p.id),
+                'token_hash': p.token_hash,
+                'pass_type': p.pass_type,
+                'valid_from': p.valid_from.isoformat(),
+                'valid_until': p.valid_until.isoformat(),
+                'status': p.status,
+                'booking_id': str(p.booking_id) if p.booking_id else None,
+                'booking_number': p.booking.booking_number if p.booking else None,
+                'member_id': str(p.user_profile_id),
+                'member_name': (
+                    f"{getattr(p.user_profile, 'first_name_snapshot', None) or getattr(getattr(p.user_profile, 'user', None), 'first_name', '')} "
+                    f"{getattr(p.user_profile, 'last_name_snapshot', None) or getattr(getattr(p.user_profile, 'user', None), 'last_name', '')}"
+                ).strip(),
+            })
+
+        return Response({
+            'server_time_utc': now.isoformat(),
+            'branch_id': branch_id,
+            'total_passes': len(passes_data),
+            'passes': passes_data,
+        }, status=status.HTTP_200_OK)
 
 
 class BookingPolicyViewSet(viewsets.ViewSet):

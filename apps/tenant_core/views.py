@@ -685,7 +685,7 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
         )
 
         qs = qs.exclude(
-            user_type__iexact='MEMBER'
+            user_type__in=['MEMBER', 'LEAD', 'member', 'lead']
         ).exclude(
             Exists(has_member_role),
             ~Exists(has_staff_role)
