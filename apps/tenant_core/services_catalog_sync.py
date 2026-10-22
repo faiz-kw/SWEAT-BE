@@ -228,16 +228,18 @@ class ShopCatalogSyncService:
         prev_alias = get_tenant_db_alias()
         set_tenant_db_alias(db_alias)
         try:
-            # Resolve organization
-            org = None
+            # Resolve target organizations (sync across all active organizations in this tenant DB)
+            orgs = []
             if organization_id:
-                org = Organization.objects.using(db_alias).filter(id=organization_id).first()
-            if not org:
-                org = Organization.objects.using(db_alias).filter(status='ACTIVE').first()
-            if not org:
-                org = Organization.objects.using(db_alias).first()
+                single_org = Organization.objects.using(db_alias).filter(id=organization_id).first()
+                if single_org:
+                    orgs.append(single_org)
+            if not orgs:
+                orgs = list(Organization.objects.using(db_alias).filter(status='ACTIVE'))
+            if not orgs:
+                orgs = list(Organization.objects.using(db_alias).all())
 
-            if not org:
+            if not orgs:
                 raise RuntimeError(f"No Organization found in database '{db_alias}' to associate products with.")
 
             branch = None
@@ -249,58 +251,59 @@ class ShopCatalogSyncService:
             synced_products = []
 
             with transaction.atomic(using=db_alias):
-                for raw_item in products_data:
-                    payload = cls.transform_product_payload(raw_item)
-                    sku = payload['sku']
+                for org in orgs:
+                    for raw_item in products_data:
+                        payload = cls.transform_product_payload(raw_item)
+                        sku = payload['sku']
 
-                    # Look up existing product by SKU or exact Name under this organization
-                    existing_product = Product.objects.using(db_alias).filter(
-                        organization=org,
-                        sku=sku
-                    ).first()
-
-                    if not existing_product:
+                        # Look up existing product by SKU or exact Name under this organization
                         existing_product = Product.objects.using(db_alias).filter(
                             organization=org,
-                            name=payload['name']
+                            sku=sku
                         ).first()
 
-                    if existing_product:
-                        existing_product.name = payload['name']
-                        existing_product.category = payload['category']
-                        existing_product.product_type = payload['product_type']
-                        existing_product.price = payload['price']
-                        existing_product.cost_price = payload['cost_price']
-                        existing_product.stock_quantity = payload['stock_quantity']
-                        existing_product.image_url = payload['image_url']
-                        existing_product.images = payload['images']
-                        existing_product.description = payload['description']
-                        existing_product.status = payload['status']
-                        existing_product.is_active = True
-                        if branch:
-                            existing_product.branch = branch
-                        existing_product.save(using=db_alias)
-                        updated_count += 1
-                        synced_products.append(existing_product)
-                    else:
-                        new_product = Product.objects.using(db_alias).create(
-                            organization=org,
-                            branch=branch,
-                            sku=sku,
-                            name=payload['name'],
-                            category=payload['category'],
-                            product_type=payload['product_type'],
-                            price=payload['price'],
-                            cost_price=payload['cost_price'],
-                            stock_quantity=payload['stock_quantity'],
-                            image_url=payload['image_url'],
-                            images=payload['images'],
-                            description=payload['description'],
-                            status=payload['status'],
-                            is_active=True,
-                        )
-                        created_count += 1
-                        synced_products.append(new_product)
+                        if not existing_product:
+                            existing_product = Product.objects.using(db_alias).filter(
+                                organization=org,
+                                name=payload['name']
+                            ).first()
+
+                        if existing_product:
+                            existing_product.name = payload['name']
+                            existing_product.category = payload['category']
+                            existing_product.product_type = payload['product_type']
+                            existing_product.price = payload['price']
+                            existing_product.cost_price = payload['cost_price']
+                            existing_product.stock_quantity = payload['stock_quantity']
+                            existing_product.image_url = payload['image_url']
+                            existing_product.images = payload['images']
+                            existing_product.description = payload['description']
+                            existing_product.status = payload['status']
+                            existing_product.is_active = True
+                            if branch:
+                                existing_product.branch = branch
+                            existing_product.save(using=db_alias)
+                            updated_count += 1
+                            synced_products.append(existing_product)
+                        else:
+                            new_product = Product.objects.using(db_alias).create(
+                                organization=org,
+                                branch=branch,
+                                sku=sku,
+                                name=payload['name'],
+                                category=payload['category'],
+                                product_type=payload['product_type'],
+                                price=payload['price'],
+                                cost_price=payload['cost_price'],
+                                stock_quantity=payload['stock_quantity'],
+                                image_url=payload['image_url'],
+                                images=payload['images'],
+                                description=payload['description'],
+                                status=payload['status'],
+                                is_active=True,
+                            )
+                            created_count += 1
+                            synced_products.append(new_product)
 
             logger.info(
                 "Sync complete on db '%s': total=%d, created=%d, updated=%d",
@@ -311,7 +314,8 @@ class ShopCatalogSyncService:
                 'total': len(products_data),
                 'created': created_count,
                 'updated': updated_count,
-                'organization': org.name,
+                'organizations': [o.name for o in orgs],
+                'organization': orgs[0].name if orgs else '',
                 'products': [
                     {
                         'id': str(p.id),

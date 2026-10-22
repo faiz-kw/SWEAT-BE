@@ -11,8 +11,8 @@ from django.db.models import Q
 from django.conf import settings
 
 from .context import get_tenant_db_alias
-from .models_inventory import Product
-from .serializers_inventory import ProductSerializer
+from .models_inventory import Product, InventoryMovement
+from .serializers_inventory import ProductSerializer, InventoryMovementSerializer
 
 
 def _get_db(request):
@@ -319,4 +319,42 @@ class RetailOrderViewSet(viewsets.ModelViewSet):
             return Response(result, status=status.HTTP_200_OK)
         except (OrderStateError, ValidationError) as e:
             return Response({'detail': str(e), 'code': 'ORDER_CANCELLATION_FAILED'}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class InventoryMovementViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Read-only audit ledger ViewSet for stock movements (sales, reservations, restocks).
+    Scoped by tenant database context and organization.
+    """
+    serializer_class = InventoryMovementSerializer
+    pagination_class = InventoryPagination
+    permission_classes = [permissions.AllowAny]
+
+    def get_queryset(self):
+        alias = _get_db(self.request)
+        qs = InventoryMovement.objects.using(alias).select_related('product', 'order').all()
+
+        org = _get_org(self.request)
+        if org:
+            qs = qs.filter(product__organization=org)
+
+        product_id = self.request.query_params.get('product')
+        if product_id:
+            qs = qs.filter(product_id=product_id)
+
+        movement_type = self.request.query_params.get('movement_type')
+        if movement_type and movement_type != 'all':
+            qs = qs.filter(movement_type__iexact=movement_type)
+
+        search = self.request.query_params.get('search')
+        if search:
+            qs = qs.filter(
+                Q(product__name__icontains=search) |
+                Q(product__sku__icontains=search) |
+                Q(notes__icontains=search) |
+                Q(movement_type__icontains=search)
+            )
+
+        return qs.order_by('-created_at')
+
 

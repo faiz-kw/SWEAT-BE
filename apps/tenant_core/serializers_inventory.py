@@ -36,3 +36,29 @@ class ProductSerializer(serializers.ModelSerializer):
         if not isinstance(ret.get('images'), list):
             ret['images'] = [ret['images']] if ret.get('images') else []
         return ret
+
+
+from .models_inventory import InventoryMovement
+
+
+class InventoryMovementSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source='product.name', read_only=True)
+    product_sku = serializers.CharField(source='product.sku', read_only=True)
+    product_category = serializers.CharField(source='product.category', read_only=True)
+
+    class Meta:
+        model = InventoryMovement
+        fields = [
+            'id',
+            'product',
+            'product_name',
+            'product_sku',
+            'product_category',
+            'movement_type',
+            'quantity_change',
+            'balance_after',
+            'notes',
+            'created_at',
+        ]
+        read_only_fields = ['id', 'created_at']
+
