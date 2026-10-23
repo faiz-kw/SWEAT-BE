@@ -1363,7 +1363,17 @@ class DailySummaryMobileView(APIView):
             return Response({'error': 'Tenant database not found'}, status=status.HTTP_400_BAD_REQUEST)
 
         org = _get_active_organization(request, alias)
+        target_user = request.user
         profile = _get_or_create_user_profile(request.user, alias)
+
+        member_id = request.query_params.get('member_id')
+        if member_id and (getattr(request.user, 'role', '') in ['ADMIN', 'SUPERADMIN', 'STAFF', 'COACH', 'TRAINER'] or getattr(request.user, 'is_staff', False)):
+            target_profile = UserProfile.objects.using(alias).filter(id=member_id).first()
+            if not target_profile:
+                target_profile = UserProfile.objects.using(alias).filter(user__id=member_id).first()
+            if target_profile:
+                profile = target_profile
+                target_user = target_profile.user or target_user
 
         date_str = request.query_params.get('date')
         if date_str:
@@ -1376,10 +1386,14 @@ class DailySummaryMobileView(APIView):
 
         # 1. Member Targets
         target = NutritionTarget.objects.using(alias).filter(
-            user=request.user,
             profile=profile,
             is_active=True,
         ).first()
+        if not target and target_user:
+            target = NutritionTarget.objects.using(alias).filter(
+                user=target_user,
+                is_active=True,
+            ).first()
 
         target_cals = target.daily_calories if target else Decimal('2000.00')
         target_protein = target.protein_grams if target else Decimal('120.00')
@@ -1390,10 +1404,14 @@ class DailySummaryMobileView(APIView):
 
         # 2. Nutrition Consumption
         meals = MealLog.objects.using(alias).filter(
-            user=request.user,
             profile=profile,
             logged_date=target_date,
         ).prefetch_related('items').order_by('logged_time')
+        if not meals.exists() and target_user:
+            meals = MealLog.objects.using(alias).filter(
+                user=target_user,
+                logged_date=target_date,
+            ).prefetch_related('items').order_by('logged_time')
 
         total_calories = Decimal('0.00')
         total_protein = Decimal('0.00')
@@ -1435,19 +1453,27 @@ class DailySummaryMobileView(APIView):
 
         # 3. Water Consumption
         water_logs = WaterLog.objects.using(alias).filter(
-            user=request.user,
             profile=profile,
             logged_date=target_date,
         )
+        if not water_logs.exists() and target_user:
+            water_logs = WaterLog.objects.using(alias).filter(
+                user=target_user,
+                logged_date=target_date,
+            )
         total_water_ml = sum(log.amount_ml for log in water_logs)
         water_pct = round((total_water_ml / target_water * 100), 1) if target_water else 0.0
 
         # 4. Sleep Entry
         sleep_log = SleepLog.objects.using(alias).filter(
-            user=request.user,
             profile=profile,
             logged_date=target_date,
         ).order_by('-start_time').first()
+        if not sleep_log and target_user:
+            sleep_log = SleepLog.objects.using(alias).filter(
+                user=target_user,
+                logged_date=target_date,
+            ).order_by('-start_time').first()
 
         sleep_duration = sleep_log.duration_minutes if sleep_log else 0
         sleep_rating = sleep_log.quality_rating if sleep_log else None

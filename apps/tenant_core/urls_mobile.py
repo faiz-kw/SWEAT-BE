@@ -1,6 +1,7 @@
 from django.urls import path
 from apps.authentication.views_otp import SendOTPView, VerifyOTPView
 from . import views_wellness
+from . import views_community
 from .views_mobile import (
     MobileRegisterView,
     MobileLeadCaptureView,
@@ -117,4 +118,17 @@ urlpatterns = [
     path('wellness/sleep-logs/', views_wellness.SleepLogListCreateMobileView.as_view(), name='mobile-wellness-sleep-logs'),
     path('wellness/sleep-logs/<uuid:pk>/', views_wellness.SleepLogDetailMobileView.as_view(), name='mobile-wellness-sleep-log-detail'),
     path('wellness/daily-summary/', views_wellness.DailySummaryMobileView.as_view(), name='mobile-wellness-daily-summary'),
+
+    # 8. Community & Transformations Engine
+    path('community/categories/', views_community.CommunityCategoriesMobileView.as_view(), name='mobile-community-categories'),
+    path('community/feed/', views_community.CommunityFeedMobileView.as_view(), name='mobile-community-feed'),
+    path('community/media/upload/', views_community.CommunityMediaUploadView.as_view(), name='mobile-community-media-upload'),
+    path('community/posts/', views_community.CommunityPostCreateMobileView.as_view(), name='mobile-community-posts-create'),
+    path('community/posts/<uuid:pk>/', views_community.CommunityPostDetailMobileView.as_view(), name='mobile-community-posts-detail'),
+    path('community/posts/<uuid:pk>/react/', views_community.CommunityPostReactMobileView.as_view(), name='mobile-community-posts-react'),
+    path('community/posts/<uuid:pk>/bookmark/', views_community.CommunityPostBookmarkMobileView.as_view(), name='mobile-community-posts-bookmark'),
+    path('community/posts/<uuid:pk>/comments/', views_community.CommunityPostCommentsMobileView.as_view(), name='mobile-community-posts-comments'),
+    path('community/report/', views_community.CommunityReportMobileView.as_view(), name='mobile-community-report'),
+    path('community/requests/', views_community.CommunityRequestsMobileView.as_view(), name='mobile-community-requests'),
+    path('community/requests/<uuid:pk>/upvote/', views_community.CommunityRequestUpvoteMobileView.as_view(), name='mobile-community-requests-upvote'),
 ]

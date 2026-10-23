@@ -1003,3 +1003,124 @@ class ProductAdmin(TenantModelAdmin):
     readonly_fields = ['id', 'created_at', 'updated_at']
     list_per_page = 25
 
+
+# ============================================================================
+# Community & Social Transformations Module
+# ============================================================================
+from .models_community import (
+    CommunityCategory, CommunityPost, PostMedia, CommunityComment,
+    PostReaction, PostBookmark, CommunityReport, MemberRequest,
+    MemberRequestVote, UserSanction, CommunityAuditLog
+)
+
+@admin.register(CommunityCategory)
+class CommunityCategoryAdmin(TenantModelAdmin):
+    list_display = ['name', 'slug', 'color_hex', 'is_admin_only', 'display_order', 'is_active', 'organization']
+    list_filter = ['is_admin_only', 'is_active', 'organization']
+    search_fields = ['name', 'slug', 'description']
+
+@admin.register(CommunityPost)
+class CommunityPostAdmin(TenantModelAdmin):
+    list_display = ['journey_title', 'author_profile', 'category', 'status', 'privacy_scope', 'duration_text', 'metric_change', 'coach_name_snapshot', 'is_pinned', 'created_at']
+    list_filter = ['status', 'privacy_scope', 'category', 'is_pinned', 'organization']
+    search_fields = ['journey_title', 'content', 'coach_name_snapshot', 'author_profile__first_name_snapshot', 'author_profile__last_name_snapshot']
+    readonly_fields = ['id', 'likes_count', 'comments_count', 'bookmarks_count', 'reports_count', 'created_at', 'updated_at']
+
+@admin.register(CommunityComment)
+class CommunityCommentAdmin(TenantModelAdmin):
+    list_display = ['author_profile', 'post', 'is_coach_verified', 'is_hidden', 'likes_count', 'created_at']
+    list_filter = ['is_coach_verified', 'is_hidden', 'organization']
+    search_fields = ['content', 'author_profile__first_name_snapshot']
+
+@admin.register(CommunityReport)
+class CommunityReportAdmin(TenantModelAdmin):
+    list_display = ['reason', 'status', 'reporter_profile', 'post', 'comment', 'created_at']
+    list_filter = ['status', 'reason', 'organization']
+    search_fields = ['custom_details']
+
+@admin.register(MemberRequest)
+class MemberRequestAdmin(TenantModelAdmin):
+    list_display = ['title', 'status', 'upvotes_count', 'author_profile', 'responded_by', 'created_at']
+    list_filter = ['status', 'organization']
+    search_fields = ['title', 'description', 'admin_response']
+
+@admin.register(UserSanction)
+class UserSanctionAdmin(TenantModelAdmin):
+    list_display = ['user_profile', 'sanction_type', 'reason', 'expires_at', 'is_active', 'issued_by']
+    list_filter = ['sanction_type', 'is_active', 'organization']
+
+@admin.register(CommunityAuditLog)
+class CommunityAuditLogAdmin(TenantModelAdmin):
+    list_display = ['action', 'target_type', 'target_id', 'actor', 'ip_address', 'created_at']
+    list_filter = ['action', 'target_type', 'organization']
+    readonly_fields = ['id', 'created_at']
+
+admin.site.register(PostMedia, TenantModelAdmin)
+admin.site.register(PostReaction, TenantModelAdmin)
+admin.site.register(PostBookmark, TenantModelAdmin)
+admin.site.register(MemberRequestVote, TenantModelAdmin)
+
+
+# ============================================================================
+# Nutrition & Wellness Module
+# ============================================================================
+from .models_wellness import (
+    FoodItem, NutritionTarget, MealLog, MealLogItem, WaterLog, SleepLog
+)
+
+
+class MealLogItemInline(admin.TabularInline):
+    model = MealLogItem
+    extra = 0
+    fields = ['food_name_snapshot', 'quantity', 'unit_name', 'consumed_grams', 'snapshot_calories', 'snapshot_protein_g', 'snapshot_carbs_g', 'snapshot_fat_g']
+    readonly_fields = ['created_at']
+
+
+@admin.register(MealLog)
+class MealLogAdmin(TenantModelAdmin):
+    list_display = ['user', 'logged_date', 'meal_type', 'logged_time', 'notes', 'created_at']
+    list_filter = ['meal_type', 'logged_date', 'organization']
+    search_fields = ['user__email', 'user__first_name', 'user__last_name', 'notes']
+    list_select_related = ['user', 'organization']
+    inlines = [MealLogItemInline]
+    ordering = ['-logged_date', '-logged_time']
+    list_per_page = 25
+
+
+@admin.register(NutritionTarget)
+class NutritionTargetAdmin(TenantModelAdmin):
+    list_display = ['user', 'daily_calories', 'protein_grams', 'carbs_grams', 'fat_grams', 'water_ml', 'sleep_target_minutes', 'is_active', 'updated_at']
+    list_filter = ['is_active', 'organization']
+    search_fields = ['user__email', 'user__first_name', 'user__last_name']
+    list_select_related = ['user', 'organization']
+    list_per_page = 25
+
+
+@admin.register(WaterLog)
+class WaterLogAdmin(TenantModelAdmin):
+    list_display = ['user', 'amount_ml', 'logged_date', 'logged_at', 'created_at']
+    list_filter = ['logged_date', 'organization']
+    search_fields = ['user__email']
+    list_select_related = ['user', 'organization']
+    ordering = ['-logged_date', '-logged_at']
+    list_per_page = 25
+
+
+@admin.register(SleepLog)
+class SleepLogAdmin(TenantModelAdmin):
+    list_display = ['user', 'logged_date', 'duration_minutes', 'quality_rating', 'start_time', 'end_time']
+    list_filter = ['quality_rating', 'logged_date', 'organization']
+    search_fields = ['user__email', 'notes']
+    list_select_related = ['user', 'organization']
+    ordering = ['-logged_date']
+    list_per_page = 25
+
+
+@admin.register(FoodItem)
+class FoodItemAdmin(TenantModelAdmin):
+    list_display = ['name', 'category', 'calories', 'protein_g', 'carbs_g', 'fat_g', 'serving_unit', 'serving_weight_grams', 'is_system', 'is_nutritionist_verified', 'is_active']
+    list_filter = ['category', 'is_system', 'is_nutritionist_verified', 'is_active']
+    search_fields = ['name', 'barcode']
+    ordering = ['name']
+    list_per_page = 30
+

@@ -341,6 +341,8 @@ router.register(r'wod/content-items', WorkoutContentItemViewSet, basename='wod-c
 router.register(r'wod/tags', WorkoutTagViewSet, basename='wod-tag')
 
 from .views_inventory import ProductViewSet, RetailOrderViewSet, InventoryMovementViewSet
+from . import views_community
+
 router.register(r'products', ProductViewSet, basename='product')
 router.register(r'retail-orders', RetailOrderViewSet, basename='retail-order')
 router.register(r'inventory-movements', InventoryMovementViewSet, basename='inventory-movement')
@@ -365,5 +367,18 @@ urlpatterns = [
     path('voice-agent/call-outcome/', VoiceAgentCallOutcomeView.as_view(), name='tenant-voice-agent-call-outcome'),
     path('access-control/events/bulk/', AccessControlBulkIngestView.as_view(), name='access-control-bulk-ingest'),
     path('access-control/sync/', AccessControlSyncPassesView.as_view(), name='access-control-sync-passes'),
+
+    # Admin Community & Social Transformations Engine
+    path('community/overview/', views_community.CommunityAdminOverviewView.as_view(), name='admin-community-overview'),
+    path('community/media/upload/', views_community.CommunityMediaUploadView.as_view(), name='admin-community-media-upload'),
+    path('community/posts/', views_community.CommunityAdminPostsView.as_view(), name='admin-community-posts'),
+    path('community/posts/<uuid:pk>/', views_community.CommunityAdminPostsView.as_view(), name='admin-community-posts-detail'),
+    path('community/reports/', views_community.CommunityAdminReportsView.as_view(), name='admin-community-reports'),
+    path('community/reports/<uuid:pk>/resolve/', views_community.CommunityAdminReportsView.as_view(), name='admin-community-reports-resolve'),
+    path('community/requests/', views_community.CommunityAdminRequestsView.as_view(), name='admin-community-requests'),
+    path('community/requests/<uuid:pk>/', views_community.CommunityAdminRequestsView.as_view(), name='admin-community-requests-detail'),
+    path('community/users/<uuid:user_id>/sanction/', views_community.CommunityAdminSanctionsView.as_view(), name='admin-community-sanction-user'),
+    path('community/audit-logs/', views_community.CommunityAdminAuditLogsView.as_view(), name='admin-community-audit-logs'),
+
     path('', include(router.urls)),
 ]

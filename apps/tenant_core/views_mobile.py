@@ -888,18 +888,35 @@ class MobileMeView(APIView):
         user.save(using=alias)
         profile.save(using=alias)
 
+        hb_data = {
+            'id': str(user.home_branch.id) if user.home_branch else (str(profile.preferred_branch.id) if profile.preferred_branch else None),
+            'name': user.home_branch.name if user.home_branch else (profile.preferred_branch.name if profile.preferred_branch else 'SWEAT Studio'),
+        } if (user.home_branch or profile.preferred_branch) else None
+
         return Response({
             'detail': 'Profile updated successfully.',
+            'id': str(user.id),
+            'email': user.email,
+            'first_name': user.first_name,
+            'last_name': user.last_name,
+            'phone': user.phone,
+            'avatar_url': user.avatar_url or '',
+            'membership_number': profile.member_number,
+            'home_branch': hb_data,
             'user': {
                 'id': str(user.id),
+                'email': user.email,
                 'first_name': user.first_name,
                 'last_name': user.last_name,
                 'phone': user.phone,
-                'avatar_url': user.avatar_url,
-                'home_branch': {
-                    'id': str(user.home_branch.id) if user.home_branch else None,
-                    'name': user.home_branch.name if user.home_branch else 'SWEAT Studio',
-                } if user.home_branch else None,
+                'avatar_url': user.avatar_url or '',
+                'home_branch': hb_data,
+            },
+            'profile': {
+                'member_number': profile.member_number,
+                'member_status': profile.member_status,
+                'member_type': profile.member_type,
+                'preferred_branch': hb_data,
             },
         })
 

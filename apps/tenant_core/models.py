@@ -345,6 +345,34 @@ __all__ += [
     'SleepLog',
 ]
 
+from .models_community import (
+    CommunityCategory,
+    CommunityPost,
+    PostMedia,
+    CommunityComment,
+    PostReaction,
+    PostBookmark,
+    CommunityReport,
+    MemberRequest,
+    MemberRequestVote,
+    UserSanction,
+    CommunityAuditLog,
+    PostPrivacyScope,
+    PostStatus,
+)
 
-
-
+__all__ += [
+    'CommunityCategory',
+    'CommunityPost',
+    'PostMedia',
+    'CommunityComment',
+    'PostReaction',
+    'PostBookmark',
+    'CommunityReport',
+    'MemberRequest',
+    'MemberRequestVote',
+    'UserSanction',
+    'CommunityAuditLog',
+    'PostPrivacyScope',
+    'PostStatus',
+]

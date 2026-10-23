@@ -214,7 +214,7 @@ def get_member_sessions_summary(profile: UserProfile, active_m: Membership = Non
                 'valid_until': str(ent.valid_until) if ent.valid_until else None,
             })
             et_lower = (ent.entitlement_type or '').lower()
-            if 'cross' in et_lower:
+            if 'cross' in et_lower or 'passport' in et_lower:
                 cross_sessions += int(rem_val) if not ent.is_unlimited else 999
             elif 'home' in et_lower or 'session' in et_lower or 'class' in et_lower:
                 home_sessions += int(rem_val) if not ent.is_unlimited else 999
@@ -356,6 +356,7 @@ def serialize_member(profile: UserProfile, alias: str = 'default') -> dict:
         'last_name': last_name,
         'phone': getattr(user, 'phone', '') or '',
         'email': getattr(user, 'email', '') or '',
+        'avatar_url': getattr(user, 'avatar_url', '') or (profile.address_json or {}).get('avatar_url', '') or '',
         'gender': profile.gender or 'M',
         'age': age,
         'date_of_birth': str(profile.date_of_birth) if profile.date_of_birth else None,
@@ -651,6 +652,8 @@ def build_member_timeline(profile: UserProfile, alias: str = 'default', limit: i
         form_v = (sub.form_snapshot.get('version') if isinstance(sub.form_snapshot, dict) else None) or (sub.intake_form.version_number if sub.intake_form else 1)
 
         events.append({
+            'id': f"parq-{sub.id}",
+            'category': 'HEALTH',
             'event_type': 'PARQ_REVISION' if is_edit else 'PARQ_CLEARED',
             'title': f"PAR-Q Assessment Updated (Rev #{rev_num})" if is_edit else f"PAR-Q Assessment Completed (v{form_v})",
             'description': f"{form_name} {'edited and re-certified' if is_edit else 'completed and digitally signed'} by {sub.signer_identity or 'Member'}.",
@@ -741,6 +744,7 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         'cross_branch_sessions_remaining': base_member['cross_branch_sessions_remaining'],
         'outstanding_balance': base_member['outstanding_balance'],
         'assigned_trainer': base_member['assigned_trainer'],
+        'avatar_url': base_member.get('avatar_url', ''),
         'alerts': alerts,
         'available_actions': available_actions,
     }
@@ -1067,6 +1071,45 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             upcoming_bookings.append(bk_obj)
         else:
             past_bookings.append(bk_obj)
+
+    # 1-on-1 PT Appointments
+    try:
+        from .models_appointments import Appointment
+        appts = (
+            Appointment.objects.using(alias)
+            .filter(user_profile=profile)
+            .select_related('appointment_type', 'branch')
+            .prefetch_related('assigned_trainers__trainer_profile__employee_profile__user_profile__user')
+            .order_by('-start_at')
+        )
+        for a in appts:
+            assigned = a.assigned_trainers.first()
+            trainer_name = 'SWEAT Coach'
+            if assigned and assigned.trainer_profile:
+                emp = getattr(assigned.trainer_profile, 'employee_profile', None)
+                if emp and emp.user_profile and emp.user_profile.user:
+                    u = emp.user_profile.user
+                    trainer_name = f"{u.first_name} {u.last_name}".strip() or u.display_name or 'Coach'
+
+            appt_obj = {
+                'id': str(a.id),
+                'booking_number': f"PT-{str(a.id)[:8].upper()}",
+                'class_name': f"1-on-1 PT: {a.appointment_type.name if a.appointment_type else 'Personal Training'}",
+                'branch_name': a.branch.name if a.branch else 'SWEAT Studio',
+                'status': a.status,
+                'booking_source': 'MEMBER_PORTAL',
+                'booked_by': 'Member (1-on-1 PT)',
+                'date_time': a.start_at.isoformat() if a.start_at else now_dt.isoformat(),
+                'trainer_name': trainer_name,
+                'is_pt': True,
+                'notes': a.notes or '',
+            }
+            if a.start_at and a.start_at >= now_dt and a.status in ['CONFIRMED', 'SCHEDULED', 'PENDING']:
+                upcoming_bookings.append(appt_obj)
+            else:
+                past_bookings.append(appt_obj)
+    except Exception as e:
+        logger.warning(f"Error loading member PT appointments in 360: {e}")
 
     # Map exit / checkout events by booking_id and date for accurate checkout timestamps
     exit_events_by_booking = {}
@@ -1562,6 +1605,12 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         if pdef and isinstance(pdef.configuration, dict):
             passport_allowed = int(pdef.configuration.get('max_passport_sessions') or 0)
     
+    if passport_allowed == 0 and active_m:
+        for ent in active_m.entitlements.using(alias).all():
+            et_name = (ent.entitlement_type or '').lower()
+            if 'cross' in et_name or 'passport' in et_name:
+                passport_allowed += int(ent.allocated_units or 0)
+
     if passport_allowed == 0:
         passport_allowed = int(base_member.get('cross_branch_sessions_remaining') or 0)
 
@@ -1587,13 +1636,23 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             })
 
     passport_consumed = len(cross_bookings)
-    passport_remaining = max(0, passport_allowed - passport_consumed) if passport_allowed > 0 else 0
+    if passport_allowed > 0:
+        passport_remaining = max(0, passport_allowed - passport_consumed)
+    elif m_cross_s > 0:
+        passport_allowed = m_cross_s + passport_consumed
+        passport_remaining = m_cross_s
+    else:
+        passport_remaining = 0
 
     passport_data = {
         'passport_allowed': passport_allowed,
         'passport_consumed': passport_consumed,
         'passport_remaining': passport_remaining,
         'cross_branch_visits': cross_bookings,
+        'home_branch': {
+            'id': str(active_m.home_branch_id) if active_m and active_m.home_branch_id else base_member.get('home_branch_id'),
+            'name': (active_m.home_branch.name if active_m and active_m.home_branch else base_member.get('home_branch')) or 'Primary Branch',
+        }
     }
 
     overview = {
@@ -1605,6 +1664,7 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             'age': base_member['age'],
             'date_of_birth': base_member.get('date_of_birth'),
             'joined_at': base_member['joined_at'],
+            'avatar_url': base_member.get('avatar_url', ''),
             'emergency_contact': base_member['emergency_contact'],
             'acquisition_source': base_member['source'],
         },
