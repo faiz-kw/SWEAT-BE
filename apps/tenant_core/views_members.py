@@ -56,6 +56,7 @@ from .models_catalog import (
     Package,
     PackageVersion,
     PackagePrice,
+    PackageEntitlementDefinition,
     Program,
     ProgramBranchAvailability,
     PackageBranchAvailability,
@@ -391,14 +392,17 @@ def serialize_member(profile: UserProfile, alias: str = 'default') -> dict:
 def get_member_available_actions(profile: UserProfile, active_m: Membership, outstanding: Decimal) -> list:
     """
     Computes backend-authoritative eligible actions for a member.
+    Always includes PURCHASE_PACKAGE for existing members as well as trial members/leads.
     """
     actions = []
     today = timezone.now().date()
 
+    # Always allow purchasing a new program / package
+    actions.append({'action': 'PURCHASE_PACKAGE', 'label': 'Purchase New Program / Package', 'eligible': True})
+
     if active_m:
         st = active_m.status
-        if st in ['ACTIVE', 'EXPIRED'] or (active_m.end_date and (active_m.end_date - today).days <= 30):
-            actions.append({'action': 'RENEW', 'label': 'Renew Membership', 'eligible': True})
+        actions.append({'action': 'RENEW', 'label': 'Renew Membership', 'eligible': True})
         if st == 'ACTIVE':
             actions.append({'action': 'UPGRADE', 'label': 'Upgrade Package', 'eligible': True})
             actions.append({'action': 'EXTEND', 'label': 'Extend Validity', 'eligible': True})
@@ -411,6 +415,8 @@ def get_member_available_actions(profile: UserProfile, active_m: Membership, out
 
         actions.append({'action': 'ADJUST_ENTITLEMENT', 'label': 'Adjust Sessions', 'eligible': True})
     else:
+        # Trial or new lead without active full membership
+        actions.append({'action': 'RENEW', 'label': 'Renew Membership', 'eligible': True})
         actions.append({'action': 'REJOIN', 'label': 'Rejoin / New Plan', 'eligible': True})
 
     if outstanding > Decimal('0.00'):
@@ -742,7 +748,54 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
     # 2. Timeline
     timeline_events = build_member_timeline(profile, alias, limit=100)
 
-    # 3. Memberships
+    # 3. Memberships & Active Programs Collection
+    user_redemptions = []
+    redemption_by_order = {}
+    coupon_history = []
+    try:
+        from django.db.models import Q
+        from .models_discounts import DiscountRedemption
+        red_q = Q(user_profile=profile)
+        if profile.legacy_reference:
+            red_q = red_q | Q(user_profile__legacy_reference=profile.legacy_reference)
+        user_redemptions = list(
+            DiscountRedemption.objects.using(alias)
+            .filter(red_q)
+            .select_related('discount_code', 'campaign', 'order')
+            .order_by('-redeemed_at')
+        )
+        for red in user_redemptions:
+            c_code = ''
+            try:
+                c_code = red.discount_code.code if red.discount_code_id else ''
+            except Exception:
+                pass
+            camp_name = ''
+            try:
+                camp_name = red.campaign.name if red.campaign_id else ''
+            except Exception:
+                pass
+            if red.order_id:
+                redemption_by_order[str(red.order_id)] = {
+                    'coupon_code': c_code,
+                    'campaign_name': camp_name,
+                    'discount_amount': float(red.discount_amount),
+                }
+
+            ord_num = red.order.order_number if red.order else 'N/A'
+            ord_status = red.order.status if red.order else 'COMPLETED'
+            coupon_history.append({
+                'id': str(red.id),
+                'coupon_code': c_code or 'SPECIAL_OVERRIDE',
+                'campaign_name': camp_name or 'Discretionary Promotional Rate',
+                'discount_amount': float(red.discount_amount),
+                'order_number': ord_num,
+                'order_status': ord_status,
+                'redeemed_at': red.redeemed_at.isoformat() if red.redeemed_at else (red.created_at.isoformat() if red.created_at else ''),
+            })
+    except Exception as e:
+        logger.warning(f"Failed to fetch user redemptions: {e}")
+
     all_memberships = (
         Membership.objects.using(alias)
         .filter(user_profile=profile)
@@ -751,20 +804,71 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
     )
 
     active_membership_data = None
+    active_memberships_list = []
+    active_programs_list = []
     upcoming_membership_data = []
     history_membership_data = []
 
     for m in all_memberships:
+        # Standard Catalog Price from active Package Version Price
+        catalog_price = None
+        if m.package_version:
+            p_price = m.package_version.prices.using(alias).filter(status='ACTIVE').first()
+            if p_price:
+                catalog_price = float(p_price.base_price)
+        if not catalog_price and m.package:
+            pv_active = m.package.versions.using(alias).filter(status='ACTIVE').order_by('-version_number').first()
+            if pv_active:
+                p_price = pv_active.prices.using(alias).filter(status='ACTIVE').first()
+                if p_price:
+                    catalog_price = float(p_price.base_price)
+
         contract = getattr(m, 'contract_snapshot', None)
         contract_data = None
         if contract:
+            c_info = (redemption_by_order.get(str(contract.source_order_id)) if getattr(contract, 'source_order_id', None) else {}) or {}
+            has_coupon = bool(c_info.get('coupon_code'))
+
+            # Retrieve salesperson / staff actor
+            sold_by_name = 'Sweat Front Desk POS'
+            if getattr(contract, 'source_order', None) and contract.source_order.sold_by_user:
+                sold_by_name = contract.source_order.sold_by_user.display_name or contract.source_order.sold_by_user.email
+            elif getattr(contract, 'sold_by_user', None):
+                sold_by_name = contract.sold_by_user.display_name or contract.sold_by_user.email
+
+            if not catalog_price and getattr(contract, 'package_price', None):
+                try:
+                    catalog_price = float(contract.package_price.base_price)
+                except Exception:
+                    pass
+
+            eff_discount = float(contract.discount_amount) or float(c_info.get('discount_amount', 0))
+            if not eff_discount and catalog_price and catalog_price > float(contract.purchase_price):
+                eff_discount = round(catalog_price - float(contract.purchase_price), 2)
+
+            discount_type = 'NONE'
+            discount_label = 'Standard Catalog Price'
+            if has_coupon:
+                discount_type = 'COUPON'
+                discount_label = f"Coupon Applied: {c_info.get('coupon_code')}"
+            elif eff_discount > 0:
+                discount_type = 'OFFLINE_BRANCH_AUTHORIZED'
+                branch_label = m.purchase_branch.name if m.purchase_branch else 'Branch'
+                discount_label = f"Offline Branch Authorized Rate ({branch_label} POS Staff)"
+
             contract_data = {
                 'id': str(contract.id),
                 'package_name': contract.package_name_snapshot,
+                'catalog_price': catalog_price or float(contract.purchase_price),
                 'purchase_price': float(contract.purchase_price),
-                'discount_amount': float(contract.discount_amount),
+                'discount_amount': eff_discount,
+                'discount_type': discount_type,
+                'discount_label': discount_label,
+                'sold_by': sold_by_name,
                 'tax_amount': float(contract.tax_amount),
                 'final_amount': float(contract.final_amount),
+                'coupon_code': c_info.get('coupon_code') or '',
+                'campaign_name': c_info.get('campaign_name') or '',
                 'currency': contract.currency,
                 'duration_value': contract.duration_value,
                 'duration_unit': contract.duration_unit,
@@ -773,12 +877,25 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
                 'entitlements_snapshot': contract.entitlements_snapshot,
             }
 
+        prog_name = (m.program.name if m.program else (m.package.program.name if (m.package and m.package.program) else 'Standard'))
+        pkg_name = m.package.name if m.package else 'Plan'
+
+        m_home_s, m_cross_s, _ = get_member_sessions_summary(profile, m, alias)
+
+        actual_purchase_price = float(contract.purchase_price) if contract else (float(m.package_price.base_price) if m.package_price else 0)
+        eff_discount = (contract_data.get('discount_amount') if contract_data else 0)
+        if not eff_discount and catalog_price and actual_purchase_price and catalog_price > actual_purchase_price:
+            eff_discount = round(catalog_price - actual_purchase_price, 2)
+
         m_obj = {
             'id': str(m.id),
             'membership_number': m.membership_number,
-            'package_name': m.package.name if m.package else 'Plan',
+            'package_id': str(m.package_id) if m.package_id else None,
+            'package_version_id': str(m.package_version_id) if m.package_version_id else None,
+            'program_id': str(m.program_id) if m.program_id else (str(m.package.program_id) if m.package and m.package.program_id else None),
+            'package_name': pkg_name,
             'package_version_name': f"v{m.package_version.version_number}" if m.package_version else 'v1',
-            'program_name': (m.program.name if m.program else (m.package.program.name if (m.package and m.package.program) else 'Standard')),
+            'program_name': prog_name,
             'status': m.status,
             'start_date': str(m.start_date),
             'end_date': str(m.end_date),
@@ -786,14 +903,57 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             'purchase_branch': m.purchase_branch.name if m.purchase_branch else 'Branch',
             'activated_at': m.activated_at.isoformat() if m.activated_at else None,
             'contract_snapshot': contract_data,
+            'catalog_price': catalog_price or actual_purchase_price,
+            'purchase_price': actual_purchase_price,
+            'discount_amount': eff_discount,
+            'discount_type': contract_data.get('discount_type') if contract_data else ('OFFLINE_BRANCH_AUTHORIZED' if eff_discount > 0 else 'NONE'),
+            'discount_label': contract_data.get('discount_label') if contract_data else ('Offline Branch Authorized Rate' if eff_discount > 0 else 'Standard Catalog Price'),
+            'sold_by': contract_data.get('sold_by') if contract_data else 'Sweat Front Desk POS',
+            'coupon_code': contract_data.get('coupon_code') if contract_data else '',
+            'campaign_name': contract_data.get('campaign_name') if contract_data else '',
+            'home_sessions_remaining': m_home_s,
+            'cross_branch_sessions_remaining': m_cross_s,
         }
 
-        if m.id == getattr(active_m, 'id', None):
-            active_membership_data = m_obj
+        # Check if membership is currently active or frozen
+        is_active_or_frozen = m.status in ('ACTIVE', 'FROZEN') and (not m.end_date or m.end_date >= timezone.now().date())
+        if is_active_or_frozen or m.id == getattr(active_m, 'id', None):
+            if not active_membership_data:
+                active_membership_data = m_obj
+            active_memberships_list.append(m_obj)
+            active_programs_list.append({
+                'membership_id': str(m.id),
+                'membership_number': m.membership_number,
+                'program_name': prog_name,
+                'package_name': pkg_name,
+                'status': m.status,
+                'start_date': str(m.start_date) if m.start_date else None,
+                'expiry_date': str(m.end_date) if m.end_date else None,
+                'home_sessions_remaining': m_home_s,
+                'cross_branch_sessions_remaining': m_cross_s,
+                'home_branch': m.home_branch.name if m.home_branch else 'Branch',
+            })
         elif m.start_date and m.start_date > timezone.now().date():
             upcoming_membership_data.append(m_obj)
         else:
             history_membership_data.append(m_obj)
+
+    # Fallback to single program if list is empty but profile has active membership
+    if not active_programs_list and base_member.get('program_name'):
+        active_programs_list.append({
+            'membership_id': str(active_m.id) if active_m else None,
+            'membership_number': base_member.get('membership_number', ''),
+            'program_name': base_member.get('program_name', 'Standard'),
+            'package_name': base_member.get('package_name', 'Plan'),
+            'status': base_member.get('membership_status', 'ACTIVE'),
+            'start_date': base_member.get('start_date'),
+            'expiry_date': base_member.get('expiry_date'),
+            'home_sessions_remaining': base_member.get('home_sessions_remaining', 0),
+            'cross_branch_sessions_remaining': base_member.get('cross_branch_sessions_remaining', 0),
+            'home_branch': base_member.get('home_branch', 'Branch'),
+        })
+
+    header['active_programs'] = active_programs_list
 
     # Freezes & history
     freezes = [
@@ -856,7 +1016,10 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
     bookings_qs = (
         Booking.objects.using(alias)
         .filter(user_profile=profile)
-        .select_related('occurrence', 'occurrence__class_template', 'branch')
+        .select_related('occurrence', 'occurrence__class_template', 'branch', 'created_by_user')
+        .prefetch_related(
+            'occurrence__trainer_assignments__trainer_profile__employee_profile__user_profile'
+        )
         .order_by('-booked_at')
     )
 
@@ -866,6 +1029,29 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
     for bk in bookings_qs:
         occ = bk.occurrence
         tpl = occ.class_template if occ else None
+
+        tr_names = []
+        if occ:
+            for tas in occ.trainer_assignments.all():
+                try:
+                    up = tas.trainer_profile.employee_profile.user_profile
+                    fn = up.first_name_snapshot or ''
+                    ln = up.last_name_snapshot or ''
+                    full = f"{fn} {ln}".strip() or getattr(up.user, 'email', '')
+                    if full:
+                        tr_names.append(full)
+                except Exception:
+                    pass
+        trainer_name = ', '.join(tr_names) if tr_names else 'Assigned Trainer'
+
+        booked_by = 'Member'
+        if bk.created_by_user:
+            booked_by = bk.created_by_user.display_name or bk.created_by_user.email
+        elif bk.booking_source == 'MOBILE_APP':
+            booked_by = 'Member (Mobile App)'
+        elif bk.booking_source == 'FRONT_DESK':
+            booked_by = 'Front Desk Staff'
+
         bk_obj = {
             'id': str(bk.id),
             'booking_number': bk.booking_number,
@@ -873,32 +1059,120 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             'branch_name': bk.branch.name if bk.branch else 'Branch',
             'status': bk.status,
             'booking_source': bk.booking_source,
+            'booked_by': booked_by,
             'date_time': occ.start_at.isoformat() if (occ and occ.start_at) else bk.booked_at.isoformat(),
-            'trainer_name': 'Assigned Trainer',
+            'trainer_name': trainer_name,
         }
         if occ and occ.start_at and occ.start_at >= now_dt and bk.status in ['CONFIRMED', 'WAITLISTED', 'RESERVED']:
             upcoming_bookings.append(bk_obj)
         else:
             past_bookings.append(bk_obj)
 
-    attendance_records = [
-        {
+    # Map exit / checkout events by booking_id and date for accurate checkout timestamps
+    exit_events_by_booking = {}
+    exit_events_by_date = {}
+    exit_events = (
+        AccessEvent.objects.using(alias)
+        .filter(user_profile=profile, event_type__in=['MARK_EXIT', 'EXIT_UPDATED', 'EXIT', 'CHECK_OUT'])
+        .order_by('-event_at')
+    )
+    for ee in exit_events:
+        if ee.booking_id and str(ee.booking_id) not in exit_events_by_booking:
+            exit_events_by_booking[str(ee.booking_id)] = ee.event_at
+        d_key = ee.event_at.date().isoformat()
+        if d_key not in exit_events_by_date:
+            exit_events_by_date[d_key] = ee.event_at
+
+    attendance_records = []
+    for att in (
+        AttendanceRecord.objects.using(alias)
+        .filter(user_profile=profile)
+        .select_related(
+            'branch',
+            'marked_by_user',
+            'occurrence',
+            'occurrence__class_template',
+            'booking',
+            'booking__occurrence',
+            'booking__occurrence__class_template',
+        )
+        .prefetch_related(
+            'occurrence__trainer_assignments__trainer_profile__employee_profile__user_profile',
+            'booking__occurrence__trainer_assignments__trainer_profile__employee_profile__user_profile',
+        )
+        .order_by('-check_in_at', '-created_at')[:200]
+    ):
+        chk_in = att.check_in_at or att.created_at
+        chk_out = att.check_out_at
+        if not chk_out and att.booking_id:
+            chk_out = exit_events_by_booking.get(str(att.booking_id))
+        if not chk_out and chk_in:
+            d_str = chk_in.date().isoformat()
+            candidate_exit = exit_events_by_date.get(d_str)
+            if candidate_exit and candidate_exit >= chk_in:
+                chk_out = candidate_exit
+        if not chk_out and att.status in ('PRESENT', 'ATTENDED', 'COMPLETED'):
+            occ = att.occurrence or (att.booking.occurrence if att.booking else None)
+            if occ and occ.end_at and occ.end_at <= timezone.now():
+                chk_out = occ.end_at
+
+        # Resolve trainer name
+        occ_target = att.occurrence or (att.booking.occurrence if att.booking else None)
+        att_tr_names = []
+        if occ_target:
+            for tas in occ_target.trainer_assignments.all():
+                try:
+                    up = tas.trainer_profile.employee_profile.user_profile
+                    fn = up.first_name_snapshot or ''
+                    ln = up.last_name_snapshot or ''
+                    full = f"{fn} {ln}".strip() or getattr(up.user, 'email', '')
+                    if full:
+                        att_tr_names.append(full)
+                except Exception:
+                    pass
+        att_trainer = ', '.join(att_tr_names) if att_tr_names else 'Assigned Trainer'
+
+        # Resolve who marked/verified attendance
+        marked_by_display = 'Front Desk Staff'
+        if att.marked_by_user:
+            marked_by_display = att.marked_by_user.display_name or att.marked_by_user.email
+        elif att.check_in_method == 'MOBILE':
+            marked_by_display = 'Member (Mobile App QR)'
+        elif att.check_in_method in ('FRONT_DESK', 'ADMIN'):
+            branch_name = att.branch.name if att.branch else 'Sweat Goregaon West'
+            marked_by_display = f"Front Desk Staff ({branch_name})"
+
+        attendance_records.append({
             'id': str(att.id),
-            'date_time': (att.check_in_at or att.created_at).isoformat(),
+            'date_time': (chk_in).isoformat() if chk_in else '',
+            'check_in_at': chk_in.isoformat() if chk_in else None,
+            'check_out_at': chk_out.isoformat() if chk_out else None,
             'branch_name': att.branch.name if att.branch else 'Branch',
+            'branch_id': str(att.branch.id) if att.branch else None,
+            'class_name': (
+                att.occurrence.class_template.name
+                if (att.occurrence and att.occurrence.class_template)
+                else (
+                    att.booking.occurrence.class_template.name
+                    if (att.booking and att.booking.occurrence and att.booking.occurrence.class_template)
+                    else 'General Session'
+                )
+            ),
             'status': att.status,
             'check_in_method': att.check_in_method,
-            'marked_by': att.marked_by_user.email if att.marked_by_user else 'Front Desk',
-        }
-        for att in AttendanceRecord.objects.using(alias).filter(user_profile=profile).select_related('branch', 'marked_by_user').order_by('-check_in_at', '-created_at')[:50]
-    ]
+            'trainer_name': att_trainer,
+            'marked_by': marked_by_display,
+        })
 
     # 6. Finance
     orders_data = []
     total_invoiced = Decimal('0.00')
     total_paid = Decimal('0.00')
 
-    for ord_obj in Order.objects.using(alias).filter(user_profile=profile).prefetch_related('items').order_by('-created_at'):
+    ord_q = Q(user_profile=profile)
+    if profile.legacy_reference:
+        ord_q = ord_q | Q(user_profile__legacy_reference=profile.legacy_reference)
+    for ord_obj in Order.objects.using(alias).filter(ord_q).select_related('sold_by_user').prefetch_related('items').order_by('-created_at'):
         paid_for_order = PaymentTransaction.objects.using(alias).filter(
             order=ord_obj, status__in=['SUCCESS', 'success']
         ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
@@ -917,18 +1191,69 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             total_invoiced += ord_obj.total_amount
             total_paid += paid_for_order
 
+        is_ext = ('extension' in (ord_obj.notes or '').lower() or any('extension' in (it.item_name_snapshot or '').lower() for it in ord_obj.items.all()))
+        c_info = redemption_by_order.get(str(ord_obj.id)) or {}
+        sold_by_display = (ord_obj.sold_by_user.display_name or ord_obj.sold_by_user.email) if ord_obj.sold_by_user else 'Sweat Front Desk POS'
+
+        # Resolve payment details from primary payment transaction
+        pt_obj = PaymentTransaction.objects.using(alias).filter(order=ord_obj).order_by('-paid_at', '-created_at').first()
+        payment_method = pt_obj.payment_method if (pt_obj and pt_obj.payment_method) else ('Credit Card' if ord_obj.total_amount > 0 else 'Direct')
+        provider = pt_obj.provider if pt_obj else 'CASH'
+        pt_ref = pt_obj.provider_transaction_id if pt_obj else ''
+        is_online = 'razorpay' in (provider or '').lower() or 'online' in (payment_method or '').lower()
+        payment_mode = 'ONLINE' if is_online else 'OFFLINE'
+
+        # Compute catalog price and authorized discount
+        order_catalog_price = Decimal('0.00')
+        for it in ord_obj.items.all():
+            if it.package_price and it.package_price.base_price:
+                order_catalog_price += it.package_price.base_price * it.quantity
+            elif it.unit_price_snapshot:
+                order_catalog_price += it.unit_price_snapshot * it.quantity
+        if order_catalog_price < ord_obj.total_amount:
+            order_catalog_price = ord_obj.total_amount
+
+        if ord_obj.discount_amount > Decimal('0.00'):
+            effective_discount = ord_obj.discount_amount
+        elif order_catalog_price > ord_obj.total_amount:
+            effective_discount = order_catalog_price - ord_obj.total_amount
+        else:
+            effective_discount = Decimal('0.00')
+
+        if c_info.get('coupon_code'):
+            discount_type = 'COUPON'
+            discount_label = f"Coupon Applied: {c_info.get('coupon_code')} ({c_info.get('campaign_name') or 'Direct Promotion'})"
+        elif effective_discount > Decimal('0.00'):
+            discount_type = 'OFFLINE_BRANCH_AUTHORIZED'
+            discount_label = f"Offline Branch Authorized Rate ({sold_by_display})"
+        else:
+            discount_type = 'STANDARD_RATE'
+            discount_label = 'Standard Catalog Price'
+
         orders_data.append({
             'id': str(ord_obj.id),
             'order_number': ord_obj.order_number,
-            'order_type': ord_obj.order_type,
+            'order_type': 'EXTENSION' if is_ext else ord_obj.order_type,
+            'is_extension': is_ext,
+            'notes': ord_obj.notes or '',
+            'sold_by': sold_by_display,
+            'coupon_code': c_info.get('coupon_code') or '',
+            'campaign_name': c_info.get('campaign_name') or '',
+            'discount_type': discount_type,
+            'discount_label': discount_label,
+            'catalog_price': float(order_catalog_price),
             'status': ord_obj.status,
             'subtotal': float(ord_obj.subtotal),
-            'discount_amount': float(ord_obj.discount_amount),
+            'discount_amount': float(effective_discount),
+            'reward_amount': float(ord_obj.reward_amount or Decimal('0.00')),
             'tax_amount': float(ord_obj.tax_amount),
             'total_amount': float(ord_obj.total_amount),
             'paid_amount': float(paid_for_order),
             'outstanding_amount': float(bal),
             'currency': ord_obj.currency,
+            'payment_mode': payment_mode,
+            'payment_method': payment_method,
+            'provider_transaction_id': pt_ref,
             'created_at': ord_obj.created_at.isoformat(),
             'items': [
                 {
@@ -953,6 +1278,8 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             'currency': pt.currency,
             'status': pt.status,
             'paid_at': pt.paid_at.isoformat() if pt.paid_at else pt.created_at.isoformat(),
+            'provider_transaction_id': pt.provider_transaction_id or '',
+            'metadata': pt.metadata or {},
         }
         for pt in PaymentTransaction.objects.using(alias).filter(user_profile=profile).select_related('order').order_by('-created_at')
     ]
@@ -1190,6 +1517,85 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
     # Next booking for Overview
     next_bk = upcoming_bookings[0] if upcoming_bookings else None
 
+    # Reward Points / Coins
+    from .models_rewards import RewardAccount
+    from .models_govern import OrganizationSettings
+    reward_acc = RewardAccount.objects.using(alias).filter(user_profile=profile).first()
+    
+    earn_rate = 100
+    current_org = _get_org(request) if request else (getattr(profile, 'organization', None) or Organization.objects.using(alias).filter(status='ACTIVE').first())
+    org_settings = None
+    if current_org:
+        org_settings = OrganizationSettings.objects.using(alias).filter(organization=current_org).first()
+    if not org_settings:
+        org_settings = OrganizationSettings.objects.using(alias).first()
+
+    if org_settings and isinstance(org_settings.membership_config, dict):
+        earn_rate = int(org_settings.membership_config.get('reward_points', {}).get('earn_rate_rupees', 100) or 100)
+
+    pts_balance = float(reward_acc.points_balance) if (reward_acc and reward_acc.points_balance > 0) else 0.0
+    lifetime_earned = float(reward_acc.lifetime_earned) if (reward_acc and reward_acc.lifetime_earned > 0) else 0.0
+    lifetime_redeemed = float(reward_acc.lifetime_redeemed) if reward_acc else 0.0
+    credit_balance = float(reward_acc.credit_balance) if reward_acc else 0.0
+
+    if pts_balance == 0.0:
+        total_spent = sum(float(p['amount']) for p in payments_data if p['status'] == 'SUCCESS')
+        pts_balance = float(int(total_spent // earn_rate))
+        lifetime_earned = pts_balance
+        credit_balance = pts_balance * 1.0  # 1 point = 1 rupee standard
+
+    rewards_data = {
+        'points_balance': pts_balance,
+        'credit_balance': credit_balance,
+        'lifetime_earned': lifetime_earned,
+        'lifetime_redeemed': lifetime_redeemed,
+        'status': reward_acc.status if reward_acc else 'ACTIVE',
+        'earn_rate_rupees': earn_rate,
+    }
+
+    # Passport / Cross-Branch Sessions
+    passport_allowed = 0
+    if active_m and active_m.package_version:
+        pdef = PackageEntitlementDefinition.objects.using(alias).filter(
+            package_version=active_m.package_version
+        ).first()
+        if pdef and isinstance(pdef.configuration, dict):
+            passport_allowed = int(pdef.configuration.get('max_passport_sessions') or 0)
+    
+    if passport_allowed == 0:
+        passport_allowed = int(base_member.get('cross_branch_sessions_remaining') or 0)
+
+    cross_bookings = []
+    if active_m and active_m.home_branch_id:
+        cross_bks = (
+            Booking.objects.using(alias)
+            .filter(user_profile=profile)
+            .exclude(branch_id=active_m.home_branch_id)
+            .select_related('branch', 'occurrence', 'occurrence__class_template')
+            .order_by('-booked_at')[:50]
+        )
+        for cb in cross_bks:
+            occ = cb.occurrence
+            tpl = occ.class_template if occ else None
+            dt_str = occ.start_at.isoformat() if (occ and occ.start_at) else (cb.booked_at.isoformat() if cb.booked_at else cb.created_at.isoformat())
+            cross_bookings.append({
+                'id': str(cb.id),
+                'branch_name': cb.branch.name if cb.branch else 'Cross Branch',
+                'class_name': tpl.name if tpl else 'Class Session',
+                'date_time': dt_str,
+                'status': cb.status,
+            })
+
+    passport_consumed = len(cross_bookings)
+    passport_remaining = max(0, passport_allowed - passport_consumed) if passport_allowed > 0 else 0
+
+    passport_data = {
+        'passport_allowed': passport_allowed,
+        'passport_consumed': passport_consumed,
+        'passport_remaining': passport_remaining,
+        'cross_branch_visits': cross_bookings,
+    }
+
     overview = {
         'contact': {
             'full_name': base_member['name'],
@@ -1213,24 +1619,44 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         'assigned_trainer': base_member['assigned_trainer'],
         'alerts': alerts,
         'recent_activities': timeline_events[:5],
+        'rewards': rewards_data,
+        'passport': passport_data,
+    }
+
+    m_cfg = (org_settings.membership_config if org_settings and isinstance(org_settings.membership_config, dict) else {})
+    pricing_config = {
+        'extension_tiers': m_cfg.get('extension_tiers', [
+            {'days': 15, 'fee': 500},
+            {'days': 30, 'fee': 1000},
+            {'days': 45, 'fee': 1500},
+            {'days': 60, 'fee': 2000}
+        ]),
+        'extension_fee_per_30_days': float(m_cfg.get('extension_fee_per_30_days', 1000)),
+        'freeze_fee': float(m_cfg.get('freeze_fee', 500)),
+        'membership_activation_fee': float(m_cfg.get('membership_activation_fee', 1500)),
     }
 
     return {
         'member': base_member,
         'header': header,
         'overview': overview,
+        'config': pricing_config,
         'timeline': timeline_events,
         'memberships': {
             'active': active_membership_data,
+            'active_list': active_memberships_list,
+            'active_programs': active_programs_list,
             'upcoming': upcoming_membership_data,
             'history': history_membership_data,
             'freezes': freezes,
             'branch_history': branch_history,
             'status_history': status_history,
+            'coupon_history': coupon_history,
         },
         'passbook': {
             'balances': balances,
             'ledger': ledger_entries,
+            'coupon_history': coupon_history,
         },
         'bookings_and_attendance': {
             'upcoming_bookings': upcoming_bookings,
@@ -1253,7 +1679,10 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             'payments': payments_data,
             'invoices': invoices_data,
             'refunds': refunds_data,
+            'coupon_history': coupon_history,
         },
+        'rewards': rewards_data,
+        'passport': passport_data,
         'health_and_forms': {
             'submissions': submissions_data,
         },
@@ -2170,6 +2599,234 @@ class MemberViewSet(viewsets.ViewSet):
                     'member': serialize_member(profile, alias),
                 }, status=status.HTTP_201_CREATED)
 
+    @action(detail=True, methods=['post'], url_path='purchase-package')
+    def purchase_package(self, request, pk=None):
+        """
+        Canonical Purchase of New Program / Package:
+        Allows purchasing any program package for existing members, trial members, or new leads.
+        Creates Order, records PaymentTransaction (with actor and provider), provisions Membership
+        and Entitlements, and records audit logs into MembershipStatusHistory, MembershipBranchHistory,
+        and business audit.
+        """
+        alias = _get_db(request)
+        org = _get_org(request)
+        profile = self.get_member_profile(alias, org, pk)
+        if not profile:
+            return Response({'detail': 'Member not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        package_id = request.data.get('package_id')
+        if not package_id:
+            return Response({'error': 'package_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        package = Package.objects.using(alias).filter(id=package_id).first()
+        if not package:
+            return Response({'error': 'Package not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        package_version_id = request.data.get('package_version_id')
+        if package_version_id:
+            package_version = PackageVersion.objects.using(alias).filter(id=package_version_id, package=package).first()
+        else:
+            package_version = package.versions.using(alias).filter(status='ACTIVE').order_by('-version_number').first()
+
+        if not package_version:
+            package_version = package.versions.using(alias).order_by('-version_number').first()
+            if not package_version:
+                package_version = PackageVersion.objects.using(alias).create(
+                    package=package,
+                    version_number=1,
+                    status='ACTIVE',
+                    created_by_user=request.user
+                )
+
+        price_obj = package_version.prices.using(alias).filter(status='ACTIVE').first()
+        unit_price = price_obj.base_price if price_obj else (package.price if hasattr(package, 'price') and package.price else Decimal('5000.00'))
+
+        # Branch
+        branch_id = request.data.get('branch_id')
+        branch = Branch.objects.using(alias).filter(id=branch_id).first() if branch_id else None
+        if not branch:
+            branch = profile.preferred_branch or Branch.objects.using(alias).filter(status='ACTIVE').first()
+
+        # Start Date
+        start_schedule = request.data.get('start_schedule', 'CONTINUOUS')
+        today = timezone.now().date()
+        custom_start_date = request.data.get('custom_start_date')
+
+        if start_schedule == 'CUSTOM' and custom_start_date:
+            try:
+                start_date = datetime.strptime(str(custom_start_date)[:10], '%Y-%m-%d').date()
+            except Exception:
+                start_date = today
+        elif start_schedule == 'CONTINUOUS':
+            prog = package.program
+            existing_same_prog = Membership.objects.using(alias).filter(
+                user_profile=profile,
+                status='ACTIVE'
+            ).filter(Q(program=prog) | Q(package__program=prog)).order_by('-end_date').first()
+            if existing_same_prog and existing_same_prog.end_date and existing_same_prog.end_date >= today:
+                start_date = existing_same_prog.end_date + timedelta(days=1)
+            else:
+                start_date = today
+        else:
+            start_date = today
+
+        with transaction.atomic(using=alias):
+            order = CommerceService.create_order(
+                branch=branch,
+                items_data=[{
+                    'item_type': 'PACKAGE',
+                    'package_id': package.id,
+                    'package_version_id': package_version.id,
+                    'package_price_id': price_obj.id if price_obj else None,
+                    'item_name_snapshot': f"{package.name} (v{package_version.version_number})",
+                    'quantity': Decimal('1.00'),
+                    'unit_price': unit_price,
+                    'discount_amount': Decimal('0.00'),
+                    'tax_percent': Decimal('0.000'),
+                }],
+                user_profile=profile,
+                order_type='MEMBERSHIP_PURCHASE',
+                source='FRONT_DESK_POS',
+                currency='INR',
+                notes=request.data.get('reason', f'Purchase of {package.name} ({package.program.name if package.program else "Program"})'),
+                created_by=request.user,
+                db_alias=alias,
+            )
+
+            payment_provider = request.data.get('payment_provider', 'CARD')
+            payment_method = request.data.get('payment_method', 'CARD')
+            is_cash = str(payment_provider).upper() == 'CASH' or str(payment_method).upper() == 'CASH'
+            is_link = str(payment_provider).upper() in ('PAYMENT_LINK', 'LINK') or str(payment_method).upper() in ('PAYMENT_LINK', 'LINK')
+            payment_amount = request.data.get('payment_amount')
+            pay_amt = Decimal(str(payment_amount)) if payment_amount is not None else order.total_amount
+
+            order_item = order.items.first()
+
+            if is_link:
+                link = CommerceService.create_payment_link(
+                    order_id=str(order.id),
+                    expiry_hours=48,
+                    actor=request.user,
+                    db_alias=alias,
+                )
+                new_membership = MembershipLifecycleService.activate_membership_from_order(
+                    order=order,
+                    order_item=order_item,
+                    start_date=start_date,
+                    db_alias=alias,
+                    created_by_user=request.user,
+                )
+                new_membership.status = 'PENDING_PAYMENT'
+                new_membership.legacy_reference = f"PAYMENT_LINK:{link.id}"
+                new_membership.save(using=alias, update_fields=['status', 'legacy_reference', 'updated_at'])
+                new_membership.entitlements.using(alias).update(status='INACTIVE')
+
+                MembershipStatusHistory.objects.using(alias).create(
+                    membership=new_membership,
+                    from_status=None,
+                    to_status='PENDING_PAYMENT',
+                    reason_code='PAYMENT_LINK_SENT',
+                    reason_text=f"Awaiting payment via payment link created by {getattr(request.user, 'email', 'Staff')}",
+                    changed_by_user=request.user,
+                )
+
+                return Response({
+                    'success': True,
+                    'status': 'PAYMENT_LINK_GENERATED',
+                    'message': f"Order {order.order_number} created. Payment link generated.",
+                    'payment_url': link.payment_url,
+                    'payment_link_id': str(link.id),
+                    'order_id': str(order.id),
+                    'order_number': order.order_number,
+                    'amount': str(order.total_amount),
+                    'new_membership_id': str(new_membership.id),
+                    'member': serialize_member(profile, alias),
+                }, status=status.HTTP_201_CREATED)
+
+            elif is_cash:
+                txn = PaymentTransaction.objects.using(alias).create(
+                    id=uuid.uuid4(),
+                    order=order,
+                    user_profile=profile,
+                    amount=pay_amt,
+                    currency=order.currency or 'INR',
+                    provider='CASH',
+                    payment_method='CASH',
+                    status='SUCCESS',
+                    idempotency_key=f"CASH-PURCHASE-{uuid.uuid4().hex[:12]}",
+                    metadata={
+                        'collected_via': 'PACKAGE_PURCHASE',
+                        'collected_by_user_id': str(request.user.id),
+                        'collected_by_name': getattr(request.user, 'display_name', getattr(request.user, 'email', 'Staff')),
+                        'member_profile_id': str(profile.id),
+                    }
+                )
+                new_membership = MembershipLifecycleService.activate_membership_from_order(
+                    order=order,
+                    order_item=order_item,
+                    start_date=start_date,
+                    db_alias=alias,
+                    created_by_user=request.user,
+                )
+                MembershipStatusHistory.objects.using(alias).create(
+                    membership=new_membership,
+                    from_status=None,
+                    to_status='ACTIVE',
+                    reason_code='NEW_PROGRAM_PACKAGE_PURCHASE_CASH',
+                    reason_text=f"Purchased {package.name} ({package.program.name if package.program else ''}) via Cash recorded by {getattr(request.user, 'email', 'Staff')}",
+                    changed_by_user=request.user,
+                )
+            else:
+                CommerceService.record_payment(
+                    order_id=str(order.id),
+                    amount=pay_amt,
+                    provider=payment_provider,
+                    payment_method=payment_method,
+                    actor=request.user,
+                    db_alias=alias,
+                )
+                new_membership = MembershipLifecycleService.activate_membership_from_order(
+                    order=order,
+                    order_item=order_item,
+                    start_date=start_date,
+                    db_alias=alias,
+                    created_by_user=request.user,
+                )
+                MembershipStatusHistory.objects.using(alias).create(
+                    membership=new_membership,
+                    from_status=None,
+                    to_status='ACTIVE',
+                    reason_code='NEW_PROGRAM_PACKAGE_PURCHASE',
+                    reason_text=f"Purchased {package.name} ({package.program.name if package.program else ''}) via {payment_method} recorded by {getattr(request.user, 'email', 'Staff')}",
+                    changed_by_user=request.user,
+                )
+
+            # Update profile member_status to ACTIVE if it was inactive or trial
+            profile.member_status = 'ACTIVE'
+            profile.save(using=alias, update_fields=['member_status', 'updated_at'])
+
+            record_business_audit(
+                organization=org,
+                branch=branch,
+                module='memberships',
+                action_code='PACKAGE_PURCHASED',
+                entity_type='Membership',
+                entity_id=new_membership.id,
+                actor_user=request.user,
+                event_description=f"Purchased {package.name} ({package.program.name if package.program else 'Program'}) by {getattr(request.user, 'email', 'Staff')}",
+                db_alias=alias,
+            )
+
+            return Response({
+                'success': True,
+                'message': f"Successfully purchased {package.name} for {profile.user.display_name or 'member'}.",
+                'new_membership_id': str(new_membership.id),
+                'start_date': str(new_membership.start_date),
+                'end_date': str(new_membership.end_date),
+                'order_id': str(order.id),
+                'member': serialize_member(profile, alias),
+            }, status=status.HTTP_201_CREATED)
+
     @action(detail=True, methods=['post'], url_path='upgrade')
     def upgrade(self, request, pk=None):
         """
@@ -2178,10 +2835,22 @@ class MemberViewSet(viewsets.ViewSet):
         alias = _get_db(request)
         org = _get_org(request)
         profile = self.get_member_profile(alias, org, pk)
+        active_m = None
+        if not profile:
+            mb = Membership.objects.using(alias).filter(id=pk).select_related('user_profile').first()
+            if mb and mb.user_profile:
+                profile = mb.user_profile
+                active_m = mb
+
         if not profile:
             return Response({'detail': 'Member not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        active_m = Membership.objects.using(alias).filter(user_profile=profile, status='ACTIVE').order_by('-created_at').first()
+        if not active_m:
+            membership_id = request.data.get('membership_id')
+            if membership_id:
+                active_m = Membership.objects.using(alias).filter(id=membership_id, user_profile=profile).first()
+        if not active_m:
+            active_m = Membership.objects.using(alias).filter(user_profile=profile, status='ACTIVE').order_by('-created_at').first()
         if not active_m:
             return Response({'error': 'No active membership to upgrade.'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -3107,35 +3776,51 @@ class MemberViewSet(viewsets.ViewSet):
     def plans(self, request):
         alias = _get_db(request)
         org = _get_org(request)
-        packages = Package.objects.using(alias).filter(status='ACTIVE')
+        packages = Package.objects.using(alias).filter(status='ACTIVE').filter(Q(program__isnull=True) | Q(program__status='ACTIVE')).select_related('program', 'program__category')
         if org:
-            packages = packages.filter(organization=org)
+            packages = packages.filter(Q(organization=org) | Q(organization__isnull=True))
 
         out = []
+        import re
         for pkg in packages.order_by('name'):
             pv = pkg.versions.using(alias).filter(status='ACTIVE').order_by('-version_number').first()
             price_val = 5000.0
             currency = 'INR'
             duration_months = 1
+            validity_days = 30
+            total_sessions = None
             if pv:
                 pr = pv.prices.using(alias).filter(status='ACTIVE').first()
                 if pr:
                     price_val = float(pr.base_price)
                     currency = pr.currency
                 duration_months = pv.duration_value if pv.duration_value else 1
+                validity_days = pv.validity_days or pv.total_days or (duration_months * 30)
 
+            # Extract session count from package name if present
+            s_match = re.search(r'(\d+)\s*session', pkg.name, re.I)
+            if s_match:
+                total_sessions = int(s_match.group(1))
+
+            prog = pkg.program
+            cat_name = prog.category.name if (prog and getattr(prog, 'category', None)) else 'General'
+            desc = getattr(pv, 'description_snapshot', '') if pv else ''
             out.append({
                 'id': str(pkg.id),
                 'package_id': str(pkg.id),
                 'package_version_id': str(pv.id) if pv else None,
                 'name': pkg.name,
-                'category': 'Membership',
+                'program_id': str(prog.id) if prog else None,
+                'program_name': prog.name if prog else 'Standard',
+                'category_name': cat_name,
+                'category': cat_name,
                 'duration_months': duration_months,
+                'validity_days': validity_days,
                 'price': price_val,
                 'currency': currency,
-                'total_sessions': None,
+                'total_sessions': total_sessions,
                 'is_active': True,
-                'description': pkg.description or '',
+                'description': desc or '',
             })
         return Response(out, status=status.HTTP_200_OK)
 

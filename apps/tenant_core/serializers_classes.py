@@ -299,7 +299,7 @@ class ClassScheduleRuleSerializer(serializers.ModelSerializer):
 
 
 class ClassOccurrenceTrainerSerializer(serializers.ModelSerializer):
-    trainer_name = serializers.CharField(source='trainer_profile.employee_profile.user_profile.user.full_name', read_only=True)
+    trainer_name = serializers.SerializerMethodField()
     trainer_code = serializers.CharField(source='trainer_profile.trainer_code', read_only=True)
 
     class Meta:
@@ -309,6 +309,30 @@ class ClassOccurrenceTrainerSerializer(serializers.ModelSerializer):
             'trainer_role', 'status', 'assigned_at', 'created_at'
         ]
         read_only_fields = ['id', 'assigned_at', 'created_at']
+
+    def get_trainer_name(self, obj):
+        tp = getattr(obj, 'trainer_profile', None)
+        if not tp:
+            return 'Trainer'
+        emp = getattr(tp, 'employee_profile', None)
+        up = getattr(emp, 'user_profile', None) if emp else None
+        if up:
+            first = getattr(up, 'first_name_snapshot', '') or ''
+            last = getattr(up, 'last_name_snapshot', '') or ''
+            full = f"{first} {last}".strip()
+            if full and full.lower() not in ['sweat', 'sweat demo', 'demo']:
+                return full
+            u = getattr(up, 'user', None)
+            if u:
+                u_full = getattr(u, 'full_name', '') or ''
+                if u_full and u_full.lower() not in ['sweat', 'sweat demo', 'demo']:
+                    return u_full
+                u_name = f"{getattr(u, 'first_name', '')} {getattr(u, 'last_name', '')}".strip()
+                if u_name and u_name.lower() not in ['sweat', 'sweat demo', 'demo']:
+                    return u_name
+            if full:
+                return f"{full} ({tp.trainer_code})"
+        return tp.trainer_code or 'Trainer'
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
@@ -357,6 +381,7 @@ class ClassOccurrenceTrainerSerializer(serializers.ModelSerializer):
 
 class ClassOccurrenceSerializer(serializers.ModelSerializer):
     class_name = serializers.CharField(source='class_template.name', read_only=True)
+    description = serializers.CharField(source='class_template.description', read_only=True)
     category = serializers.UUIDField(source='class_template.category_id', read_only=True)
     category_name = serializers.CharField(source='class_template.category.name', read_only=True)
     category_code = serializers.CharField(source='class_template.category.code', read_only=True)
@@ -514,7 +539,7 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
             'waitlist_capacity', 'booking_open_at', 'booking_close_at',
             'cancellation_cutoff_at', 'status', 'is_manual', 'is_override',
             'trainers', 'trainer_checked_in', 'trainer_check_in_details', 'booking_count', 'waitlist_count',
-            'active_content', 'is_eligible', 'ineligibility_reason', 'ineligibility_code', 'created_at', 'updated_at'
+            'active_content', 'is_eligible', 'ineligibility_reason', 'ineligibility_code', 'description', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
         extra_kwargs = {

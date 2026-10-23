@@ -86,6 +86,8 @@ class WorkoutContentItemSerializer(serializers.ModelSerializer):
     has_video = serializers.BooleanField(read_only=True)
     has_stored_video = serializers.BooleanField(read_only=True)
     playback_video_url = serializers.SerializerMethodField()
+    embed_player_url = serializers.SerializerMethodField()
+    youtube_video_id = serializers.SerializerMethodField()
     missing_requirements = serializers.SerializerMethodField()
 
     class Meta:
@@ -114,6 +116,8 @@ class WorkoutContentItemSerializer(serializers.ModelSerializer):
             'has_video',
             'has_stored_video',
             'playback_video_url',
+            'embed_player_url',
+            'youtube_video_id',
             'folder_number',
             'cue_1',
             'cue_2',
@@ -149,6 +153,8 @@ class WorkoutContentItemSerializer(serializers.ModelSerializer):
             'has_video',
             'has_stored_video',
             'playback_video_url',
+            'embed_player_url',
+            'youtube_video_id',
             'missing_requirements',
             'created_at',
             'updated_at',
@@ -181,6 +187,30 @@ class WorkoutContentItemSerializer(serializers.ModelSerializer):
         return grouped
 
     def get_playback_video_url(self, obj: WorkoutContentItem) -> str:
+        if obj.has_stored_video:
+            return f"/api/v1/tenant/wod/content-items/{obj.id}/stream-video/"
+        return obj.video_url or ''
+
+    def get_youtube_video_id(self, obj: WorkoutContentItem) -> str:
+        url = obj.video_url or ''
+        if not url:
+            return ''
+        import re
+        patterns = [
+            r'(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=))([\w-]{11})',
+            r'youtu\.be\/([\w-]{11})',
+        ]
+        for p in patterns:
+            m = re.search(p, url)
+            if m:
+                return m.group(1)
+        return ''
+
+    def get_embed_player_url(self, obj: WorkoutContentItem) -> str:
+        yt_id = self.get_youtube_video_id(obj)
+        if yt_id:
+            # Privacy-enhanced embedded player: suppresses external recommendations, branding, and annotations
+            return f"https://www.youtube-nocookie.com/embed/{yt_id}?rel=0&modestbranding=1&controls=1&showinfo=0&iv_load_policy=3"
         if obj.has_stored_video:
             return f"/api/v1/tenant/wod/content-items/{obj.id}/stream-video/"
         return obj.video_url or ''

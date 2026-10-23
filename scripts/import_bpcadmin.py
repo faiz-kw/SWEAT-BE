@@ -54,7 +54,7 @@ SQL_FILE_PATH = os.path.join(
 )
 
 IST = timezone.get_fixed_timezone(330)  # UTC+05:30
-TODAY = date(2026, 10, 3)
+TODAY = timezone.now().astimezone(IST).date()
 NOW = timezone.now()
 
 

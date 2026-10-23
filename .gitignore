@@ -83,3 +83,6 @@ Thumbs.db
 celerybeat-schedule*
 *.wav
 *.mp3
+
+# SQL database dumps
+*.sql

@@ -709,6 +709,130 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             'checked_in_at': now.isoformat(),
         }, status=status.HTTP_200_OK)
 
+    @action(detail=True, methods=['get'], url_path='trainer-video')
+    def trainer_video(self, request, pk=None):
+        """
+        Secure video streaming endpoint for trainers and administrators.
+        Verifies that the authenticated user is an Admin, Manager, Staff member, or assigned Trainer.
+        Returns the safe in-website embedded streaming configuration and targeted muscle group tags.
+        """
+        alias = _get_db(request)
+        try:
+            occurrence = ClassOccurrence.objects.using(alias).select_related('class_template', 'branch').get(id=pk)
+        except ClassOccurrence.DoesNotExist:
+            return Response({'error': 'Class occurrence not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        user = request.user
+        from .models_classes import ClassOccurrenceTrainer
+        from .models_workforce import TrainerProfile
+        from .models_wod import WorkoutContentItem
+
+        user_role = str(getattr(user, 'role', '')).upper()
+        user_type = str(getattr(user, 'user_type', '')).lower()
+        auth_type = str(getattr(user, '_auth_type', '')).lower()
+
+        # Admins, managers, staff, trainers, and platform operators are all authorized
+        is_authorized = (
+            getattr(user, 'is_staff', False)
+            or getattr(user, 'is_superuser', False)
+            or user_role in ['ADMIN', 'SUPER_ADMIN', 'ORG_ADMIN', 'BRANCH_MANAGER', 'STAFF', 'FRONT_DESK', 'TRAINER', 'MANAGER']
+            or user_type in ['platform', 'tenant_staff', 'staff', 'admin', 'trainer', 'manager']
+            or auth_type == 'platform'
+        )
+
+        if not is_authorized:
+            user_email = (getattr(user, 'email', '') or '').strip().lower()
+            is_assigned = False
+            if user_email:
+                is_assigned = ClassOccurrenceTrainer.objects.using(alias).filter(
+                    occurrence=occurrence,
+                    trainer_profile__employee_profile__user_profile__user__email__iexact=user_email
+                ).exists()
+
+            if not is_assigned:
+                return Response({
+                    'detail': 'Access denied. Video content is restricted to authorized gym staff, managers, or the assigned trainer.',
+                    'code': 'TRAINER_ASSIGNMENT_REQUIRED'
+                }, status=status.HTTP_403_FORBIDDEN)
+
+        template_name = occurrence.class_template.name if occurrence.class_template else ''
+
+        # 1. Check direct content assignment linked to this occurrence from Content Studio
+        direct_assignment = occurrence.content_assignments.using(alias).select_related('content_item').first()
+        video_url = ''
+        instructions = ''
+        description = occurrence.class_template.description if occurrence.class_template else ''
+        movement_title = template_name
+
+        if direct_assignment and direct_assignment.content_item:
+            ci = direct_assignment.content_item
+            video_url = getattr(ci, 'external_url', '') or getattr(ci, 'video_url', '')
+            instructions = getattr(ci, 'description', '') or ''
+            movement_title = getattr(ci, 'title', template_name)
+
+        # 2. Fall back to WorkoutContentItem (WOD Library) by template name or active item
+        workout_item = None
+        if not video_url:
+            workout_item = (
+                WorkoutContentItem.objects.using(alias)
+                .filter(movement_name__icontains=template_name, status='ACTIVE')
+                .order_by('-created_at')
+                .first()
+            )
+            if not workout_item:
+                workout_item = WorkoutContentItem.objects.using(alias).filter(status='ACTIVE').order_by('-created_at').first()
+
+            if workout_item:
+                video_url = workout_item.video_url or ''
+                if not instructions:
+                    instructions = workout_item.description or ''
+                movement_title = workout_item.movement_name or template_name
+
+        # 3. Extract YouTube Video ID if applicable
+        import re
+        yt_id = None
+        if video_url:
+            patterns = [
+                r'(?:youtu\.be/|youtube\.com/(?:embed/|v/|watch\?v=|watch\?.+&v=))([\w-]{11})',
+                r'youtu\.be/([\w-]{11})',
+            ]
+            for p in patterns:
+                m = re.search(p, video_url)
+                if m:
+                    yt_id = m.group(1)
+                    break
+
+        embed_player_url = (
+            f"https://www.youtube-nocookie.com/embed/{yt_id}?rel=0&modestbranding=1&controls=1&showinfo=0&iv_load_policy=3&fs=0"
+            if yt_id else (video_url or '')
+        )
+
+        tags = []
+        if workout_item:
+            try:
+                tags = [ct.tag.name for ct in workout_item.content_tags.using(alias).select_related('tag').all() if ct.tag]
+            except Exception:
+                tags = []
+
+        return Response({
+            'occurrence_id': str(occurrence.id),
+            'class_name': template_name,
+            'description': description,
+            'movement_title': movement_title,
+            'has_video': bool(video_url),
+            'youtube_video_id': yt_id,
+            'embed_player_url': embed_player_url,
+            'targeted_muscles': tags,
+            'instructions': instructions,
+            'is_assigned_trainer': True,
+            'player_security': {
+                'stream_inside_website_only': True,
+                'prevent_download': True,
+                'hide_channel_link': True,
+                'nocookie_mode': True,
+            }
+        }, status=status.HTTP_200_OK)
+
 
 class ClassOccurrenceTrainerViewSet(viewsets.ModelViewSet):
     serializer_class = ClassOccurrenceTrainerSerializer

@@ -48,6 +48,7 @@ from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 
 from config.routers import set_tenant_db_alias, get_tenant_db_alias
 from apps.master.models_tenant import Tenant
@@ -3185,6 +3186,7 @@ class MobileOnboardingSurveyView(APIView):
     Fetches onboarding and PAR-Q questions dynamically from the authoritative IntakeForm definition.
     """
     permission_classes = [AllowAny]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get(self, request):
         alias, _ = _resolve_mobile_tenant_and_db(request)
@@ -3192,8 +3194,14 @@ class MobileOnboardingSurveyView(APIView):
         from .models_crm import IntakeForm, IntakeSubmission, IntakeAnswer
         from .models_workforce import UserProfile
 
-        # Authoritative lookup for active PAR-Q form
-        form = IntakeForm.objects.using(alias).filter(form_type='PAR_Q', status='ACTIVE').order_by('-version_number').first()
+        # Authoritative lookup for active form (supports ?form_type=ONBOARDING or ?form_type=PAR_Q)
+        requested_type = request.query_params.get('form_type') or request.query_params.get('type')
+        if requested_type:
+            form = IntakeForm.objects.using(alias).filter(form_type__iexact=requested_type, status='ACTIVE').order_by('-version_number').first()
+        else:
+            form = IntakeForm.objects.using(alias).filter(form_type='ONBOARDING', status='ACTIVE').order_by('-version_number').first()
+            if not form:
+                form = IntakeForm.objects.using(alias).filter(form_type='PAR_Q', status='ACTIVE').order_by('-version_number').first()
         if not form:
             form = IntakeForm.objects.using(alias).filter(status='ACTIVE').order_by('-version_number').first()
 
@@ -3212,10 +3220,39 @@ class MobileOnboardingSurveyView(APIView):
         if form:
             qs = form.questions.filter(status='ACTIVE').order_by('display_order', 'created_at')
             for q in qs:
-                opts = [
-                    {'label': o.label, 'value': o.value, 'order': o.display_order}
-                    for o in q.options.filter(status='ACTIVE').order_by('display_order')
-                ]
+                opts = []
+                for o in q.options.filter(status='ACTIVE').order_by('display_order'):
+                    opt_item = {
+                        'id': str(o.id),
+                        'label': o.label,
+                        'value': o.value,
+                        'order': o.display_order,
+                    }
+                    if '///' in o.label:
+                        parts = [p.strip() for p in o.label.split('///')]
+                        opt_item['title'] = parts[0]
+                        opt_item['label'] = parts[0]
+                        if len(parts) > 1 and parts[1]:
+                            opt_item['subtitle'] = parts[1]
+                            opt_item['description'] = parts[1]
+                        for extra_part in parts[2:]:
+                            if extra_part.startswith('icon:'):
+                                opt_item['icon'] = extra_part.split(':', 1)[1]
+                            elif extra_part.startswith('img:'):
+                                opt_item['image'] = extra_part.split(':', 1)[1]
+                            elif extra_part.startswith('bars:'):
+                                try:
+                                    opt_item['bars'] = int(extra_part.split(':', 1)[1])
+                                except ValueError:
+                                    opt_item['bars'] = extra_part.split(':', 1)[1]
+                            elif extra_part == 'EXCLUSIVE':
+                                opt_item['is_exclusive'] = True
+                            elif extra_part == 'RECOMMENDED':
+                                opt_item['is_recommended'] = True
+                                opt_item['badge'] = 'RECOMMENDED'
+                            else:
+                                opt_item['badge'] = extra_part
+                    opts.append(opt_item)
                 q_item = {
                     'id': str(q.id),
                     'text': q.question_text,
@@ -3362,8 +3399,10 @@ class MobileOnboardingSubmitView(APIView):
     """
     POST /api/v1/mobile/onboarding/submit/
     Authoritatively saves member onboarding and PAR-Q responses to IntakeSubmission & IntakeAnswer.
+    Accepts application/json and multipart/form-data.
     """
     permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def post(self, request):
         user = request.user
@@ -3375,14 +3414,25 @@ class MobileOnboardingSubmitView(APIView):
         profile = _get_or_create_user_profile(user, alias)
         data = request.data or {}
 
-        # 1. Authoritative active form
-        form = IntakeForm.objects.using(alias).filter(form_type='PAR_Q', status='ACTIVE').order_by('-version_number').first()
+        # 1. Authoritative active form (supports form_type in payload or query params)
+        requested_type = data.get('form_type') or request.query_params.get('form_type')
+        if requested_type:
+            form = IntakeForm.objects.using(alias).filter(form_type__iexact=requested_type, status='ACTIVE').order_by('-version_number').first()
+        else:
+            form = IntakeForm.objects.using(alias).filter(form_type='ONBOARDING', status='ACTIVE').order_by('-version_number').first()
+            if not form:
+                form = IntakeForm.objects.using(alias).filter(form_type='PAR_Q', status='ACTIVE').order_by('-version_number').first()
         if not form:
             form = IntakeForm.objects.using(alias).filter(status='ACTIVE').order_by('-version_number').first()
 
         now = timezone.now()
-        signature_data = data.get('signature_data') or ''
+
+        # Support both multipart file upload (request.FILES) and base64 string (request.data)
+        uploaded_sig = request.FILES.get('signature') or request.FILES.get('signature_file') or request.FILES.get('signature_data')
+        signature_data = data.get('signature_data') or data.get('signature') or ''
         agreement_accepted = data.get('agreement_accepted', True)
+        if isinstance(agreement_accepted, str):
+            agreement_accepted = agreement_accepted.lower() in ('true', '1', 't', 'yes')
 
         # Check existing submissions for lifecycle & revision decision
         prior_subs = IntakeSubmission.objects.using(alias).filter(user_profile=profile).order_by('-submitted_at')
@@ -3424,11 +3474,19 @@ class MobileOnboardingSubmitView(APIView):
                 'is_reused': True,
             }, status=status.HTTP_200_OK)
 
+        has_valid_signature = bool(uploaded_sig) or (
+            bool(signature_data) and (
+                str(signature_data).startswith('data:image/') or
+                str(signature_data).startswith('/media/') or
+                len(str(signature_data)) >= 100
+            )
+        )
+
         # OPTION B: EDIT EXISTING PAR-Q (Create audited revision with new signature)
         if parq_decision == 'EDIT' or allow_revision:
             is_edit = True
             rev_num = prior_count + 1
-            if not signature_data or len(str(signature_data)) < 100 or not str(signature_data).startswith('data:image/'):
+            if not has_valid_signature:
                 return Response({
                     'detail': 'A newly drawn digital signature is required when creating a revised PAR-Q assessment.',
                     'code': 'NEW_SIGNATURE_REQUIRED',
@@ -3438,7 +3496,7 @@ class MobileOnboardingSubmitView(APIView):
         elif parq_decision == 'NEW':
             is_edit = False
             rev_num = prior_count + 1
-            if not signature_data or len(str(signature_data)) < 100 or not str(signature_data).startswith('data:image/'):
+            if not has_valid_signature:
                 return Response({
                     'detail': 'A newly drawn digital signature is required when completing a new PAR-Q assessment.',
                     'code': 'SIGNATURE_REQUIRED',
@@ -3448,7 +3506,7 @@ class MobileOnboardingSubmitView(APIView):
         else:
             is_edit = False
             rev_num = 1
-            if not signature_data or len(str(signature_data)) < 100 or not str(signature_data).startswith('data:image/'):
+            if not has_valid_signature:
                 return Response({
                     'detail': 'A valid drawn digital signature is required to complete the health assessment.',
                     'code': 'SIGNATURE_REQUIRED',
@@ -3465,7 +3523,11 @@ class MobileOnboardingSubmitView(APIView):
             'parq_decision': parq_decision or ('INITIAL' if prior_count == 0 else 'EDIT'),
         }
 
-        # 2. Persist authoritative IntakeSubmission
+        # 2. Persist authoritative IntakeSubmission (compress signature to disk if file/Base64)
+        from .services_storage import save_compressed_signature
+        sig_input = uploaded_sig if uploaded_sig else (signature_data if signature_data else None)
+        stored_signature = save_compressed_signature(sig_input, tenant_slug=alias) if sig_input else None
+
         submission = IntakeSubmission(
             intake_form=form,
             user_profile=profile,
@@ -3475,8 +3537,8 @@ class MobileOnboardingSubmitView(APIView):
             agreement_text_snapshot=form.agreement_text if form else '',
             form_snapshot={'name': form.name, 'version': form.version_number} if form else {},
             metadata=meta_info,
-            signature_data=signature_data if signature_data else None,
-            signature_date=now if signature_data else None,
+            signature_data=stored_signature,
+            signature_date=now if sig_input else None,
             signer_identity=f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '')}".strip() or user.email,
             signer_ip=request.META.get('REMOTE_ADDR'),
             signer_user_agent=request.META.get('HTTP_USER_AGENT', '')[:500],
@@ -3487,6 +3549,11 @@ class MobileOnboardingSubmitView(APIView):
 
         # 3. Save answers with full question snapshots & revision carryover
         answers_dict = data.get('answers') or data.get('par_q') or data.get('responses') or data
+        if isinstance(answers_dict, str):
+            try:
+                answers_dict = json.loads(answers_dict)
+            except Exception:
+                pass
         snapshot_questions = []
 
         if form:
@@ -4375,8 +4442,10 @@ class MobileMembershipRenewView(APIView):
             sig_data = request.data.get('signature_data')
             if sig_data or answers:
                 from .models_crm import IntakeForm
+                from .services_storage import save_compressed_signature
                 form = active_m.parq_form or IntakeForm.objects.using(alias).filter(status='ACTIVE', form_type__in=['PAR_Q', 'PARQ']).order_by('-version_number').first()
                 if form:
+                    stored_sig = save_compressed_signature(sig_data, tenant_slug=alias) if sig_data else ''
                     new_sub = IntakeSubmission.objects.using(alias).create(
                         organization=branch.organization if branch else None,
                         intake_form=form,
@@ -4385,7 +4454,7 @@ class MobileMembershipRenewView(APIView):
                         channel='MEMBER_PORTAL',
                         status='COMPLETED',
                         is_cleared=True,
-                        signature_data=sig_data or '',
+                        signature_data=stored_sig,
                         signed_at=timezone.now(),
                     )
                     parq_submission_id = str(new_sub.id)

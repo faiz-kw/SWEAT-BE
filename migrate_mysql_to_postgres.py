@@ -11,6 +11,9 @@ import psycopg2
 import psycopg2.extras
 import pymysql
 
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+
 # ============================================================================
 # 1. DATABASE CONFIGURATION
 # ============================================================================
@@ -210,7 +213,7 @@ def get_safe_default(col_name, data_type, udt_type):
 def get_pg_columns_and_types(pg_cur, table_name):
   pg_cur.execute(
       """
-        SELECT column_name, data_type, udt_name, is_nullable, column_default 
+        SELECT column_name, data_type, udt_name, is_nullable, column_default, character_maximum_length 
         FROM information_schema.columns 
         WHERE table_schema = 'public' AND table_name = %s
     """,
@@ -223,6 +226,7 @@ def get_pg_columns_and_types(pg_cur, table_name):
           "udt_name": r[2],
           "is_nullable": r[3],
           "column_default": r[4],
+          "char_len": r[5],
       }
       for r in res
   }
@@ -377,6 +381,10 @@ def main():
             ):
               val = None if meta["is_nullable"] == "YES" else str(uuid.uuid4())
 
+          # Truncate strings exceeding character limit
+          if isinstance(val, str) and meta.get("char_len"):
+            val = val[: meta["char_len"]]
+
           # 7. Handle check constraints on days/counts (must be > 0)
           if col in ("total_days", "duration_value", "validity_days"):
             if val is None or val == 0:
@@ -409,7 +417,7 @@ def main():
       pg_conn.commit()
       rows_done += len(cleaned_batch)
 
-    print(f"✓ {pg_table:<32}: {rows_done:>7,} / {total_in_table:,} rows")
+    print(f"[OK] {pg_table:<32}: {rows_done:>7,} / {total_in_table:,} rows")
     total_rows_migrated += rows_done
 
   print(
@@ -454,9 +462,9 @@ def main():
           ON CONFLICT (id) DO NOTHING;
       """)
       pg_conn.commit()
-      print(f"✓ trial_bookings synchronized: {pg_cur.rowcount} rows")
+      print(f"[OK] trial_bookings synchronized: {pg_cur.rowcount} rows")
   except Exception as e:
-      print(f"⚠️ trial_bookings sync notice: {e}")
+      print(f"[!] trial_bookings sync notice: {e}")
       pg_conn.rollback()
 
   pg_cur.close()
@@ -490,11 +498,11 @@ def main():
                 ON CONFLICT (id) DO UPDATE SET status = 'ACTIVE';
             """)
       master_conn.commit()
-      print("✓ Tenant registered in Master DB!")
+      print("[OK] Tenant registered in Master DB!")
     master_cur.close()
     master_conn.close()
   except Exception as e:
-    print(f"⚠️  Master DB check: {e}")
+    print(f"[!] Master DB check: {e}")
 
   print("\n" + "=" * 70)
   print(f"MIGRATION COMPLETE: {total_rows_migrated:,} total rows migrated!")

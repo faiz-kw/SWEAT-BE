@@ -1,4 +1,5 @@
 from django.urls import path
+from apps.authentication.views_otp import SendOTPView, VerifyOTPView
 from . import views_wellness
 from .views_mobile import (
     MobileRegisterView,
@@ -42,6 +43,8 @@ app_name = 'mobile_api'
 
 urlpatterns = [
     # 1. Auth & Profile
+    path('auth/otp/send/', SendOTPView.as_view(), name='mobile-auth-otp-send'),
+    path('auth/otp/verify/', VerifyOTPView.as_view(), name='mobile-auth-otp-verify'),
     path('auth/register/', MobileRegisterView.as_view(), name='mobile-register'),
     path('leads/', MobileLeadCaptureView.as_view(), name='mobile-leads'),
     path('leads/register/', MobileLeadCaptureView.as_view(), name='mobile-leads-register'),

@@ -126,7 +126,7 @@ def _get_org(request):
         alias = _get_db(request)
         if user and getattr(user, 'organization_id', None):
             return Organization.objects.using(alias).filter(id=user.organization_id).first()
-        return Organization.objects.using(alias).filter(status='ACTIVE').order_by('-created_at').first()
+        return Organization.objects.using(alias).filter(status='ACTIVE').order_by('created_at').first()
     return org
 
 
@@ -827,6 +827,8 @@ class LeadViewSet(viewsets.ModelViewSet):
 
             org = _get_org(request)
             branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
+            date_from = request.query_params.get('date_from') or request.query_params.get('start_date')
+            date_to = request.query_params.get('date_to') or request.query_params.get('end_date')
             tb_qs = TrialBooking.objects.using(alias)
             if org:
                 tb_qs = tb_qs.filter(Q(lead__organization=org) | Q(branch__organization=org))
@@ -835,6 +837,10 @@ class LeadViewSet(viewsets.ModelViewSet):
                 tb_qs = tb_qs.filter(branch_id__in=permitted_branches)
             if branch_id and branch_id not in ('all', 'ALL'):
                 tb_qs = tb_qs.filter(branch_id=branch_id)
+            if date_from:
+                tb_qs = tb_qs.filter(created_at__date__gte=date_from)
+            if date_to:
+                tb_qs = tb_qs.filter(created_at__date__lte=date_to)
 
             trials_count = max(agg['trials_status'] or 0, tb_qs.count())
 
@@ -2541,7 +2547,8 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
     }
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['lead__first_name', 'lead__last_name', 'trial_type']
-    ordering = ['-scheduled_start']
+    ordering_fields = ['scheduled_start', 'created_at', 'status', 'confirmation_status']
+    ordering = ['-scheduled_start', '-created_at']
 
     def get_queryset(self):
         alias = _get_db(self.request)
