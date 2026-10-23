@@ -478,9 +478,15 @@ LOGGING = {
     },
 }
 
+try:
+    import concurrent_log_handler  # noqa: F401
+    _ROTATING_HANDLER_CLASS = 'concurrent_log_handler.ConcurrentRotatingFileHandler'
+except ImportError:
+    _ROTATING_HANDLER_CLASS = 'logging.handlers.RotatingFileHandler'
+
 if _file_logging_available:
     LOGGING['handlers']['file_app'] = {
-        'class': 'logging.handlers.RotatingFileHandler',
+        'class': _ROTATING_HANDLER_CLASS,
         'filename': os.path.join(LOG_DIR, 'application.log'),
         'maxBytes': LOG_MAX_BYTES,
         'backupCount': LOG_BACKUP_COUNT,
@@ -488,7 +494,7 @@ if _file_logging_available:
         'encoding': 'utf-8',
     }
     LOGGING['handlers']['file_meta'] = {
-        'class': 'logging.handlers.RotatingFileHandler',
+        'class': _ROTATING_HANDLER_CLASS,
         'filename': os.path.join(LOG_DIR, 'meta_integration.log'),
         'maxBytes': LOG_MAX_BYTES,
         'backupCount': LOG_BACKUP_COUNT,
