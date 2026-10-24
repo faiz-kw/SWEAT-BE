@@ -2346,9 +2346,10 @@ class MobileQRPassView(APIView):
         valid_from_dt = (occ.start_at - timedelta(minutes=60)) if occ and occ.start_at else now
         valid_until_dt = (occ.end_at + timedelta(minutes=60)) if (occ and getattr(occ, 'end_at', None)) else (valid_from_dt + timedelta(hours=2))
 
-        # Deterministic compact 22-char token bound to booking & SECRET_KEY
-        compact_token = generate_booking_qr_token(booking.id, settings.SECRET_KEY)
-        t_hash = hash_qr_token(compact_token)
+        # Deterministic compact Base62 cryptographic booking token
+        qr_display_token = generate_booking_qr_token(booking.id, settings.SECRET_KEY)
+        compact_token = qr_display_token
+        t_hash = hash_qr_token(qr_display_token)
 
         # Upsert active AccessPass bound to this booking
         pass_obj, _ = AccessPass.objects.using(alias).update_or_create(
@@ -2360,7 +2361,7 @@ class MobileQRPassView(APIView):
                 'pass_type': 'CLASS_BOOKING',
                 'valid_from': valid_from_dt,
                 'valid_until': valid_until_dt,
-                'status': 'ACTIVE' if booking.status == 'CONFIRMED' else 'CANCELLED',
+                'status': 'ACTIVE' if booking.status in ('CONFIRMED', 'ATTENDED', 'COMPLETED') else 'CANCELLED',
                 'updated_at': now,
             }
         )
@@ -2387,9 +2388,9 @@ class MobileQRPassView(APIView):
             'pass_id': str(pass_obj.id),
             'booking_id': str(booking.id),
             'booking_number': booking.booking_number,
-            'qr_token': compact_token,
-            'compact_token': compact_token,
-            'qr_payload': compact_token,
+            'qr_token': qr_display_token,
+            'compact_token': qr_display_token,
+            'qr_payload': qr_display_token,
             'legacy_signed_token': token,
             'member_name': f"{user.first_name} {user.last_name}".strip(),
             'member_number': profile.member_number,

@@ -293,6 +293,31 @@ class AttendanceRecordSerializer(serializers.ModelSerializer):
     class_name = serializers.CharField(source='occurrence.class_template.name', read_only=True)
     branch_name = serializers.CharField(source='branch.name', read_only=True)
     booking_number = serializers.CharField(source='booking.booking_number', read_only=True)
+    marked_by = serializers.SerializerMethodField()
+    marked_by_display = serializers.SerializerMethodField()
+
+    def get_marked_by(self, obj):
+        return self.get_marked_by_display(obj)
+
+    def get_marked_by_display(self, obj):
+        if obj.marked_by_user:
+            return obj.marked_by_user.display_name or obj.marked_by_user.email
+        if obj.check_in_method == 'QR':
+            return 'Member Mobile Scan'
+        if obj.check_in_method in ('ACCESS_DEVICE', 'BARCODE'):
+            return 'Turnstile / RFID'
+        if obj.check_in_method == 'MOBILE':
+            return 'Trainer / Geofenced App'
+        if obj.check_in_method == 'FRONT_DESK':
+            branch_name = obj.branch.name if obj.branch else 'Front Desk'
+            return f"Manual Staff Check-in ({branch_name})"
+        if obj.check_in_method == 'ADMIN':
+            return 'System Administrator'
+        if obj.check_in_method == 'MANUAL':
+            return 'Manual Override'
+        if obj.check_in_method == 'FACE_LIVENESS':
+            return 'Biometric Turnstile (Face)'
+        return obj.check_in_method or 'System'
 
     class Meta:
         model = AttendanceRecord

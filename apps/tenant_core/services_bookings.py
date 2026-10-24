@@ -1960,7 +1960,7 @@ class BookingWaitlistAttendanceService:
                     cls.record_attendance(
                         booking=booking,
                         status=att_status,
-                        check_in_method='QR' if (provider_reference or '').lower().find('qr') >= 0 else 'ACCESS_DEVICE',
+                        check_in_method='QR' if (token_hash or (provider_reference or '').lower().find('qr') >= 0) else 'ACCESS_DEVICE',
                         db_alias=alias,
                     )
                     # Mark local AccessPass consumed if one exists

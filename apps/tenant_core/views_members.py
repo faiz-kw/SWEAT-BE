@@ -1176,14 +1176,25 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         att_trainer = ', '.join(att_tr_names) if att_tr_names else 'Assigned Trainer'
 
         # Resolve who marked/verified attendance
-        marked_by_display = 'Front Desk Staff'
         if att.marked_by_user:
             marked_by_display = att.marked_by_user.display_name or att.marked_by_user.email
+        elif att.check_in_method == 'QR':
+            marked_by_display = 'Member Mobile Scan'
+        elif att.check_in_method in ('ACCESS_DEVICE', 'BARCODE'):
+            marked_by_display = 'Turnstile / RFID'
         elif att.check_in_method == 'MOBILE':
-            marked_by_display = 'Member (Mobile App QR)'
-        elif att.check_in_method in ('FRONT_DESK', 'ADMIN'):
-            branch_name = att.branch.name if att.branch else 'Sweat Goregaon West'
-            marked_by_display = f"Front Desk Staff ({branch_name})"
+            marked_by_display = 'Trainer / Geofenced App'
+        elif att.check_in_method == 'FRONT_DESK':
+            branch_name = att.branch.name if att.branch else 'Front Desk'
+            marked_by_display = f"Manual Staff Check-in ({branch_name})"
+        elif att.check_in_method == 'ADMIN':
+            marked_by_display = 'System Administrator'
+        elif att.check_in_method == 'MANUAL':
+            marked_by_display = 'Manual Override'
+        elif att.check_in_method == 'FACE_LIVENESS':
+            marked_by_display = 'Biometric Turnstile (Face)'
+        else:
+            marked_by_display = att.check_in_method or 'System'
 
         attendance_records.append({
             'id': str(att.id),
