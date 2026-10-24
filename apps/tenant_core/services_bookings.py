@@ -898,11 +898,12 @@ class BookingWaitlistAttendanceService:
                     if not ent:
                         raise ValidationError("No membership entitlement sessions available.")
 
-                    MembershipLifecycleService.consume_entitlement(
+                    cls_title = occurrence.class_template.name if (occurrence and occurrence.class_template) else "Class"
+                    consumption_ledger = MembershipLifecycleService.consume_entitlement(
                         membership=membership,
                         entitlement_type=ent.entitlement_type,
                         units=units_to_consume,
-                        reason_text="Class booking reservation",
+                        reason_text=f"Class booking reservation ({cls_title})",
                         created_by_user=created_by_user,
                         db_alias=alias,
                     )
@@ -925,6 +926,10 @@ class BookingWaitlistAttendanceService:
                     booked_at=timezone.now(),
                     created_by_user=created_by_user,
                 )
+
+                if entitlement and 'consumption_ledger' in locals() and consumption_ledger:
+                    consumption_ledger.booking_id = booking.id
+                    consumption_ledger.save(using=alias, update_fields=['booking_id'])
 
                 BookingStatusHistory.objects.using(alias).create(
                     booking=booking,
@@ -1741,6 +1746,36 @@ class BookingWaitlistAttendanceService:
                 booking.completed_at = now
                 booking.save(using=alias, update_fields=['status', 'completed_at', 'updated_at'])
 
+                # Reconcile entitlement session consumption if not already debited
+                if booking.membership:
+                    from .models_memberships import MembershipEntitlementLedger
+                    has_consumption = MembershipEntitlementLedger.objects.using(alias).filter(
+                        booking_id=booking.id,
+                        transaction_type='CONSUMPTION'
+                    ).exists()
+                    if not has_consumption:
+                        ent = booking.entitlement or MembershipEntitlement.objects.using(alias).filter(
+                            membership=booking.membership,
+                            status='ACTIVE'
+                        ).first()
+                        if ent:
+                            try:
+                                cls_name = occurrence.class_template.name if (occurrence and occurrence.class_template) else "Class"
+                                ledger = MembershipLifecycleService.consume_entitlement(
+                                    membership=booking.membership,
+                                    entitlement_type=ent.entitlement_type,
+                                    units=Decimal('1.00'),
+                                    booking_id=booking.id,
+                                    reason_text=f"Class attendance deduction ({cls_name})",
+                                    created_by_user=marked_by_user,
+                                    db_alias=alias,
+                                )
+                                if not booking.entitlement:
+                                    booking.entitlement = ent
+                                    booking.save(using=alias, update_fields=['entitlement', 'updated_at'])
+                            except Exception as e:
+                                logger.warning(f"Failed to reconcile attendance entitlement consumption: {e}")
+
                 # Handle attendance policy & state reset
                 policy = AttendancePolicySet.objects.using(alias).filter(organization=organization, status='ACTIVE').first()
                 if policy:
@@ -1990,7 +2025,7 @@ class BookingWaitlistAttendanceService:
                     )
 
                 if booking:
-                    AccessPass.objects.using(alias).filter(booking=booking, status='CONSUMED_ENTERED').update(
+                    AccessPass.objects.using(alias).filter(booking=booking).exclude(status='CONSUMED_EXITED').update(
                         status='CONSUMED_EXITED',
                         updated_at=now
                     )

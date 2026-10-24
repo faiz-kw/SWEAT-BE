@@ -2286,43 +2286,62 @@ class MobileQRPassView(APIView):
             generate_booking_qr_token,
             hash_qr_token,
         )
-        from .models_attendance import AccessPass
+        from .models_attendance import AccessPass, AttendanceRecord
+
+        now = timezone.now()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_end = today_start + timedelta(days=1)
+
+        def is_booking_active_for_pass(b):
+            if not b or b.status in ('CANCELLED', 'NO_SHOW'):
+                return False, 'Booking is cancelled or inactive.'
+
+            # If attendance is already complete (member checked out or session attendance finalised)
+            att = AttendanceRecord.objects.using(alias).filter(booking=b).first()
+            if att and att.attendance_completed:
+                return False, 'Workout attendance has completed. Access pass has expired.'
+
+            occ = b.occurrence
+            if not occ:
+                return False, 'No class occurrence associated with booking.'
+
+            duration = occ.class_template.default_duration_minutes if (occ.class_template and occ.class_template.default_duration_minutes) else 50
+            end_at = occ.end_at or (occ.start_at + timedelta(minutes=duration)) if occ.start_at else None
+            # Allow pass access until 15 minutes after session ends
+            if end_at and (end_at + timedelta(minutes=15)) < now:
+                return False, 'Class session has concluded. Access pass has expired.'
+
+            if b.status == 'COMPLETED':
+                return False, 'Workout session is already marked completed.'
+
+            return True, None
 
         if not booking_id:
-            now = timezone.now()
-            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            today_end = today_start + timedelta(days=1)
-            active_booking = (
+            # Query candidate bookings for today that are upcoming or currently in session
+            candidate_bookings = (
                 Booking.objects.using(alias)
                 .select_related('occurrence__class_template', 'branch', 'user_profile')
                 .filter(
                     user_profile=profile,
-                    status__in=['CONFIRMED', 'ATTENDED', 'COMPLETED'],
+                    status__in=['CONFIRMED', 'ATTENDED'],
                     occurrence__start_at__gte=now - timedelta(hours=2),
                     occurrence__start_at__lte=today_end,
                 )
                 .order_by('occurrence__start_at')
-                .first()
             )
-            if not active_booking:
-                active_booking = (
-                    Booking.objects.using(alias)
-                    .select_related('occurrence__class_template', 'branch', 'user_profile')
-                    .filter(
-                        user_profile=profile,
-                        status__in=['CONFIRMED', 'ATTENDED', 'COMPLETED'],
-                        occurrence__start_at__gte=today_start,
-                        occurrence__start_at__lte=today_end,
-                    )
-                    .order_by('occurrence__start_at')
-                    .first()
-                )
+
+            active_booking = None
+            for cand in candidate_bookings:
+                is_active, _ = is_booking_active_for_pass(cand)
+                if is_active:
+                    active_booking = cand
+                    break
 
             if not active_booking:
                 return Response({
                     'has_booking': False,
-                    'detail': 'No confirmed class booking found for today. Please reserve a class session to generate your turnstile access key.',
-                }, status=status.HTTP_404_NOT_FOUND)
+                    'detail': 'No upcoming class session scheduled today. Please reserve a class session to generate your turnstile access key.',
+                }, status=status.HTTP_200_OK)
 
             booking = active_booking
         else:
@@ -2337,6 +2356,14 @@ class MobileQRPassView(APIView):
 
             if booking.user_profile_id != profile.id:
                 return Response({'detail': 'Access denied.'}, status=status.HTTP_403_FORBIDDEN)
+
+            is_active, reason = is_booking_active_for_pass(booking)
+            if not is_active:
+                return Response({
+                    'has_booking': False,
+                    'status': 'EXPIRED',
+                    'detail': reason or 'This workout session has concluded and the access pass has expired.',
+                }, status=status.HTTP_200_OK)
 
         occ = booking.occurrence
         now = timezone.now()
@@ -2361,7 +2388,7 @@ class MobileQRPassView(APIView):
                 'pass_type': 'CLASS_BOOKING',
                 'valid_from': valid_from_dt,
                 'valid_until': valid_until_dt,
-                'status': 'ACTIVE' if booking.status in ('CONFIRMED', 'ATTENDED', 'COMPLETED') else 'CANCELLED',
+                'status': 'ACTIVE',
                 'updated_at': now,
             }
         )
