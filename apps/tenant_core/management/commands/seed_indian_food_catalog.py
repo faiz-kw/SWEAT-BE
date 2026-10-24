@@ -680,6 +680,7 @@ class Command(BaseCommand):
                 is_system=True,
                 defaults={
                     'organization': None,
+                    'barcode': item_data.get('barcode', None),
                     'regional_aliases': item_data['regional_aliases'],
                     'category': item_data['category'],
                     'serving_unit': item_data['serving_unit'],

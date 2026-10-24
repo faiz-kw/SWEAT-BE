@@ -170,6 +170,13 @@ class FoodBarcodeMobileView(APIView):
             is_active=True
         ).filter(scope_q).first()
 
+        if not local_item:
+            local_item = FoodItem.objects.using(alias).filter(
+                models.Q(regional_aliases__icontains=clean_barcode) |
+                models.Q(barcode__icontains=clean_barcode),
+                is_active=True
+            ).filter(scope_q).first()
+
         if local_item:
             return Response({
                 'found': True,
