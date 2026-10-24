@@ -355,12 +355,15 @@ class TenantDatabaseMiddleware:
         if not is_exempt:
             tenant_id = _extract_tenant_id_from_jwt(request)
 
-            # Allow open public lead capture: resolve tenant DB via header or default to 'sweat'
+            # Allow open public lead capture & on-site edge service: resolve tenant DB via header or default to 'sweat'
             explicit_slug = (
                 request.headers.get('X-Tenant-Slug')
                 or request.META.get('HTTP_X_TENANT_SLUG')
                 or request.GET.get('tenant')
             )
+            if not tenant_id and not explicit_slug and (path.startswith('/api/v1/access-control/') or path.startswith('/api/v1/tenant/access-control/')):
+                explicit_slug = 'sweat'
+
             if not tenant_id and explicit_slug:
                 from apps.master.models_tenant import Tenant
                 clean_slug = str(explicit_slug).strip().lower()

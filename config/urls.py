@@ -18,6 +18,7 @@ from apps.tenant_core.views_razorpay_webhook import RazorpayWebhookView
 from apps.tenant_core.views_meta_webhook import MetaLeadWebhookView
 from apps.tenant_core.views_legal import privacy_policy_view, terms_of_service_view, data_deletion_view
 from apps.tenant_core.views_health import HealthLivenessView, HealthReadinessView
+from apps.tenant_core.views_bookings import AccessControlSyncPassesView, AccessControlBulkIngestView
 from apps.tenant_core.views_voice_agent import (
     VoiceAgentBranchesView,
     VoiceAgentClassesView,
@@ -76,6 +77,10 @@ urlpatterns = [
 
     # Mobile App API — Consumer / Member facing endpoints
     path('api/v1/mobile/', include('apps.tenant_core.urls_mobile')),
+
+    # Edge Service Access Control (Local Turnstile Gate Sync & Bulk Ingestion)
+    path('api/v1/access-control/sync/', AccessControlSyncPassesView.as_view(), name='edge-sync-passes'),
+    path('api/v1/access-control/events/bulk/', AccessControlBulkIngestView.as_view(), name='edge-events-bulk'),
 
     # OpenAPI 3.1 Schema & Interactive Docs
     path('api/schema/', SpectacularAPIView.as_view(), name='schema'),

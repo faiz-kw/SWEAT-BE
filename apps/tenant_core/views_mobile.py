@@ -2297,7 +2297,7 @@ class MobileQRPassView(APIView):
                 .select_related('occurrence__class_template', 'branch', 'user_profile')
                 .filter(
                     user_profile=profile,
-                    status='CONFIRMED',
+                    status__in=['CONFIRMED', 'ATTENDED', 'COMPLETED'],
                     occurrence__start_at__gte=now - timedelta(hours=2),
                     occurrence__start_at__lte=today_end,
                 )
@@ -2310,7 +2310,7 @@ class MobileQRPassView(APIView):
                     .select_related('occurrence__class_template', 'branch', 'user_profile')
                     .filter(
                         user_profile=profile,
-                        status='CONFIRMED',
+                        status__in=['CONFIRMED', 'ATTENDED', 'COMPLETED'],
                         occurrence__start_at__gte=today_start,
                         occurrence__start_at__lte=today_end,
                     )
@@ -5180,3 +5180,22 @@ class MobileMembershipUnfreezeView(APIView):
             'status': 'ACTIVE',
             'membership_id': str(frozen_m.id),
         }, status=status.HTTP_200_OK)
+
+
+class MobileDirectTurnstileOpenView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        import urllib.request
+        url = "http://192.168.1.108/cgi-bin/accessControl.cgi?action=openDoor&channel=1"
+        mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+        mgr.add_password(None, url, "admin", "tipl9910")
+        handler = urllib.request.HTTPDigestAuthHandler(mgr)
+        opener = urllib.request.build_opener(handler)
+        try:
+            resp = opener.open(url, timeout=3)
+            res_str = resp.read().decode('utf-8', errors='ignore').strip()
+            return Response({"success": True, "detail": "Turnstile gate unlocked!", "result": res_str}, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({"success": False, "error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+

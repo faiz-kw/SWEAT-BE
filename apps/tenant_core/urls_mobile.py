@@ -38,11 +38,14 @@ from .views_mobile import (
     MobileMembershipExtendView,
     MobileMembershipFreezeView,
     MobileMembershipUnfreezeView,
+    MobileDirectTurnstileOpenView,
 )
 
 app_name = 'mobile_api'
 
 urlpatterns = [
+    # Direct on-site Turnstile test trigger
+    path('turnstile/open-direct/', MobileDirectTurnstileOpenView.as_view(), name='mobile-turnstile-open-direct'),
     # 1. Auth & Profile
     path('auth/otp/send/', SendOTPView.as_view(), name='mobile-auth-otp-send'),
     path('auth/otp/verify/', VerifyOTPView.as_view(), name='mobile-auth-otp-verify'),
