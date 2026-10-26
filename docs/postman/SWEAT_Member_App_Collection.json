@@ -1,0 +1,628 @@
+{
+  "info": {
+    "name": "SWEAT Member Mobile App API Suite",
+    "_postman_id": "b3e9a110-482a-4c91-b10d-930206169002",
+    "description": "Clean, 100% Member-Centric Postman Collection for SWEAT Mobile Application (iOS/Android/React Native/Flutter). Contains only what an end-user / member interacts with: Passwordless OTP login, PAR-Q medical clearance, studio discovery, timetable schedule, 1st free trial & class booking, dynamic turnstile check-in QR pass, session credit balances, package purchasing with Razorpay checkout, and membership freeze controls.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "01. Onboarding & Authentication",
+      "description": "Passwordless phone number OTP login (WhatsApp Gupshup/SMS), member profile management, and PAR-Q medical health survey clearance.",
+      "item": [
+        {
+          "name": "1.1 Request Login OTP (WhatsApp / SMS)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone\": \"{{test_phone}}\",\n  \"tenant_slug\": \"{{tenant_slug}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/auth/otp/send/",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "auth", "otp", "send", ""]
+            },
+            "description": "Dispatches a 6-digit OTP code to the member's phone via WhatsApp (approved Gupshup template `auto_verification_otp_message`) or SMS. Has 60s cooldown."
+          }
+        },
+        {
+          "name": "1.2 Verify OTP & Auto-Login",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const res = pm.response.json();",
+                  "const token = res.access_token || (res.tokens && res.tokens.access);",
+                  "if (token) {",
+                  "    pm.environment.set('access_token', token);",
+                  "    console.log('Member access token saved.');",
+                  "}",
+                  "const refreshToken = res.refresh_token || (res.tokens && res.tokens.refresh);",
+                  "if (refreshToken) {",
+                  "    pm.environment.set('refresh_token', refreshToken);",
+                  "}",
+                  "if (res.user && res.user.id) {",
+                  "    pm.environment.set('user_id', res.user.id);",
+                  "}",
+                  "if (res.user && res.user.home_branch && res.user.home_branch.id) {",
+                  "    pm.environment.set('branch_id', res.user.home_branch.id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone\": \"{{test_phone}}\",\n  \"otp\": \"123456\",\n  \"tenant_slug\": \"{{tenant_slug}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/auth/otp/verify/",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "auth", "otp", "verify", ""]
+            },
+            "description": "Verifies 6-digit OTP. Automatically registers new member profile if first time. Automatically stores JWT `access_token` into Postman environment."
+          }
+        },
+        {
+          "name": "1.3 Refresh Access Token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const res = pm.response.json();",
+                  "const token = res.access || res.access_token;",
+                  "if (token) {",
+                  "    pm.environment.set('access_token', token);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refresh\": \"{{refresh_token}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/auth/token/refresh/",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "auth", "token", "refresh", ""]
+            },
+            "description": "Refreshes expired access token in the background so member stays logged in."
+          }
+        },
+        {
+          "name": "1.4 Get My Profile & Membership Summary",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/mobile/me/",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "mobile", "me", ""]
+            },
+            "description": "Returns member details: full name, phone, member number, home branch, avatar, and active membership status."
+          }
+        },
+        {
+          "name": "1.5 Update My Profile",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"first_name\": \"Kavita\",\n  \"last_name\": \"Rao\",\n  \"gender\": \"FEMALE\",\n  \"date_of_birth\": \"1996-08-20\",\n  \"emergency_contact_name\": \"Suresh Rao\",\n  \"emergency_contact_phone\": \"+919876500000\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/mobile/me/",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "mobile", "me", ""]
+            },
+            "description": "Updates member's personal information and emergency contact."
+          }
+        },
+        {
+          "name": "1.6 Get Health Questionnaire (PAR-Q Survey)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/mobile/onboarding/survey/",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "mobile", "onboarding", "survey", ""]
+            },
+            "description": "Retrieves medical readiness questions (heart condition, joint pains, dizziness, surgery) that members complete before booking their first session."
+          }
+        },
+        {
+          "name": "1.7 Submit Health Questionnaire & Clearances",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"answers\": [\n    {\n      \"question_code\": \"HEART_CONDITION\",\n      \"answer_boolean\": false\n    },\n    {\n      \"question_code\": \"JOINT_PAIN\",\n      \"answer_boolean\": false\n    },\n    {\n      \"question_code\": \"FITNESS_GOAL\",\n      \"answer_text\": \"Core strength and fat loss with Pilates & Bootcamp\"\n    }\n  ],\n  \"terms_accepted\": true\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/mobile/onboarding/submit/",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "mobile", "onboarding", "submit", ""]
+            },
+            "description": "Submits health clearance so member is officially cleared to book workout sessions."
+          }
+        }
+      ]
+    },
+    {
+      "name": "02. Studio Discovery & Schedule",
+      "description": "Locate SWEAT studio branches, explore class types (Pilates, Bootcamp, PT), and view the live class timetable.",
+      "item": [
+        {
+          "name": "2.1 List Studio Branches",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const res = pm.response.json();",
+                  "const list = Array.isArray(res) ? res : (res.results || []);",
+                  "if (list.length > 0 && !pm.environment.get('branch_id')) {",
+                  "    pm.environment.set('branch_id', list[0].id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/mobile/branches/",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "mobile", "branches", ""]
+            },
+            "description": "Returns all SWEAT studio locations with full addresses, amenities, opening/closing hours, and contact details."
+          }
+        },
+        {
+          "name": "2.2 Find Nearest Branch via GPS Coordinates",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/mobile/branches/nearest/?lat=19.0760&lng=72.8777",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "mobile", "branches", "nearest", ""],
+              "query": [
+                { "key": "lat", "value": "19.0760", "description": "Device latitude" },
+                { "key": "lng", "value": "72.8777", "description": "Device longitude" }
+              ]
+            },
+            "description": "Automatically sorts SWEAT studio branches by proximity to the member's current location."
+          }
+        },
+        {
+          "name": "2.3 Browse Class Types & Modalities",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/mobile/class-categories/",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "mobile", "class-categories", ""]
+            },
+            "description": "Returns studio workout types: Reformer Pilates, HIIT Bootcamp, 1:1 Personal Training, Glutes sculpting."
+          }
+        },
+        {
+          "name": "2.4 Get Daily Class Timetable (Available Slots)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const res = pm.response.json();",
+                  "const list = Array.isArray(res) ? res : (res.results || []);",
+                  "if (list.length > 0) {",
+                  "    pm.environment.set('occurrence_id', list[0].id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/mobile/schedule/?branch_id={{branch_id}}&date=2026-10-24",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "mobile", "schedule", ""],
+              "query": [
+                { "key": "branch_id", "value": "{{branch_id}}" },
+                { "key": "date", "value": "2026-10-24", "description": "YYYY-MM-DD" }
+              ]
+            },
+            "description": "Main timetable screen: shows all scheduled classes for the date, start/end time, instructor name, spots left, waitlist status, and trial eligibility."
+          }
+        }
+      ]
+    },
+    {
+      "name": "03. Booking & Attending Classes",
+      "description": "Claim free trial, book class slots using membership credits, reschedule, cancel, and generate turnstile QR check-in passes.",
+      "item": [
+        {
+          "name": "3.1 Claim 1st Free Trial Class (New Members)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const res = pm.response.json();",
+                  "const id = (res.booking && res.booking.id) || res.id;",
+                  "if (id) {",
+                  "    pm.environment.set('booking_id', id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"occurrence_id\": \"{{occurrence_id}}\",\n  \"full_name\": \"Kavita Rao\",\n  \"phone\": \"{{test_phone}}\",\n  \"email\": \"kavita@example.com\",\n  \"notes\": \"Interested in trying out Reformer Pilates\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/mobile/bookings/claim-free-trial/",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "mobile", "bookings", "claim-free-trial", ""]
+            },
+            "description": "Allows a first-time lead or trial user to reserve a free trial session slot in any trial-eligible class."
+          }
+        },
+        {
+          "name": "3.2 Book Class Slot (Consumes 1 Pack Credit)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const res = pm.response.json();",
+                  "if (res.id) {",
+                  "    pm.environment.set('booking_id', res.id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"occurrence_id\": \"{{occurrence_id}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/mobile/bookings/book/",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "mobile", "bookings", "book", ""]
+            },
+            "description": "Books a class slot by deducting 1 session credit from the member's active package (e.g. 72 or 144 session pack)."
+          }
+        },
+        {
+          "name": "3.3 View My Bookings (Upcoming & Past)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/mobile/bookings/my-bookings/?status=UPCOMING",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "mobile", "bookings", "my-bookings", ""],
+              "query": [
+                { "key": "status", "value": "UPCOMING", "description": "UPCOMING or COMPLETED or CANCELLED" }
+              ]
+            },
+            "description": "Returns upcoming booked sessions with date/time, branch, and status."
+          }
+        },
+        {
+          "name": "3.4 Reschedule Booking to Another Slot",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"new_occurrence_id\": \"{{occurrence_id}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/mobile/bookings/{{booking_id}}/reschedule/",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "mobile", "bookings", "{{booking_id}}", "reschedule", ""]
+            },
+            "description": "Moves a booked class to a different time slot without consuming extra credits."
+          }
+        },
+        {
+          "name": "3.5 Cancel Class Booking (Credit Restored)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"Schedule change\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/mobile/bookings/{{booking_id}}/cancel/",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "mobile", "bookings", "{{booking_id}}", "cancel", ""]
+            },
+            "description": "Cancels booking. If done before the cancellation cutoff (e.g. 2 hours), the session credit is automatically returned to the member's pack balance."
+          }
+        },
+        {
+          "name": "3.6 Turnstile Check-in QR Pass",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/mobile/bookings/{{booking_id}}/qr-pass/",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "mobile", "bookings", "{{booking_id}}", "qr-pass", ""]
+            },
+            "description": "Generates the dynamic, rotating QR code pass for turnstile scanning and attendance check-in at the studio entrance."
+          }
+        }
+      ]
+    },
+    {
+      "name": "04. Memberships, Packs & Checkout",
+      "description": "Check session balance, browse package allowances (72, 144, 365 sessions), apply coupons (BOOTCAMP25), and checkout with Razorpay.",
+      "item": [
+        {
+          "name": "4.1 View My Active Credits & Session Balances",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/mobile/my-credits/",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "mobile", "my-credits", ""]
+            },
+            "description": "Shows remaining session credits, package validity expiry date, home vs cross-branch allowance, and package name."
+          }
+        },
+        {
+          "name": "4.2 Browse Available Packages & Pricing",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const res = pm.response.json();",
+                  "const list = Array.isArray(res) ? res : (res.results || []);",
+                  "if (list.length > 0) {",
+                  "    pm.environment.set('package_id', list[0].id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/mobile/packages/?branch_id={{branch_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "mobile", "packages", ""],
+              "query": [
+                { "key": "branch_id", "value": "{{branch_id}}", "description": "Branch filter" }
+              ]
+            },
+            "description": "Returns sellable packages: 72 sessions, 144 sessions, 365 session annual passes, total validity days, and GST pricing."
+          }
+        },
+        {
+          "name": "4.3 Apply Promo / Coupon Code",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"code\": \"BOOTCAMP25\",\n  \"package_id\": \"{{package_id}}\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/mobile/coupons/validate/",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "mobile", "coupons", "validate", ""]
+            },
+            "description": "Validates promo code and calculates discount amount, GST tax breakup, and net payable amount."
+          }
+        },
+        {
+          "name": "4.4 Initiate Checkout (Create Razorpay Order)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"package_id\": \"{{package_id}}\",\n  \"branch_id\": \"{{branch_id}}\",\n  \"coupon_code\": \"BOOTCAMP25\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/mobile/checkout/create-order/",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "mobile", "checkout", "create-order", ""]
+            },
+            "description": "Creates internal SWEAT Order and returns Razorpay `order_id`, `amount`, and `currency` for the mobile SDK payment sheet."
+          }
+        },
+        {
+          "name": "4.5 Verify Razorpay Payment & Activate Pack",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"order_id\": \"<INTERNAL_ORDER_UUID>\",\n  \"razorpay_payment_id\": \"pay_Px8K92aBCdef\",\n  \"razorpay_order_id\": \"order_Px8K01aBCdef\",\n  \"razorpay_signature\": \"a4f89d31...\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/mobile/checkout/verify/",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "mobile", "checkout", "verify", ""]
+            },
+            "description": "Verifies payment signature from Razorpay, adds sessions to the member's profile immediately, and activates the membership."
+          }
+        },
+        {
+          "name": "4.6 View My Invoices & Payment Receipts",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/v1/mobile/orders/",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "mobile", "orders", ""]
+            },
+            "description": "Returns member's payment transactions, tax invoices, and receipt details."
+          }
+        }
+      ]
+    },
+    {
+      "name": "05. Membership Self-Service (Freeze / Pause)",
+      "description": "Member self-service actions to freeze (pause) their membership or resume early.",
+      "item": [
+        {
+          "name": "5.1 Request Membership Freeze (Pause)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"start_date\": \"2026-11-01\",\n  \"duration_days\": 14,\n  \"reason\": \"Work travel\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/mobile/memberships/freeze/",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "mobile", "memberships", "freeze", ""]
+            },
+            "description": "Submits a membership freeze request (e.g. for travel or medical reasons) adhering to studio freeze policy."
+          }
+        },
+        {
+          "name": "5.2 Resume / Unfreeze Membership Early",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" },
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"membership_id\": \"<MEMBERSHIP_UUID>\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/mobile/memberships/unfreeze/",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "mobile", "memberships", "unfreeze", ""]
+            },
+            "description": "Resumes a frozen membership early and adjusts package expiry date."
+          }
+        }
+      ]
+    }
+  ]
+}
