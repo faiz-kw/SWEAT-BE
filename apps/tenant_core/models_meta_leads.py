@@ -31,7 +31,7 @@ class MetaConnection(models.Model):
     class Meta:
         app_label = 'tenant_core'
         db_table = 'crm_meta_connections'
-        constraints = [models.UniqueConstraint(fields=['organization'], name='uq_meta_connection_org')]
+        constraints = [models.UniqueConstraint(fields=['organization', 'meta_user_id'], name='uq_meta_connection_org_user')]
 
     def __str__(self):
         return f"MetaConnection ({self.status}) for Org {self.organization_id}"

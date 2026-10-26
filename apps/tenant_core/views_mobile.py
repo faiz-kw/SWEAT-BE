@@ -3327,7 +3327,15 @@ class MobileOnboardingSurveyView(APIView):
         submission_info = None
 
         if request.user and request.user.is_authenticated:
-            user_profile = UserProfile.objects.using(alias).filter(user=request.user).first()
+            target_mid = request.query_params.get('member_id') or request.query_params.get('memberId') or request.headers.get('X-Member-Id')
+            if target_mid:
+                from django.db.models import Q
+                user_profile = UserProfile.objects.using(alias).filter(Q(id=target_mid) | Q(user__id=target_mid) | Q(member_number=target_mid)).first()
+            if not user_profile:
+                user_profile = UserProfile.objects.using(alias).filter(user=request.user).first()
+            if not user_profile:
+                user_profile = UserProfile.objects.using(alias).filter(user__email__iexact=request.user.email).first()
+
             if user_profile:
                 all_subs = IntakeSubmission.objects.using(alias).filter(
                     user_profile=user_profile, status='COMPLETED'
@@ -3339,18 +3347,43 @@ class MobileOnboardingSurveyView(APIView):
                     s_meta = getattr(s_item, 'metadata', {}) or {}
                     s_answers_map = {}
                     s_answers_detailed = []
-                    for ans_rec in s_item.answers.all():
+
+                    # Build lookup map from form_snapshot questions if available
+                    snap_q_map = {}
+                    if isinstance(s_item.form_snapshot, dict) and isinstance(s_item.form_snapshot.get('questions'), list):
+                        for sq in s_item.form_snapshot['questions']:
+                            if isinstance(sq, dict):
+                                sq_id = str(sq.get('id', ''))
+                                sq_ans = sq.get('submitted_answer') if sq.get('submitted_answer') is not None else sq.get('answer')
+                                if sq_id:
+                                    snap_q_map[sq_id] = sq_ans
+                                if sq.get('order'):
+                                    snap_q_map[f"q_{sq['order']}"] = sq_ans
+
+                    item_answers = IntakeAnswer.objects.using(alias).filter(submission=s_item).select_related('question').order_by('question__display_order')
+                    for ans_rec in item_answers:
                         val_rec = None
                         if ans_rec.boolean_value is not None:
                             val_rec = ans_rec.boolean_value
                         elif ans_rec.numeric_value is not None:
                             val_rec = float(ans_rec.numeric_value)
-                        elif ans_rec.json_value is not None:
-                            val_rec = ans_rec.json_value
                         elif ans_rec.date_value is not None:
                             val_rec = ans_rec.date_value.isoformat() if hasattr(ans_rec.date_value, 'isoformat') else str(ans_rec.date_value)
-                        elif ans_rec.text_value:
+                        elif ans_rec.text_value not in (None, ''):
                             val_rec = ans_rec.text_value
+                        elif ans_rec.json_value not in (None, {}, [], ''):
+                            val_rec = ans_rec.json_value
+
+                        # Fallback to form_snapshot if still empty
+                        if val_rec in (None, {}, '') and ans_rec.question_id:
+                            snap_val = snap_q_map.get(str(ans_rec.question_id))
+                            if snap_val not in (None, {}, ''):
+                                val_rec = snap_val
+                        if val_rec in (None, {}, '') and ans_rec.question:
+                            snap_val = snap_q_map.get(f"q_{ans_rec.question.display_order}")
+                            if snap_val not in (None, {}, ''):
+                                val_rec = snap_val
+
                         if ans_rec.question_id:
                             s_answers_map[str(ans_rec.question_id)] = val_rec
                         if ans_rec.question:
@@ -3363,7 +3396,33 @@ class MobileOnboardingSurveyView(APIView):
                                 'is_sensitive': ans_rec.question.is_sensitive,
                                 'order': ans_rec.question.display_order,
                                 'answer': val_rec,
+                                'submitted_answer': val_rec,
+                                'text_value': str(val_rec) if val_rec is not None else '',
                             })
+
+                    # If no IntakeAnswer records exist yet but form_snapshot exists, extract from form_snapshot
+                    if not s_answers_detailed and isinstance(s_item.form_snapshot, dict) and isinstance(s_item.form_snapshot.get('questions'), list):
+                        for sq in s_item.form_snapshot['questions']:
+                            if isinstance(sq, dict):
+                                sq_ans = sq.get('submitted_answer') if sq.get('submitted_answer') is not None else sq.get('answer')
+                                sq_id = str(sq.get('id', ''))
+                                sq_order = sq.get('order')
+                                if sq_id:
+                                    s_answers_map[sq_id] = sq_ans
+                                if sq_order:
+                                    s_answers_map[f"q_{sq_order}"] = sq_ans
+                                s_answers_detailed.append({
+                                    'question_id': sq_id,
+                                    'question_text': sq.get('question_text', ''),
+                                    'question_type': sq.get('question_type', 'TEXT'),
+                                    'category': sq.get('category', 'GENERAL'),
+                                    'is_sensitive': sq.get('is_sensitive', False),
+                                    'order': sq_order,
+                                    'answer': sq_ans,
+                                    'submitted_answer': sq_ans,
+                                    'text_value': str(sq_ans) if sq_ans is not None else '',
+                                })
+
                     submission_history.append({
                         'id': str(s_item.id),
                         'submitted_at': s_item.submitted_at.isoformat() if s_item.submitted_at else None,
@@ -3376,45 +3435,16 @@ class MobileOnboardingSurveyView(APIView):
                         'revision_number': s_meta.get('revision_number', 1),
                         'agreement_accepted': s_item.agreement_accepted,
                         'agreement_text_snapshot': s_item.agreement_text_snapshot,
+                        'form_snapshot': s_item.form_snapshot,
                         'answers': s_answers_map,
                         'answers_detailed': s_answers_detailed,
                     })
 
-                if last_sub:
+                if last_sub and submission_history:
                     is_cleared = True
-                    for ans in last_sub.answers.all():
-                        val = None
-                        if ans.boolean_value is not None:
-                            val = ans.boolean_value
-                        elif ans.numeric_value is not None:
-                            val = ans.numeric_value
-                        elif ans.json_value is not None:
-                            val = ans.json_value
-                        elif ans.date_value is not None:
-                            val = ans.date_value.isoformat() if hasattr(ans.date_value, 'isoformat') else str(ans.date_value)
-                        elif ans.text_value:
-                            val = ans.text_value
-
-                        if ans.question_id:
-                            saved_responses[str(ans.question_id)] = val
-                        if ans.question:
-                            saved_responses[f"q_{ans.question.display_order}"] = val
-
-                    sub_meta = getattr(last_sub, 'metadata', {}) or {}
-                    submission_info = {
-                        'id': str(last_sub.id),
-                        'submitted_at': last_sub.submitted_at.isoformat() if last_sub.submitted_at else None,
-                        'signer_identity': last_sub.signer_identity,
-                        'signature_data': last_sub.signature_data,
-                        'form_name': (last_sub.form_snapshot.get('name') if isinstance(last_sub.form_snapshot, dict) else None) or (last_sub.intake_form.name if last_sub.intake_form else form.name if form else 'PAR-Q Form'),
-                        'version_number': (last_sub.form_snapshot.get('version') if isinstance(last_sub.form_snapshot, dict) else None) or (last_sub.intake_form.version_number if last_sub.intake_form else form.version_number if form else 1),
-                        'submission_count': sub_count,
-                        'is_edit': sub_meta.get('is_edit', sub_count > 1),
-                        'revision_number': sub_meta.get('revision_number', sub_count),
-                        'agreement_accepted': last_sub.agreement_accepted,
-                        'answers': submission_history[0]['answers'] if submission_history else saved_responses,
-                        'answers_detailed': submission_history[0]['answers_detailed'] if submission_history else [],
-                    }
+                    saved_responses = dict(submission_history[0]['answers'])
+                    submission_info = dict(submission_history[0])
+                    submission_info['submission_count'] = sub_count
                 elif user_profile.address_json and user_profile.address_json.get('onboarding'):
                     onb = user_profile.address_json['onboarding']
                     is_cleared = not onb.get('requires_doctor_clearance', False)

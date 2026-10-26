@@ -251,10 +251,15 @@ def process_live_import(organization, event_id, actor_user=None, graph_client=No
                 event.status = 'FAILED'
                 event.error_code = 'TOKEN_EXPIRED'
                 event.error_message = 'Meta Page access token has expired or was revoked. Reconnect account.'
-                # Update connection state
-                MetaConnection.objects.using(alias).filter(organization=organization).update(
-                    status='TOKEN_EXPIRED', last_error='Access token invalidated by Meta'
-                )
+                # Update connection state (isolated to the specific connection if available)
+                if page_conn and getattr(page_conn, 'connection_id', None):
+                    MetaConnection.objects.using(alias).filter(id=page_conn.connection_id).update(
+                        status='TOKEN_EXPIRED', last_error='Access token invalidated by Meta'
+                    )
+                else:
+                    MetaConnection.objects.using(alias).filter(organization=organization).update(
+                        status='TOKEN_EXPIRED', last_error='Access token invalidated by Meta'
+                    )
                 event.save(using=alias)
                 return event
             except MetaLeadNotFoundError as exc:
@@ -492,12 +497,14 @@ def _apply_mapping(event, mapping, alias, actor_user, is_live: bool = False):
             'raw_metadata': {'is_test': True, 'import_id': str(event.id)},
         }
 
+    allow_dedup = (mapping.repeat_policy != 'CREATE_NEW')
     lead = CRMLeadService.create_lead(
         organization=event.organization, first_name=mapped['first_name'], last_name=mapped['last_name'],
         email=email, phone=phone, branch=branch, lead_source=mapping.lead_source,
         assigned_sales_user=assigned_sales_user,
         actor_user=actor_user, extra_fields=extra,
         attribution_data=attribution_data,
+        deduplicate=allow_dedup,
         db_alias=alias,
     )
 

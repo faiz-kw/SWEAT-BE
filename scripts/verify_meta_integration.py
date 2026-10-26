@@ -49,6 +49,12 @@ def record(test_name, passed, detail=""):
     status_label = "[PASS]" if passed else "[FAIL]"
     print(f"  {status_label} {test_name}" + (f" -> {detail}" if detail else ""))
 
+def get_org(db_alias):
+    return (
+        Organization.objects.using(db_alias).filter(status='ACTIVE', branches__isnull=False).distinct().first()
+        or Organization.objects.using(db_alias).filter(status='ACTIVE').first()
+    )
+
 print("=" * 80)
 print("META LEAD ADS INTEGRATION — POSTGRESQL RUNTIME VERIFICATION")
 print("=" * 80)
@@ -90,7 +96,7 @@ try:
 
     # Check database storage
     with tenant_database_context(tenant.id) as db_alias:
-        org = Organization.objects.using(db_alias).filter(status='ACTIVE').first()
+        org = get_org(db_alias)
         conn, _ = MetaConnection.objects.using(db_alias).update_or_create(
             organization=org,
             defaults={
@@ -132,7 +138,8 @@ except Exception as exc:
 # ---------------------------------------------------------------------------
 print(); print("[4] Checking Safe Tenant Resolution...")
 try:
-    test_page_id = "fb_page_sweat_andheri_99"
+    test_page_id = "109928374650192"
+    test_form_id = "987654321012345"
     MetaPageRegistry.objects.using('default').update_or_create(
         page_id=test_page_id,
         defaults={'tenant': tenant, 'page_name': 'SWEAT Andheri Official Page', 'is_active': True}
@@ -148,17 +155,17 @@ except Exception as exc:
 print(); print("[5] Checking PostgreSQL Concurrency & Deduplication...")
 try:
     with tenant_database_context(tenant.id) as db_alias:
-        org = Organization.objects.using(db_alias).filter(status='ACTIVE').first()
+        org = get_org(db_alias)
         unique_leadgen_id = f"meta_lead_concurrency_{uuid.uuid4().hex[:8]}"
 
         # Delivery 1
         ev1, created1 = receive_live_webhook_event(
-            organization=org, page_id=test_page_id, form_id="form_99",
+            organization=org, page_id=test_page_id, form_id=test_form_id,
             leadgen_id=unique_leadgen_id, raw_payload={"test": 1}, alias=db_alias
         )
         # Simultaneous Delivery 2
         ev2, created2 = receive_live_webhook_event(
-            organization=org, page_id=test_page_id, form_id="form_99",
+            organization=org, page_id=test_page_id, form_id=test_form_id,
             leadgen_id=unique_leadgen_id, raw_payload={"test": 1}, alias=db_alias
         )
 
@@ -175,13 +182,13 @@ except Exception as exc:
 print(); print("[6] Checking Live Lead Processing & Attribution Persistence...")
 try:
     with tenant_database_context(tenant.id) as db_alias:
-        org = Organization.objects.using(db_alias).filter(status='ACTIVE').first()
+        org = get_org(db_alias)
         branch = Branch.objects.using(db_alias).filter(organization=org, status='ACTIVE').first()
         source = LeadSource.objects.using(db_alias).filter(organization=org, source_type='META', status='ACTIVE').first()
 
         # Create/ensure mapping
         mapping, _ = MetaLeadMapping.objects.using(db_alias).update_or_create(
-            organization=org, page_id=test_page_id, form_id="form_99",
+            organization=org, page_id=test_page_id, form_id=test_form_id,
             defaults={
                 'name': 'Andheri Summer Trial Lead Campaign',
                 'branch_mode': 'FIXED',
@@ -212,7 +219,7 @@ try:
         mock_client = MetaGraphClient()
         mock_client.fetch_leadgen_details = lambda leadgen_id, token: {
             'id': leadgen_id,
-            'form_id': 'form_99',
+            'form_id': test_form_id,
             'field_data': [
                 {'name': 'full_name', 'values': ['Kavita Mehra']},
                 {'name': 'email', 'values': [f'kavita_{uuid.uuid4().hex[:6]}@example.com']},
@@ -229,7 +236,7 @@ try:
 
         live_leadgen_id = f"meta_live_lead_{uuid.uuid4().hex[:8]}"
         live_import, _ = receive_live_webhook_event(
-            organization=org, page_id=test_page_id, form_id="form_99",
+            organization=org, page_id=test_page_id, form_id=test_form_id,
             leadgen_id=live_leadgen_id, raw_payload={}, alias=db_alias
         )
 
@@ -261,7 +268,37 @@ except Exception as exc:
 print(); print("[7] Checking Simulator vs Live Reporting Isolation...")
 try:
     with tenant_database_context(tenant.id) as db_alias:
-        org = Organization.objects.using(db_alias).filter(status='ACTIVE').first()
+        org = get_org(db_alias)
+        branch = Branch.objects.using(db_alias).filter(organization=org, status='ACTIVE').first()
+        source = LeadSource.objects.using(db_alias).filter(organization=org, source_type='META', status='ACTIVE').first()
+
+        sim_count = MetaLeadImport.objects.using(db_alias).filter(organization=org, mode='SIMULATOR', status='IMPORTED').count()
+        if sim_count == 0:
+            from apps.tenant_core.services_crm import CRMLeadService
+            sim_lead = CRMLeadService.create_lead(
+                organization=org, first_name='Simulated', last_name='Prospect',
+                email=f'sim_{uuid.uuid4().hex[:6]}@example.com',
+                phone=f'+9198{uuid.uuid4().int % 90000000 + 10000000}',
+                branch=branch, lead_source=source,
+                actor_user=None,
+                attribution_data={
+                    'platform': 'META',
+                    'external_lead_id': f'simulation:test_{uuid.uuid4().hex[:6]}',
+                    'form_external_id': test_form_id,
+                    'raw_metadata': {'is_test': True, 'mode': 'SIMULATOR'},
+                },
+                db_alias=db_alias,
+            )
+            MetaLeadImport.objects.using(db_alias).create(
+                organization=org,
+                mode='SIMULATOR',
+                page_id=test_page_id,
+                form_id=test_form_id,
+                external_lead_id=f'sim_lead_{uuid.uuid4().hex[:8]}',
+                status='IMPORTED',
+                lead=sim_lead,
+            )
+
         live_imports = MetaLeadImport.objects.using(db_alias).filter(organization=org, mode='LIVE', status='IMPORTED').count()
         sim_imports = MetaLeadImport.objects.using(db_alias).filter(organization=org, mode='SIMULATOR', status='IMPORTED').count()
         record("Live vs Simulator Import Separation", live_imports > 0 and sim_imports > 0, f"Live: {live_imports}, Simulator: {sim_imports}")

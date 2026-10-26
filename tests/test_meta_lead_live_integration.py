@@ -124,7 +124,7 @@ class MetaLiveIntegrationTests(TestCase):
             status='CONNECTED',
             meta_user_id='meta_user_999',
             meta_user_name='Meta Marketer',
-            encrypted_user_access_token=encrypt_token('user_token_abc'),
+            encrypted_user_access_token=encrypt_token('EAABtest_long_lived_genuine_token_with_length_greater_than_thirty'),
             token_expires_at=timezone.now() + timezone.timedelta(days=60),
             scopes=['leads_retrieval', 'pages_show_list'],
         )
@@ -134,7 +134,7 @@ class MetaLiveIntegrationTests(TestCase):
             connection=self.conn,
             page_id='1001',
             page_name='SWEAT Official Facebook Page',
-            encrypted_page_access_token=encrypt_token('page_token_xyz'),
+            encrypted_page_access_token=encrypt_token('page_token_xyz_greater_than_thirty_chars'),
             is_subscribed_to_webhooks=True,
             is_active=True,
         )
@@ -147,6 +147,7 @@ class MetaLiveIntegrationTests(TestCase):
             name='SWEAT Fitness',
             status='ACTIVE',
         )
+        self.user._tenant_id = self.tenant.id
         TenantDataSource.objects.using('default').create(
             tenant=self.tenant,
             status='ACTIVE',
@@ -175,7 +176,7 @@ class MetaLiveIntegrationTests(TestCase):
     @patch('apps.tenant_core.services_meta_graph.requests.get')
     @patch('apps.tenant_core.services_meta_graph.requests.post')
     def test_oauth_callback_and_page_discovery(self, mock_post, mock_get):
-        state = generate_oauth_state('sweat', str(self.org.id), str(self.user.id))
+        state = generate_oauth_state(str(self.tenant.id), str(self.org.id), str(self.user.id))
 
         # Mock token exchanges & accounts
         mock_resp1 = MagicMock()
@@ -212,8 +213,8 @@ class MetaLiveIntegrationTests(TestCase):
         self.assertEqual(len(res.data['pages']), 1)
         self.assertEqual(res.data['pages'][0]['page_id'], 'page_777')
 
-        # Verify token in DB is encrypted
-        conn = MetaConnection.objects.get(organization=self.org)
+        # Verify token in DB is encrypted for the newly connected account
+        conn = MetaConnection.objects.get(organization=self.org, meta_user_id='user_meta_55')
         self.assertNotEqual(conn.encrypted_user_access_token, 'long_token_60d')
         self.assertEqual(decrypt_token(conn.encrypted_user_access_token), 'long_token_60d')
 
@@ -425,3 +426,59 @@ class MetaLiveIntegrationTests(TestCase):
         )
         self.assertEqual(MetaLeadImport.objects.using('tenant_other').count(), 0)
         self.assertEqual(Lead.objects.using('tenant_other').count(), 0)
+
+    def test_multi_account_connection_and_isolated_disconnect(self):
+        # 1. Connect a second Meta account under the same organization
+        conn2 = MetaConnection.objects.create(
+            organization=self.org,
+            status='CONNECTED',
+            meta_user_id='meta_user_222',
+            meta_user_name='Second Client Account',
+            encrypted_user_access_token=encrypt_token('EAABtest_long_token_for_second_account_above_thirty_chars'),
+            token_expires_at=timezone.now() + timezone.timedelta(days=60),
+            scopes=['leads_retrieval', 'pages_show_list'],
+        )
+        page_conn2 = MetaPageConnection.objects.create(
+            organization=self.org,
+            connection=conn2,
+            page_id='2002',
+            page_name='SWEAT Bandra',
+            encrypted_page_access_token=encrypt_token('EAABpage_token_bandra_123456789012345'),
+            is_active=True,
+            is_subscribed_to_webhooks=True,
+        )
+
+        # 2. Verify connection endpoint returns both accounts
+        res = self.client.get('/meta-lead-mappings/connection/')
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data['is_connected'], True)
+        self.assertIn('connections', res.data)
+        self.assertEqual(len(res.data['connections']), 2)
+
+        # 3. Disconnect ONLY the second account
+        disc_res = self.client.post('/meta-lead-mappings/disconnect/', {'connection_id': str(conn2.id)})
+        self.assertEqual(disc_res.status_code, 200)
+        self.assertEqual(disc_res.data['status'], 'DISCONNECTED')
+        self.assertEqual(disc_res.data['disconnected_connection_id'], str(conn2.id))
+
+        # 4. Verify account 2 is disconnected and its page deactivated
+        conn2.refresh_from_db()
+        self.assertEqual(conn2.status, 'DISCONNECTED')
+        self.assertEqual(conn2.encrypted_user_access_token, '')
+        page_conn2.refresh_from_db()
+        self.assertFalse(page_conn2.is_active)
+
+        # 5. Verify account 1 and its page are completely unaffected
+        self.conn.refresh_from_db()
+        self.assertEqual(self.conn.status, 'CONNECTED')
+        self.assertTrue(bool(self.conn.encrypted_user_access_token))
+        self.page_conn.refresh_from_db()
+        self.assertTrue(self.page_conn.is_active)
+
+        # 6. Verify connection endpoint still reports overall CONNECTED due to account 1
+        res_after = self.client.get('/meta-lead-mappings/connection/')
+        self.assertEqual(res_after.status_code, 200)
+        self.assertEqual(res_after.data['is_connected'], True)
+        self.assertEqual(len(res_after.data['pages']), 1)
+        self.assertEqual(res_after.data['pages'][0]['page_id'], '1001')
+

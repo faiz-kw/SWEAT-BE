@@ -474,11 +474,54 @@ def _format_page_connection_payload(p: dict) -> dict:
     return {
         'id': page_id_str,
         'page_id': page_id_str,
-        'connection_id': str(p.get('id') or ''),
+        'page_connection_id': str(p.get('id') or ''),
+        'connection_id': str(p.get('connection_id') or p.get('id') or ''),
         'name': page_name_str,
         'page_name': page_name_str,
         'is_subscribed_to_webhooks': bool(p.get('is_subscribed_to_webhooks', False)),
         'subscribed_at': sub_at_str,
+    }
+
+
+def _format_connection_details(conn, db_alias=None, pages=None) -> dict:
+    if not conn:
+        return None
+    token_is_synthetic = is_synthetic_token(conn.encrypted_user_access_token)
+    sim_active = simulator_enabled()
+
+    if conn.status == 'NOT_CONNECTED' or not conn.encrypted_user_access_token:
+        conn_status = 'NOT_CONNECTED'
+        is_live_conn = False
+    elif token_is_synthetic:
+        conn_status = 'SIMULATOR_MOCK' if sim_active else 'NOT_CONNECTED'
+        is_live_conn = False
+    else:
+        conn_status = conn.status
+        is_live_conn = conn.status in ('CONNECTED', 'LIVE_CONNECTED')
+
+    if pages is None and db_alias:
+        raw_pages = list(MetaPageConnection.objects.using(db_alias).filter(
+            connection=conn, is_active=True
+        ).values('id', 'page_id', 'page_name', 'is_subscribed_to_webhooks', 'subscribed_at', 'connection_id'))
+        pages = [_format_page_connection_payload(p) for p in raw_pages]
+    elif pages is None:
+        pages = []
+
+    return {
+        'id': str(conn.id),
+        'status': conn_status,
+        'is_connected': is_live_conn,
+        'is_synthetic': token_is_synthetic,
+        'meta_user_id': conn.meta_user_id if (not token_is_synthetic or sim_active) else '',
+        'meta_user_name': conn.meta_user_name if (not token_is_synthetic or sim_active) else '',
+        'token_expires_at': conn.token_expires_at.isoformat() if conn.token_expires_at else None,
+        'scopes': conn.scopes or [],
+        'last_connected_at': conn.last_connected_at.isoformat() if conn.last_connected_at else None,
+        'last_error': conn.last_error,
+        'pages': pages,
+        'pages_count': len(pages),
+        'created_at': conn.created_at.isoformat() if hasattr(conn, 'created_at') and conn.created_at else None,
+        'updated_at': conn.updated_at.isoformat() if hasattr(conn, 'updated_at') and conn.updated_at else None,
     }
 
 
@@ -638,9 +681,9 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
         with transaction.atomic(using=db_alias):
             conn, _ = MetaConnection.objects.using(db_alias).update_or_create(
                 organization=organization,
+                meta_user_id=meta_user_id,
                 defaults={
                     'status': 'CONNECTED',
-                    'meta_user_id': meta_user_id,
                     'meta_user_name': meta_user_name,
                     'encrypted_user_access_token': encrypt_token(user_token),
                     'token_expires_at': expires_at,
@@ -872,50 +915,79 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
 
     @action(detail=False, methods=['get'], url_path='connection')
     def connection(self, request):
-        conn = MetaConnection.objects.using(self.alias).filter(organization=self.organization).first()
-        if not conn:
-            return Response({'status': 'NOT_CONNECTED', 'pages': []})
+        conns = list(MetaConnection.objects.using(self.alias).filter(
+            organization=self.organization
+        ).order_by('-last_connected_at', '-created_at'))
 
         raw_conn_pages = list(MetaPageConnection.objects.using(self.alias).filter(
             organization=self.organization, is_active=True
-        ).values('id', 'page_id', 'page_name', 'is_subscribed_to_webhooks', 'subscribed_at'))
+        ).values('id', 'page_id', 'page_name', 'is_subscribed_to_webhooks', 'subscribed_at', 'connection_id'))
         pages = [_format_page_connection_payload(p) for p in raw_conn_pages]
 
-        token_is_synthetic = is_synthetic_token(conn.encrypted_user_access_token)
+        connections_payload = []
+        for c in conns:
+            c_pages = [p for p in pages if str(p.get('connection_id') or '') == str(c.id)]
+            c_details = _format_connection_details(c, self.alias, c_pages)
+            if c_details:
+                connections_payload.append(c_details)
+
+        active_conns = [c for c in conns if c.status in ('CONNECTED', 'LIVE_CONNECTED') and c.encrypted_user_access_token]
+        primary_conn = active_conns[0] if active_conns else (conns[0] if conns else None)
+
+        if not primary_conn:
+            return Response({'status': 'NOT_CONNECTED', 'is_connected': False, 'pages': [], 'connections': []})
+
+        token_is_synthetic = is_synthetic_token(primary_conn.encrypted_user_access_token)
         sim_active = simulator_enabled()
 
-        if conn.status == 'NOT_CONNECTED' or not conn.encrypted_user_access_token:
+        if primary_conn.status == 'NOT_CONNECTED' or not primary_conn.encrypted_user_access_token:
             conn_status = 'NOT_CONNECTED'
             is_live_conn = False
         elif token_is_synthetic:
             conn_status = 'SIMULATOR_MOCK' if sim_active else 'NOT_CONNECTED'
             is_live_conn = False
         else:
-            conn_status = conn.status
-            is_live_conn = conn.status in ('CONNECTED', 'LIVE_CONNECTED')
+            conn_status = primary_conn.status
+            is_live_conn = primary_conn.status in ('CONNECTED', 'LIVE_CONNECTED')
 
         return Response({
             'status': conn_status,
             'is_connected': is_live_conn,
             'is_synthetic': token_is_synthetic,
-            'meta_user_id': conn.meta_user_id if (not token_is_synthetic or sim_active) else '',
-            'meta_user_name': conn.meta_user_name if (not token_is_synthetic or sim_active) else '',
-            'token_expires_at': conn.token_expires_at.isoformat() if conn.token_expires_at else None,
-            'scopes': conn.scopes,
-            'last_connected_at': conn.last_connected_at.isoformat() if conn.last_connected_at else None,
-            'last_error': conn.last_error,
+            'meta_user_id': primary_conn.meta_user_id if (not token_is_synthetic or sim_active) else '',
+            'meta_user_name': primary_conn.meta_user_name if (not token_is_synthetic or sim_active) else '',
+            'token_expires_at': primary_conn.token_expires_at.isoformat() if primary_conn.token_expires_at else None,
+            'scopes': primary_conn.scopes,
+            'last_connected_at': primary_conn.last_connected_at.isoformat() if primary_conn.last_connected_at else None,
+            'last_error': primary_conn.last_error,
             'pages': pages if (not token_is_synthetic or sim_active) else [],
+            'connections': connections_payload,
         })
 
     @action(detail=False, methods=['post'], url_path='disconnect')
     def disconnect(self, request):
-        conn = MetaConnection.objects.using(self.alias).filter(organization=self.organization).first()
+        connection_id = request.data.get('connection_id') or request.data.get('id')
+        if connection_id:
+            conn = MetaConnection.objects.using(self.alias).filter(
+                organization=self.organization, id=connection_id
+            ).first()
+            if not conn:
+                conn = MetaConnection.objects.using(self.alias).filter(
+                    organization=self.organization, meta_user_id=str(connection_id)
+                ).first()
+        else:
+            conn = MetaConnection.objects.using(self.alias).filter(
+                organization=self.organization
+            ).order_by('-last_connected_at').first()
+
         if not conn:
             return Response({'status': 'NOT_CONNECTED'})
 
         with transaction.atomic(using=self.alias):
             client = MetaGraphClient()
-            for p_conn in MetaPageConnection.objects.using(self.alias).filter(organization=self.organization):
+            for p_conn in MetaPageConnection.objects.using(self.alias).filter(
+                organization=self.organization, connection=conn
+            ):
                 token = decrypt_token(p_conn.encrypted_page_access_token)
                 if token:
                     try:
@@ -935,16 +1007,21 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
             record_business_audit(
                 organization=self.organization, module='crm', action_code='META_ACCOUNT_DISCONNECTED',
                 entity_type='MetaConnection', entity_id=conn.id, actor_user=request.user,
-                metadata={'status': 'DISCONNECTED'}, db_alias=self.alias
+                metadata={'status': 'DISCONNECTED', 'meta_user_id': conn.meta_user_id, 'meta_user_name': conn.meta_user_name},
+                db_alias=self.alias
             )
 
-        return Response({'status': 'DISCONNECTED'})
+        return Response({
+            'status': 'DISCONNECTED',
+            'disconnected_connection_id': str(conn.id),
+            'meta_user_id': conn.meta_user_id,
+        })
 
     @action(detail=False, methods=['get'], url_path='pages')
     def pages(self, request):
         raw_pages = list(MetaPageConnection.objects.using(self.alias).filter(
             organization=self.organization, is_active=True
-        ).values('id', 'page_id', 'page_name', 'is_subscribed_to_webhooks', 'subscribed_at'))
+        ).values('id', 'page_id', 'page_name', 'is_subscribed_to_webhooks', 'subscribed_at', 'connection_id'))
         pages = [_format_page_connection_payload(p) for p in raw_pages]
         return Response({'results': pages, 'pages': pages})
 
@@ -1169,44 +1246,47 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
         for u in eligible_users:
             u['name'] = f"{u['first_name']} {u['last_name']}".strip() or u['email']
 
-        conn = MetaConnection.objects.using(self.alias).filter(organization=self.organization).first()
-        app_id, _, _ = get_meta_app_credentials()
-
-        token_is_synthetic = is_synthetic_token(conn.encrypted_user_access_token) if conn else True
-        sim_active = simulator_enabled()
-        if token_is_synthetic:
-            conn_status = 'SIMULATOR_MOCK' if (sim_active and conn and conn.status == 'CONNECTED') else (conn.status if (conn and conn.status != 'CONNECTED') else 'NOT_CONNECTED')
-            is_live_conn = False
-        else:
-            conn_status = conn.status if conn else 'NOT_CONNECTED'
-            is_live_conn = conn.status in ('CONNECTED', 'LIVE_CONNECTED') if conn else False
-
-        conn_details = None
-        if conn and is_live_conn:
-            conn_details = {
-                'id': str(conn.id),
-                'is_connected': is_live_conn,
-                'meta_user_id': conn.meta_user_id,
-                'meta_user_name': conn.meta_user_name,
-                'scopes': conn.scopes or [],
-                'expires_at': conn.token_expires_at.isoformat() if conn.token_expires_at else None,
-                'created_at': conn.created_at.isoformat(),
-                'updated_at': conn.updated_at.isoformat(),
-            }
+        conns = list(MetaConnection.objects.using(self.alias).filter(
+            organization=self.organization
+        ).order_by('-last_connected_at', '-created_at'))
 
         raw_meta_pages = list(MetaPageConnection.objects.using(self.alias).filter(
             organization=self.organization, is_active=True
-        ).values('id', 'page_id', 'page_name', 'is_subscribed_to_webhooks', 'subscribed_at')) if (conn and is_live_conn) else []
+        ).values('id', 'page_id', 'page_name', 'is_subscribed_to_webhooks', 'subscribed_at', 'connection_id'))
         pages_list = [_format_page_connection_payload(p) for p in raw_meta_pages]
+
+        connections_payload = []
+        for c in conns:
+            c_pages = [p for p in pages_list if str(p.get('connection_id') or '') == str(c.id)]
+            c_details = _format_connection_details(c, self.alias, c_pages)
+            if c_details:
+                connections_payload.append(c_details)
+
+        active_conns = [c for c in conns if c.status in ('CONNECTED', 'LIVE_CONNECTED') and c.encrypted_user_access_token]
+        primary_conn = active_conns[0] if active_conns else (conns[0] if conns else None)
+
+        app_id, _, _ = get_meta_app_credentials()
+
+        token_is_synthetic = is_synthetic_token(primary_conn.encrypted_user_access_token) if primary_conn else True
+        sim_active = simulator_enabled()
+        if token_is_synthetic:
+            conn_status = 'SIMULATOR_MOCK' if (sim_active and primary_conn and primary_conn.status == 'CONNECTED') else (primary_conn.status if (primary_conn and primary_conn.status != 'CONNECTED') else 'NOT_CONNECTED')
+            is_live_conn = False
+        else:
+            conn_status = primary_conn.status if primary_conn else 'NOT_CONNECTED'
+            is_live_conn = primary_conn.status in ('CONNECTED', 'LIVE_CONNECTED') if primary_conn else False
+
+        conn_details = _format_connection_details(primary_conn, self.alias) if (primary_conn and is_live_conn) else None
 
         return Response({
             'connection_status': conn_status,
-            'connected_user_name': conn.meta_user_name if (conn and (not token_is_synthetic or sim_active)) else '',
-            'connected_user_id': conn.meta_user_id if (conn and (not token_is_synthetic or sim_active)) else '',
-            'token_expires_at': conn.token_expires_at.isoformat() if conn and conn.token_expires_at else None,
+            'connected_user_name': primary_conn.meta_user_name if (primary_conn and (not token_is_synthetic or sim_active)) else '',
+            'connected_user_id': primary_conn.meta_user_id if (primary_conn and (not token_is_synthetic or sim_active)) else '',
+            'token_expires_at': primary_conn.token_expires_at.isoformat() if primary_conn and primary_conn.token_expires_at else None,
             'is_connected': is_live_conn,
             'is_synthetic': token_is_synthetic,
             'connection': conn_details,
+            'connections': connections_payload,
             'pages': pages_list,
             'live_available': bool(app_id),
             'app_id_configured': bool(app_id),
@@ -1248,7 +1328,11 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
         now = timezone.now()
         since_24h = now - timedelta(hours=24)
 
-        conn = MetaConnection.objects.using(self.alias).filter(organization=self.organization).first()
+        conns = list(MetaConnection.objects.using(self.alias).filter(
+            organization=self.organization
+        ).order_by('-last_connected_at', '-created_at'))
+        active_conns = [c for c in conns if c.status in ('CONNECTED', 'LIVE_CONNECTED') and c.encrypted_user_access_token]
+        conn = active_conns[0] if active_conns else (conns[0] if conns else None)
         app_id, _, _ = get_meta_app_credentials()
 
         token_is_synthetic = is_synthetic_token(conn.encrypted_user_access_token) if conn else True
