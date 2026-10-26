@@ -8,7 +8,9 @@ Enforces server-side authorization across the 10-check schema chain:
   - Dynamically detects target branch context for branch-scoped operations.
 """
 
+import uuid
 import logging
+from typing import Optional
 from rest_framework import permissions
 from rest_framework.exceptions import PermissionDenied, AuthenticationFailed
 from .rbac_engine import RBACAuthorizationEngine
@@ -59,31 +61,46 @@ class TenantRBACPermission(permissions.BasePermission):
 
         return None
 
-    def _resolve_branch_id(self, request, view, obj=None) -> str:
-        """Extract target branch_id from request params, body, kwargs, or object."""
-        if obj is not None and hasattr(obj, 'branch_id') and obj.branch_id:
-            return str(obj.branch_id)
+    def _resolve_branch_id(self, request, view, obj=None) -> Optional[str]:
+        """Extract valid target branch_id from request params, body, kwargs, or object."""
+        def _clean_branch_id(val):
+            if val is None:
+                return None
+            val_str = str(val).strip()
+            if not val_str or val_str.lower() in ('none', 'null', 'undefined', 'all', ''):
+                return None
+            try:
+                uuid.UUID(val_str)
+                return val_str
+            except (ValueError, AttributeError, TypeError):
+                return None
+
+        if obj is not None and hasattr(obj, 'branch_id'):
+            cleaned = _clean_branch_id(obj.branch_id)
+            if cleaned:
+                return cleaned
 
         # URL kwarg (e.g. /branches/<branch_id>/...)
         if hasattr(view, 'kwargs') and view.kwargs:
-            if 'branch_id' in view.kwargs:
-                return str(view.kwargs['branch_id'])
-            if 'branch_pk' in view.kwargs:
-                return str(view.kwargs['branch_pk'])
+            for k in ('branch_id', 'branch_pk', 'branch'):
+                cleaned = _clean_branch_id(view.kwargs.get(k))
+                if cleaned:
+                    return cleaned
 
         # Query param
-        if request.query_params:
-            if 'branch_id' in request.query_params:
-                return request.query_params['branch_id']
-            if 'branch' in request.query_params:
-                return request.query_params['branch']
+        if getattr(request, 'query_params', None):
+            for k in ('branch_id', 'branch'):
+                cleaned = _clean_branch_id(request.query_params.get(k))
+                if cleaned:
+                    return cleaned
 
         # Request data (for POST/PUT/PATCH)
-        if request.data and isinstance(request.data, dict):
-            if 'branch_id' in request.data:
-                return str(request.data['branch_id'])
-            if 'branch' in request.data:
-                return str(request.data['branch'])
+        data = getattr(request, 'data', None)
+        if data and isinstance(data, dict):
+            for k in ('branch_id', 'branch'):
+                cleaned = _clean_branch_id(data.get(k))
+                if cleaned:
+                    return cleaned
 
         return None
 

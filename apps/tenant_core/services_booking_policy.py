@@ -60,7 +60,10 @@ DEFAULT_BOOKING_POLICY: Dict[str, Any] = {
     'max_upcoming_bookings': 5,
     'advance_booking_days_max': 14,
 
-    # 6. Scope
+    # 6. Turnstile QR Access Configuration
+    'qr_activation_minutes_before_class': 20,
+
+    # 7. Scope
     'apply_to_existing_bookings': False,
     'policy_effective_at': None,
 
@@ -180,6 +183,7 @@ class BookingPolicyService:
                 'require_active_membership',
                 'max_upcoming_bookings',
                 'advance_booking_days_max',
+                'qr_activation_minutes_before_class',
                 'notify_unpaid_auto_cancellation',
                 'notify_unconfirmed_auto_cancellation',
                 'notify_late_cancellation',

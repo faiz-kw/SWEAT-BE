@@ -549,7 +549,13 @@ class BookingPolicyConfig(models.Model):
         help_text="Maximum days in advance a member is allowed to book"
     )
 
-    # 6. Policy Application Scope
+    # 6. Turnstile QR Access Configuration
+    qr_activation_minutes_before_class = models.IntegerField(
+        default=20,
+        help_text="Minutes before scheduled class start when turnstile QR pass becomes accessible"
+    )
+
+    # 7. Policy Application Scope
     apply_to_existing_bookings = models.BooleanField(
         default=False,
         help_text="If True, auto-cancellation applies to existing eligible bookings. If False, applies to new bookings only."

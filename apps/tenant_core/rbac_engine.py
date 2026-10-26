@@ -160,15 +160,18 @@ class RBACAuthorizationEngine:
         # CHECK 3: Location/Branch ACTIVE (when resource is branch-scoped)
         # -------------------------------------------------------------------
         from apps.tenant_core.models_org import Branch
+        from django.core.exceptions import ValidationError
         target_branch = None
         if branch_id:
-            try:
-                target_branch = Branch.objects.using(db_alias).only('id', 'status', 'name').get(id=branch_id)
-            except Branch.DoesNotExist:
-                return False, f'Requested branch {branch_id} does not exist.', 'CHECK_3_BRANCH_NOT_FOUND'
+            b_str = str(branch_id).strip()
+            if b_str.lower() not in ('none', 'null', 'undefined', 'all', ''):
+                try:
+                    target_branch = Branch.objects.using(db_alias).only('id', 'status', 'name').get(id=b_str)
+                except (Branch.DoesNotExist, ValidationError, ValueError):
+                    return False, f'Requested branch {branch_id} does not exist.', 'CHECK_3_BRANCH_NOT_FOUND'
 
-            if target_branch.status != 'ACTIVE':
-                return False, f'Branch {target_branch.name} is {target_branch.status}. Operations blocked.', 'CHECK_3_BRANCH_INACTIVE'
+                if target_branch.status != 'ACTIVE':
+                    return False, f'Branch {target_branch.name} is {target_branch.status}. Operations blocked.', 'CHECK_3_BRANCH_INACTIVE'
 
         # -------------------------------------------------------------------
         # CHECK 4: Tenant product module ENABLED (Master DB: tenant_modules.is_enabled == TRUE)

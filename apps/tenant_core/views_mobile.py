@@ -2270,7 +2270,9 @@ class MobileRescheduleBookingView(APIView):
 class MobileQRPassView(APIView):
     """
     GET /api/v1/mobile/bookings/<uuid:booking_id>/qr-pass/
-    Generates a cryptographically signed, verified QR pass token for turnstile / reception scanning.
+    GET /api/v1/mobile/qr-pass/
+    Generates a cryptographically signed, verified QR pass token for turnstile / reception scanning
+    strictly ON-DEMAND when within the admin-configured activation window.
     """
     permission_classes = [IsAuthenticated]
 
@@ -2286,69 +2288,19 @@ class MobileQRPassView(APIView):
             generate_booking_qr_token,
             hash_qr_token,
         )
+        from .services_booking_policy import BookingPolicyService
         from .models_attendance import AccessPass, AttendanceRecord
+        from .models_org import Organization
+        from zoneinfo import ZoneInfo
 
         now = timezone.now()
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        today_end = today_start + timedelta(days=1)
 
-        def is_booking_active_for_pass(b):
-            if not b or b.status in ('CANCELLED', 'NO_SHOW'):
-                return False, 'Booking is cancelled or inactive.'
-
-            # If attendance is already complete (member checked out or session attendance finalised)
-            att = AttendanceRecord.objects.using(alias).filter(booking=b).first()
-            if att and att.attendance_completed:
-                return False, 'Workout attendance has completed. Access pass has expired.'
-
-            occ = b.occurrence
-            if not occ:
-                return False, 'No class occurrence associated with booking.'
-
-            duration = occ.class_template.default_duration_minutes if (occ.class_template and occ.class_template.default_duration_minutes) else 50
-            end_at = occ.end_at or (occ.start_at + timedelta(minutes=duration)) if occ.start_at else None
-            # Allow pass access until 15 minutes after session ends
-            if end_at and (end_at + timedelta(minutes=15)) < now:
-                return False, 'Class session has concluded. Access pass has expired.'
-
-            if b.status == 'COMPLETED':
-                return False, 'Workout session is already marked completed.'
-
-            return True, None
-
-        if not booking_id:
-            # Query candidate bookings for today that are upcoming or currently in session
-            candidate_bookings = (
-                Booking.objects.using(alias)
-                .select_related('occurrence__class_template', 'branch', 'user_profile')
-                .filter(
-                    user_profile=profile,
-                    status__in=['CONFIRMED', 'ATTENDED'],
-                    occurrence__start_at__gte=now - timedelta(hours=2),
-                    occurrence__start_at__lte=today_end,
-                )
-                .order_by('occurrence__start_at')
-            )
-
-            active_booking = None
-            for cand in candidate_bookings:
-                is_active, _ = is_booking_active_for_pass(cand)
-                if is_active:
-                    active_booking = cand
-                    break
-
-            if not active_booking:
-                return Response({
-                    'has_booking': False,
-                    'detail': 'No upcoming class session scheduled today. Please reserve a class session to generate your turnstile access key.',
-                }, status=status.HTTP_200_OK)
-
-            booking = active_booking
-        else:
+        # 1. Resolve target booking (either explicitly by ID or nearest upcoming confirmed booking)
+        if booking_id:
             try:
                 booking = (
                     Booking.objects.using(alias)
-                    .select_related('occurrence__class_template', 'branch', 'user_profile')
+                    .select_related('occurrence__class_template', 'branch__organization', 'user_profile')
                     .get(id=booking_id)
                 )
             except Booking.DoesNotExist:
@@ -2356,29 +2308,133 @@ class MobileQRPassView(APIView):
 
             if booking.user_profile_id != profile.id:
                 return Response({'detail': 'Access denied.'}, status=status.HTTP_403_FORBIDDEN)
+        else:
+            # Query candidate bookings that are upcoming or currently in session (no restrictive today_end cutoff)
+            candidate_bookings = (
+                Booking.objects.using(alias)
+                .select_related('occurrence__class_template', 'branch__organization', 'user_profile')
+                .filter(
+                    user_profile=profile,
+                    status__in=['CONFIRMED', 'ATTENDED'],
+                    occurrence__start_at__gte=now - timedelta(hours=2),
+                )
+                .order_by('occurrence__start_at')
+            )
 
-            is_active, reason = is_booking_active_for_pass(booking)
-            if not is_active:
+            booking = candidate_bookings.first()
+            if not booking:
                 return Response({
                     'has_booking': False,
-                    'status': 'EXPIRED',
-                    'detail': reason or 'This workout session has concluded and the access pass has expired.',
+                    'is_active': False,
+                    'status': 'NO_BOOKING',
+                    'detail': 'No upcoming class session scheduled. Please reserve a class session to generate your turnstile access key.',
                 }, status=status.HTTP_200_OK)
 
-        occ = booking.occurrence
-        now = timezone.now()
-        start_ts = int(occ.start_at.timestamp()) if occ and occ.start_at else int(now.timestamp())
-        # Valid from 60 minutes before class until 60 minutes after class ends
-        valid_until_ts = start_ts + 7200
-        valid_from_dt = (occ.start_at - timedelta(minutes=60)) if occ and occ.start_at else now
-        valid_until_dt = (occ.end_at + timedelta(minutes=60)) if (occ and getattr(occ, 'end_at', None)) else (valid_from_dt + timedelta(hours=2))
+        # 2. Basic booking status validation
+        if booking.status in ('CANCELLED', 'NO_SHOW'):
+            return Response({
+                'has_booking': False,
+                'is_active': False,
+                'status': booking.status,
+                'detail': f'This booking has been {booking.status.lower()}. Access pass cannot be generated.',
+            }, status=status.HTTP_200_OK)
 
-        # Deterministic compact Base62 cryptographic booking token
+        # If attendance is already complete (member checked out or session finalized)
+        att = AttendanceRecord.objects.using(alias).filter(booking=booking).first()
+        if att and att.attendance_completed:
+            return Response({
+                'has_booking': True,
+                'is_active': False,
+                'status': 'EXPIRED',
+                'detail': 'Workout attendance has completed. Access pass has expired.',
+            }, status=status.HTTP_200_OK)
+
+        occ = booking.occurrence
+        if not occ or not occ.start_at:
+            return Response({
+                'has_booking': False,
+                'is_active': False,
+                'status': 'INVALID',
+                'detail': 'No class occurrence schedule associated with booking.',
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # 3. Resolve Admin-Configured QR Activation Window (default: 20 minutes)
+        org = None
+        if booking.branch and booking.branch.organization:
+            org = booking.branch.organization
+        elif profile.organization:
+            org = profile.organization
+        else:
+            org = Organization.objects.using(alias).filter(status='ACTIVE').first()
+
+        policy = BookingPolicyService.get_effective_policy(
+            org,
+            branch=booking.branch,
+            db_alias=alias,
+        )
+        qr_activation_minutes = int(policy.get('qr_activation_minutes_before_class', 20) or 20)
+
+        # 4. Calculate timing boundaries
+        start_at = occ.start_at
+        duration = occ.class_template.default_duration_minutes if (occ.class_template and occ.class_template.default_duration_minutes) else 50
+        end_at = occ.end_at or (start_at + timedelta(minutes=duration))
+        activation_time = start_at - timedelta(minutes=qr_activation_minutes)
+
+        # Format local times cleanly for human presentation
+        tz_str = (booking.branch.timezone if (booking.branch and booking.branch.timezone) else None) or 'Asia/Kolkata'
+        try:
+            branch_tz = ZoneInfo(tz_str)
+        except Exception:
+            branch_tz = ZoneInfo('Asia/Kolkata')
+
+        local_start = start_at.astimezone(branch_tz)
+        local_act = activation_time.astimezone(branch_tz)
+        start_str = local_start.strftime('%I:%M %p').lstrip('0')
+        act_str = local_act.strftime('%I:%M %p').lstrip('0')
+        date_str = local_start.strftime('%a, %b %d')
+
+        # 5. EARLY REQUEST: Before Activation Window Opens
+        # Demand-driven requirement: Do NOT generate a QR code in advance or queue it.
+        if now < activation_time:
+            return Response({
+                'has_booking': True,
+                'is_active': False,
+                'status': 'EARLY',
+                'booking_id': str(booking.id),
+                'booking_number': booking.booking_number,
+                'class_name': occ.class_template.name if occ and occ.class_template else 'SWEAT Session',
+                'branch_name': booking.branch.name if booking.branch else 'SWEAT Studio',
+                'start_at': start_at.isoformat(),
+                'activation_time': activation_time.isoformat(),
+                'activation_minutes_before': qr_activation_minutes,
+                'formatted_start_time': f"{start_str} ({date_str})",
+                'formatted_activation_time': act_str,
+                'detail': (
+                    f"Your QR code isn't available yet. Your class starts at {start_str}. "
+                    f"Your turnstile access QR code will become available at {act_str} "
+                    f"({qr_activation_minutes} minutes before class). Please return at that time to generate your QR code."
+                ),
+            }, status=status.HTTP_200_OK)
+
+        # 6. EXPIRED REQUEST: 15+ minutes after session conclusion
+        if (end_at + timedelta(minutes=15)) < now:
+            return Response({
+                'has_booking': True,
+                'is_active': False,
+                'status': 'EXPIRED',
+                'detail': 'Class session has concluded. Access pass has expired.',
+            }, status=status.HTTP_200_OK)
+
+        # 7. ACTIVE WINDOW: activation_time <= now <= (end_at + 15m)
+        # Generate on-demand 22-character cryptographic Base62 token and upsert AccessPass
+        start_ts = int(start_at.timestamp())
+        valid_until_ts = start_ts + 7200
+        valid_from_dt = activation_time
+        valid_until_dt = (end_at + timedelta(minutes=60))
+
         qr_display_token = generate_booking_qr_token(booking.id, settings.SECRET_KEY)
-        compact_token = qr_display_token
         t_hash = hash_qr_token(qr_display_token)
 
-        # Upsert active AccessPass bound to this booking
         pass_obj, _ = AccessPass.objects.using(alias).update_or_create(
             booking=booking,
             defaults={
@@ -2412,6 +2468,8 @@ class MobileQRPassView(APIView):
 
         return Response({
             'has_booking': True,
+            'is_active': True,
+            'status': 'ACTIVE',
             'pass_id': str(pass_obj.id),
             'booking_id': str(booking.id),
             'booking_number': booking.booking_number,
@@ -2423,8 +2481,10 @@ class MobileQRPassView(APIView):
             'member_number': profile.member_number,
             'class_name': pass_data['class'],
             'branch_name': pass_data['branch'],
-            'start_at': occ.start_at.isoformat() if occ and occ.start_at else None,
-            'status': booking.status,
+            'start_at': start_at.isoformat(),
+            'activation_time': activation_time.isoformat(),
+            'activation_minutes_before': qr_activation_minutes,
+            'booking_status': booking.status,
             'valid_from': valid_from_dt.isoformat(),
             'valid_until': valid_until_dt.isoformat(),
             'pass_type': 'CLASS_BOOKING',

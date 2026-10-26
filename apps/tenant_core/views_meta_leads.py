@@ -222,7 +222,16 @@ class MappingSerializer(serializers.ModelSerializer):
             if not isinstance(due_hours, int) or due_hours < 1 or due_hours > 720:
                 raise serializers.ValidationError({'followup_due_hours': 'Follow-up due hours must be between 1 and 720 (30 days).'})
 
-        source = LeadSource.objects.using(alias).filter(id=value('lead_source'), organization=org, status='ACTIVE', source_type='META').first()
+        source = None
+        source_id = value('lead_source')
+        if source_id:
+            try:
+                uuid.UUID(str(source_id))
+                source = LeadSource.objects.using(alias).filter(id=source_id, organization=org, status='ACTIVE', source_type='META').first()
+            except (ValueError, TypeError, Exception):
+                source = None
+        if not source:
+            source = LeadSource.objects.using(alias).filter(organization=org, status='ACTIVE', source_type='META').first()
         if not source:
             raise serializers.ValidationError({'lead_source': 'Choose an active Meta lead source in this organisation.'})
         duplicate = MetaLeadMapping.objects.using(alias).filter(organization=org, page_id=value('page_id'), form_id=value('form_id'))
@@ -232,7 +241,10 @@ class MappingSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError('This Page/form already has a mapping.')
         attrs['lead_source'] = source
         if attrs.get('branch'):
-            attrs['branch'] = Branch.objects.using(alias).get(id=attrs['branch'], organization=org)
+            try:
+                attrs['branch'] = Branch.objects.using(alias).get(id=attrs['branch'], organization=org)
+            except Exception:
+                attrs['branch'] = None
         attrs.pop('expected_version', None)
         return attrs
 
@@ -536,6 +548,7 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
 
     def create(self, request):
         from django.db import IntegrityError
+        from django.core.exceptions import ValidationError as DjangoValidationError
         try:
             with transaction.atomic(using=self.alias):
                 serializer = self.get_serializer(data=request.data)
@@ -544,10 +557,14 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
                 self._audit(mapping, 'META_MAPPING_CREATED')
         except IntegrityError:
             raise ValidationError('A mapping for this Page/form already exists. Reload the mapping list.')
+        except DjangoValidationError as exc:
+            msg = getattr(exc, 'message_dict', getattr(exc, 'messages', str(exc)))
+            raise ValidationError(msg)
         return Response(self.get_serializer(mapping).data, status=201)
 
     def partial_update(self, request, pk=None):
         from django.db import IntegrityError
+        from django.core.exceptions import ValidationError as DjangoValidationError
         try:
             with transaction.atomic(using=self.alias):
                 mapping = get_object_or_404(self.get_queryset().select_for_update(), pk=pk)
@@ -561,6 +578,9 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
                 self._audit(mapping, 'META_MAPPING_UPDATED', before)
         except IntegrityError:
             raise ValidationError('A mapping for this Page/form already exists.')
+        except DjangoValidationError as exc:
+            msg = getattr(exc, 'message_dict', getattr(exc, 'messages', str(exc)))
+            raise ValidationError(msg)
         return Response(self.get_serializer(mapping).data)
 
     def _audit(self, mapping, action_code, before=None):
