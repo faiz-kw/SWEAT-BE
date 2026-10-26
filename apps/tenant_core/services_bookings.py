@@ -754,8 +754,11 @@ class BookingWaitlistAttendanceService:
                 ).exists():
                     raise ValidationError("Cannot book class occurring during an active or scheduled membership freeze window.")
 
-                # Gate: Verify PAR-Q completed and digitally signed for this specific membership if required by policy
-                parq_enforced = bool(booking_policy and booking_policy.require_parq)
+                # Gate: Verify PAR-Q completed and digitally signed for this specific membership
+                parq_enforced = bool(
+                    (booking_policy and booking_policy.require_parq)
+                    or getattr(membership, 'parq_status', 'PENDING') != 'COMPLETED'
+                )
                 if parq_enforced and getattr(membership, 'parq_status', 'PENDING') != 'COMPLETED':
                     if not membership.parq_form:
                         from .models_crm import IntakeForm

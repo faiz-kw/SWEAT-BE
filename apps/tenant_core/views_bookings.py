@@ -817,7 +817,20 @@ class BookingPolicySetViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         alias = _get_db(self.request)
-        serializer.save(created_by_user=self.request.user)
+        org = serializer.validated_data.get('organization')
+        if not org:
+            branch = serializer.validated_data.get('branch')
+            if branch and branch.organization:
+                org = branch.organization
+        if not org:
+            from .models_org import Organization
+            org = Organization.objects.using(alias).first()
+        user = self.request.user
+        created_by_user = user if hasattr(user, 'organization') else None
+        if not created_by_user and hasattr(user, 'email'):
+            from .models_users import TenantUser
+            created_by_user = TenantUser.objects.using(alias).filter(email=user.email).first()
+        serializer.save(organization=org, created_by_user=created_by_user)
 
 
 class BookingCancellationRuleViewSet(viewsets.ModelViewSet):

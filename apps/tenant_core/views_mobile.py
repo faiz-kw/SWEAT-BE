@@ -3412,6 +3412,8 @@ class MobileOnboardingSurveyView(APIView):
                         'is_edit': sub_meta.get('is_edit', sub_count > 1),
                         'revision_number': sub_meta.get('revision_number', sub_count),
                         'agreement_accepted': last_sub.agreement_accepted,
+                        'answers': submission_history[0]['answers'] if submission_history else saved_responses,
+                        'answers_detailed': submission_history[0]['answers_detailed'] if submission_history else [],
                     }
                 elif user_profile.address_json and user_profile.address_json.get('onboarding'):
                     onb = user_profile.address_json['onboarding']
@@ -3599,6 +3601,19 @@ class MobileOnboardingSubmitView(APIView):
                 answers_dict = json.loads(answers_dict)
             except Exception:
                 pass
+        if isinstance(answers_dict, list):
+            mapped_dict = {}
+            for item in answers_dict:
+                if isinstance(item, dict):
+                    q_key = str(item.get('question_id') or item.get('id') or '')
+                    val_item = item.get('value', item.get('answer', item.get('text_value')))
+                    if q_key:
+                        mapped_dict[q_key] = val_item
+                    if item.get('order'):
+                        mapped_dict[f"q_{item['order']}"] = val_item
+                        mapped_dict[str(item['order'])] = val_item
+            answers_dict = mapped_dict
+
         snapshot_questions = []
 
         if form:

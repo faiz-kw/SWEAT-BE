@@ -340,12 +340,13 @@ from .views_wod import WorkoutContentItemViewSet, WorkoutTagViewSet
 router.register(r'wod/content-items', WorkoutContentItemViewSet, basename='wod-content-item')
 router.register(r'wod/tags', WorkoutTagViewSet, basename='wod-tag')
 
-from .views_inventory import ProductViewSet, RetailOrderViewSet, InventoryMovementViewSet
+from .views_inventory import ProductViewSet, RetailOrderViewSet, InventoryMovementViewSet, SupplierViewSet
 from . import views_community
 
 router.register(r'products', ProductViewSet, basename='product')
 router.register(r'retail-orders', RetailOrderViewSet, basename='retail-order')
 router.register(r'inventory-movements', InventoryMovementViewSet, basename='inventory-movement')
+router.register(r'suppliers', SupplierViewSet, basename='supplier')
 
 app_name = 'tenant_core'
 

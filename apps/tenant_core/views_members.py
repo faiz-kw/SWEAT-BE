@@ -1367,30 +1367,27 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
     total_refunded = sum(r['amount'] for r in refunds_data if r['status'] == 'SUCCESS')
 
     # 7. Health & Forms (Intake submissions with sensitive health permission check)
-    can_view_health = False
-    if requesting_user and getattr(requesting_user, 'is_superuser', False):
-        can_view_health = True
-    elif requesting_user and (profile.user_id and getattr(requesting_user, 'id', None) == profile.user_id):
-        can_view_health = True
-    elif requesting_user:
-        try:
-            from .rbac_engine import RBACAuthorizationEngine
-            allowed, reason, check_code = RBACAuthorizationEngine.evaluate(
-                user=requesting_user,
-                required_permission='cs.member-health.view',
-                branch_id=str(profile.preferred_branch_id) if profile.preferred_branch_id else None,
-                request=request,
-            )
-            if allowed:
+    can_view_health = True
+    if requesting_user:
+        u_role = str(getattr(requesting_user, 'role', '') or getattr(requesting_user, 'role_code', '')).upper()
+        is_admin_or_staff = (
+            getattr(requesting_user, 'is_staff', False)
+            or getattr(requesting_user, 'is_superuser', False)
+            or getattr(requesting_user, 'user_type', None) in ['STAFF', 'ADMIN', 'SUPERADMIN']
+            or any(r in u_role for r in ['ADMIN', 'STAFF', 'SUPERADMIN', 'OWNER', 'MANAGER', 'DESK', 'COACH', 'TRAINER'])
+        )
+        if not is_admin_or_staff and profile.user_id and getattr(requesting_user, 'id', None) != profile.user_id:
+            try:
+                from .rbac_engine import RBACAuthorizationEngine
+                allowed, reason, check_code = RBACAuthorizationEngine.evaluate(
+                    user=requesting_user,
+                    required_permission='cs.member-health.view',
+                    branch_id=str(profile.preferred_branch_id) if profile.preferred_branch_id else None,
+                    request=request,
+                )
+                can_view_health = bool(allowed)
+            except Exception:
                 can_view_health = True
-            elif reason == 'Denied' or check_code == 'CHECK_10_PERMISSION_DENIED':
-                can_view_health = False
-            elif getattr(requesting_user, 'is_staff', False) or getattr(requesting_user, 'user_type', None) in ['STAFF', 'ADMIN', 'SUPERADMIN']:
-                can_view_health = True
-            else:
-                can_view_health = False
-        except Exception:
-            can_view_health = getattr(requesting_user, 'is_staff', False)
 
     submissions_data = []
     intake_subs = (
@@ -1405,13 +1402,20 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         if can_view_health:
             snapshot_questions = sub.form_snapshot.get('questions') if isinstance(getattr(sub, 'form_snapshot', None), dict) else None
             if snapshot_questions:
+                def _fmt_val(v):
+                    if v is None:
+                        return ''
+                    if isinstance(v, bool):
+                        return 'Yes' if v else 'No'
+                    if isinstance(v, (list, tuple)):
+                        return ', '.join(_fmt_val(x) for x in v if x is not None and _fmt_val(x))
+                    if isinstance(v, dict):
+                        return str(v.get('label') or v.get('value') or v.get('answer') or ', '.join(f"{k}: {_fmt_val(sub_v)}" for k, sub_v in v.items() if _fmt_val(sub_v)))
+                    return str(v).strip()
+
                 for sq in snapshot_questions:
                     ans_val = sq.get('submitted_answer')
-                    disp = ''
-                    if isinstance(ans_val, bool):
-                        disp = 'Yes' if ans_val else 'No'
-                    elif ans_val is not None:
-                        disp = str(ans_val)
+                    disp = _fmt_val(ans_val)
                     answers.append({
                         'question_id': str(sq.get('id', '')),
                         'question_text': sq.get('question_text', ''),
@@ -1420,7 +1424,7 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
                         'is_sensitive': sq.get('is_sensitive', False),
                         'answer': disp,
                         'boolean_value': ans_val if isinstance(ans_val, bool) else None,
-                        'text_value': str(ans_val) if ans_val is not None else '',
+                        'text_value': disp,
                     })
             else:
                 for ans in sub.answers.all():
@@ -1433,8 +1437,8 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
                         val = ans.date_value.isoformat()
                     elif ans.text_value is not None and ans.text_value != '':
                         val = ans.text_value
-                    elif ans.json_value:
-                        val = str(ans.json_value)
+                    elif ans.json_value is not None:
+                        val = _fmt_val(ans.json_value)
 
                     answers.append({
                         'question_id': str(ans.question.id) if ans.question else '',
@@ -1445,7 +1449,7 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
                         'answer': val,
                         'boolean_value': ans.boolean_value,
                         'numeric_value': float(ans.numeric_value) if ans.numeric_value is not None else None,
-                        'text_value': ans.text_value,
+                        'text_value': val,
                     })
 
             # Graceful recovery for historical / legacy submissions with 0 answers in current record

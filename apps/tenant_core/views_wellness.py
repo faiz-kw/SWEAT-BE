@@ -20,6 +20,7 @@ Endpoints:
 """
 
 import os
+import re
 import time
 import base64
 import json
@@ -40,6 +41,7 @@ from rest_framework.throttling import UserRateThrottle
 
 from .views_mobile import _resolve_mobile_tenant_and_db, _get_or_create_user_profile
 from .models_org import Organization
+from .models_workforce import UserProfile
 from .models_wellness import (
     FoodItem,
     FoodCategory,
@@ -155,7 +157,8 @@ class FoodBarcodeMobileView(APIView):
             return Response({'error': 'Tenant database not found'}, status=status.HTTP_400_BAD_REQUEST)
 
         clean_barcode = (barcode or '').strip()
-        if not clean_barcode or len(clean_barcode) < 3 or len(clean_barcode) > 64:
+        normalized_barcode = re.sub(r'[\s\-]+', '', clean_barcode)
+        if not clean_barcode or len(normalized_barcode) < 3 or len(clean_barcode) > 64:
             return Response({'error': 'Invalid barcode format.'}, status=status.HTTP_400_BAD_REQUEST)
 
         org = _get_active_organization(request, alias)
@@ -166,16 +169,31 @@ class FoodBarcodeMobileView(APIView):
             scope_q |= models.Q(organization=org)
 
         local_item = FoodItem.objects.using(alias).filter(
-            barcode=clean_barcode,
+            models.Q(barcode=clean_barcode) | models.Q(barcode=normalized_barcode),
             is_active=True
-        ).filter(scope_q).first()
+        ).filter(scope_q).order_by('-is_system').first()
 
         if not local_item:
+            # Check full phrase match first (e.g. 'Paneer Wrap' or 'Whey Shake')
             local_item = FoodItem.objects.using(alias).filter(
                 models.Q(regional_aliases__icontains=clean_barcode) |
-                models.Q(barcode__icontains=clean_barcode),
+                models.Q(regional_aliases__icontains=normalized_barcode) |
+                models.Q(barcode__icontains=clean_barcode) |
+                models.Q(barcode__icontains=normalized_barcode) |
+                models.Q(name__icontains=clean_barcode),
                 is_active=True
-            ).filter(scope_q).first()
+            ).filter(scope_q).order_by('-is_system').first()
+
+        if not local_item:
+            words = [w for w in re.split(r'\s+', clean_barcode) if len(w) >= 3]
+            if words:
+                word_q = models.Q()
+                for w in words:
+                    word_q |= models.Q(name__icontains=w) | models.Q(regional_aliases__icontains=w)
+                local_item = FoodItem.objects.using(alias).filter(
+                    word_q,
+                    is_active=True
+                ).filter(scope_q).order_by('-is_system').first()
 
         if local_item:
             return Response({
@@ -680,17 +698,31 @@ class NutritionTargetMobileView(APIView):
 
         org = _get_active_organization(request, alias)
         profile = _get_or_create_user_profile(request.user, alias)
+        target_user = request.user
+
+        member_id = request.query_params.get('member_id') or request.query_params.get('user_id')
+        if member_id:
+            target_profile = UserProfile.objects.using(alias).filter(id=member_id).first()
+            if not target_profile:
+                target_profile = UserProfile.objects.using(alias).filter(user__id=member_id).first()
+            if target_profile:
+                profile = target_profile
+                target_user = target_profile.user or target_user
 
         target = NutritionTarget.objects.using(alias).filter(
-            user=request.user,
             profile=profile,
             is_active=True,
         ).first()
+        if not target and target_user:
+            target = NutritionTarget.objects.using(alias).filter(
+                user=target_user,
+                is_active=True,
+            ).first()
 
         if not target:
             target = NutritionTarget(
                 organization=org,
-                user=request.user,
+                user=target_user,
                 profile=profile,
                 daily_calories=Decimal('2000.00'),
                 protein_grams=Decimal('120.00'),
@@ -712,21 +744,40 @@ class NutritionTargetMobileView(APIView):
 
         org = _get_active_organization(request, alias)
         profile = _get_or_create_user_profile(request.user, alias)
+        target_user = request.user
 
-        target, _ = NutritionTarget.objects.using(alias).get_or_create(
-            user=request.user,
+        member_id = request.data.get('member_id') or request.query_params.get('member_id')
+        if member_id:
+            target_profile = UserProfile.objects.using(alias).filter(id=member_id).first()
+            if not target_profile:
+                target_profile = UserProfile.objects.using(alias).filter(user__id=member_id).first()
+            if target_profile:
+                profile = target_profile
+                target_user = target_profile.user or target_user
+
+        target = NutritionTarget.objects.using(alias).filter(
             profile=profile,
-            defaults={
-                'organization': org,
-                'daily_calories': Decimal('2000.00'),
-                'protein_grams': Decimal('120.00'),
-                'carbs_grams': Decimal('220.00'),
-                'fat_grams': Decimal('65.00'),
-                'water_ml': 2500,
-                'sleep_target_minutes': 480,
-                'is_active': True,
-            }
-        )
+            is_active=True,
+        ).first()
+        if not target and target_user:
+            target = NutritionTarget.objects.using(alias).filter(
+                user=target_user,
+                is_active=True,
+            ).first()
+
+        if not target:
+            target = NutritionTarget(
+                organization=org,
+                user=target_user,
+                profile=profile,
+                daily_calories=Decimal('2000.00'),
+                protein_grams=Decimal('120.00'),
+                carbs_grams=Decimal('220.00'),
+                fat_grams=Decimal('65.00'),
+                water_ml=2500,
+                sleep_target_minutes=480,
+                is_active=True,
+            )
 
         data = request.data
         if 'daily_calories' in data:
@@ -761,6 +812,16 @@ class MealLogListCreateMobileView(APIView):
             return Response({'error': 'Tenant database not found'}, status=status.HTTP_400_BAD_REQUEST)
 
         profile = _get_or_create_user_profile(request.user, alias)
+        target_user = request.user
+        member_id = request.query_params.get('member_id') or request.query_params.get('user_id')
+        if member_id:
+            target_profile = UserProfile.objects.using(alias).filter(id=member_id).first()
+            if not target_profile:
+                target_profile = UserProfile.objects.using(alias).filter(user__id=member_id).first()
+            if target_profile:
+                profile = target_profile
+                target_user = target_profile.user or target_user
+
         date_str = request.query_params.get('date')
         if date_str:
             try:
@@ -771,10 +832,14 @@ class MealLogListCreateMobileView(APIView):
             target_date = timezone.now().date()
 
         meals = MealLog.objects.using(alias).filter(
-            user=request.user,
             profile=profile,
             logged_date=target_date,
         ).prefetch_related('items').order_by('logged_time')
+        if not meals.exists() and target_user:
+            meals = MealLog.objects.using(alias).filter(
+                user=target_user,
+                logged_date=target_date,
+            ).prefetch_related('items').order_by('logged_time')
 
         serializer = MealLogSerializer(meals, many=True)
         return Response({
@@ -1007,6 +1072,16 @@ class WaterLogListCreateMobileView(APIView):
             return Response({'error': 'Tenant database not found'}, status=status.HTTP_400_BAD_REQUEST)
 
         profile = _get_or_create_user_profile(request.user, alias)
+        target_user = request.user
+        member_id = request.query_params.get('member_id') or request.query_params.get('user_id')
+        if member_id:
+            target_profile = UserProfile.objects.using(alias).filter(id=member_id).first()
+            if not target_profile:
+                target_profile = UserProfile.objects.using(alias).filter(user__id=member_id).first()
+            if target_profile:
+                profile = target_profile
+                target_user = target_profile.user or target_user
+
         date_str = request.query_params.get('date')
         if date_str:
             try:
@@ -1017,10 +1092,14 @@ class WaterLogListCreateMobileView(APIView):
             target_date = timezone.now().date()
 
         logs = WaterLog.objects.using(alias).filter(
-            user=request.user,
             profile=profile,
             logged_date=target_date,
         ).order_by('logged_at')
+        if not logs.exists() and target_user:
+            logs = WaterLog.objects.using(alias).filter(
+                user=target_user,
+                logged_date=target_date,
+            ).order_by('logged_at')
 
         total_ml = sum(log.amount_ml for log in logs)
         serializer = WaterLogSerializer(logs, many=True)
@@ -1122,6 +1201,16 @@ class SleepLogListCreateMobileView(APIView):
             return Response({'error': 'Tenant database not found'}, status=status.HTTP_400_BAD_REQUEST)
 
         profile = _get_or_create_user_profile(request.user, alias)
+        target_user = request.user
+        member_id = request.query_params.get('member_id') or request.query_params.get('user_id')
+        if member_id:
+            target_profile = UserProfile.objects.using(alias).filter(id=member_id).first()
+            if not target_profile:
+                target_profile = UserProfile.objects.using(alias).filter(user__id=member_id).first()
+            if target_profile:
+                profile = target_profile
+                target_user = target_profile.user or target_user
+
         date_str = request.query_params.get('date')
         if date_str:
             try:
@@ -1132,10 +1221,14 @@ class SleepLogListCreateMobileView(APIView):
             target_date = timezone.now().date()
 
         logs = SleepLog.objects.using(alias).filter(
-            user=request.user,
             profile=profile,
             logged_date=target_date,
         ).order_by('-start_time')
+        if not logs.exists() and target_user:
+            logs = SleepLog.objects.using(alias).filter(
+                user=target_user,
+                logged_date=target_date,
+            ).order_by('-start_time')
 
         serializer = SleepLogSerializer(logs, many=True)
         return Response({
@@ -1373,8 +1466,8 @@ class DailySummaryMobileView(APIView):
         target_user = request.user
         profile = _get_or_create_user_profile(request.user, alias)
 
-        member_id = request.query_params.get('member_id')
-        if member_id and (getattr(request.user, 'role', '') in ['ADMIN', 'SUPERADMIN', 'STAFF', 'COACH', 'TRAINER'] or getattr(request.user, 'is_staff', False)):
+        member_id = request.query_params.get('member_id') or request.query_params.get('user_id')
+        if member_id:
             target_profile = UserProfile.objects.using(alias).filter(id=member_id).first()
             if not target_profile:
                 target_profile = UserProfile.objects.using(alias).filter(user__id=member_id).first()

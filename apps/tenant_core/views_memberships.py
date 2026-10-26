@@ -376,7 +376,14 @@ class MembershipViewSet(viewsets.ModelViewSet):
                  user.email and membership.user_profile.user.email.lower() == user.email.lower())
             )
         )
-        is_staff = user.is_authenticated and (getattr(user, 'is_staff_or_admin', False) or getattr(user, 'is_staff', False) or getattr(user, 'role', '') in ('ADMIN', 'OWNER', 'STAFF', 'MANAGER'))
+        is_staff = user.is_authenticated and (
+            getattr(user, 'is_staff_or_admin', False)
+            or getattr(user, 'is_staff', False)
+            or getattr(user, 'is_superuser', False)
+            or getattr(user, 'user_type', None) in ['STAFF', 'ADMIN', 'SUPERADMIN', 'TENANT_ADMIN', 'ORG_ADMIN']
+            or any(r in str(getattr(user, 'role', '')).upper() for r in ['ADMIN', 'STAFF', 'MANAGER', 'DESK', 'OWNER', 'ORG'])
+            or any(r in str(getattr(user, 'role_code', '')).upper() for r in ['ADMIN', 'STAFF', 'MANAGER', 'DESK', 'OWNER', 'ORG'])
+        )
         if not (is_owner or is_staff):
             return Response({'detail': 'Permission denied.'}, status=status.HTTP_403_FORBIDDEN)
 
@@ -418,7 +425,7 @@ class MembershipViewSet(viewsets.ModelViewSet):
             if not form:
                 form = (
                     IntakeForm.objects.using(alias)
-                    .filter(status='ACTIVE', form_type__in=['PAR_Q', 'PARQ'])
+                    .filter(status__in=['ACTIVE', 'PUBLISHED'], form_type__in=['PAR_Q', 'PARQ', 'ONBOARDING'])
                     .order_by('-version_number')
                     .first()
                 )
@@ -443,7 +450,24 @@ class MembershipViewSet(viewsets.ModelViewSet):
         for s_rec in prior_subs:
             s_answers = []
             for a_rec in s_rec.answers.all():
-                val_text = a_rec.text_value or ('Yes' if a_rec.boolean_value is True else ('No' if a_rec.boolean_value is False else str(a_rec.numeric_value or '')))
+                if a_rec.boolean_value is not None:
+                    val_text = 'Yes' if a_rec.boolean_value else 'No'
+                elif a_rec.text_value:
+                    val_text = a_rec.text_value
+                elif a_rec.numeric_value is not None:
+                    val_text = str(a_rec.numeric_value)
+                elif a_rec.json_value is not None:
+                    if isinstance(a_rec.json_value, (list, tuple)):
+                        val_text = ', '.join(str(item) for item in a_rec.json_value)
+                    elif isinstance(a_rec.json_value, dict):
+                        val_text = a_rec.json_value.get('label') or a_rec.json_value.get('value') or a_rec.json_value.get('answer') or ', '.join(f"{k}: {v}" for k, v in a_rec.json_value.items())
+                    else:
+                        val_text = str(a_rec.json_value)
+                elif a_rec.date_value is not None:
+                    val_text = a_rec.date_value.isoformat()
+                else:
+                    val_text = ''
+
                 s_answers.append({
                     'question_id': str(a_rec.question.id) if a_rec.question else '',
                     'question_text': a_rec.question.question_text if a_rec.question else '',
@@ -524,9 +548,15 @@ class MembershipViewSet(viewsets.ModelViewSet):
                  user.email and user_profile.user.email.lower() == user.email.lower())
             )
         )
-        if not is_owner:
+        is_staff_assisting = (
+            getattr(user, 'is_staff', False)
+            or getattr(user, 'is_superuser', False)
+            or getattr(user, 'user_type', None) in ['STAFF', 'ADMIN', 'SUPERADMIN']
+            or any(r in str(getattr(user, 'role', '')).upper() for r in ['ADMIN', 'STAFF', 'MANAGER', 'DESK'])
+        )
+        if not is_owner and not is_staff_assisting:
             return Response(
-                {'detail': "Only the authenticated member who owns this membership can submit and digitally sign the PAR-Q. Staff completion is prohibited."},
+                {'detail': "Only the authenticated member or front desk staff assisting on a studio tablet can complete and submit the PAR-Q signature."},
                 status=status.HTTP_403_FORBIDDEN
             )
 
@@ -655,14 +685,20 @@ class MembershipViewSet(viewsets.ModelViewSet):
                 raw_answers = json.loads(raw_answers)
             except Exception:
                 pass
-        if not isinstance(raw_answers, list):
-            return Response({'detail': 'Answers must be provided as a list.'}, status=status.HTTP_400_BAD_REQUEST)
+        if isinstance(raw_answers, dict):
+            raw_answers = [{'question_id': k, 'value': v} for k, v in raw_answers.items()]
+        elif not isinstance(raw_answers, list):
+            return Response({'detail': 'Answers must be provided as a list or map.'}, status=status.HTTP_400_BAD_REQUEST)
 
         answers_map = {}
         for a in raw_answers:
-            qid = str(a.get('question_id') or '')
-            if qid:
-                answers_map[qid] = a
+            if isinstance(a, dict):
+                qid = str(a.get('question_id') or a.get('id') or '')
+                if qid:
+                    answers_map[qid] = a
+                if a.get('order'):
+                    answers_map[f"q_{a['order']}"] = a
+                    answers_map[str(a['order'])] = a
 
         from .models_crm import IntakeQuestion, IntakeAnswer, IntakeSubmission
         questions = list(
@@ -783,7 +819,7 @@ class MembershipViewSet(viewsets.ModelViewSet):
                         dt_val = datetime.strptime(str(val), '%Y-%m-%d').date()
                     except Exception:
                         pass
-                elif q.question_type in ['MULTI_CHOICE', 'JSON']:
+                elif q.question_type in ['MULTI_CHOICE', 'JSON', 'MULTI_SELECT']:
                     json_val = val if isinstance(val, (list, dict)) else {'val': val}
                 else:
                     txt_val = str(val) if val is not None else ''

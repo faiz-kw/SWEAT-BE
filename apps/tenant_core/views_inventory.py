@@ -11,17 +11,37 @@ from django.db.models import Q
 from django.conf import settings
 
 from .context import get_tenant_db_alias
-from .models_inventory import Product, InventoryMovement
-from .serializers_inventory import ProductSerializer, InventoryMovementSerializer
+from .models_inventory import Product, Supplier, InventoryMovement
+from .serializers_inventory import ProductSerializer, SupplierSerializer, InventoryMovementSerializer
 
 
 def _get_db(request):
-    return (
+    alias = (
         get_tenant_db_alias()
         or getattr(getattr(request, 'user', None), '_db_alias', None)
         or getattr(request, '_tenant_db_alias', None)
-        or 'default'
     )
+    if alias and alias != 'default':
+        return alias
+
+    # Fallback resolution for local development or background requests
+    from django.db import connections
+    for active_alias in list(connections.databases.keys()):
+        if active_alias.startswith('tenant_'):
+            return active_alias
+
+    try:
+        from apps.master.models_tenant import Tenant
+        from config.tenant_middleware import _register_tenant_connection
+        t = Tenant.objects.using('default').filter(status='ACTIVE').first()
+        if t:
+            active_alias = f'tenant_{t.slug}'
+            _register_tenant_connection(t)
+            return active_alias
+    except Exception:
+        pass
+
+    return 'default'
 
 
 def _get_org(request):
@@ -34,6 +54,9 @@ def _get_org(request):
         from .models_org import Organization
         if user and getattr(user, 'organization_id', None):
             return Organization.objects.using(alias).filter(id=user.organization_id).first()
+        uat_org = Organization.objects.using(alias).filter(name__icontains='UAT', status='ACTIVE').first()
+        if uat_org:
+            return uat_org
         return Organization.objects.using(alias).filter(status='ACTIVE').first()
     return org
 
@@ -382,5 +405,57 @@ class InventoryMovementViewSet(viewsets.ReadOnlyModelViewSet):
             )
 
         return qs.order_by('-created_at')
+ 
+ 
+class SupplierViewSet(viewsets.ModelViewSet):
+    """
+    CRUD ViewSet for suppliers, vendors, equipment manufacturers, and nutrition distributors.
+    Scoped by tenant database context and organization.
+    """
+    serializer_class = SupplierSerializer
+    pagination_class = InventoryPagination
+    permission_classes = [permissions.AllowAny]
+
+    def get_queryset(self):
+        alias = _get_db(self.request)
+        qs = Supplier.objects.using(alias).all()
+
+        org = _get_org(self.request)
+        if org:
+            qs = qs.filter(organization=org)
+
+        category = self.request.query_params.get('category')
+        if category and category != 'all':
+            qs = qs.filter(category__iexact=category)
+
+        status_param = self.request.query_params.get('status')
+        if status_param and status_param != 'all':
+            qs = qs.filter(status__iexact=status_param)
+
+        search = self.request.query_params.get('search')
+        if search:
+            qs = qs.filter(
+                Q(name__icontains=search) |
+                Q(contact_person__icontains=search) |
+                Q(email__icontains=search) |
+                Q(phone__icontains=search) |
+                Q(category__icontains=search)
+            )
+
+        return qs.order_by('name')
+
+    def perform_create(self, serializer):
+        alias = _get_db(self.request)
+        org = _get_org(self.request)
+        if not org:
+            from .models_org import Organization
+            org = Organization.objects.using(alias).first()
+        serializer.save(organization=org)
+
+    def perform_update(self, serializer):
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        instance.delete()
 
 

@@ -1873,9 +1873,9 @@ class VoiceAgentCallbackView(View):
             # Assignee
             assigned_user = lead.assigned_sales_user
             if not assigned_user:
-                assigned_user = TenantUser.objects.using(alias).filter(organization=lead.organization, is_active=True).first()
+                assigned_user = TenantUser.objects.using(alias).filter(organization=lead.organization, status='ACTIVE').first()
             if not assigned_user:
-                assigned_user = TenantUser.objects.using(alias).filter(is_active=True).first()
+                assigned_user = TenantUser.objects.using(alias).filter(status='ACTIVE').first()
 
             # Create SalesFollowupTask
             task = SalesFollowupTask.objects.using(alias).create(
@@ -2002,6 +2002,7 @@ class VoiceAgentCallOutcomeView(View):
                 lead = _lookup_lead_by_phone(alias, phone)
 
             # Fallback to active CallSession if lead still not resolved
+            active_cs = None
             if not lead:
                 recent_cutoff = timezone.now() - timedelta(minutes=25)
                 active_cs = (
@@ -2255,7 +2256,7 @@ class VoiceAgentCallOutcomeView(View):
                             tomorrow = now_ist.date() + timedelta(days=1)
                             cb_dt = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 10, 0, tzinfo=IST)
 
-                        assigned_u = lead.assigned_sales_user or TenantUser.objects.using(alias).filter(organization=lead.organization, is_active=True).first() or TenantUser.objects.using(alias).filter(is_active=True).first()
+                        assigned_u = lead.assigned_sales_user or TenantUser.objects.using(alias).filter(organization=lead.organization, status='ACTIVE').first() or TenantUser.objects.using(alias).filter(status='ACTIVE').first()
 
                         SalesFollowupTask.objects.using(alias).create(
                             lead=lead,

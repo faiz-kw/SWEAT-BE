@@ -3,7 +3,27 @@ Serializers for Module: Retail Products, Pro Shop & Inventory
 """
 
 from rest_framework import serializers
-from .models_inventory import Product
+from .models_inventory import Product, Supplier, InventoryMovement
+
+
+class SupplierSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Supplier
+        fields = [
+            'id',
+            'name',
+            'category',
+            'contact_person',
+            'email',
+            'phone',
+            'address',
+            'lead_time_days',
+            'payment_terms',
+            'status',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
 
 
 class ProductSerializer(serializers.ModelSerializer):
@@ -18,6 +38,10 @@ class ProductSerializer(serializers.ModelSerializer):
             'price',
             'cost_price',
             'stock_quantity',
+            'supplier',
+            'batch_number',
+            'expiry_date',
+            'manufacturing_date',
             'image_url',
             'images',
             'video_url',
@@ -36,9 +60,6 @@ class ProductSerializer(serializers.ModelSerializer):
         if not isinstance(ret.get('images'), list):
             ret['images'] = [ret['images']] if ret.get('images') else []
         return ret
-
-
-from .models_inventory import InventoryMovement
 
 
 class InventoryMovementSerializer(serializers.ModelSerializer):

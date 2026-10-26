@@ -688,3 +688,11 @@ if SENTRY_DSN:
 # ---------------------------------------------------------------------------
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '').strip()
 
+# ---------------------------------------------------------------------------
+# Static and Media File Storage
+# ---------------------------------------------------------------------------
+STATIC_URL = '/static/'
+STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
+MEDIA_URL = '/media/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+

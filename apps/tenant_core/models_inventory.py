@@ -8,6 +8,37 @@ from django.utils import timezone
 from .models_org import Organization, Branch
 
 
+class Supplier(models.Model):
+    """
+    Suppliers, manufacturers, equipment vendors, and nutrition distributors.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey(
+        Organization, on_delete=models.CASCADE, related_name='suppliers'
+    )
+    name = models.CharField(max_length=255, db_index=True)
+    category = models.CharField(max_length=100, default='General Equipment', blank=True)
+    contact_person = models.CharField(max_length=150, blank=True, default='')
+    email = models.EmailField(blank=True, default='')
+    phone = models.CharField(max_length=50, blank=True, default='')
+    address = models.TextField(blank=True, default='')
+    lead_time_days = models.PositiveIntegerField(default=7, help_text="Typical fulfillment lead time in days")
+    payment_terms = models.CharField(max_length=100, default='Net 30', blank=True)
+    status = models.CharField(max_length=30, default='Active', choices=[('Active', 'Active'), ('Inactive', 'Inactive')])
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'inventory_suppliers'
+        ordering = ['name']
+        indexes = [
+            models.Index(fields=['organization', 'status'], name='idx_supp_org_status'),
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.category})"
+
+
 class Product(models.Model):
     """
     Master product catalog item for gym pro shop, merchandise, supplements, and digital goods.
@@ -43,6 +74,10 @@ class Product(models.Model):
         Branch, on_delete=models.SET_NULL, null=True, blank=True, related_name='branch_products',
         help_text="Optional specific branch allocation. If null, product is catalog-wide."
     )
+    supplier = models.ForeignKey(
+        Supplier, on_delete=models.SET_NULL, null=True, blank=True, related_name='products',
+        help_text="Optional supplier / vendor providing this product"
+    )
     name = models.CharField(max_length=255, db_index=True)
     category = models.CharField(max_length=100, choices=CATEGORY_CHOICES, default='Supplements', db_index=True)
     product_type = models.CharField(max_length=50, choices=PRODUCT_TYPE_CHOICES, default='Physical Goods')
@@ -51,6 +86,11 @@ class Product(models.Model):
     cost_price = models.DecimalField(max_digits=10, decimal_places=2, default=0.00, help_text="Cost / wholesale price")
     stock_quantity = models.IntegerField(default=0, help_text="Current available inventory units")
     
+    # Batch & Expiry tracking
+    batch_number = models.CharField(max_length=100, blank=True, null=True, help_text="Batch / Lot number for batch tracking")
+    expiry_date = models.DateField(blank=True, null=True, help_text="Expiration date for perishable inventory")
+    manufacturing_date = models.DateField(blank=True, null=True, help_text="Manufacturing date")
+
     # Media
     image_url = models.TextField(blank=True, null=True, help_text="Primary display image URL or Base64")
     images = models.JSONField(default=list, blank=True, help_text="List of multiple product gallery images")

@@ -17,11 +17,41 @@ from .models_bookings import (
 from .models_attendance import AttendanceRecord, AccessEvent
 
 
+from .models_org import Organization
+
+
 class BookingPolicySetSerializer(serializers.ModelSerializer):
+    name = serializers.SerializerMethodField(read_only=True)
+    branch_name = serializers.SerializerMethodField(read_only=True)
+    program_name = serializers.SerializerMethodField(read_only=True)
+    organization = serializers.PrimaryKeyRelatedField(
+        queryset=Organization.objects.all(),
+        required=False,
+        allow_null=True
+    )
+
     class Meta:
         model = BookingPolicySet
         fields = '__all__'
         read_only_fields = ['id', 'created_at', 'updated_at']
+        extra_kwargs = {
+            'organization': {'required': False, 'allow_null': True},
+        }
+
+    def get_name(self, obj):
+        if obj.branch:
+            return f"{obj.branch.name} Policy (v{obj.version_number})"
+        if obj.program:
+            return f"{obj.program.name} Policy (v{obj.version_number})"
+        if obj.class_template:
+            return f"{obj.class_template.name} Policy (v{obj.version_number})"
+        return f"Studio Standard Policy (v{obj.version_number})"
+
+    def get_branch_name(self, obj):
+        return obj.branch.name if obj.branch else None
+
+    def get_program_name(self, obj):
+        return obj.program.name if obj.program else None
 
 
 class BookingCancellationRuleSerializer(serializers.ModelSerializer):

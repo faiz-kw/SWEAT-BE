@@ -172,7 +172,7 @@ class WellnessCoreTests(TestCase):
     def test_catalog_seeded_values_and_idempotency(self):
         """Verify the 25 items are seeded with exact mathematical values and idempotent re-runs."""
         foods = FoodItem.objects.using(self.alias).filter(is_system=True)
-        self.assertEqual(foods.count(), 25)
+        self.assertEqual(foods.count(), 36)
 
         # Plain Dosa check
         dosa = foods.get(name='Plain Dosa')
@@ -210,7 +210,7 @@ class WellnessCoreTests(TestCase):
 
         # Idempotency: Re-run seed command
         call_command('seed_indian_food_catalog', database=self.alias)
-        self.assertEqual(FoodItem.objects.using(self.alias).filter(is_system=True).count(), 25)
+        self.assertEqual(FoodItem.objects.using(self.alias).filter(is_system=True).count(), 36)
 
     # -------------------------------------------------------------------------
     # TEST 2: Portion Calculation & Meal Logging API
