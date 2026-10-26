@@ -322,15 +322,20 @@ class ProgramAdmin(TenantModelAdmin):
 @admin.register(Package)
 class PackageAdmin(TenantModelAdmin):
     list_display = ['name', 'code', 'program', 'status', 'created_at']
-    list_filter = ['status']
+    list_filter = ['status', 'program']
     search_fields = ['name', 'code']
+    autocomplete_fields = ['program']
+    list_select_related = ['program']
     readonly_fields = ['id', 'created_at', 'updated_at']
 
 
 @admin.register(PackageVersion)
 class PackageVersionAdmin(TenantModelAdmin):
     list_display = ['package', 'version_number', 'status', 'total_days', 'is_trial_package', 'effective_from', 'published_at']
-    list_filter = ['status', 'is_trial_package']
+    list_filter = ['status', 'package__program', 'is_trial_package']
+    search_fields = ['package__name', 'package__code', 'version_number', 'name_snapshot']
+    autocomplete_fields = ['package']
+    list_select_related = ['package', 'package__program']
     readonly_fields = ['id', 'created_at', 'updated_at']
 
 
@@ -338,6 +343,10 @@ class PackageVersionAdmin(TenantModelAdmin):
 class PackagePriceAdmin(TenantModelAdmin):
     list_display = ['package_version', 'branch', 'base_price', 'display_price', 'currency', 'status', 'effective_from']
     list_filter = ['status', 'currency']
+    search_fields = ['package_version__package__name', 'package_version__package__code']
+    autocomplete_fields = ['package_version']
+    list_select_related = ['package_version', 'package_version__package', 'branch']
+    readonly_fields = ['id', 'created_at', 'updated_at']
 
 
 @admin.register(TermsDocument)

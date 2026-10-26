@@ -177,6 +177,7 @@ class TrainerProfileViewSet(viewsets.ModelViewSet):
         'destroy': 'ops.trainers.delete',
         'check_availability': 'ops.trainers.view',
         'find_eligible': 'ops.trainers.view',
+        'me': 'ops.trainers.view',
     }
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = [
@@ -311,6 +312,31 @@ class TrainerProfileViewSet(viewsets.ModelViewSet):
             ).distinct()
 
         return qs
+
+    @action(detail=False, methods=['get'], url_path='me')
+    def me(self, request):
+        alias = _get_db(request)
+        org = getattr(request, 'organization', None)
+        self._ensure_trainer_profiles_for_staff(alias, org)
+        profile = TrainerProfile.objects.using(alias).filter(
+            employee_profile__user_profile__user_id=request.user.id
+        ).select_related(
+            'employee_profile',
+            'employee_profile__user_profile',
+            'employee_profile__user_profile__user',
+        ).first()
+        if not profile and request.user.email:
+            profile = TrainerProfile.objects.using(alias).filter(
+                employee_profile__user_profile__user__email__iexact=request.user.email
+            ).select_related(
+                'employee_profile',
+                'employee_profile__user_profile',
+                'employee_profile__user_profile__user',
+            ).first()
+        if not profile:
+            return Response({'detail': 'No trainer profile found for authenticated user.'}, status=status.HTTP_404_NOT_FOUND)
+        serializer = self.get_serializer(profile)
+        return Response(serializer.data)
 
     def create(self, request, *args, **kwargs):
         alias = _get_db(request)

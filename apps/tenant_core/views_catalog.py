@@ -752,6 +752,8 @@ class PackageViewSet(viewsets.ModelViewSet):
         if program_id:
             qs = qs.filter(program_id=program_id)
         if status_param and status_param.upper() not in ('ALL', ''):
+            if status_param.upper() == 'ACTIVE':
+                qs = qs.filter(program__status='ACTIVE')
             qs = qs.filter(status=status_param.upper())
         if branch_id:
             qs = qs.filter(branch_availabilities__branch_id=branch_id, branch_availabilities__status='ENABLED')
@@ -765,6 +767,15 @@ class PackageViewSet(viewsets.ModelViewSet):
         alias = _get_db(self.request)
         org = _get_org(self.request)
         instance = serializer.save(organization=org)
+
+        # Auto-deactivate existing active packages in the same program ONLY when created as ACTIVE
+        if instance.status == 'ACTIVE' and instance.program_id:
+            Package.objects.using(alias).filter(
+                organization=org,
+                program_id=instance.program_id,
+                status='ACTIVE'
+            ).exclude(id=instance.id).update(status='INACTIVE')
+
         record_business_audit(
             organization=org,
             module='core',
@@ -780,8 +791,18 @@ class PackageViewSet(viewsets.ModelViewSet):
     def perform_update(self, serializer):
         from .services_reliability import record_business_audit
         alias = _get_db(self.request)
+        before_status = serializer.instance.status
         before_data = {'name': serializer.instance.name, 'status': serializer.instance.status}
         instance = serializer.save()
+
+        # When transitioned to ACTIVE or updated as ACTIVE, deactivate older active packages
+        if instance.status == 'ACTIVE' and before_status != 'ACTIVE' and instance.program_id:
+            Package.objects.using(alias).filter(
+                organization=instance.organization,
+                program_id=instance.program_id,
+                status='ACTIVE'
+            ).exclude(id=instance.id).update(status='INACTIVE')
+
         record_business_audit(
             organization=instance.organization,
             module='core',
@@ -822,6 +843,14 @@ class PackageViewSet(viewsets.ModelViewSet):
         instance = self.get_object()
         instance.status = 'ACTIVE'
         instance.save(using=alias)
+
+        if instance.program_id:
+            Package.objects.using(alias).filter(
+                organization=instance.organization,
+                program_id=instance.program_id,
+                status='ACTIVE'
+            ).exclude(id=instance.id).update(status='INACTIVE')
+
         record_business_audit(
             organization=instance.organization,
             module='core',
@@ -954,15 +983,21 @@ class PackageViewSet(viewsets.ModelViewSet):
                     db_alias=alias,
                 )
 
+            allow_partial_payment = request.data.get('allow_partial_payment', False)
+            if isinstance(allow_partial_payment, str):
+                allow_partial_payment = allow_partial_payment.lower() in ('true', '1', 'yes')
+
             # Optional entitlements
             max_sessions = request.data.get('max_sessions') or request.data.get('allocated_units')
             is_unlimited_home = request.data.get('is_unlimited_home', False) or request.data.get('home_is_unlimited', False)
-            if is_unlimited_home or max_sessions is not None:
+            home_config = {'allow_partial_payment': bool(allow_partial_payment)}
+            if is_unlimited_home or max_sessions is not None or allow_partial_payment:
                 PackageCatalogService.create_entitlement_definition(
                     package_version=ver,
                     entitlement_type='HOME_BRANCH_SESSION',
-                    allocated_units=Decimal(str(max_sessions)) if (max_sessions is not None and not is_unlimited_home) else None,
+                    allocated_units=Decimal(str(max_sessions)) if (max_sessions is not None and not is_unlimited_home) else (Decimal('0') if not is_unlimited_home else None),
                     is_unlimited=bool(is_unlimited_home),
+                    configuration=home_config,
                     actor=request.user,
                     db_alias=alias,
                 )
@@ -980,7 +1015,24 @@ class PackageViewSet(viewsets.ModelViewSet):
                     db_alias=alias,
                 )
 
-            if request.data.get('publish_immediately', False):
+            # Optional Booking Credits (e.g. SWEAT Elite universal credits)
+            credits_val = request.data.get('credits') or request.data.get('booking_credits')
+            if credits_val is not None and str(credits_val).strip() != '':
+                try:
+                    c_num = Decimal(str(credits_val))
+                    if c_num > 0:
+                        PackageCatalogService.create_entitlement_definition(
+                            package_version=ver,
+                            entitlement_type='CREDIT_WALLET',
+                            allocated_units=c_num,
+                            is_unlimited=False,
+                            actor=request.user,
+                            db_alias=alias,
+                        )
+                except Exception as ex:
+                    logger.warning("Failed to allocate credit entitlement: %s", ex)
+
+            if request.data.get('publish_immediately', False) or request.data.get('status') == 'ACTIVE':
                 PackageVersion.objects.using(alias).filter(
                     package=package, status='ACTIVE'
                 ).exclude(id=ver.id).update(status='RETIRED', effective_until=timezone.now())
@@ -989,6 +1041,15 @@ class PackageViewSet(viewsets.ModelViewSet):
                     actor=request.user,
                     db_alias=alias,
                 )
+                if package.status != 'ACTIVE':
+                    package.status = 'ACTIVE'
+                    package.save(using=alias)
+                if package.program_id:
+                    Package.objects.using(alias).filter(
+                        organization=package.organization,
+                        program_id=package.program_id,
+                        status='ACTIVE'
+                    ).exclude(id=package.id).update(status='INACTIVE')
 
             return Response(PackageVersionSerializer(ver).data, status=status.HTTP_201_CREATED)
         except Exception as e:
@@ -1007,6 +1068,15 @@ class PackageViewSet(viewsets.ModelViewSet):
                 actor=request.user,
                 db_alias=alias,
             )
+            if package.status != 'ACTIVE':
+                package.status = 'ACTIVE'
+                package.save(using=alias)
+            if package.program_id:
+                Package.objects.using(alias).filter(
+                    organization=package.organization,
+                    program_id=package.program_id,
+                    status='ACTIVE'
+                ).exclude(id=package.id).update(status='INACTIVE')
             return Response(PackageVersionSerializer(published).data, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -1069,6 +1139,8 @@ class PackageVersionViewSet(viewsets.ModelViewSet):
         if program_id:
             qs = qs.filter(package__program_id=program_id)
         if status_param:
+            if status_param.upper() == 'ACTIVE':
+                qs = qs.filter(package__status='ACTIVE', package__program__status='ACTIVE')
             qs = qs.filter(status=status_param.upper())
         elif str(sellable_only).lower() in ('true', '1'):
             from django.utils import timezone
@@ -1077,6 +1149,7 @@ class PackageVersionViewSet(viewsets.ModelViewSet):
             qs = qs.filter(
                 status='ACTIVE',
                 package__status='ACTIVE',
+                package__program__status='ACTIVE',
                 only_for_trial=False,
             ).filter(
                 Q(effective_from__isnull=True) | Q(effective_from__lte=now)
@@ -1111,6 +1184,236 @@ class PackageVersionViewSet(viewsets.ModelViewSet):
 
         return qs.prefetch_related('prices', 'entitlement_definitions').order_by('-version_number')
 
+    def _update_draft_version(self, request, instance, partial=True):
+        from .models_catalog import PackagePrice, PackageEntitlementDefinition
+        from .models import TenantUser
+        from .services_catalog import PackageCatalogService
+        from .services_reliability import record_business_audit
+        from django.db import transaction
+        from django.utils import timezone
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+        from decimal import Decimal
+
+        alias = _get_db(request)
+
+        # Resolve an actor user for created_by_user foreign keys
+        actor = getattr(request, 'user', None)
+        if not isinstance(actor, TenantUser):
+            actor = getattr(instance, 'created_by_user', None) or TenantUser.objects.using(alias).first()
+
+        try:
+            with transaction.atomic(using=alias):
+                # 1. Update version core fields
+                serializer = self.get_serializer(instance, data=request.data, partial=partial)
+                serializer.is_valid(raise_exception=True)
+                instance = serializer.save()
+
+                # 2. Update or create PackagePrice if price fields provided (allows 0 for free trials)
+                raw_sale_price = request.data.get('sale_price')
+                if raw_sale_price is None:
+                    raw_sale_price = request.data.get('base_price')
+
+                if raw_sale_price is not None and str(raw_sale_price).strip() != '':
+                    currency = request.data.get('currency', 'INR')
+                    raw_disp_price = request.data.get('display_price')
+                    display_price = Decimal(str(raw_disp_price)) if raw_disp_price is not None and str(raw_disp_price).strip() != '' else None
+                    prices_include_tax = request.data.get('prices_include_tax', True)
+                    tax_val = request.data.get('tax_percentage', request.data.get('tax_percent', 0))
+                    tax_percent = Decimal(str(tax_val if tax_val is not None and str(tax_val).strip() != '' else 0))
+                    base_price = Decimal(str(raw_sale_price))
+
+                    existing_price = PackagePrice.objects.using(alias).filter(
+                        package_version=instance, status='ACTIVE'
+                    ).first()
+                    if existing_price:
+                        existing_price.base_price = base_price
+                        existing_price.currency = currency
+                        existing_price.display_price = display_price
+                        existing_price.prices_include_tax = prices_include_tax
+                        existing_price.tax_percent = tax_percent
+                        existing_price.save(using=alias)
+                    else:
+                        PackageCatalogService.create_package_price(
+                            package_version=instance,
+                            currency=currency,
+                            base_price=base_price,
+                            display_price=display_price,
+                            prices_include_tax=prices_include_tax,
+                            tax_percent=tax_percent,
+                            actor=actor,
+                            db_alias=alias,
+                        )
+
+                # 3. Update or create Home Branch Sessions entitlement
+                allow_partial_payment = request.data.get('allow_partial_payment')
+                max_sessions = request.data.get('max_sessions') if 'max_sessions' in request.data else request.data.get('allocated_units')
+                is_unlimited_home = request.data.get('is_unlimited_home') if 'is_unlimited_home' in request.data else request.data.get('home_is_unlimited')
+
+                home_ent = PackageEntitlementDefinition.objects.using(alias).filter(
+                    package_version=instance, entitlement_type='HOME_BRANCH_SESSION'
+                ).first()
+
+                cfg = dict(home_ent.configuration or {}) if home_ent else {}
+                if allow_partial_payment is not None:
+                    if isinstance(allow_partial_payment, str):
+                        allow_partial_payment = allow_partial_payment.lower() in ('true', '1', 'yes')
+                    cfg['allow_partial_payment'] = bool(allow_partial_payment)
+
+                if is_unlimited_home is True:
+                    if home_ent:
+                        home_ent.is_unlimited = True
+                        home_ent.allocated_units = None
+                        home_ent.configuration = cfg
+                        home_ent.save(using=alias)
+                    else:
+                        PackageCatalogService.create_entitlement_definition(
+                            package_version=instance,
+                            entitlement_type='HOME_BRANCH_SESSION',
+                            allocated_units=None,
+                            is_unlimited=True,
+                            configuration=cfg,
+                            actor=actor,
+                            db_alias=alias,
+                        )
+                elif max_sessions is not None and str(max_sessions).strip() != '':
+                    u = Decimal(str(max_sessions))
+                    if u > 0:
+                        if home_ent:
+                            home_ent.is_unlimited = False
+                            home_ent.allocated_units = u
+                            home_ent.configuration = cfg
+                            home_ent.save(using=alias)
+                        else:
+                            PackageCatalogService.create_entitlement_definition(
+                                package_version=instance,
+                                entitlement_type='HOME_BRANCH_SESSION',
+                                allocated_units=u,
+                                is_unlimited=False,
+                                configuration=cfg,
+                                actor=actor,
+                                db_alias=alias,
+                            )
+                    elif home_ent:
+                        if allow_partial_payment is not None:
+                            home_ent.configuration = cfg
+                            home_ent.save(using=alias)
+                elif home_ent and allow_partial_payment is not None:
+                    home_ent.configuration = cfg
+                    home_ent.save(using=alias)
+
+                # 4. Update or create Passport Sessions entitlement (safely ignores when not provided)
+                passport_sessions = request.data.get('passport_sessions')
+                passport_cost = request.data.get('passport_cost') if 'passport_cost' in request.data else request.data.get('passport_extra_cost')
+                is_unlimited_cross = request.data.get('is_unlimited_cross') if 'is_unlimited_cross' in request.data else request.data.get('cross_is_unlimited')
+
+                cross_ent = PackageEntitlementDefinition.objects.using(alias).filter(
+                    package_version=instance, entitlement_type='CROSS_BRANCH_SESSION'
+                ).first()
+
+                if is_unlimited_cross is True:
+                    extra_price = Decimal(str(passport_cost)) if (passport_cost is not None and str(passport_cost).strip() != '') else Decimal('0.00')
+                    if cross_ent:
+                        cross_ent.is_unlimited = True
+                        cross_ent.allocated_units = None
+                        cross_ent.extra_unit_price = extra_price
+                        cross_ent.save(using=alias)
+                    else:
+                        PackageCatalogService.create_entitlement_definition(
+                            package_version=instance,
+                            entitlement_type='CROSS_BRANCH_SESSION',
+                            allocated_units=None,
+                            is_unlimited=True,
+                            extra_unit_price=extra_price,
+                            actor=actor,
+                            db_alias=alias,
+                        )
+                elif passport_sessions is not None and str(passport_sessions).strip() != '' and Decimal(str(passport_sessions)) > 0:
+                    units_cross = Decimal(str(passport_sessions))
+                    extra_price = Decimal(str(passport_cost)) if (passport_cost is not None and str(passport_cost).strip() != '') else Decimal('0.00')
+                    if cross_ent:
+                        cross_ent.is_unlimited = False
+                        cross_ent.allocated_units = units_cross
+                        cross_ent.extra_unit_price = extra_price
+                        cross_ent.save(using=alias)
+                    else:
+                        PackageCatalogService.create_entitlement_definition(
+                            package_version=instance,
+                            entitlement_type='CROSS_BRANCH_SESSION',
+                            allocated_units=units_cross,
+                            is_unlimited=False,
+                            extra_unit_price=extra_price,
+                            actor=actor,
+                            db_alias=alias,
+                        )
+                elif cross_ent:
+                    cross_ent.delete(using=alias)
+
+                # 5. Update or create Booking Credits entitlement
+                credits_val = request.data.get('credits') if 'credits' in request.data else request.data.get('booking_credits')
+                credit_ent = PackageEntitlementDefinition.objects.using(alias).filter(
+                    package_version=instance, entitlement_type='CREDIT_WALLET'
+                ).first()
+                if credits_val is not None and str(credits_val).strip() != '' and Decimal(str(credits_val)) > 0:
+                    c_num = Decimal(str(credits_val))
+                    if credit_ent:
+                        credit_ent.allocated_units = c_num
+                        credit_ent.status = 'ACTIVE'
+                        credit_ent.save(using=alias)
+                    else:
+                        PackageCatalogService.create_entitlement_definition(
+                            package_version=instance,
+                            entitlement_type='CREDIT_WALLET',
+                            allocated_units=c_num,
+                            is_unlimited=False,
+                            actor=actor,
+                            db_alias=alias,
+                        )
+                elif credit_ent:
+                    credit_ent.delete(using=alias)
+
+                # 6. Audit logging
+                record_business_audit(
+                    organization=instance.package.organization,
+                    module='core',
+                    action_code='PACKAGE_VERSION_UPDATED',
+                    entity_type='PackageVersion',
+                    entity_id=instance.id,
+                    actor_user=actor,
+                    event_description=f"Updated draft version v{instance.version_number} of package {instance.package.name}",
+                    after_data={'version_number': instance.version_number, 'status': instance.status},
+                    db_alias=alias,
+                )
+
+                # 7. Optional immediate publication
+                if request.data.get('publish_immediately', False) or request.data.get('status') == 'ACTIVE':
+                    PackageVersion.objects.using(alias).filter(
+                        package=instance.package, status='ACTIVE'
+                    ).exclude(id=instance.id).update(status='RETIRED', effective_until=timezone.now())
+                    instance = PackageCatalogService.publish_package_version(
+                        package_version_id=instance.id,
+                        actor=actor,
+                        db_alias=alias,
+                    )
+                    if instance.package.status != 'ACTIVE':
+                        instance.package.status = 'ACTIVE'
+                        instance.package.save(using=alias)
+                    if instance.package.program_id:
+                        from .models_catalog import Package
+                        Package.objects.using(alias).filter(
+                            organization=instance.package.organization,
+                            program_id=instance.package.program_id,
+                            status='ACTIVE'
+                        ).exclude(id=instance.package.id).update(status='INACTIVE')
+
+            return Response(PackageVersionSerializer(instance).data, status=status.HTTP_200_OK)
+
+        except (DjangoValidationError, DRFValidationError) as ve:
+            err_msg = ve.message_dict if hasattr(ve, 'message_dict') else (ve.messages if hasattr(ve, 'messages') else str(ve))
+            return Response({'error': err_msg}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as ex:
+            return Response({'error': str(ex)}, status=status.HTTP_400_BAD_REQUEST)
+
     def update(self, request, *args, **kwargs):
         instance = self.get_object()
         if instance.status in ('ACTIVE', 'RETIRED'):
@@ -1121,7 +1424,7 @@ class PackageVersionViewSet(viewsets.ModelViewSet):
                 },
                 status=status.HTTP_400_BAD_REQUEST
             )
-        return super().update(request, *args, **kwargs)
+        return self._update_draft_version(request, instance, partial=False)
 
     def partial_update(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -1133,11 +1436,14 @@ class PackageVersionViewSet(viewsets.ModelViewSet):
                 },
                 status=status.HTTP_400_BAD_REQUEST
             )
-        return super().partial_update(request, *args, **kwargs)
+        return self._update_draft_version(request, instance, partial=True)
 
     def destroy(self, request, *args, **kwargs):
         from .models_memberships import Membership
         from .models_commerce import OrderItem
+        from .models_catalog import PackagePrice, PackageEntitlementDefinition
+        from .services_reliability import record_business_audit
+        from django.db import transaction
         alias = _get_db(request)
         instance = self.get_object()
         if instance.status != 'DRAFT':
@@ -1153,7 +1459,23 @@ class PackageVersionViewSet(viewsets.ModelViewSet):
                 {'error': "Cannot delete version that has associated memberships or orders.", 'code': 'VERSION_HAS_HISTORY'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        return super().destroy(request, *args, **kwargs)
+        with transaction.atomic(using=alias):
+            # Clean up child draft configuration records protected by PROTECT foreign key
+            PackagePrice.objects.using(alias).filter(package_version=instance).delete()
+            PackageEntitlementDefinition.objects.using(alias).filter(package_version=instance).delete()
+            record_business_audit(
+                organization=instance.package.organization,
+                module='core',
+                action_code='PACKAGE_VERSION_DISCARDED',
+                entity_type='PackageVersion',
+                entity_id=instance.id,
+                actor_user=request.user,
+                event_description=f"Discarded draft version v{instance.version_number} of package {instance.package.name}",
+                before_data={'version_number': instance.version_number, 'status': instance.status},
+                db_alias=alias,
+            )
+            instance.delete(using=alias)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=['post'], url_path='publish')
     def publish(self, request, pk=None):
@@ -1165,6 +1487,16 @@ class PackageVersionViewSet(viewsets.ModelViewSet):
                 actor=request.user,
                 db_alias=alias,
             )
+            package = instance.package
+            if package.status != 'ACTIVE':
+                package.status = 'ACTIVE'
+                package.save(using=alias)
+            if package.program_id:
+                Package.objects.using(alias).filter(
+                    organization=package.organization,
+                    program_id=package.program_id,
+                    status='ACTIVE'
+                ).exclude(id=package.id).update(status='INACTIVE')
             return Response(PackageVersionSerializer(published).data, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)

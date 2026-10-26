@@ -166,6 +166,9 @@ class BookingListSerializer(serializers.ModelSerializer):
     member_number = serializers.CharField(source='user_profile.member_number', read_only=True)
     member_phone = serializers.SerializerMethodField()
     occurrence_title = serializers.CharField(source='occurrence.class_template.name', read_only=True)
+    class_name = serializers.CharField(source='occurrence.class_template.name', read_only=True)
+    program_name = serializers.SerializerMethodField()
+    booked_by_name = serializers.SerializerMethodField()
     occurrence_date = serializers.DateField(source='occurrence.occurrence_date', read_only=True)
     occurrence_start_at = serializers.DateTimeField(source='occurrence.start_at', read_only=True)
     occurrence_end_at = serializers.DateTimeField(source='occurrence.end_at', read_only=True)
@@ -181,7 +184,7 @@ class BookingListSerializer(serializers.ModelSerializer):
             'payment_status', 'confirmation_status', 'confirmed_at',
             'waitlist_position', 'booked_at', 'cancelled_at', 'completed_at',
             'user_profile', 'user_profile_name', 'user_profile_email', 'member_name', 'member_email', 'member_number', 'member_phone',
-            'occurrence', 'occurrence_title', 'occurrence_date', 'occurrence_start_at', 'occurrence_end_at',
+            'occurrence', 'occurrence_title', 'class_name', 'program_name', 'booked_by_name', 'occurrence_date', 'occurrence_start_at', 'occurrence_end_at',
             'branch', 'branch_name',
             'membership', 'package_name',
             'entitlement',
@@ -223,6 +226,28 @@ class BookingListSerializer(serializers.ModelSerializer):
         has_sub = IntakeSubmission.objects.using(alias).filter(user_profile=obj.user_profile).exists()
         return 'CLEARED' if has_sub else 'PENDING'
 
+    def get_program_name(self, obj):
+        if obj.occurrence and obj.occurrence.class_template and obj.occurrence.class_template.program:
+            return obj.occurrence.class_template.program.name
+        if obj.membership and obj.membership.package and obj.membership.package.program:
+            return obj.membership.package.program.name
+        if obj.occurrence and obj.occurrence.class_template and obj.occurrence.class_template.category:
+            return obj.occurrence.class_template.category.name
+        return None
+
+    def get_booked_by_name(self, obj):
+        if getattr(obj, 'created_by_user', None):
+            u = obj.created_by_user
+            name = f"{getattr(u, 'first_name', '')} {getattr(u, 'last_name', '')}".strip()
+            return name or getattr(u, 'email', 'Staff')
+        if obj.booking_source == 'MOBILE_APP':
+            return 'Member (Self - App)'
+        if obj.booking_source == 'WEB':
+            return 'Member (Self - Web)'
+        if obj.booking_source in ['FRONT_DESK', 'ADMIN', 'KIOSK']:
+            return 'Front Desk / Staff'
+        return 'Member (Self)'
+
     def get_attendance_record(self, obj):
         cache = getattr(obj, '_prefetched_objects_cache', None)
         if cache and 'attendance_records' in cache:
@@ -253,6 +278,9 @@ class BookingSerializer(serializers.ModelSerializer):
     member_phone = serializers.SerializerMethodField()
     member_number = serializers.SerializerMethodField()
     class_name = serializers.CharField(source='occurrence.class_template.name', read_only=True)
+    occurrence_title = serializers.CharField(source='occurrence.class_template.name', read_only=True, allow_null=True)
+    program_name = serializers.SerializerMethodField()
+    booked_by_name = serializers.SerializerMethodField()
     occurrence_date = serializers.DateField(source='occurrence.occurrence_date', read_only=True)
     start_at = serializers.DateTimeField(source='occurrence.start_at', read_only=True)
     end_at = serializers.DateTimeField(source='occurrence.end_at', read_only=True)

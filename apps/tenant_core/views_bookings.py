@@ -184,7 +184,10 @@ class BookingViewSet(viewsets.ModelViewSet):
 
         base_select = [
             'user_profile', 'user_profile__user', 'occurrence',
-            'occurrence__class_template', 'branch', 'membership', 'membership__package', 'entitlement'
+            'occurrence__class_template', 'occurrence__class_template__program',
+            'occurrence__class_template__category', 'branch', 'membership',
+            'membership__package', 'membership__package__program', 'entitlement',
+            'created_by_user'
         ]
         qs = Booking.objects.using(alias).select_related(*base_select)
 
@@ -213,8 +216,41 @@ class BookingViewSet(viewsets.ModelViewSet):
             qs = qs.filter(user_profile__user=self.request.user)
 
         branch_id = self.request.query_params.get('branch_id')
-        if branch_id and branch_id != 'all':
+        if branch_id and branch_id != 'all' and branch_id != 'ALL':
             qs = qs.filter(branch_id=branch_id)
+
+        program_id = self.request.query_params.get('program_id') or self.request.query_params.get('program')
+        if program_id and program_id != 'all' and program_id != 'ALL':
+            from .models_catalog import Program
+            matching_ids = [program_id]
+            try:
+                prog_obj = Program.objects.using(alias).filter(id=program_id).first()
+                if prog_obj:
+                    sibling_ids = list(Program.objects.using(alias).filter(name__iexact=prog_obj.name).values_list('id', flat=True))
+                    matching_ids = list(set(matching_ids + [str(s) for s in sibling_ids]))
+            except Exception:
+                pass
+
+            qs = qs.filter(
+                models.Q(occurrence__class_template__program_id__in=matching_ids) |
+                models.Q(occurrence__class_template__category_id__in=matching_ids) |
+                models.Q(membership__package__program_id__in=matching_ids) |
+                models.Q(occurrence__class_template__program__name__iexact=program_id)
+            )
+
+        booking_type = self.request.query_params.get('booking_type')
+        is_trial = self.request.query_params.get('is_trial')
+        if is_trial is not None and str(is_trial).lower() in ['true', '1', 'yes']:
+            qs = qs.filter(booking_type='TRIAL')
+        elif is_trial is not None and str(is_trial).lower() in ['false', '0', 'no']:
+            qs = qs.exclude(booking_type='TRIAL')
+        elif booking_type and booking_type.upper() != 'ALL':
+            if booking_type.upper() == 'TRIAL':
+                qs = qs.filter(booking_type='TRIAL')
+            elif booking_type.upper() == 'MEMBER':
+                qs = qs.exclude(booking_type='TRIAL')
+            else:
+                qs = qs.filter(booking_type=booking_type.upper())
 
         occurrence_id = self.request.query_params.get('occurrence_id')
         if occurrence_id:
@@ -280,17 +316,22 @@ class BookingViewSet(viewsets.ModelViewSet):
         staff_roles = {'ORG_ADMIN', 'BRANCH_MANAGER', 'FRONT_DESK', 'TRAINER', 'SALES_REP', 'FINANCE_ADMIN'}
         is_member_only = 'MEMBER' in user_roles and not (user_roles & staff_roles)
 
+        booking_type_param = (request.query_params.get('booking_type') or '').upper()
+        is_trial_param = request.query_params.get('is_trial')
+        if booking_type_param == 'MEMBER' or (is_trial_param is not None and str(is_trial_param).lower() in ['false', '0', 'no']):
+            include_trials = False
+
         trial_items = []
         current_page_num = int(request.query_params.get('page', 1) or 1)
         if include_trials and not is_member_only and current_page_num == 1:
-            trial_qs = TrialBooking.objects.using(alias).select_related('lead', 'branch', 'assigned_trainer_profile')
+            trial_qs = TrialBooking.objects.using(alias).select_related('lead', 'branch', 'assigned_trainer_profile', 'created_by_user')
 
             permitted_branches = get_user_effective_branch_ids(request.user, alias)
             if permitted_branches is not None:
                 trial_qs = trial_qs.filter(branch_id__in=permitted_branches)
 
             branch_id = request.query_params.get('branch_id')
-            if branch_id and branch_id != 'all':
+            if branch_id and branch_id != 'all' and branch_id != 'ALL':
                 trial_qs = trial_qs.filter(branch_id=branch_id)
 
             occurrence_id = request.query_params.get('occurrence_id')
@@ -303,6 +344,41 @@ class BookingViewSet(viewsets.ModelViewSet):
                     trial_qs = trial_qs.filter(models.Q(status='CONFIRMED') | models.Q(confirmation_status='CONFIRMED'))
                 else:
                     trial_qs = trial_qs.filter(status=status_filter)
+
+            # Program Filter for Trials
+            program_id = request.query_params.get('program_id') or request.query_params.get('program')
+            if program_id and program_id != 'all' and program_id != 'ALL':
+                from .models_catalog import Program
+                matching_ids = [program_id]
+                try:
+                    prog_obj = Program.objects.using(alias).filter(id=program_id).first()
+                    if prog_obj:
+                        sibling_ids = list(Program.objects.using(alias).filter(name__iexact=prog_obj.name).values_list('id', flat=True))
+                        matching_ids = list(set(matching_ids + [str(s) for s in sibling_ids]))
+                except Exception:
+                    pass
+
+                matching_occ_ids = list(
+                    ClassOccurrence.objects.using(alias).filter(
+                        models.Q(class_template__program_id__in=matching_ids) |
+                        models.Q(class_template__category_id__in=matching_ids) |
+                        models.Q(class_template__program__name__iexact=program_id)
+                    ).values_list('id', flat=True)
+                )
+                trial_qs = trial_qs.filter(class_occurrence_id__in=matching_occ_ids)
+
+            # Date Filters for Trials
+            occ_date = request.query_params.get('occurrence_date')
+            if occ_date:
+                trial_qs = trial_qs.filter(scheduled_start__date=occ_date)
+
+            from_date = request.query_params.get('from_date')
+            if from_date:
+                trial_qs = trial_qs.filter(scheduled_start__date__gte=from_date)
+
+            to_date = request.query_params.get('to_date')
+            if to_date:
+                trial_qs = trial_qs.filter(scheduled_start__date__lte=to_date)
 
             search = (request.query_params.get('search') or '').strip()
             if search:
@@ -318,9 +394,13 @@ class BookingViewSet(viewsets.ModelViewSet):
             occ_ids = [t.class_occurrence_id for t in trial_list if t.class_occurrence_id]
             occ_map = {}
             if occ_ids:
-                for occ in ClassOccurrence.objects.using(alias).filter(id__in=occ_ids).select_related('class_template'):
+                for occ in ClassOccurrence.objects.using(alias).filter(id__in=occ_ids).select_related('class_template', 'class_template__program'):
+                    prog_name = None
+                    if occ.class_template and occ.class_template.program:
+                        prog_name = occ.class_template.program.name
                     occ_map[occ.id] = {
                         'title': occ.class_template.name if occ.class_template else 'Class Session',
+                        'program_name': prog_name,
                         'date': occ.occurrence_date.isoformat() if occ.occurrence_date else None,
                         'start_at': occ.start_at.isoformat() if occ.start_at else None,
                         'end_at': occ.end_at.isoformat() if occ.end_at else None,
@@ -336,6 +416,12 @@ class BookingViewSet(viewsets.ModelViewSet):
                     f"TRL-{str(t.id)[:8].upper()}".lower().find(search.lower()) != -1
                 ):
                     continue
+
+                staff_name = ''
+                if t.created_by_user:
+                    staff_name = f"{t.created_by_user.first_name or ''} {t.created_by_user.last_name or ''}".strip() or t.created_by_user.email
+                else:
+                    staff_name = 'Front Desk / Staff'
 
                 trial_items.append({
                     'id': str(t.id),
@@ -356,6 +442,9 @@ class BookingViewSet(viewsets.ModelViewSet):
                     'phone': t.lead.phone_normalized if t.lead else None,
                     'occurrence': str(t.class_occurrence_id) if t.class_occurrence_id else None,
                     'occurrence_title': occ_info.get('title', 'Trial Session'),
+                    'class_name': occ_info.get('title', 'Trial Session'),
+                    'program_name': occ_info.get('program_name'),
+                    'booked_by_name': staff_name,
                     'occurrence_date': occ_info.get('date', t.scheduled_start.date().isoformat() if t.scheduled_start else None),
                     'occurrence_start_at': occ_info.get('start_at', t.scheduled_start.isoformat() if t.scheduled_start else None),
                     'occurrence_end_at': occ_info.get('end_at', t.scheduled_end.isoformat() if t.scheduled_end else None),
@@ -376,7 +465,23 @@ class BookingViewSet(viewsets.ModelViewSet):
             if trial_items:
                 results = trial_items + results
                 results.sort(key=lambda x: x.get('booked_at') or x.get('created_at') or '', reverse=True)
-            return self.get_paginated_response(results)
+            response = self.get_paginated_response(results)
+            if trial_items and hasattr(response, 'data') and isinstance(response.data, dict):
+                response.data['count'] = (response.data.get('count') or 0) + len(trial_items)
+                if 'summary' in response.data and isinstance(response.data['summary'], dict):
+                    sum_dict = response.data['summary']
+                    sum_dict['total_count'] = (sum_dict.get('total_count') or 0) + len(trial_items)
+                    for t in trial_items:
+                        st = t.get('status')
+                        if st == 'CONFIRMED' or t.get('confirmation_status') == 'CONFIRMED':
+                            sum_dict['confirmed_count'] = (sum_dict.get('confirmed_count') or 0) + 1
+                        elif st in ['ATTENDED', 'COMPLETED']:
+                            sum_dict['attended_count'] = (sum_dict.get('attended_count') or 0) + 1
+                        elif st == 'NO_SHOW':
+                            sum_dict['no_show_count'] = (sum_dict.get('no_show_count') or 0) + 1
+                        elif st in ['CANCELLED', 'LATE_CANCELLED']:
+                            sum_dict['cancelled_count'] = (sum_dict.get('cancelled_count') or 0) + 1
+            return response
 
         serializer = self.get_serializer(queryset[:200], many=True)
         results = trial_items + list(serializer.data)

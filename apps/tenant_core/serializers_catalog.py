@@ -195,7 +195,7 @@ class ProgramCategorySerializer(serializers.ModelSerializer):
         model = ProgramCategory
         fields = [
             'id', 'organization', 'code', 'name', 'description',
-            'display_order', 'status', 'programs_count', 'created_at', 'updated_at',
+            'display_order', 'credits', 'status', 'programs_count', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
         extra_kwargs = {
@@ -302,7 +302,7 @@ class ProgramSerializer(serializers.ModelSerializer):
         model = Program
         fields = [
             'id', 'organization', 'category', 'category_name', 'category_code',
-            'code', 'name', 'description', 'delivery_mode', 'display_order',
+            'code', 'name', 'description', 'delivery_mode', 'display_order', 'credits',
             'program_type', 'program_type_name', 'program_type_code',
             'trial_allowed', 'status', 'packages_count',
             'available_branch_ids', 'available_branches',
@@ -685,6 +685,26 @@ class PackageVersionSerializer(serializers.ModelSerializer):
     package_name = serializers.CharField(source='package.name', read_only=True)
     effective_price = serializers.SerializerMethodField()
     currency = serializers.SerializerMethodField()
+    allow_partial_payment = serializers.SerializerMethodField()
+    credits = serializers.SerializerMethodField()
+
+    def get_credits(self, obj):
+        try:
+            for ent in obj.entitlement_definitions.all():
+                if ent.entitlement_type == 'CREDIT_WALLET' and ent.status == 'ACTIVE':
+                    return float(ent.allocated_units) if ent.allocated_units is not None else None
+        except Exception:
+            pass
+        return None
+
+    def get_allow_partial_payment(self, obj):
+        try:
+            for ent in obj.entitlement_definitions.all():
+                if isinstance(ent.configuration, dict) and 'allow_partial_payment' in ent.configuration:
+                    return bool(ent.configuration['allow_partial_payment'])
+        except Exception:
+            pass
+        return False
 
     def get_effective_price(self, obj):
         req = self.context.get('request')
@@ -711,7 +731,7 @@ class PackageVersionSerializer(serializers.ModelSerializer):
             'total_days', 'validity_days', 'is_trial_package', 'is_trial',
             'only_for_trial', 'show_on_web', 'show_on_app',
             'effective_from', 'effective_until', 'published_at',
-            'status', 'prices', 'effective_price', 'currency', 'entitlement_definitions',
+            'status', 'prices', 'effective_price', 'currency', 'allow_partial_payment', 'credits', 'entitlement_definitions',
             'created_by_user', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'version_number', 'created_by_user', 'created_at', 'updated_at']
