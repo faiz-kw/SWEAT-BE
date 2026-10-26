@@ -4,6 +4,9 @@ Tenant core app models — re-exports from all model modules.
 
 from .models_org import Organization, CompanyEntity, Location, Branch
 
+from .models_assessment import (
+    MemberAssessment,
+)
 from .models_users import TenantUser, Department, UserBranch, UserDepartment
 
 from .models_rbac import (
@@ -375,4 +378,5 @@ __all__ += [
     'CommunityAuditLog',
     'PostPrivacyScope',
     'PostStatus',
+     'MemberAssessment',
 ]

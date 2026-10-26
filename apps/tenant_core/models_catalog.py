@@ -170,6 +170,7 @@ class ProgramCategory(models.Model):
     name = models.CharField(max_length=150)
     description = models.TextField(null=True, blank=True)
     display_order = models.IntegerField(default=0)
+    credits = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, help_text="Optional default credits deducted per class/booking for credit-based packages (e.g. SWEAT Elite)")
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='ACTIVE')
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
@@ -256,6 +257,7 @@ class Program(models.Model):
     description = models.TextField(null=True, blank=True)
     delivery_mode = models.CharField(max_length=30, choices=DELIVERY_MODE_CHOICES, default='GROUP_CLASS', blank=True)
     display_order = models.IntegerField(default=0)
+    credits = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, help_text="Optional default credits deducted per class/booking for credit-based packages (e.g. SWEAT Elite)")
     trial_allowed = models.BooleanField(default=False)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='ACTIVE')
     created_at = models.DateTimeField(default=timezone.now)
@@ -601,6 +603,7 @@ class PackageEntitlementDefinition(models.Model):
         ('PERSONAL_TRAINING_SESSION', 'Personal Training Session'),
         ('ASSESSMENT', 'Assessment'),
         ('OPEN_ACCESS', 'Open Access / Gym Floor'),
+        ('CREDIT_WALLET', 'Booking Credits Wallet'),
         ('OTHER', 'Other'),
     ]
     STATUS_CHOICES = [

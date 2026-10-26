@@ -2,6 +2,7 @@ from django.urls import path
 from apps.authentication.views_otp import SendOTPView, VerifyOTPView
 from . import views_wellness
 from . import views_community
+from .views_assessment import AssessmentEligibilityMobileView, AssessmentSessionViewSet
 from .views_mobile import (
     MobileRegisterView,
     MobileLeadCaptureView,
@@ -134,4 +135,8 @@ urlpatterns = [
     path('community/report/', views_community.CommunityReportMobileView.as_view(), name='mobile-community-report'),
     path('community/requests/', views_community.CommunityRequestsMobileView.as_view(), name='mobile-community-requests'),
     path('community/requests/<uuid:pk>/upvote/', views_community.CommunityRequestUpvoteMobileView.as_view(), name='mobile-community-requests-upvote'),
+    # 8. Assessment & Transformation (Gated by Package Entitlement)
+    path('assessment/eligibility/', AssessmentEligibilityMobileView.as_view(), name='mobile-assessment-eligibility'),
+    path('assessment/start/', AssessmentSessionViewSet.as_view({'post': 'create'}), name='mobile-assessment-start'),
+    path('assessment/<uuid:pk>/', AssessmentSessionViewSet.as_view({'get': 'retrieve'}), name='mobile-assessment-detail'),
 ]

@@ -348,6 +348,9 @@ router.register(r'retail-orders', RetailOrderViewSet, basename='retail-order')
 router.register(r'inventory-movements', InventoryMovementViewSet, basename='inventory-movement')
 router.register(r'suppliers', SupplierViewSet, basename='supplier')
 
+from .views_assessment import AssessmentSessionViewSet, StudioScreenPairingView
+router.register(r'assessments', AssessmentSessionViewSet, basename='assessment')
+
 app_name = 'tenant_core'
 
 urlpatterns = [
@@ -381,5 +384,8 @@ urlpatterns = [
     path('community/users/<uuid:user_id>/sanction/', views_community.CommunityAdminSanctionsView.as_view(), name='admin-community-sanction-user'),
     path('community/audit-logs/', views_community.CommunityAdminAuditLogsView.as_view(), name='admin-community-audit-logs'),
 
+    path('assessments/<uuid:pk>/capture/', AssessmentSessionViewSet.as_view({'post': 'capture_photos'}), name='assessment-capture'),
+    path('assessments/<uuid:pk>/approve-and-send/', AssessmentSessionViewSet.as_view({'post': 'approve_and_send'}), name='assessment-approve'),
+    path('assessments/pair/', StudioScreenPairingView.as_view(), name='assessment-pair'),
     path('', include(router.urls)),
 ]

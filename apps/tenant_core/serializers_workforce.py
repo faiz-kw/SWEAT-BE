@@ -68,6 +68,8 @@ class TrainerProfileSerializer(serializers.ModelSerializer):
     trainer_name = serializers.SerializerMethodField()
     employee_code = serializers.CharField(source='employee_profile.employee_code', read_only=True)
     email = serializers.CharField(source='employee_profile.user_profile.user.email', read_only=True)
+    user_id = serializers.UUIDField(source='employee_profile.user_profile.user.id', read_only=True)
+    user = serializers.UUIDField(source='employee_profile.user_profile.user.id', read_only=True)
     specialties = serializers.SerializerMethodField()
 
     branch_ids = serializers.SerializerMethodField()
@@ -144,6 +146,8 @@ class SalesProfileSerializer(serializers.ModelSerializer):
     sales_rep_name = serializers.SerializerMethodField()
     employee_code = serializers.CharField(source='employee_profile.employee_code', read_only=True)
     email = serializers.CharField(source='employee_profile.user_profile.user.email', read_only=True)
+    user_id = serializers.UUIDField(source='employee_profile.user_profile.user.id', read_only=True)
+    user = serializers.UUIDField(source='employee_profile.user_profile.user.id', read_only=True)
 
     class Meta:
         model = SalesProfile

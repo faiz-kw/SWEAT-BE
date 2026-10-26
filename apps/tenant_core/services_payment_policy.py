@@ -108,10 +108,22 @@ class PaymentPolicyService:
 
         # 3. Package / Version overrides
         target_pkg = package_version or package
-        if target_pkg and hasattr(target_pkg, 'metadata') and isinstance(target_pkg.metadata, dict):
-            pkg_policy = target_pkg.metadata.get('payment_policy')
-            if isinstance(pkg_policy, dict):
-                cls._deep_merge(policy, pkg_policy)
+        if target_pkg:
+            if hasattr(target_pkg, 'metadata') and isinstance(target_pkg.metadata, dict):
+                pkg_policy = target_pkg.metadata.get('payment_policy')
+                if isinstance(pkg_policy, dict):
+                    cls._deep_merge(policy, pkg_policy)
+
+            # Check allow_partial_payment in entitlement configuration
+            pkg_ver = getattr(target_pkg, 'active_version', None) or target_pkg
+            if hasattr(pkg_ver, 'entitlement_definitions'):
+                try:
+                    for ent in pkg_ver.entitlement_definitions.all():
+                        if isinstance(ent.configuration, dict) and 'allow_partial_payment' in ent.configuration:
+                            policy['partial_payment_policy']['enabled'] = bool(ent.configuration['allow_partial_payment'])
+                            break
+                except Exception:
+                    pass
 
         return policy
 
