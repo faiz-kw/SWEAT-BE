@@ -1,5 +1,6 @@
 import logging
 import uuid
+from django import forms
 from django.contrib import admin, messages
 from django.http import HttpResponseRedirect
 from django.urls import reverse
@@ -22,6 +23,7 @@ from .models_catalog import (
     Package,
     PackageVersion,
     PackagePrice,
+    PackageEntitlementDefinition,
     PackageBranchAvailability,
     TermsDocument,
     TermsDocumentVersion,
@@ -329,14 +331,67 @@ class PackageAdmin(TenantModelAdmin):
     readonly_fields = ['id', 'created_at', 'updated_at']
 
 
+class PackageEntitlementDefinitionInline(admin.TabularInline):
+    model = PackageEntitlementDefinition
+    extra = 0
+    fields = ['entitlement_type', 'allocated_units', 'is_unlimited', 'extra_unit_price', 'status', 'configuration']
+
+
+class PackagePriceInline(admin.TabularInline):
+    model = PackagePrice
+    extra = 0
+    fields = ['branch', 'base_price', 'display_price', 'currency', 'prices_include_tax', 'tax_percent', 'status']
+
+
+class PackageVersionAdminForm(forms.ModelForm):
+    allow_partial_payment = forms.BooleanField(
+        required=False,
+        label='Allow Partial Payment',
+        help_text='Allow customers to purchase this package using split / partial installment payments.'
+    )
+
+    class Meta:
+        model = PackageVersion
+        fields = '__all__'
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.instance and self.instance.pk:
+            ent = self.instance.entitlement_definitions.filter(entitlement_type='HOME_BRANCH_SESSION').first() or self.instance.entitlement_definitions.first()
+            if ent and isinstance(ent.configuration, dict) and 'allow_partial_payment' in ent.configuration:
+                self.fields['allow_partial_payment'].initial = bool(ent.configuration['allow_partial_payment'])
+
+    def save(self, commit=True):
+        instance = super().save(commit=commit)
+        allow = self.cleaned_data.get('allow_partial_payment', False)
+        ent = instance.entitlement_definitions.filter(entitlement_type='HOME_BRANCH_SESSION').first() or instance.entitlement_definitions.first()
+        if ent:
+            cfg = ent.configuration if isinstance(ent.configuration, dict) else {}
+            cfg['allow_partial_payment'] = allow
+            ent.configuration = cfg
+            ent.save(update_fields=['configuration'])
+        return instance
+
+
 @admin.register(PackageVersion)
 class PackageVersionAdmin(TenantModelAdmin):
-    list_display = ['package', 'version_number', 'status', 'total_days', 'is_trial_package', 'effective_from', 'published_at']
+    form = PackageVersionAdminForm
+    list_display = ['package', 'version_number', 'status', 'total_days', 'allow_partial_payment_display', 'is_trial_package', 'effective_from', 'published_at']
     list_filter = ['status', 'package__program', 'is_trial_package']
     search_fields = ['package__name', 'package__code', 'version_number', 'name_snapshot']
-    autocomplete_fields = ['package']
+    autocomplete_fields = ['package', 'created_by_user']
     list_select_related = ['package', 'package__program']
     readonly_fields = ['id', 'created_at', 'updated_at']
+    inlines = [PackagePriceInline, PackageEntitlementDefinitionInline]
+
+    def allow_partial_payment_display(self, obj):
+        for ent in obj.entitlement_definitions.all():
+            if isinstance(ent.configuration, dict) and 'allow_partial_payment' in ent.configuration:
+                return bool(ent.configuration['allow_partial_payment'])
+        return False
+
+    allow_partial_payment_display.boolean = True
+    allow_partial_payment_display.short_description = 'Part Payment'
 
 
 @admin.register(PackagePrice)
@@ -344,9 +399,23 @@ class PackagePriceAdmin(TenantModelAdmin):
     list_display = ['package_version', 'branch', 'base_price', 'display_price', 'currency', 'status', 'effective_from']
     list_filter = ['status', 'currency']
     search_fields = ['package_version__package__name', 'package_version__package__code']
-    autocomplete_fields = ['package_version']
+    autocomplete_fields = ['package_version', 'created_by_user']
     list_select_related = ['package_version', 'package_version__package', 'branch']
     readonly_fields = ['id', 'created_at', 'updated_at']
+
+
+@admin.register(PackageEntitlementDefinition)
+class PackageEntitlementDefinitionAdmin(TenantModelAdmin):
+    list_display = ['package_version', 'entitlement_type', 'allocated_units', 'is_unlimited', 'status', 'allow_partial_payment_display']
+    list_filter = ['status', 'entitlement_type', 'is_unlimited']
+    search_fields = ['package_version__package__name', 'entitlement_type']
+    autocomplete_fields = ['package_version']
+
+    def allow_partial_payment_display(self, obj):
+        return bool(obj.configuration.get('allow_partial_payment')) if isinstance(obj.configuration, dict) else False
+
+    allow_partial_payment_display.boolean = True
+    allow_partial_payment_display.short_description = 'Part Payment' 
 
 
 @admin.register(TermsDocument)

@@ -991,6 +991,9 @@ class PackageSerializer(serializers.ModelSerializer):
                 }
                 for e in active.entitlement_definitions.filter(status='ACTIVE')
             ]
+            credits_ent = next((e for e in active.entitlement_definitions.filter(status='ACTIVE') if e.entitlement_type == 'CREDIT_WALLET'), None)
+            credits_val = float(credits_ent.allocated_units) if (credits_ent and credits_ent.allocated_units is not None) else None
+
             return {
                 'id': str(active.id),
                 'version_number': active.version_number,
@@ -1002,6 +1005,7 @@ class PackageSerializer(serializers.ModelSerializer):
                 'show_on_web': active.show_on_web,
                 'show_on_app': active.show_on_app,
                 'status': active.status,
+                'credits': credits_val,
                 'prices': prices,
                 'entitlements': entitlements,
             }

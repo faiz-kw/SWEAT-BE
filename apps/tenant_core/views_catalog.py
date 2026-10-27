@@ -768,14 +768,6 @@ class PackageViewSet(viewsets.ModelViewSet):
         org = _get_org(self.request)
         instance = serializer.save(organization=org)
 
-        # Auto-deactivate existing active packages in the same program ONLY when created as ACTIVE
-        if instance.status == 'ACTIVE' and instance.program_id:
-            Package.objects.using(alias).filter(
-                organization=org,
-                program_id=instance.program_id,
-                status='ACTIVE'
-            ).exclude(id=instance.id).update(status='INACTIVE')
-
         record_business_audit(
             organization=org,
             module='core',
@@ -794,14 +786,6 @@ class PackageViewSet(viewsets.ModelViewSet):
         before_status = serializer.instance.status
         before_data = {'name': serializer.instance.name, 'status': serializer.instance.status}
         instance = serializer.save()
-
-        # When transitioned to ACTIVE or updated as ACTIVE, deactivate older active packages
-        if instance.status == 'ACTIVE' and before_status != 'ACTIVE' and instance.program_id:
-            Package.objects.using(alias).filter(
-                organization=instance.organization,
-                program_id=instance.program_id,
-                status='ACTIVE'
-            ).exclude(id=instance.id).update(status='INACTIVE')
 
         record_business_audit(
             organization=instance.organization,
@@ -843,13 +827,6 @@ class PackageViewSet(viewsets.ModelViewSet):
         instance = self.get_object()
         instance.status = 'ACTIVE'
         instance.save(using=alias)
-
-        if instance.program_id:
-            Package.objects.using(alias).filter(
-                organization=instance.organization,
-                program_id=instance.program_id,
-                status='ACTIVE'
-            ).exclude(id=instance.id).update(status='INACTIVE')
 
         record_business_audit(
             organization=instance.organization,
@@ -951,6 +928,7 @@ class PackageViewSet(viewsets.ModelViewSet):
         alias = _get_db(request)
         package = self.get_object()
         try:
+            wants_active = bool(request.data.get('publish_immediately', False) or request.data.get('status') == 'ACTIVE')
             ver = PackageCatalogService.create_package_version(
                 package=package,
                 name_snapshot=request.data.get('name_snapshot', package.name),
@@ -965,7 +943,7 @@ class PackageViewSet(viewsets.ModelViewSet):
                 only_for_trial=request.data.get('only_for_trial', False),
                 show_on_web=request.data.get('show_on_web', True),
                 show_on_app=request.data.get('show_on_app', True),
-                status=request.data.get('status', 'DRAFT'),
+                status='DRAFT' if wants_active else request.data.get('status', 'DRAFT'),
                 db_alias=alias,
             )
             # Optional initial pricing
@@ -991,11 +969,11 @@ class PackageViewSet(viewsets.ModelViewSet):
             max_sessions = request.data.get('max_sessions') or request.data.get('allocated_units')
             is_unlimited_home = request.data.get('is_unlimited_home', False) or request.data.get('home_is_unlimited', False)
             home_config = {'allow_partial_payment': bool(allow_partial_payment)}
-            if is_unlimited_home or max_sessions is not None or allow_partial_payment:
+            if is_unlimited_home or (max_sessions is not None and str(max_sessions).strip() != '' and Decimal(str(max_sessions)) > 0):
                 PackageCatalogService.create_entitlement_definition(
                     package_version=ver,
                     entitlement_type='HOME_BRANCH_SESSION',
-                    allocated_units=Decimal(str(max_sessions)) if (max_sessions is not None and not is_unlimited_home) else (Decimal('0') if not is_unlimited_home else None),
+                    allocated_units=Decimal(str(max_sessions)) if not is_unlimited_home else None,
                     is_unlimited=bool(is_unlimited_home),
                     configuration=home_config,
                     actor=request.user,
@@ -1044,12 +1022,6 @@ class PackageViewSet(viewsets.ModelViewSet):
                 if package.status != 'ACTIVE':
                     package.status = 'ACTIVE'
                     package.save(using=alias)
-                if package.program_id:
-                    Package.objects.using(alias).filter(
-                        organization=package.organization,
-                        program_id=package.program_id,
-                        status='ACTIVE'
-                    ).exclude(id=package.id).update(status='INACTIVE')
 
             return Response(PackageVersionSerializer(ver).data, status=status.HTTP_201_CREATED)
         except Exception as e:
@@ -1071,12 +1043,6 @@ class PackageViewSet(viewsets.ModelViewSet):
             if package.status != 'ACTIVE':
                 package.status = 'ACTIVE'
                 package.save(using=alias)
-            if package.program_id:
-                Package.objects.using(alias).filter(
-                    organization=package.organization,
-                    program_id=package.program_id,
-                    status='ACTIVE'
-                ).exclude(id=package.id).update(status='INACTIVE')
             return Response(PackageVersionSerializer(published).data, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -1398,13 +1364,6 @@ class PackageVersionViewSet(viewsets.ModelViewSet):
                     if instance.package.status != 'ACTIVE':
                         instance.package.status = 'ACTIVE'
                         instance.package.save(using=alias)
-                    if instance.package.program_id:
-                        from .models_catalog import Package
-                        Package.objects.using(alias).filter(
-                            organization=instance.package.organization,
-                            program_id=instance.package.program_id,
-                            status='ACTIVE'
-                        ).exclude(id=instance.package.id).update(status='INACTIVE')
 
             return Response(PackageVersionSerializer(instance).data, status=status.HTTP_200_OK)
 
@@ -1491,12 +1450,6 @@ class PackageVersionViewSet(viewsets.ModelViewSet):
             if package.status != 'ACTIVE':
                 package.status = 'ACTIVE'
                 package.save(using=alias)
-            if package.program_id:
-                Package.objects.using(alias).filter(
-                    organization=package.organization,
-                    program_id=package.program_id,
-                    status='ACTIVE'
-                ).exclude(id=package.id).update(status='INACTIVE')
             return Response(PackageVersionSerializer(published).data, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)

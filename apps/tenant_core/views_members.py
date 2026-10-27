@@ -812,6 +812,8 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
     active_programs_list = []
     upcoming_membership_data = []
     history_membership_data = []
+    m_cross_s = int(base_member.get('cross_branch_sessions_remaining') or 0)
+    m_home_s = int(base_member.get('home_sessions_remaining') or 0)
 
     for m in all_memberships:
         # Standard Catalog Price from active Package Version Price
@@ -1651,11 +1653,12 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             })
 
     passport_consumed = len(cross_bookings)
+    cross_rem = int(m_cross_s if 'm_cross_s' in locals() else (base_member.get('cross_branch_sessions_remaining') or 0))
     if passport_allowed > 0:
         passport_remaining = max(0, passport_allowed - passport_consumed)
-    elif m_cross_s > 0:
-        passport_allowed = m_cross_s + passport_consumed
-        passport_remaining = m_cross_s
+    elif cross_rem > 0:
+        passport_allowed = cross_rem + passport_consumed
+        passport_remaining = cross_rem
     else:
         passport_remaining = 0
 

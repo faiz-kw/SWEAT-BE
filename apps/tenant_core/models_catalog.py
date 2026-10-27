@@ -454,7 +454,8 @@ class PackageVersion(models.Model):
         if self.status == 'ACTIVE' and not self.published_at:
             self.published_at = timezone.now()
 
-        # Enforce single ACTIVE version invariant at model level
+        # Enforce single ACTIVE version invariant at model level:
+        # Auto-retire prior active versions of this package when a new version is activated
         if self.status == 'ACTIVE':
             db = kwargs.get('using') or self._state.db or 'default'
             other_active = PackageVersion.objects.using(db).filter(
@@ -464,10 +465,7 @@ class PackageVersion(models.Model):
             if self.pk:
                 other_active = other_active.exclude(pk=self.pk)
             if other_active.exists():
-                raise ValidationError(
-                    f"Package '{self.package_id}' already has an ACTIVE version. "
-                    "Only one version may be ACTIVE at a time. Retire the previous version before activating."
-                )
+                other_active.update(status='RETIRED', effective_until=timezone.now())
 
         # Enforce immutability of ACTIVE / RETIRED package versions
         if not self._state.adding and self.pk:
