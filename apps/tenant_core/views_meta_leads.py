@@ -1430,8 +1430,15 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
         })
 
 
+class MetaImportsPagination(PageNumberPagination):
+    page_size = 10
+    page_size_query_param = 'page_size'
+    max_page_size = 100
+
+
 class MetaLeadImportViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):
     serializer_class = ImportSerializer
+    pagination_class = MetaImportsPagination
 
     def get_queryset(self):
         qs = MetaLeadImport.objects.using(self.alias).filter(organization=self.organization)

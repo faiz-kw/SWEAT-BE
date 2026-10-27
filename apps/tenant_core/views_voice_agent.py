@@ -2397,7 +2397,8 @@ class VoiceAgentRecordingAudioView(View):
         os.makedirs(cache_dir, exist_ok=True)
         local_path = os.path.join(cache_dir, f"{session_id}.wav")
 
-        if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+        # If cached file exists and is healthy (>100KB), serve immediately
+        if os.path.exists(local_path) and os.path.getsize(local_path) > 100000:
             return _serve_audio(local_path)
 
         # 2. Locate CallSession across tenants to fetch from Sarvam if not cached
@@ -2421,34 +2422,53 @@ class VoiceAgentRecordingAudioView(View):
         if not cs:
             raise Http404("Call session recording not found.")
 
-        if not os.path.exists(local_path) or os.path.getsize(local_path) == 0:
-            api_key = os.getenv('SARVAM_API_KEY', '')
-            org_id = os.getenv('SARVAM_ORG_ID', '')
-            workspace_id = os.getenv('SARVAM_WORKSPACE_ID', '')
-            app_id = os.getenv('SARVAM_APP_ID', '')
+        # Cache validation: if cached file is truncated (< 50KB while duration is > 20s), re-fetch full recording
+        is_cache_truncated = (
+            os.path.exists(local_path)
+            and getattr(cs, 'duration_seconds', 0)
+            and cs.duration_seconds > 20
+            and os.path.getsize(local_path) < 50000
+        )
+
+        if not os.path.exists(local_path) or os.path.getsize(local_path) == 0 or is_cache_truncated:
+            api_key = getattr(settings, 'SARVAM_API_KEY', '') or os.getenv('SARVAM_API_KEY', '')
+            org_id = getattr(settings, 'SARVAM_ORG_ID', '') or os.getenv('SARVAM_ORG_ID', '')
+            workspace_id = getattr(settings, 'SARVAM_WORKSPACE_ID', '') or os.getenv('SARVAM_WORKSPACE_ID', '')
+            app_id = getattr(settings, 'SARVAM_APP_ID', '') or os.getenv('SARVAM_APP_ID', '')
 
             inter_id = cs.metadata.get('interaction_id') if isinstance(cs.metadata, dict) else None
 
-            # If no interaction_id in metadata, look it up via interactions list
-            if not inter_id and api_key and org_id and workspace_id and app_id:
+            # If no interaction_id in metadata or cached file was truncated, look up matching interaction from Sarvam
+            if (not inter_id or is_cache_truncated) and api_key and org_id and workspace_id and app_id:
                 try:
-                    now = timezone.now()
+                    ref_time = cs.started_at or timezone.now()
                     list_url = f"https://apps.sarvam.ai/api/analytics/v1/{org_id}/{workspace_id}/{app_id}/interactions"
                     params = {
-                        'start_datetime': (now - timedelta(days=2)).strftime('%Y-%m-%dT%H:%M:%SZ'),
-                        'end_datetime': (now + timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                        'start_datetime': (ref_time - timedelta(days=2)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                        'end_datetime': (ref_time + timedelta(hours=2)).strftime('%Y-%m-%dT%H:%M:%SZ'),
                         'include_transcript': 'true',
+                        'limit': 50,
                     }
                     lr = requests.get(list_url, headers={'X-API-Key': api_key}, params=params, timeout=12)
                     if lr.status_code == 200:
                         items = lr.json().get('items', [])
-                        if items:
-                            latest_item = items[-1]
-                            inter_id = latest_item.get('interaction_id')
+                        matched_item = None
+                        session_phone = str(cs.user_phone_number or '').replace('+', '').replace(' ', '')
+                        if session_phone and len(session_phone) >= 10:
+                            short_phone = session_phone[-10:]
+                            for it in reversed(items):
+                                it_phone = str(it.get('user_phone_number') or it.get('phone_number') or '').replace('+', '').replace(' ', '')
+                                if short_phone in it_phone:
+                                    matched_item = it
+                                    break
+                        if not matched_item and items:
+                            matched_item = items[-1]
+                        if matched_item:
+                            inter_id = matched_item.get('interaction_id')
                             if isinstance(cs.metadata, dict):
                                 cs.metadata['interaction_id'] = inter_id
-                                if latest_item.get('original_transcript') and not cs.transcript:
-                                    cs.transcript = latest_item.get('original_transcript')
+                                if matched_item.get('original_transcript') and not cs.transcript:
+                                    cs.transcript = matched_item.get('original_transcript')
                                 cs.save(using=target_alias, update_fields=['metadata', 'transcript', 'updated_at'])
                 except Exception as list_err:
                     logger.warning("Failed to lookup interaction ID from Sarvam: %s", list_err)
@@ -2458,7 +2478,7 @@ class VoiceAgentRecordingAudioView(View):
                 rec_url = f"https://apps.sarvam.ai/api/analytics/v1/{org_id}/{workspace_id}/{app_id}/recordings/{encoded_inter}"
                 try:
                     resp = requests.get(rec_url, headers={'X-API-Key': api_key}, timeout=25)
-                    if resp.status_code == 200 and resp.content:
+                    if resp.status_code == 200 and resp.content and len(resp.content) > 1000:
                         with open(local_path, 'wb') as f:
                             f.write(resp.content)
                         # Normalize telephony sample rates to 44.1kHz for universal browser/WASAPI playback

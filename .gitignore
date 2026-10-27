@@ -87,3 +87,6 @@ celerybeat-schedule*
 
 # SQL database dumps
 *.sql
+
+# Excel exports
+*.xlsx

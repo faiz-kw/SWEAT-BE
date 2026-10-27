@@ -101,6 +101,13 @@ def trigger_automated_sarvam_call_task(self, tenant_id: str, lead_id: str, **kwa
                 logger.info("Lead %s already in terminal or booked status %s. Skipping automated call.", lead.id, lead.current_status)
                 return {'status': 'SKIPPED_STATUS', 'lead_id': str(lead.id), 'current_status': lead.current_status}
 
+            # 3b. Check if direct walk-in / package purchase
+            src_name = getattr(lead.lead_source, 'name', '') or ''
+            src_type = getattr(lead.lead_source, 'source_type', '') or ''
+            if any(k in f"{src_type} {src_name}".lower() for k in ('walk', 'direct', 'reception', 'in-person', 'in person')):
+                logger.info("Lead %s is walk-in / direct purchase (source=%s). Skipping automated Sarvam call.", lead.id, src_name or src_type)
+                return {'status': 'SKIPPED_WALK_IN', 'lead_id': str(lead.id)}
+
             # 4. Initiate Outbound Call via VoiceCallingService
             idempotency_key = f"AUTO_VOICE_LEAD_{lead.id}"
             session = VoiceCallingService.initiate_outbound_call(

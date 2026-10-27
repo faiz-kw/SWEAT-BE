@@ -488,6 +488,7 @@ class LeadViewSet(viewsets.ModelViewSet):
         'conversion_eligibility': 'crm.leads.convert',
         'conversion_quote': 'crm.leads.convert',
         'convert': 'crm.leads.convert',
+        'export_excel': 'crm.leads.view',
     }
     action_alternative_permissions = {
         'conversion_eligibility': ['crm.leads.edit'],
@@ -699,11 +700,30 @@ class LeadViewSet(viewsets.ModelViewSet):
             getattr(lead_source, 'source_type', None) == 'MOBILE_APP'
             or getattr(lead_source, 'code', None) in ('MOBILE_APP', 'APP_SIGNUP')
         )
-        trigger_call = self.request.data.get('trigger_ai_call') or self.request.data.get('trigger_call')
-        consent_voice = self.request.data.get('consent_voice')
+        src_name = getattr(lead_source, 'name', '') or ''
+        src_type = getattr(lead_source, 'source_type', '') or ''
+        is_walk_in = any(k in f"{src_type} {src_name}".lower() for k in ('walk', 'direct', 'reception', 'in-person', 'in person'))
 
-        should_record_consent = trigger_call or consent_voice or (is_self_signup and is_app_source)
-        should_trigger_call = trigger_call or (is_self_signup and is_app_source)
+        raw_trigger_ai = self.request.data.get('trigger_ai_call')
+        if raw_trigger_ai is not None:
+            if isinstance(raw_trigger_ai, str):
+                trigger_call = raw_trigger_ai.lower() in ('true', '1', 'yes')
+            else:
+                trigger_call = bool(raw_trigger_ai)
+        else:
+            trigger_call = not is_walk_in and (is_self_signup and is_app_source)
+
+        raw_consent_voice = self.request.data.get('consent_voice')
+        if raw_consent_voice is not None:
+            if isinstance(raw_consent_voice, str):
+                consent_voice = raw_consent_voice.lower() in ('true', '1', 'yes')
+            else:
+                consent_voice = bool(raw_consent_voice)
+        else:
+            consent_voice = trigger_call
+
+        should_record_consent = bool(trigger_call or consent_voice or (is_self_signup and is_app_source))
+        should_trigger_call = bool(trigger_call and not is_walk_in)
 
         if should_record_consent:
             consent_src = 'APP_SIGNUP' if is_self_signup else 'STAFF_VERIFIED'
@@ -738,23 +758,28 @@ class LeadViewSet(viewsets.ModelViewSet):
             lead.consent_voice = True
             lead.consent_voice_source = consent_src
             lead.consent_voice_recorded_at = timezone.now()
-            if hasattr(lead, '_cached_voice_consent'):
-                delattr(lead, '_cached_voice_consent')
+        else:
+            lead.consent_voice = False
+            lead.consent_voice_source = 'STAFF_INTAKE_DISABLED'
+            lead.consent_voice_recorded_at = timezone.now()
 
-            if should_trigger_call:
-                try:
-                    from apps.tenant_core.tasks_voice_calling import trigger_automated_sarvam_call_task
-                    from apps.master.models_tenant import Tenant
-                    tenant = getattr(self.request, 'tenant', None)
-                    tenant_id = str(tenant.id) if tenant else (getattr(self.request.user, '_tenant_id', None) or None)
-                    if not tenant_id:
-                        t = Tenant.objects.filter(slug='sweat', status='ACTIVE').first() or Tenant.objects.filter(status='ACTIVE').first()
-                        tenant_id = str(t.id) if t else None
-                    if tenant_id:
-                        trigger_automated_sarvam_call_task.delay(tenant_id=tenant_id, lead_id=str(lead.id))
-                        logger.info("Dispatched automated Sarvam call task on lead creation (source=%s) for lead %s", consent_src, lead.id)
-                except Exception as call_err:
-                    logger.warning("Could not queue automated Sarvam call on lead creation: %s", call_err)
+        if hasattr(lead, '_cached_voice_consent'):
+            delattr(lead, '_cached_voice_consent')
+
+        if should_trigger_call:
+            try:
+                from apps.tenant_core.tasks_voice_calling import trigger_automated_sarvam_call_task
+                from apps.master.models_tenant import Tenant
+                tenant = getattr(self.request, 'tenant', None)
+                tenant_id = str(tenant.id) if tenant else (getattr(self.request.user, '_tenant_id', None) or None)
+                if not tenant_id:
+                    t = Tenant.objects.filter(slug='sweat', status='ACTIVE').first() or Tenant.objects.filter(status='ACTIVE').first()
+                    tenant_id = str(t.id) if t else None
+                if tenant_id:
+                    trigger_automated_sarvam_call_task.delay(tenant_id=tenant_id, lead_id=str(lead.id))
+                    logger.info("Dispatched automated Sarvam call task on lead creation for lead %s", lead.id)
+            except Exception as call_err:
+                logger.warning("Could not queue automated Sarvam call on lead creation: %s", call_err)
 
     def perform_update(self, serializer):
         lead = self.get_object()
@@ -872,6 +897,39 @@ class LeadViewSet(viewsets.ModelViewSet):
                 'Post-rehab / Recovery',
             ],
         })
+
+    @action(detail=False, methods=['get'], url_path='export-excel')
+    def export_excel(self, request):
+        """
+        Exports leads to a multi-tab formatted Excel (.xlsx) file.
+        Includes full CRM lead profile, Meta Lead Form question answers,
+        and Sarvam AI Voice Calling audio links and transcripts.
+        Respects active filters (branch, date range, search, etc.).
+        """
+        from apps.tenant_core.services_crm_export import export_leads_to_excel_buffer
+        from django.http import HttpResponse
+        from django.utils import timezone
+
+        alias = _get_db(request)
+        qs = self.filter_queryset(self.get_queryset())
+
+        # If no explicit date parameter is passed, default to leads from 26th October onwards
+        date_from = request.query_params.get('date_from') or request.query_params.get('start_date')
+        if not date_from:
+            from datetime import datetime, timezone as py_timezone
+            start_default = datetime(2026, 10, 26, 0, 0, 0, tzinfo=py_timezone.utc)
+            qs = qs.filter(created_at__gte=start_default)
+
+        excel_bytes = export_leads_to_excel_buffer(qs, db_alias=alias, request=request)
+
+        filename = f"sweat_leads_{timezone.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        response = HttpResponse(
+            excel_bytes,
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        response['Access-Control-Expose-Headers'] = 'Content-Disposition'
+        return response
 
     @action(detail=False, methods=['get'], url_path='eligible-agents')
     def eligible_agents(self, request):

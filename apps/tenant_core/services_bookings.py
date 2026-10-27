@@ -695,8 +695,12 @@ class BookingWaitlistAttendanceService:
             from .services_booking_policy import BookingPolicyService
             effective_bp = BookingPolicyService.get_effective_policy(organization, branch=branch, db_alias=alias)
             allowed_types = effective_bp.get('allowed_booking_types')
-            if allowed_types and booking_type not in allowed_types:
-                raise ValidationError(f"Booking type '{booking_type}' is not permitted by current booking policy.")
+            if allowed_types:
+                # Normalize types: A member booking an occurrence/class is permitted under 'CLASS' or 'MEMBER'
+                normalized_type = 'CLASS' if booking_type in ['CLASS', 'MEMBER'] else booking_type
+                normalized_allowed = {'CLASS' if t in ['CLASS', 'MEMBER'] else t for t in allowed_types}
+                if normalized_type not in normalized_allowed:
+                    raise ValidationError(f"Booking type '{booking_type}' is not permitted by current booking policy.")
 
             # Check advance booking window limit
             adv_days_max = effective_bp.get('advance_booking_days_max')

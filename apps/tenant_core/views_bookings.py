@@ -1346,6 +1346,19 @@ class BookingPolicyViewSet(viewsets.ViewSet):
     """
     permission_classes = [permissions.IsAuthenticated]
 
+    def initial(self, request, *args, **kwargs):
+        super().initial(request, *args, **kwargs)
+        user = request.user
+        if not user or not user.is_authenticated:
+            return
+
+        # Explicitly block consumer members/leads from managing studio policies
+        user_type = str(getattr(user, 'user_type', '')).upper()
+        user_role = str(getattr(user, 'role', '')).upper()
+        if user_type in ('MEMBER', 'LEAD') or user_role in ('MEMBER', 'LEAD'):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("Members are not authorized to access or modify organization booking policies.")
+
     def list(self, request):
         alias = _get_db(request)
         from .models_org import Organization
