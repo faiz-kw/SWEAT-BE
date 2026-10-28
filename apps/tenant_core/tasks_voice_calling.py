@@ -109,7 +109,12 @@ def trigger_automated_sarvam_call_task(self, tenant_id: str, lead_id: str, **kwa
                 return {'status': 'SKIPPED_WALK_IN', 'lead_id': str(lead.id)}
 
             # 4. Initiate Outbound Call via VoiceCallingService
-            idempotency_key = f"AUTO_VOICE_LEAD_{lead.id}"
+            attempt_number = kwargs.get('attempt_number', 1)
+            if attempt_number > 2:
+                logger.info("Lead %s exceeded max AI attempts (%d). Skipping automated dial.", lead.id, attempt_number)
+                return {'status': 'SKIPPED_MAX_ATTEMPTS', 'lead_id': str(lead.id), 'attempts': attempt_number}
+
+            idempotency_key = f"AUTO_VOICE_LEAD_{lead.id}_ATT_{attempt_number}"
             session = VoiceCallingService.initiate_outbound_call(
                 lead=lead,
                 actor_user=None,

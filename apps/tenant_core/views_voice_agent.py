@@ -2201,40 +2201,41 @@ class VoiceAgentTransferCallView(View):
             if not resolved_branch:
                 resolved_branch = Branch.objects.using(alias).filter(status='ACTIVE').order_by('name').first()
 
-            # 3. Resolve Target Phone Number for Central Sales Team
-            from apps.tenant_core.models_infra import Integration
-            target_phone = ''
-            dest_name = 'SWEAT Sales Team'
+            # 3. Resolve Target Sales Rep (Priority: Assigned Rep's Vobiz WebPhone Extension)
+            from apps.tenant_core.services_telephony_config import TelephonyConfigService
+            preferred_rep = lead.assigned_sales_user if lead else None
+            agent_presence = TelephonyConfigService.get_available_agent(
+                alias,
+                org=lead.organization if lead else None,
+                preferred_user=preferred_rep,
+                caller_branch=resolved_branch,
+            )
 
-            # Primary: Vobiz Sales DID number connected to Zoiper softphones
-            vobiz_int = Integration.objects.using(alias).filter(provider__iexact='VOBIZ', status='ACTIVE').first()
-            if vobiz_int and (vobiz_int.configuration or {}).get('from_number'):
-                target_phone = str(vobiz_int.configuration['from_number']).strip()
+            target_phone = ''
+            sip_endpoint = ''
+            dest_name = 'SWEAT Sales Rep'
+            target_user_id = None
+
+            if agent_presence and agent_presence.user:
+                rep_user = agent_presence.user
+                target_user_id = str(rep_user.id)
+                dest_name = f"{rep_user.first_name} {rep_user.last_name}".strip() or 'Sales Representative'
+                sip_endpoint = agent_presence.sip_username
+                target_phone = rep_user.phone or agent_presence.sip_username
+            elif preferred_rep:
+                target_user_id = str(preferred_rep.id)
+                dest_name = f"{preferred_rep.first_name} {preferred_rep.last_name}".strip() or 'Assigned Representative'
+                target_phone = preferred_rep.phone or ''
+            else:
+                vobiz_cfg = TelephonyConfigService.get_vobiz_config(alias)
+                target_phone = vobiz_cfg.get('from_number') or os.getenv('VOBIZ_SALES_DID', '+919240954144')
                 dest_name = 'SWEAT Sales Team'
 
-            # Fallback 1: Assigned sales user phone
-            if not target_phone and lead and lead.assigned_sales_user and lead.assigned_sales_user.phone:
-                target_phone = lead.assigned_sales_user.phone.strip()
-                dest_name = f"Coach {lead.assigned_sales_user.first_name}"
-
-            # Fallback 2: Active sales rep / admin phone
-            if not target_phone:
-                rep_user = TenantUser.objects.using(alias).filter(
-                    status='ACTIVE'
-                ).exclude(phone='').exclude(phone__isnull=True).first()
-                if rep_user and rep_user.phone:
-                    target_phone = rep_user.phone.strip()
-                    dest_name = f"{rep_user.first_name} (Sales Rep)"
-
-            # Fallback 3: Branch phone if present
-            if not target_phone and resolved_branch and resolved_branch.phone:
-                target_phone = resolved_branch.phone.strip()
-
-            # Clean and normalize target phone
-            if target_phone:
+            if target_phone and not sip_endpoint:
                 target_phone = VoiceCallingService.normalize_phone(target_phone)
-            else:
-                target_phone = os.getenv('VOBIZ_SALES_DID') or os.getenv('VOBIZ_VIRTUAL_DID', '+919240954144')
+            elif not target_phone:
+                vobiz_cfg = TelephonyConfigService.get_vobiz_config(alias)
+                target_phone = vobiz_cfg.get('from_number') or os.getenv('VOBIZ_SALES_DID', '+919240954144')
 
             branch_short = _get_branch_spoken_name(resolved_branch) if resolved_branch else 'our studio'
 
@@ -2260,7 +2261,7 @@ class VoiceAgentTransferCallView(View):
             try:
                 from apps.tenant_core.views_telephony import push_agent_telephony_event
                 push_agent_telephony_event(
-                    user_id=None,
+                    user_id=target_user_id,
                     event_type='ai_call_transfer',
                     payload={
                         'lead_id': str(lead.id) if lead else '',
@@ -2316,13 +2317,17 @@ class VoiceAgentTransferCallView(View):
 
             return JsonResponse({
                 'status': 'transfer_initiated',
-                'action': 'transfer',
+                'action': 'transfer_call',
                 'target_phone_number': target_phone,
+                'sip_endpoint': sip_endpoint or target_phone,
                 'destination_name': dest_name,
+                'assigned_agent_name': dest_name,
                 'branch_name': resolved_branch.name if resolved_branch else '',
                 'lead_id': str(lead.id) if lead else None,
+                'lead_name': f"{lead.first_name} {lead.last_name}".strip() if lead else 'Guest Caller',
                 'spoken_transfer_message': spoken_transfer,
                 'fallback_message': fallback_msg,
+                'whisper_message': f"Incoming prospect transfer for {lead.first_name if lead else 'Guest'} via Vobiz WebPhone."
             })
 
 
@@ -2683,6 +2688,105 @@ class VoiceAgentCallOutcomeView(View):
                             outcome=f"Callback Scheduled ({disposition})",
                             notes=f"Follow-up task created from voice call outcome. Due: {cb_dt.strftime('%A, %b %d at %I:%M %p IST')}. Summary: {call_summary}",
                             performed_by_user=assigned_u,
+                        )
+
+
+                # 4b. AI Missed / Unanswered 2-Attempt Retry & Human Handoff Policy (Option B)
+                is_unanswered_ai = any(k in disp_upper for k in ('NO_ANSWER', 'MISSED', 'BUSY', 'SWITCHED_OFF', 'REJECTED', 'HUNG_UP'))
+                if is_unanswered_ai and lead.current_status not in ('TRIAL_BOOKED', 'TRIAL_CONFIRMED', 'CONVERTED'):
+                    # Count total Sarvam AI call attempts for this lead
+                    ai_attempt_count = CallSession.objects.using(alias).filter(
+                        lead=lead,
+                        provider='SARVAM',
+                    ).count()
+
+                    if ai_attempt_count <= 1:
+                        # Attempt 1 failed -> Schedule Attempt 2 for 30 minutes later (within 09:00 - 21:00 IST)
+                        now_ist = timezone.now().astimezone(IST)
+                        target_retry = now_ist + timedelta(minutes=30)
+                        if target_retry.hour >= 21:
+                            target_retry = (now_ist + timedelta(days=1)).replace(hour=9, minute=15, second=0, microsecond=0)
+                        elif target_retry.hour < 9:
+                            target_retry = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+
+                        delay_seconds = max(60, int((target_retry - now_ist).total_seconds()))
+
+                        from apps.tenant_core.tasks_voice_calling import trigger_automated_sarvam_call_task
+                        trigger_automated_sarvam_call_task.apply_async(
+                            kwargs={
+                                'tenant_id': str(tenant.id),
+                                'lead_id': str(lead.id),
+                                'attempt_number': 2,
+                            },
+                            countdown=delay_seconds,
+                        )
+
+                        LeadActivity.objects.using(alias).create(
+                            lead=lead,
+                            activity_type='CALL',
+                            outcome='AI Call Attempt 1 Unanswered',
+                            notes=(
+                                f"🤖 AI Outbound Call (Attempt 1) resulted in '{disposition}'. "
+                                f"Scheduled automated 2nd retry attempt in 30 minutes ({target_retry.strftime('%I:%M %p IST')})."
+                            ),
+                            activity_at=timezone.now(),
+                        )
+                    else:
+                        # Attempt 2 failed (>= 2 attempts) -> HANDOFF TO HUMAN SALES!
+                        prior_st = lead.current_status
+                        lead.current_status = 'AI_MISSED'
+                        lead.save(using=alias, update_fields=['current_status', 'updated_at'])
+
+                        LeadStatusHistory.objects.using(alias).create(
+                            lead=lead,
+                            from_status=prior_st,
+                            to_status='AI_MISSED',
+                            reason_code='AI_CALL_MAX_RETRIES_EXCEEDED',
+                            reason_text=f"AI voice call failed {ai_attempt_count} attempts ({disposition}). Handed off to human sales.",
+                        )
+
+                        # Assign to lead's assigned sales rep or next available on-duty rep
+                        assigned_u = lead.assigned_sales_user
+                        if not assigned_u:
+                            from apps.tenant_core.services_telephony_config import TelephonyConfigService
+                            avail_agent = TelephonyConfigService.get_available_agent(alias, org=lead.organization, caller_branch=lead.branch)
+                            assigned_u = avail_agent.user if avail_agent else None
+                        if not assigned_u:
+                            assigned_u = TenantUser.objects.using(alias).filter(organization=lead.organization, status='ACTIVE').first()
+
+                        SalesFollowupTask.objects.using(alias).create(
+                            lead=lead,
+                            assigned_to_user=assigned_u,
+                            task_type='CALL',
+                            priority='URGENT',
+                            due_at=timezone.now(),
+                            status='PENDING',
+                            outcome=f"AI Outbound Call Failed 2x ({disposition}). Please call lead manually via Vobiz WebPhone.",
+                            external_reference=f"AI_MISSED_HANDOFF_{lead.id}",
+                        )
+
+                        # Automatically trigger WhatsApp missed call outreach
+                        try:
+                            from apps.tenant_core.communication.whatsapp_automation import WhatsAppAutomationService
+                            WhatsAppAutomationService.send_unanswered_call_followup(
+                                session=recent_sess,
+                                lead=lead,
+                                actor_user=assigned_u,
+                                db_alias=alias,
+                            )
+                        except Exception as wa_err:
+                            logger.warning("WhatsApp missed call followup failed for lead %s: %s", lead.id, wa_err)
+
+                        LeadActivity.objects.using(alias).create(
+                            lead=lead,
+                            activity_type='STATUS_CHANGE',
+                            outcome='AI Call 2x Failed -> Handed to Sales',
+                            notes=(
+                                f"🚨 AI Outbound Call 2nd Attempt Failed ({disposition}). "
+                                f"Maximum AI retries reached. Lead auto-routed to {assigned_u.first_name if assigned_u else 'Sales Team'} "
+                                f"for priority Vobiz WebPhone outreach & dispatched WhatsApp follow-up."
+                            ),
+                            activity_at=timezone.now(),
                         )
 
                 # 5. Cancellation synchronization
