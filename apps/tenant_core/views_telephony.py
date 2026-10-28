@@ -1115,3 +1115,245 @@ class TelephonyConfigView(APIView):
                 'message': 'Telephony configuration updated successfully.',
                 'config': safe_updated,
             }, status=status.HTTP_200_OK)
+
+
+
+class TelephonyAnalyticsView(APIView):
+    """
+    GET /api/v1/tenant/crm/telephony/analytics/
+    Provides comprehensive Sales Calling Analytics, Rep Leaderboard, Dispositions Breakdown,
+    and Hourly Connect Rate Heatmap for managers and sales leads.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        is_admin = getattr(user, 'is_superuser', False) or getattr(user, 'is_staff', False)
+        # Check permissions
+        has_perm = is_admin or any(
+            user.role_assignments.filter(
+                role__permission_sets__items__permission__codename__in=[
+                    'crm.leads.view', 'crm.leads.edit', 'reports.sales.view'
+                ]
+            ).exists()
+            for _ in [1]
+        )
+        if not has_perm:
+            return Response({'error': 'Unauthorized to view sales calling analytics.'}, status=status.HTTP_403_FORBIDDEN)
+
+        with resolve_telephony_tenant_context():
+            from django.db.models import Q
+            alias = get_tenant_db_alias() or 'default'
+            org = getattr(user, 'organization', None)
+            if not org:
+                org = Organization.objects.using(alias).filter(status='ACTIVE').first()
+
+            if not org:
+                return Response({'error': 'No active organization found.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            timeframe = request.query_params.get('timeframe', 'today').lower()
+            branch_id = request.query_params.get('branch_id')
+            rep_id = request.query_params.get('rep_id')
+            team_only = str(request.query_params.get('team_only', 'false')).lower() in ('true', '1')
+
+            # Calculate date boundaries in IST (Asia/Kolkata)
+            try:
+                tz = zoneinfo.ZoneInfo('Asia/Kolkata')
+            except Exception:
+                tz = timezone.get_current_timezone()
+
+            now_ist = timezone.now().astimezone(tz)
+            start_of_today = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+
+            if timeframe == 'today':
+                date_filter = Q(created_at__gte=start_of_today)
+            elif timeframe == 'yesterday':
+                start_yesterday = start_of_today - timedelta(days=1)
+                date_filter = Q(created_at__gte=start_yesterday, created_at__lt=start_of_today)
+            elif timeframe == 'this_week':
+                start_week = start_of_today - timedelta(days=start_of_today.weekday())
+                date_filter = Q(created_at__gte=start_week)
+            elif timeframe == 'this_month':
+                start_month = start_of_today.replace(day=1)
+                date_filter = Q(created_at__gte=start_month)
+            elif timeframe == 'last_30_days':
+                start_30d = start_of_today - timedelta(days=30)
+                date_filter = Q(created_at__gte=start_30d)
+            elif timeframe == 'custom':
+                date_from = request.query_params.get('date_from')
+                date_to = request.query_params.get('date_to')
+                df = Q()
+                if date_from:
+                    df &= Q(created_at__date__gte=date_from)
+                if date_to:
+                    df &= Q(created_at__date__lte=date_to)
+                date_filter = df
+            else:
+                date_filter = Q(created_at__gte=start_of_today)
+
+            qs = CallSession.objects.using(alias).filter(
+                organization=org
+            ).filter(date_filter)
+
+            if branch_id and branch_id != 'ALL':
+                qs = qs.filter(branch_id=branch_id)
+
+            if rep_id and rep_id != 'ALL':
+                qs = qs.filter(sales_rep_id=rep_id)
+
+            if team_only:
+                from apps.tenant_core.models_workforce import EmployeeProfile
+                subordinate_ids = list(
+                    EmployeeProfile.objects.using(alias).filter(
+                        reporting_manager__user_profile__user=user
+                    ).values_list('user_profile__user_id', flat=True)
+                )
+                qs = qs.filter(sales_rep_id__in=subordinate_ids)
+
+            # 1. Summary Metrics
+            total_dials = qs.count()
+            connected_calls = qs.filter(status__in=['COMPLETED', 'CONNECTED']).count()
+            connect_rate_pct = round((connected_calls / total_dials * 100), 1) if total_dials > 0 else 0.0
+            meaningful_calls = qs.filter(is_meaningful=True).count()
+            meaningful_rate_pct = round((meaningful_calls / connected_calls * 100), 1) if connected_calls > 0 else 0.0
+            total_talk_sec = qs.aggregate(s=models.Sum('duration_seconds'))['s'] or 0.0
+            total_talk_minutes = round(total_talk_sec / 60.0, 1)
+            avg_duration_sec = round(total_talk_sec / connected_calls, 1) if connected_calls > 0 else 0.0
+            trials_booked = qs.filter(disposition='TRIAL_BOOKED').count()
+            converted_members = qs.filter(disposition='CONVERTED_MEMBER').count()
+            inbound_count = qs.filter(direction='INBOUND').count()
+            outbound_count = qs.filter(direction='OUTBOUND').count()
+
+            # 2. Leaderboard per Sales Rep
+            reps_qs = qs.filter(sales_rep__isnull=False).values(
+                'sales_rep__id', 'sales_rep__first_name', 'sales_rep__last_name', 'sales_rep__email'
+            ).annotate(
+                dials=models.Count('id'),
+                connected=models.Count('id', filter=Q(status__in=['COMPLETED', 'CONNECTED'])),
+                meaningful=models.Count('id', filter=Q(is_meaningful=True)),
+                talk_seconds=models.Sum('duration_seconds'),
+                trials=models.Count('id', filter=Q(disposition='TRIAL_BOOKED')),
+                conversions=models.Count('id', filter=Q(disposition='CONVERTED_MEMBER')),
+            ).order_by('-meaningful', '-dials')
+
+            leaderboard = []
+            for rank, r in enumerate(reps_qs, start=1):
+                d = r['dials'] or 0
+                c = r['connected'] or 0
+                cr = round((c / d * 100), 1) if d > 0 else 0.0
+                ts = r['talk_seconds'] or 0.0
+                tm = round(ts / 60.0, 1)
+                first = r['sales_rep__first_name'] or ''
+                last = r['sales_rep__last_name'] or ''
+                full_name = f"{first} {last}".strip() or r['sales_rep__email']
+                leaderboard.append({
+                    'rank': rank,
+                    'rep_id': str(r['sales_rep__id']),
+                    'name': full_name,
+                    'email': r['sales_rep__email'],
+                    'dials': d,
+                    'connected': c,
+                    'connect_rate_pct': cr,
+                    'meaningful_calls': r['meaningful'] or 0,
+                    'talk_time_minutes': tm,
+                    'trials_booked': r['trials'] or 0,
+                    'members_converted': r['conversions'] or 0,
+                })
+
+            # 3. Dispositions Breakdown
+            disposition_counts = qs.filter(disposition__isnull=False).values('disposition').annotate(
+                count=models.Count('id')
+            ).order_by('-count')
+
+            labels_map = dict(CallSession.DISPOSITION_CHOICES)
+            dispositions = []
+            for d in disposition_counts:
+                code = d['disposition']
+                cnt = d['count']
+                pct = round((cnt / total_dials * 100), 1) if total_dials > 0 else 0.0
+                dispositions.append({
+                    'code': code,
+                    'label': labels_map.get(code, code.replace('_', ' ').title()),
+                    'count': cnt,
+                    'percentage': pct,
+                })
+
+            # 4. Hourly Connect Rate Heatmap (09:00 - 21:00 IST)
+            hourly_stats = {}
+            for h in range(9, 21):
+                hourly_stats[h] = {'dials': 0, 'connected': 0}
+
+            for call in qs.values('created_at', 'status'):
+                cat = call['created_at'].astimezone(tz)
+                h = cat.hour
+                if 9 <= h <= 20:
+                    hourly_stats[h]['dials'] += 1
+                    if call['status'] in ('COMPLETED', 'CONNECTED'):
+                        hourly_stats[h]['connected'] += 1
+
+            heatmap = []
+            peak_hour = None
+            peak_rate = -1.0
+            for h in range(9, 21):
+                d = hourly_stats[h]['dials']
+                c = hourly_stats[h]['connected']
+                rate = round((c / d * 100), 1) if d > 0 else 0.0
+                label = f"{h:02d}:00 - {h+1:02d}:00"
+                if d >= 2 and rate > peak_rate:
+                    peak_rate = rate
+                    peak_hour = label
+                heatmap.append({
+                    'hour': h,
+                    'label': label,
+                    'dials': d,
+                    'connected': c,
+                    'connect_rate_pct': rate,
+                })
+
+            # 5. Recent Calls Audit Log (top 50)
+            recent_calls_qs = qs.select_related('lead', 'sales_rep', 'branch').order_by('-created_at')[:50]
+            recent_calls = []
+            for cs in recent_calls_qs:
+                p = cs.user_phone_number or ''
+                masked_phone = f"+91-XXXXX-{p[-4:]}" if len(p) >= 4 else "+91-XXXXX-XXXX"
+                rep_name = f"{cs.sales_rep.first_name} {cs.sales_rep.last_name}".strip() if cs.sales_rep else "Automated / Pool"
+                lead_name = f"{cs.lead.first_name} {cs.lead.last_name}".strip() if cs.lead else "Unknown Lead"
+                recent_calls.append({
+                    'id': str(cs.id),
+                    'lead_id': str(cs.lead_id) if cs.lead_id else None,
+                    'lead_name': lead_name,
+                    'masked_phone': masked_phone,
+                    'sales_rep_name': rep_name,
+                    'sales_rep_id': str(cs.sales_rep_id) if cs.sales_rep_id else None,
+                    'direction': cs.direction,
+                    'status': cs.status,
+                    'duration_seconds': cs.duration_seconds,
+                    'is_meaningful': cs.is_meaningful,
+                    'disposition': cs.disposition,
+                    'disposition_label': labels_map.get(cs.disposition, cs.disposition) if cs.disposition else 'Pending',
+                    'disposition_notes': cs.disposition_notes,
+                    'has_recording': bool(cs.recording_url),
+                    'created_at': cs.created_at.isoformat(),
+                })
+
+            return Response({
+                'timeframe': timeframe,
+                'summary': {
+                    'total_dials': total_dials,
+                    'connected_calls': connected_calls,
+                    'connect_rate_pct': connect_rate_pct,
+                    'meaningful_calls': meaningful_calls,
+                    'meaningful_rate_pct': meaningful_rate_pct,
+                    'total_talk_time_minutes': total_talk_minutes,
+                    'avg_duration_seconds': avg_duration_sec,
+                    'trials_booked': trials_booked,
+                    'members_converted': converted_members,
+                    'inbound_calls': inbound_count,
+                    'outbound_calls': outbound_count,
+                    'peak_connect_hour': peak_hour or '11:00 - 12:00',
+                },
+                'leaderboard': leaderboard,
+                'dispositions': dispositions,
+                'hourly_heatmap': heatmap,
+                'recent_calls': recent_calls,
+            }, status=status.HTTP_200_OK)
