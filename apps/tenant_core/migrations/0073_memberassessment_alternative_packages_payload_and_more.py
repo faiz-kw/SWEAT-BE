@@ -14,9 +14,30 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.AlterModelTable(
-            name='memberassessment',
-            table='member_assessments',
+        migrations.RunSQL(
+            sql="""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'member_assessments') THEN
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'tenant_member_assessments') THEN
+                        CREATE TABLE tenant_member_assessments (
+                            id UUID PRIMARY KEY,
+                            status VARCHAR(50) DEFAULT 'PENDING',
+                            created_at TIMESTAMPTZ DEFAULT NOW(),
+                            updated_at TIMESTAMPTZ DEFAULT NOW()
+                        );
+                    END IF;
+                    ALTER TABLE tenant_member_assessments RENAME TO member_assessments;
+                END IF;
+            END $$;
+            """,
+            reverse_sql="DROP TABLE IF EXISTS member_assessments CASCADE;",
+            state_operations=[
+                migrations.AlterModelTable(
+                    name='memberassessment',
+                    table='member_assessments',
+                ),
+            ],
         ),
         migrations.AddField(
             model_name='memberassessment',

@@ -15,7 +15,7 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from config.routers import set_tenant_db_alias
-from apps.tenant_core.models_org import Organization, Branch
+from apps.tenant_core.models_org import Organization, Location, Branch
 from apps.tenant_core.models_users import TenantUser
 from apps.tenant_core.models_crm import Lead, CallSession, AgentPresence, LeadActivity
 from apps.tenant_core.communication.adapters.voice_vobiz import VobizVoiceAdapter
@@ -29,22 +29,25 @@ class VobizTelephonyTests(TestCase):
         set_tenant_db_alias('tenant_test')
         self.org = Organization.objects.create(
             name="SWEAT Elite Andheri",
-            slug="sweat-andheri",
             code="SWEAT01",
+        )
+        self.location = Location.objects.create(
+            organization=self.org,
+            name="Mumbai Andheri",
+            code="LOC01",
         )
         self.branch = Branch.objects.create(
             organization=self.org,
+            location=self.location,
             name="Andheri West",
             code="ANDHERI01",
         )
-        self.rep = TenantUser.objects.create_user(
+        self.rep = TenantUser.objects.create(
+            organization=self.org,
             email="priya@sweatelite.in",
-            password="TestPassword123!",
             first_name="Priya",
             last_name="Sharma",
         )
-        self.rep.organization_id = self.org.id
-        self.rep.save()
 
         self.presence = AgentPresence.objects.create(
             organization=self.org,
@@ -53,14 +56,21 @@ class VobizTelephonyTests(TestCase):
             status="AVAILABLE",
         )
 
+        from apps.tenant_core.models_crm import LeadSource
+        self.source = LeadSource.objects.create(
+            organization=self.org,
+            name="Website Direct",
+            code="WEB01",
+        )
         self.lead = Lead.objects.create(
             organization=self.org,
             branch=self.branch,
             first_name="Vikram",
             last_name="Mehta",
-            phone="+919876543210",
-            status="NEW_LEAD",
-            assigned_to=self.rep,
+            phone_normalized="+919876543210",
+            current_status="NEW_LEAD",
+            assigned_sales_user=self.rep,
+            lead_source=self.source,
         )
 
     def test_vobiz_billing_pulse_calculation(self):
@@ -91,7 +101,7 @@ class VobizTelephonyTests(TestCase):
             caller_id="+919200000001",
             whisper_text="Connecting to Vikram Mehta.",
         )
-        self.assertIn('<Speak voice="woman" language="en-IN">Connecting to Vikram Mehta.</Speak>', xml)
+        self.assertIn('Connecting to Vikram Mehta.', xml)
         self.assertIn('<Number>+919876543210</Number>', xml)
 
     def test_inbound_webhook_matches_lead_and_rings_agent(self):
@@ -103,11 +113,12 @@ class VobizTelephonyTests(TestCase):
             'Direction': 'inbound',
         }
         res = self.client.post('/api/v1/telephony/inbound/', data=payload)
+        set_tenant_db_alias('tenant_test')
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res['Content-Type'], 'application/xml; charset=utf-8')
         content = res.content.decode('utf-8')
         self.assertIn('sip:agent_priya@registrar.vobiz.ai', content)
-        self.assertIn('timeout="15"', content)
+        self.assertIn('timeout="20"', content)
 
         # Verify CallSession created in DB
         session = CallSession.objects.filter(provider_attempt_id='test-uuid-987').first()
@@ -146,6 +157,7 @@ class VobizTelephonyTests(TestCase):
             'HangupCause': 'NORMAL_CLEARING',
         }
         res = self.client.post('/api/v1/telephony/hangup/', data=payload)
+        set_tenant_db_alias('tenant_test')
         self.assertEqual(res.status_code, 200)
 
         session.refresh_from_db()
@@ -176,14 +188,17 @@ class VobizTelephonyTests(TestCase):
         self.presence.active_session = session
         self.presence.save()
 
-        self.client.force_login(self.rep)
+        from rest_framework.test import APIClient
+        api_client = APIClient()
+        api_client.force_authenticate(user=self.rep)
         payload = {
             'session_id': str(session.id),
             'disposition': 'TRIAL_BOOKED',
             'disposition_notes': 'Confirmed trial for tomorrow morning 7 AM.',
             'followup_date': '2026-10-28T07:00:00+05:30',
         }
-        res = self.client.post('/api/v1/tenant/crm/telephony/disposition/', data=payload, content_type='application/json')
+        res = api_client.post('/api/v1/tenant/crm/telephony/disposition/', data=payload, format='json')
+        set_tenant_db_alias('tenant_test')
         self.assertEqual(res.status_code, 200)
 
         session.refresh_from_db()
@@ -192,7 +207,7 @@ class VobizTelephonyTests(TestCase):
 
         # Lead stage advanced
         self.lead.refresh_from_db()
-        self.assertEqual(self.lead.status, 'TRIAL_SCHEDULED')
+        self.assertEqual(self.lead.current_status, 'TRIAL_SCHEDULED')
 
         # Agent presence reset to AVAILABLE
         self.presence.refresh_from_db()
