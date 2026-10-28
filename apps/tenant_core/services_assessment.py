@@ -250,6 +250,135 @@ class AssessmentEngineService:
         }
 
     @classmethod
+    def calculate_metabolic_nutrition_plan(
+        cls,
+        weight_kg: float,
+        height_cm: float,
+        age: int = 30,
+        sex: str = 'FEMALE',
+        activity_level: str = 'MODERATELY_ACTIVE',
+        goal: str = 'POSTURE_ALIGNMENT',
+    ) -> Dict[str, Any]:
+        """
+        Calculates RMR (Mifflin-St Jeor), TDEE, Calorie Target, and Macro Targets.
+        """
+        w = float(weight_kg)
+        h = float(height_cm)
+        a = int(age)
+
+        # 1. RMR / BMR via Mifflin-St Jeor
+        if str(sex).upper() in ['MALE', 'M']:
+            rmr = (10.0 * w) + (6.25 * h) - (5.0 * a) + 5.0
+        else:
+            rmr = (10.0 * w) + (6.25 * h) - (5.0 * a) - 161.0
+        rmr_val = int(round(rmr))
+
+        # 2. Activity Multiplier for TDEE
+        multipliers = {
+            'SEDENTARY': 1.20,
+            'LIGHTLY_ACTIVE': 1.375,
+            'MODERATELY_ACTIVE': 1.55,
+            'HIGHLY_ACTIVE': 1.725,
+        }
+        mult = multipliers.get(str(activity_level).upper(), 1.50)
+        tdee_val = int(round(rmr * mult))
+
+        # 3. Goal-directed Daily Calorie Target
+        goal_norm = str(goal).upper()
+        if 'FAT_LOSS' in goal_norm or 'LEAN' in goal_norm:
+            calorie_target = max(1200, tdee_val - 400)
+            goal_strategy = "Moderate 400 kcal deficit for safe fat loss with muscle retention."
+        elif 'HYPERTROPHY' in goal_norm or 'MUSCLE' in goal_norm or 'STRENGTH' in goal_norm:
+            calorie_target = tdee_val + 250
+            goal_strategy = "Controlled 250 kcal surplus to fuel progressive overload and lean mass growth."
+        else:
+            calorie_target = tdee_val
+            goal_strategy = "Maintenance calories to optimize energy, posture de-rotation, and neuromuscular adaptation."
+
+        # 4. Macronutrient Targets
+        # Protein: 1.8g per kg bodyweight
+        protein_g = int(round(w * 1.8))
+        protein_kcal = protein_g * 4
+
+        # Fat: 25% of total calories (9 kcal/g)
+        fat_kcal = calorie_target * 0.25
+        fat_g = int(round(fat_kcal / 9.0))
+
+        # Carbohydrates: remaining calories (4 kcal/g)
+        carb_kcal = max(0, calorie_target - protein_kcal - int(fat_kcal))
+        carb_g = int(round(carb_kcal / 4.0))
+
+        # Daily Hydration: ~35-40 ml per kg
+        hydration_l = round(w * 0.038, 1)
+
+        return {
+            'rmr_kcal': rmr_val,
+            'tdee_kcal': tdee_val,
+            'daily_calorie_target': calorie_target,
+            'goal_strategy': goal_strategy,
+            'macros': {
+                'protein_g': protein_g,
+                'carbs_g': carb_g,
+                'fat_g': fat_g,
+                'fiber_g': 28,
+                'hydration_liters': hydration_l,
+                'meal_guidance': f"Prioritize {protein_g}g daily protein split across 3-4 meals. Drink ~{hydration_l}L water daily for optimal fascia and muscle recovery.",
+            },
+        }
+
+    @classmethod
+    def calculate_capability_matrix(cls, tests_payload: Dict[str, Any]) -> Dict[str, str]:
+        """
+        Evaluates domain capabilities (Beginner, Developing, Established) from logged test data.
+        """
+        matrix = {
+            'lower_body': 'Developing',
+            'upper_body': 'Developing',
+            'core': 'Developing',
+            'balance': 'Developing',
+            'mobility': 'Within Protocol',
+            'cardiovascular': 'Establishing Baseline',
+            'functional_movement': 'Independent',
+        }
+
+        # Lower body evaluation
+        lb = tests_payload.get('lower_body', {})
+        lb_reps = int(lb.get('reps') or 0)
+        lb_var = str(lb.get('variation') or '').lower()
+        if 'box' in lb_var or lb_reps < 8:
+            matrix['lower_body'] = 'Beginner'
+        elif lb_reps >= 15 or 'goblet' in lb_var or 'single' in lb_var:
+            matrix['lower_body'] = 'Established'
+
+        # Upper body evaluation
+        ub = tests_payload.get('upper_body', {})
+        ub_reps = int(ub.get('pushup_reps') or 0)
+        ub_var = str(ub.get('pushup_variation') or '').lower()
+        if 'wall' in ub_var or ub_reps < 6:
+            matrix['upper_body'] = 'Beginner'
+        elif 'floor' in ub_var and ub_reps >= 12:
+            matrix['upper_body'] = 'Established'
+
+        # Core evaluation
+        core = tests_payload.get('core', {})
+        hold_sec = int(core.get('hold_seconds') or 0)
+        if hold_sec < 25:
+            matrix['core'] = 'Beginner'
+        elif hold_sec >= 60:
+            matrix['core'] = 'Established'
+
+        # Balance evaluation
+        bal = tests_payload.get('balance', {})
+        bal_l = int(bal.get('single_leg_left_sec') or 0)
+        bal_r = int(bal.get('single_leg_right_sec') or 0)
+        if min(bal_l, bal_r) < 15:
+            matrix['balance'] = 'Needs Support'
+        elif min(bal_l, bal_r) >= 30:
+            matrix['balance'] = 'Established'
+
+        return matrix
+
+    @classmethod
     def calculate_computer_vision_metrics(
         cls,
         front_photo_url: Optional[str] = None,
@@ -292,12 +421,13 @@ class AssessmentEngineService:
         coach_notes: Optional[str] = None,
         workout_prescription: Optional[str] = None,
         diet_prescription: Optional[str] = None,
-        send_whatsapp: bool = True,
+        send_whatsapp: bool = False,
         db_alias: Optional[str] = None,
     ) -> MemberAssessment:
         """
-        Manual Admin Approval Gate.
-        Marks assessment as APPROVED and dispatches the transformation report via Gupshup WhatsApp.
+        Coach / Admin Approval Gate.
+        Marks assessment as APPROVED, unlocking the high-definition studio screen display.
+        (WhatsApp sharing is disabled by default; only shown on screen upon approval).
         """
         alias = _get_alias(db_alias, assessment)
         now = timezone.now()
