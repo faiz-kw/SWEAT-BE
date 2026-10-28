@@ -1098,3 +1098,86 @@ class WhatsAppAutomationService:
                 external_reference=ref_id,
                 outcome=f"WhatsApp Reschedule Request from {name}: {message_body[:150]}",
             )
+
+
+    @classmethod
+    def send_unanswered_call_followup(
+        cls,
+        session: Any,
+        lead: Optional[Lead] = None,
+        message_text: Optional[str] = None,
+        actor_user: Optional[TenantUser] = None,
+        db_alias: Optional[str] = None,
+    ) -> Optional[CommunicationMessage]:
+        """
+        Dispatches an automated or 1-click WhatsApp follow-up to a lead after an unanswered / busy call.
+        Uses the approved Gupshup / Meta template 'sweat_call_missed_followup' with fallback to custom body.
+        Guaranteed idempotent by call session ID.
+        """
+        from typing import Any
+        alias = db_alias or 'default'
+        target_lead = lead or getattr(session, 'lead', None)
+        if not target_lead:
+            logger.warning("send_unanswered_call_followup: No lead attached to session %s", getattr(session, 'id', None))
+            return None
+
+        recipient = target_lead.phone or getattr(session, 'user_phone_number', '') or ''
+        if not recipient:
+            logger.warning("send_unanswered_call_followup: No phone for lead %s", target_lead.id)
+            return None
+
+        org = target_lead.organization
+        if not org:
+            return None
+
+        # Build template parameters
+        first_name = target_lead.first_name or 'there'
+        rep_name = f"{actor_user.first_name} {actor_user.last_name}".strip() if actor_user else 'Sales Team'
+
+        default_body = f"Hi {first_name}, I tried reaching you from SWEAT Elite regarding your fitness inquiry. When is a convenient time to speak?"
+        final_body = (message_text or '').strip() or default_body
+
+        template_name = 'sweat_call_missed_followup'
+        params = {
+            '1': first_name,
+            'name': first_name,
+            'lead_name': first_name,
+            'rep_name': rep_name,
+        }
+
+        idempotency_key = f"WHATSAPP_CALL_MISSED_{session.id}"
+
+        try:
+            msg = CommunicationService.send_communication(
+                organization=org,
+                channel='WHATSAPP',
+                recipient=recipient,
+                lead=target_lead,
+                template_reference=template_name,
+                subject="SWEAT Elite - Call Follow-up",
+                body=final_body,
+                context_data=params,
+                purpose='TRANSACTIONAL',
+                idempotency_key=idempotency_key,
+                trigger_type='CALL_MISSED_FOLLOWUP',
+                created_by_user=actor_user,
+            )
+
+            # Record verified LeadActivity on lead timeline
+            from apps.tenant_core.models_crm import LeadActivity
+            LeadActivity.objects.using(alias).create(
+                lead=target_lead,
+                activity_type='WHATSAPP',
+                outcome='SENT',
+                notes=f"💬 WhatsApp follow-up dispatched (Disposition: {session.disposition or 'Unanswered'}):\n\"{final_body}\"",
+                performed_by_user=actor_user,
+                external_reference=str(session.id),
+                activity_at=timezone.now(),
+            )
+
+            logger.info("send_unanswered_call_followup: Successfully dispatched WhatsApp to %s for session %s", recipient, session.id)
+            return msg
+
+        except Exception as exc:
+            logger.error("send_unanswered_call_followup failed for session %s: %s", getattr(session, 'id', None), exc, exc_info=True)
+            return None

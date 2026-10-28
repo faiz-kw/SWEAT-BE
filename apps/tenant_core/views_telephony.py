@@ -710,6 +710,31 @@ class CallDispositionView(APIView):
                     except Exception as parse_err:
                         logger.warning("Could not parse followup date %s: %s", followup_date_str, parse_err)
 
+
+            # Check for automated or requested WhatsApp follow-up
+            send_whatsapp = bool(request.data.get('send_whatsapp', False))
+            whatsapp_msg_override = request.data.get('whatsapp_message', '').strip()
+            whatsapp_dispatched = False
+
+            unanswered_dispositions = ('NO_ANSWER', 'RINGING_NO_ANSWER', 'BUSY', 'BUSY_CALLBACK', 'SWITCHED_OFF')
+            should_send_wa = send_whatsapp or (
+                request.data.get('send_whatsapp') is None and disposition in unanswered_dispositions
+            )
+
+            if should_send_wa and lead:
+                try:
+                    from apps.tenant_core.communication.whatsapp_automation import WhatsAppAutomationService
+                    wa_msg = WhatsAppAutomationService.send_unanswered_call_followup(
+                        session=session,
+                        lead=lead,
+                        message_text=whatsapp_msg_override or None,
+                        actor_user=user if getattr(user, 'is_authenticated', False) else None,
+                        db_alias=get_tenant_db_alias() or 'default',
+                    )
+                    whatsapp_dispatched = bool(wa_msg)
+                except Exception as wa_err:
+                    logger.warning("Automated WhatsApp follow-up dispatch error: %s", wa_err)
+
             # Reset Agent Presence to AVAILABLE
             AgentPresence.objects.filter(user=user).update(
                 status='AVAILABLE',
@@ -720,6 +745,7 @@ class CallDispositionView(APIView):
                 'success': True,
                 'message': 'Disposition recorded and agent status updated to AVAILABLE.',
                 'lead_status': lead.current_status if lead else None,
+                'whatsapp_sent': whatsapp_dispatched,
             }, status=status.HTTP_200_OK)
 
         return Response({
