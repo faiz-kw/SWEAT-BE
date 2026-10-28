@@ -1011,3 +1011,83 @@ class PackageSerializer(serializers.ModelSerializer):
             }
         return None
 
+
+# ============================================================================
+# CATALOG TREE & NESTED PROGRAM / PACKAGE SERIALIZERS (FOR MOBILE / CLIENT APPS)
+# ============================================================================
+
+class ProgramCatalogSerializer(serializers.ModelSerializer):
+    """
+    Serializes a Program with nested ACTIVE packages, including active version details,
+    pricing, and entitlements. Supports filtering by branch_id via request query params.
+    """
+    category_name = serializers.CharField(source='category.name', read_only=True)
+    category_code = serializers.CharField(source='category.code', read_only=True)
+    packages = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Program
+        fields = [
+            'id', 'category', 'category_name', 'category_code',
+            'code', 'name', 'description', 'delivery_mode', 'display_order',
+            'status', 'trial_allowed', 'packages'
+        ]
+
+    def get_packages(self, obj):
+        alias = obj._state.db or 'default'
+        request = self.context.get('request')
+        branch_id = request.query_params.get('branch_id') if request else None
+
+        # Only ACTIVE packages
+        packages_qs = obj.packages.using(alias).filter(status='ACTIVE')
+
+        # If branch_id is specified, filter to packages available at that branch
+        if branch_id:
+            packages_qs = packages_qs.filter(
+                models.Q(branch_availabilities__branch_id=branch_id, branch_availabilities__status='ENABLED') |
+                models.Q(branch_availabilities__isnull=True)
+            ).distinct()
+
+        serializer = PackageSerializer(packages_qs, many=True, context=self.context)
+        data = serializer.data
+
+        # Filter out packages that do not have an active published version
+        return [pkg for pkg in data if pkg.get('active_version')]
+
+
+class CategoryCatalogTreeSerializer(serializers.ModelSerializer):
+    """
+    Serializes a ProgramCategory with all nested ACTIVE programs and their ACTIVE packages.
+    """
+    programs = serializers.SerializerMethodField()
+    programs_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProgramCategory
+        fields = [
+            'id', 'code', 'name', 'description',
+            'display_order', 'status', 'programs_count', 'programs'
+        ]
+
+    def get_programs(self, obj):
+        alias = obj._state.db or 'default'
+        request = self.context.get('request')
+        branch_id = request.query_params.get('branch_id') if request else None
+
+        programs_qs = obj.programs.using(alias).filter(status='ACTIVE')
+
+        # If branch_id specified, ensure program is available at that branch
+        if branch_id:
+            programs_qs = programs_qs.filter(
+                models.Q(branch_availabilities__branch_id=branch_id, branch_availabilities__is_active=True) |
+                models.Q(branch_availabilities__isnull=True)
+            ).distinct()
+
+        programs_qs = programs_qs.order_by('display_order', 'name')
+        return ProgramCatalogSerializer(programs_qs, many=True, context=self.context).data
+
+    def get_programs_count(self, obj):
+        alias = obj._state.db or 'default'
+        return obj.programs.using(alias).filter(status='ACTIVE').count()
+
+

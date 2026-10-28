@@ -422,9 +422,23 @@ _base_handlers = ['console']
 if _file_logging_available:
     _base_handlers.append('file_app')
 
+import logging
+
+class CorrelationIdFilter(logging.Filter):
+    def filter(self, record):
+        if not hasattr(record, 'correlation_id'):
+            record.correlation_id = '-'
+        return True
+
+
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
+    'filters': {
+        'correlation_id_filter': {
+            '()': CorrelationIdFilter,
+        },
+    },
     'formatters': {
         'structured': {
             'format': '[{asctime}] {levelname} {name} | request={correlation_id} | {message}',
@@ -494,6 +508,7 @@ if _file_logging_available:
         'maxBytes': LOG_MAX_BYTES,
         'backupCount': LOG_BACKUP_COUNT,
         'formatter': 'structured',
+        'filters': ['correlation_id_filter'],
         'encoding': 'utf-8',
     }
     LOGGING['handlers']['file_meta'] = {
@@ -502,6 +517,7 @@ if _file_logging_available:
         'maxBytes': LOG_MAX_BYTES,
         'backupCount': LOG_BACKUP_COUNT,
         'formatter': 'structured',
+        'filters': ['correlation_id_filter'],
         'encoding': 'utf-8',
     }
 

@@ -5,6 +5,7 @@ DRF ViewSets for Layer 2: Module C (Terms / Acceptance) & Module D (Programs / P
 import logging
 from decimal import Decimal
 from rest_framework import viewsets, status
+from rest_framework.views import APIView
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
@@ -352,9 +353,32 @@ class ProgramCategoryViewSet(viewsets.ModelViewSet):
     }
 
     def get_permissions(self):
-        if self.action in ['list', 'retrieve']:
+        if self.action in ['list', 'retrieve', 'tree']:
             return [RequireActiveTenantAndOrg()]
         return super().get_permissions()
+
+    @action(detail=False, methods=['get'], url_path='tree')
+    def tree(self, request):
+        """
+        Returns program categories with nested active programs and active packages.
+        Query params:
+          - category_id=<uuid> (filter for specific category)
+          - branch_id=<uuid> (filter by branch availability/pricing)
+          - status=ACTIVE (default: ACTIVE)
+        """
+        alias = _get_db(request)
+        org = _get_org(request)
+        qs = ProgramCategory.objects.using(alias).filter(organization=org)
+        cat_id = request.query_params.get('category_id')
+        if cat_id:
+            qs = qs.filter(id=cat_id)
+        status_param = request.query_params.get('status', 'ACTIVE')
+        if status_param and status_param.upper() != 'ALL':
+            qs = qs.filter(status=status_param.upper())
+        qs = qs.order_by('display_order', 'name')
+        from .serializers_catalog import CategoryCatalogTreeSerializer
+        serializer = CategoryCatalogTreeSerializer(qs, many=True, context={'request': request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
     def get_queryset(self):
         alias = _get_db(self.request)
@@ -491,6 +515,12 @@ class ProgramViewSet(viewsets.ModelViewSet):
         if self.action in ['list', 'retrieve']:
             return [RequireActiveTenantAndOrg()]
         return super().get_permissions()
+
+    def get_serializer_class(self):
+        if self.action in ['list', 'retrieve'] and str(self.request.query_params.get('include_packages', '')).lower() in ('true', '1'):
+            from .serializers_catalog import ProgramCatalogSerializer
+            return ProgramCatalogSerializer
+        return super().get_serializer_class()
 
     def get_queryset(self):
         alias = _get_db(self.request)
@@ -1796,3 +1826,31 @@ class PackageEntitlementDefinitionViewSet(viewsets.ModelViewSet):
             after_data={'entitlement_type': instance.entitlement_type, 'allocated_units': str(instance.allocated_units) if instance.allocated_units else 'UNLIMITED'},
             db_alias=alias,
         )
+
+
+class CatalogTreeView(APIView):
+    """
+    Catalog Tree API:
+    Returns categories with nested active programs and active packages (including prices, credits, validity).
+    Supports query parameters:
+      - category_id=<UUID> (filter for a specific category)
+      - branch_id=<UUID> (filter for programs and packages available at a specific branch)
+      - status=ACTIVE (default: ACTIVE)
+    """
+    permission_classes = [RequireActiveTenantAndOrg]
+
+    def get(self, request, *args, **kwargs):
+        alias = _get_db(request)
+        org = _get_org(request)
+        qs = ProgramCategory.objects.using(alias).filter(organization=org)
+        cat_id = request.query_params.get('category_id')
+        if cat_id:
+            qs = qs.filter(id=cat_id)
+        status_param = request.query_params.get('status', 'ACTIVE')
+        if status_param and status_param.upper() != 'ALL':
+            qs = qs.filter(status=status_param.upper())
+        qs = qs.order_by('display_order', 'name')
+        from .serializers_catalog import CategoryCatalogTreeSerializer
+        serializer = CategoryCatalogTreeSerializer(qs, many=True, context={'request': request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
