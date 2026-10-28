@@ -73,7 +73,7 @@ class LeadRecyclingService:
                 activity_type__in=['CALL', 'NOTE', 'WHATSAPP', 'EMAIL', 'MEETING'],
             ).exists()
 
-            if has_calls or has_activities or lead.last_contacted_at:
+            if has_calls or has_activities or lead.first_response_at:
                 continue  # Lead was contacted; SLA is not breached
 
             # Verify active assignment duration
@@ -185,14 +185,12 @@ class LeadRecyclingService:
         alias = db_alias or get_tenant_db_alias() or 'default'
         cutoff_date = timezone.now() - timedelta(days=dormant_days)
 
-        # Non-terminal leads where last contact was before cutoff (or never contacted and created before cutoff)
+        # Non-terminal leads created before cutoff
         leads_qs = Lead.objects.using(alias).filter(
             organization=organization,
+            created_at__lte=cutoff_date,
         ).exclude(
             current_status__in=TERMINAL_LEAD_STATUSES
-        ).filter(
-            models.Q(last_contacted_at__lte=cutoff_date) |
-            models.Q(last_contacted_at__isnull=True, created_at__lte=cutoff_date)
         ).select_related('assigned_sales_user', 'branch', 'organization')
 
         revived_leads: List[Dict[str, Any]] = []
@@ -207,6 +205,14 @@ class LeadRecyclingService:
 
             if has_pending_followup:
                 continue  # Rep already has a scheduled follow-up planned
+
+            # Check if any recent call occurred within dormant window
+            has_recent_call = CallSession.objects.using(alias).filter(
+                lead=lead,
+                created_at__gte=cutoff_date,
+            ).exists()
+            if has_recent_call:
+                continue
 
             # Check if any recent activity occurred within dormant window
             has_recent_activity = LeadActivity.objects.using(alias).filter(
