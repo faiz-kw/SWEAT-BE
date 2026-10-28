@@ -16,6 +16,7 @@ from .sms_twilio import TwilioSMSAdapter
 from .sms_msg91 import MSG91SMSAdapter
 from .sms_gupshup import GupshupSMSAdapter
 from .voice_sarvam import SarvamVoiceAdapter
+from .voice_vobiz import VobizVoiceAdapter
 
 __all__ = [
     'BaseCommunicationAdapter',
@@ -30,5 +31,6 @@ __all__ = [
     'MSG91SMSAdapter',
     'GupshupSMSAdapter',
     'SarvamVoiceAdapter',
+    'VobizVoiceAdapter',
 ]
 

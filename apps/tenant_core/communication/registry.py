@@ -17,6 +17,7 @@ from .adapters import (
     MSG91SMSAdapter,
     GupshupSMSAdapter,
     SarvamVoiceAdapter,
+    VobizVoiceAdapter,
 )
 
 logger = logging.getLogger(__name__)
@@ -150,4 +151,6 @@ CommunicationProviderRegistry.register('SMS', 'GUPSHUP_SMS', GupshupSMSAdapter)
 CommunicationProviderRegistry.register('SMS', 'GUPSHUP', GupshupSMSAdapter)
 CommunicationProviderRegistry.register('VOICE', 'SARVAM', SarvamVoiceAdapter)
 CommunicationProviderRegistry.register('AI_CALL', 'SARVAM', SarvamVoiceAdapter)
+CommunicationProviderRegistry.register('VOICE', 'VOBIZ', VobizVoiceAdapter)
+CommunicationProviderRegistry.register('TELEPHONY', 'VOBIZ', VobizVoiceAdapter)
 

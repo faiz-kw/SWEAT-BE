@@ -1070,15 +1070,29 @@ class CRMLeadService:
         from .models_crm import CallSession
         from django.db.utils import ProgrammingError, OperationalError
         try:
+            from django.db.models import Q
+            lead_phone = getattr(lead, 'phone_normalized', None) or getattr(lead, 'phone', None) or ''
+            lead_phone_digits = lead_phone.replace('+', '').replace(' ', '').lstrip('0')[-10:] if lead_phone else ''
             with transaction.atomic(using=alias):
-                call_sessions = list(CallSession.objects.using(alias).filter(lead=lead))
+                if lead_phone_digits:
+                    call_sessions = list(CallSession.objects.using(alias).filter(
+                        Q(lead=lead) | Q(user_phone_number__icontains=lead_phone_digits)
+                    ).order_by('-started_at').distinct())
+                else:
+                    call_sessions = list(CallSession.objects.using(alias).filter(lead=lead).order_by('-started_at'))
             has_trial_booking = TrialBooking.objects.using(alias).filter(lead=lead).exists()
             for cs in call_sessions:
                 status_label = cs.status.replace('_', ' ').title()
                 call_meta = cs.metadata if isinstance(cs.metadata, dict) else {}
                 call_type = str(call_meta.get('call_type') or call_meta.get('type') or call_meta.get('purpose') or '').upper()
                 is_reminder = 'REMINDER' in call_type or 'reminder' in str(call_meta).lower()
-                title = f"AI Reminder Call: {status_label}" if is_reminder else f"AI Call: {status_label}"
+                is_human = cs.call_mode == 'HUMAN_MANUAL' or (cs.sales_rep and cs.provider != 'SARVAM')
+                if is_reminder:
+                    title = f"AI Reminder Call: {status_label}"
+                elif is_human:
+                    title = f"{'Inbound' if cs.direction == 'INBOUND' else 'Outbound'} Call: {status_label}"
+                else:
+                    title = f"AI Call: {status_label}"
                 ev_type = 'REMINDER_CALL' if is_reminder else 'VOICE_CALL'
                 raw_transcript = cs.transcript or ""
                 call_summary = ""
@@ -1112,11 +1126,21 @@ class CRMLeadService:
                 if not rec_url and not is_unanswered and cs.status == 'COMPLETED':
                     rec_url = f"/api/v1/voice-agent/recordings/{cs.id}/audio/"
 
-                desc = call_summary or (
-                    (f"Duration: {int(cs.duration_seconds)}s • Provider: {cs.provider}" + (
-                        f" • Turns: {len(cs.transcript)}" if isinstance(cs.transcript, list) else ""
-                    )) if not is_unanswered else f"Call outcome: {status_label}. No answer from recipient."
-                )
+                if is_human:
+                    actor_label = f"{cs.sales_rep.first_name} {cs.sales_rep.last_name or ''}".strip() if cs.sales_rep else 'Sales Rep'
+                    dur = int(cs.duration_seconds or 0)
+                    dur_label = f"{dur}s" if dur < 60 else f"{dur // 60}m {dur % 60}s"
+                    desc = call_summary or (
+                        (f"Inbound call: Connected {dur_label} with {actor_label}." if dur > 0 else f"Inbound call: {status_label} (no answer).")
+                        + (f" {cs.disposition_notes}" if cs.disposition_notes else "")
+                    ).strip()
+                else:
+                    actor_label = f"{cs.provider.title()} Voice Agent (Mahek)"
+                    desc = call_summary or (
+                        (f"Duration: {int(cs.duration_seconds)}s • Provider: {cs.provider}" + (
+                            f" • Turns: {len(cs.transcript)}" if isinstance(cs.transcript, list) else ""
+                        )) if not is_unanswered else f"Call outcome: {status_label}. No answer from recipient."
+                    )
 
                 events.append({
                     'id': f"call-{cs.id}",
@@ -1124,7 +1148,7 @@ class CRMLeadService:
                     'occurred_at': (cs.started_at or cs.created_at).isoformat(),
                     'title': title,
                     'description': desc,
-                    'actor': f"{cs.provider.title()} Voice Agent (Mahek)",
+                    'actor': actor_label,
                     'channel': 'VOICE',
                     'metadata': {
                         'call_session_id': str(cs.id),

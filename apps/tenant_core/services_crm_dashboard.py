@@ -32,6 +32,7 @@ from .models_crm import (
     LeadActivity,
     TrialBooking,
     SalesFollowupTask,
+    CallSession,
 )
 from .models_commerce import Order, PaymentTransaction, Refund
 from .services_attention import LeadAttentionService
@@ -213,6 +214,15 @@ class CRMDashboardService:
             db_alias=alias,
         )
 
+        telephony = cls._get_telephony_metrics(
+            organization=organization,
+            branch_filter_id=branch_filter_id,
+            agent_id=agent_id,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            db_alias=alias,
+        )
+
         return {
             'filters': {
                 'date_from': start_dt.date().isoformat(),
@@ -235,6 +245,7 @@ class CRMDashboardService:
             'agents': agents,
             'branches': branches,
             'trends': trends,
+            'telephony': telephony,
         }
 
     # -------------------------------------------------------------------------
@@ -998,3 +1009,90 @@ class CRMDashboardService:
             cur_date += timedelta(days=1)
 
         return trends
+
+    # -------------------------------------------------------------------------
+    # PART K: Telephony & Sales Calling Performance (Vobiz Engine)
+    # -------------------------------------------------------------------------
+    @classmethod
+    def _get_telephony_metrics(
+        cls,
+        organization: Organization,
+        branch_filter_id: Optional[str],
+        agent_id: Optional[str],
+        start_dt: datetime,
+        end_dt: datetime,
+        db_alias: str,
+    ) -> Dict[str, Any]:
+        call_qs = CallSession.objects.using(db_alias).filter(
+            organization=organization,
+            started_at__range=(start_dt, end_dt),
+        )
+        if branch_filter_id:
+            call_qs = call_qs.filter(branch_id=branch_filter_id)
+        if agent_id:
+            call_qs = call_qs.filter(sales_rep_id=agent_id)
+
+        total_dials = call_qs.count()
+        connected_calls = call_qs.filter(duration_seconds__gt=0).count()
+        meaningful_calls = call_qs.filter(Q(duration_seconds__gte=30) | Q(is_meaningful=True)).count()
+        inbound_calls = call_qs.filter(direction='INBOUND').count()
+        outbound_calls = call_qs.filter(direction='OUTBOUND').count()
+        missed_inbound = call_qs.filter(direction='INBOUND', status__in=['NO_ANSWER', 'FAILED', 'RINGING']).count()
+
+        totals = call_qs.aggregate(
+            total_talk_sec=Sum('duration_seconds'),
+            total_bill_sec=Sum('bill_duration_seconds'),
+        )
+        total_talk_sec = float(totals.get('total_talk_sec') or 0.0)
+        total_bill_sec = int(totals.get('total_bill_sec') or 0)
+
+        connect_rate_pct = round((connected_calls / total_dials * 100), 1) if total_dials > 0 else 0.0
+        meaningful_rate_pct = round((meaningful_calls / connected_calls * 100), 1) if connected_calls > 0 else 0.0
+
+        # Dispositions breakdown
+        disp_counts = list(
+            call_qs.exclude(disposition__isnull=True).exclude(disposition='')
+            .values('disposition')
+            .annotate(count=Count('id'))
+            .order_by('-count')[:6]
+        )
+
+        # Rep Leaderboard
+        rep_leaderboard = list(
+            call_qs.filter(sales_rep__isnull=False)
+            .values('sales_rep_id', 'sales_rep__first_name', 'sales_rep__last_name', 'sales_rep__email')
+            .annotate(
+                total_calls=Count('id'),
+                connected=Count('id', filter=Q(duration_seconds__gt=0)),
+                meaningful=Count('id', filter=Q(duration_seconds__gte=30) | Q(is_meaningful=True)),
+                total_talk_time=Sum('duration_seconds'),
+            )
+            .order_by('-meaningful', '-total_calls')[:10]
+        )
+        leaderboard_formatted = []
+        for r in rep_leaderboard:
+            full_name = f"{r['sales_rep__first_name']} {r['sales_rep__last_name'] or ''}".strip() or r['sales_rep__email']
+            leaderboard_formatted.append({
+                'agent_id': str(r['sales_rep_id']),
+                'agent_name': full_name,
+                'total_calls': r['total_calls'],
+                'connected': r['connected'],
+                'meaningful': r['meaningful'],
+                'talk_time_seconds': float(r['total_talk_time'] or 0.0),
+            })
+
+        return {
+            'total_dials': total_dials,
+            'connected_calls': connected_calls,
+            'connect_rate_pct': connect_rate_pct,
+            'meaningful_calls': meaningful_calls,
+            'meaningful_rate_pct': meaningful_rate_pct,
+            'inbound_calls': inbound_calls,
+            'outbound_calls': outbound_calls,
+            'missed_inbound': missed_inbound,
+            'total_talk_time_seconds': total_talk_sec,
+            'total_bill_duration_seconds': total_bill_sec,
+            'top_dispositions': disp_counts,
+            'agent_leaderboard': leaderboard_formatted,
+        }
+

@@ -45,6 +45,69 @@ def _is_placeholder_phone(val: Any) -> bool:
     return False
 
 
+def _resolve_target_date(raw_date_str: Optional[str], now_ist: datetime) -> date:
+    """
+    Parses conversational and ISO date strings into a local calendar date.
+    Handles: 'today', 'tomorrow', 'day after tomorrow', 'this weekend',
+    day of week ('saturday', 'this sunday', 'next monday'), and standard date formats.
+    """
+    if not raw_date_str:
+        return now_ist.date() + timedelta(days=1)
+
+    s = str(raw_date_str).strip().lower()
+    today = now_ist.date()
+
+    if s in ('today', 'now', 'tonight'):
+        return today
+    if s in ('tomorrow', 'tmrw', 'tommorow'):
+        return today + timedelta(days=1)
+    if s in ('day_after_tomorrow', 'day after tomorrow', 'overmorrow'):
+        return today + timedelta(days=2)
+
+    # Weekdays mapping (Monday = 0 ... Sunday = 6)
+    weekdays = {
+        'monday': 0, 'mon': 0,
+        'tuesday': 1, 'tue': 1, 'tues': 1,
+        'wednesday': 2, 'wed': 2,
+        'thursday': 3, 'thu': 3, 'thur': 3, 'thurs': 3,
+        'friday': 4, 'fri': 4,
+        'saturday': 5, 'sat': 5,
+        'sunday': 6, 'sun': 6,
+    }
+
+    # Handle 'this weekend' or 'weekend' -> upcoming Saturday
+    if 'weekend' in s:
+        days_ahead = (5 - today.weekday()) % 7
+        if days_ahead == 0 and now_ist.hour >= 18:
+            days_ahead = 7
+        elif days_ahead == 0 and today.weekday() == 6:  # Today is Sunday
+            days_ahead = 6  # Next Saturday
+        return today + timedelta(days=days_ahead if days_ahead > 0 else (7 if now_ist.hour >= 18 else 0))
+
+    # Check for weekday names
+    for day_name, day_idx in weekdays.items():
+        if day_name in s:
+            current_day_idx = today.weekday()
+            days_ahead = (day_idx - current_day_idx) % 7
+            if days_ahead == 0 and (now_ist.hour >= 18 or 'next' in s):
+                days_ahead = 7
+            return today + timedelta(days=days_ahead)
+
+    # Standard date formats
+    for fmt in ('%Y-%m-%d', '%d-%m-%Y', '%d/%m/%Y', '%Y/%m/%d', '%b %d', '%B %d'):
+        try:
+            parsed = datetime.strptime(s, fmt).date()
+            if parsed.year == 1900:
+                parsed = parsed.replace(year=today.year)
+                if parsed < today:
+                    parsed = parsed.replace(year=today.year + 1)
+            return parsed
+        except ValueError:
+            pass
+
+    return today + timedelta(days=1)
+
+
 def _authenticate_request(request, enforce_token: bool = False) -> Tuple[Optional[Tenant], Optional[Any], Optional[JsonResponse]]:
     """
     Validates token and resolves Tenant.
@@ -183,8 +246,7 @@ def _resolve_tenant_org(alias: str, branch=None):
         return branch.organization
     from apps.tenant_core.models_org import Organization
     return (
-        Organization.objects.using(alias).filter(code='SWEAT_UAT_ORG', status='ACTIVE').first()
-        or Organization.objects.using(alias).filter(status='ACTIVE').order_by('-created_at').first()
+        Organization.objects.using(alias).filter(status='ACTIVE').order_by('-created_at').first()
     )
 
 
@@ -213,6 +275,115 @@ def _lookup_lead_by_phone(alias: str, phone_val: Optional[str]):
         .order_by('-created_at')
         .first()
     )
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class VoiceAgentStudioFaqView(View):
+    """
+    Studio FAQ & Objection Handling Tool for Sarvam Voice Agents.
+    Answers common caller questions about pricing, amenities, beginner readiness,
+    parking, directions, and what to bring.
+
+    Guarantees:
+    1. Returns natural spoken answers suited for voice telephony (under 2 sentences).
+    2. Deflects pricing objections by encouraging the VIP trial where exclusive discounts apply.
+    3. Reassures beginners about coach guidance and exercise modifications.
+    """
+
+    def get(self, request, *args, **kwargs):
+        return self._process(request)
+
+    def post(self, request, *args, **kwargs):
+        return self._process(request)
+
+    def _process(self, request):
+        tenant, _, err_resp = _authenticate_request(request, enforce_token=False)
+        if err_resp:
+            return err_resp
+
+        params = request.GET.dict()
+        if request.method == 'POST' and request.body:
+            try:
+                body_json = json.loads(request.body.decode('utf-8'))
+                params.update(body_json)
+            except Exception:
+                pass
+
+        raw_query = (
+            params.get('query')
+            or params.get('question')
+            or params.get('topic')
+            or ''
+        ).strip().lower()
+
+        branch_param = (
+            params.get('branch')
+            or params.get('branch_name')
+            or params.get('location')
+            or ''
+        ).strip()
+
+        with tenant_database_context(tenant.id):
+            alias = get_tenant_db_alias()
+            from apps.tenant_core.models_org import Branch
+            resolved_branch = None
+            if branch_param:
+                resolved_branch = _resolve_branch(alias, None, branch_param)
+            if not resolved_branch:
+                resolved_branch = Branch.objects.using(alias).filter(status='ACTIVE').order_by('name').first()
+
+            branch_short = _get_branch_spoken_name(resolved_branch) if resolved_branch else 'our studio'
+
+            # FAQ Knowledge Engine
+            topic = 'general'
+            if any(k in raw_query for k in ('price', 'pricing', 'cost', 'fee', 'charge', 'rate', 'membership', 'package', 'expensive')):
+                topic = 'pricing'
+                answer = (
+                    "This call is exclusively to gift you a completely complimentary trial session so you can experience the workout firsthand! "
+                    "Our team at the studio will happily explain all options when you visit. Would you prefer a morning or evening workout?"
+                )
+            elif any(k in raw_query for k in ('beginner', 'first time', 'never done', 'injury', 'back pain', 'knee', 'level', 'modification', 'scared', 'hard')):
+                topic = 'beginner_friendly'
+                answer = (
+                    f"Don't worry at all! Our classes are completely beginner-friendly. "
+                    f"Our certified coaches assess your fitness level before the session and provide personal modifications for every movement. "
+                    f"You'll feel comfortable and supported the entire time."
+                )
+            elif any(k in raw_query for k in ('park', 'parking', 'valet', 'car')):
+                topic = 'parking'
+                answer = (
+                    f"Yes! We offer convenient parking facilities and valet services at our {branch_short} studio so you can arrive stress-free."
+                )
+            elif any(k in raw_query for k in ('shower', 'locker', 'amenit', 'changing', 'towel', 'washroom', 'water')):
+                topic = 'amenities'
+                answer = (
+                    f"Yes! We provide luxury private shower facilities, secure electronic lockers, clean changing rooms, and alkaline water stations at all our studios."
+                )
+            elif any(k in raw_query for k in ('bring', 'wear', 'clothes', 'shoes', 'dress', 'carry')):
+                topic = 'what_to_bring'
+                answer = (
+                    f"Just wear comfortable athletic clothes like shorts or tracks, bring a fresh pair of clean grip shoes or socks, and carry an empty water bottle that you can refill at the studio."
+                )
+            elif any(k in raw_query for k in ('where', 'location', 'address', 'directions', 'landmark', 'reach')):
+                topic = 'location'
+                addr = getattr(resolved_branch, 'address_line_1', '') or (resolved_branch.address if resolved_branch else 'Mumbai')
+                answer = (
+                    f"Our {branch_short} studio is conveniently located at {addr}. "
+                    f"Once we book your session, I'll send the exact Google Maps navigation pin straight to your WhatsApp."
+                )
+            else:
+                topic = 'general'
+                answer = (
+                    f"SWEAT is an elite boutique fitness studio offering high-energy bootcamp conditioning and reformer pilates. "
+                    f"Every session is coached by master trainers to help you burn fat, tone muscle, and build functional strength."
+                )
+
+            return JsonResponse({
+                'status': 'success',
+                'topic': topic,
+                'branch_name': resolved_branch.name if resolved_branch else '',
+                'spoken_answer': answer,
+            })
 
 
 @method_decorator(csrf_exempt, name='dispatch')
@@ -328,18 +499,8 @@ class VoiceAgentClassesView(View):
         now_utc = timezone.now()
         now_ist = now_utc.astimezone(IST)
 
-        # Resolve target date
-        if date_param in ('today', 'now'):
-            target_date = now_ist.date()
-        elif date_param in ('tomorrow', 'tmrw'):
-            target_date = now_ist.date() + timedelta(days=1)
-        elif date_param in ('day_after_tomorrow', 'day after tomorrow'):
-            target_date = now_ist.date() + timedelta(days=2)
-        else:
-            try:
-                target_date = datetime.strptime(date_param, '%Y-%m-%d').date()
-            except ValueError:
-                target_date = now_ist.date() + timedelta(days=1)
+        # Resolve target date using conversational and ISO parser
+        target_date = _resolve_target_date(date_param, now_ist)
 
         with tenant_database_context(tenant.id):
             alias = get_tenant_db_alias()
@@ -447,17 +608,27 @@ class VoiceAgentClassesView(View):
 
                 effective_capacity = (
                     occ.capacity
-                    or (branch_avail.capacity_override if branch_avail and branch_avail.capacity_override else None)
-                    or occ.class_template.default_capacity
-                )
-                effective_trial_cap = (
-                    occ.trial_capacity
-                    or (branch_avail.trial_capacity_override if branch_avail and branch_avail.trial_capacity_override else None)
-                    or occ.class_template.default_trial_capacity
-                    or 2  # default trial spots
+                    if occ.capacity is not None and occ.capacity > 0
+                    else ((branch_avail.capacity_override if branch_avail and branch_avail.capacity_override else None)
+                          or occ.class_template.default_capacity or 20)
                 )
 
-                if effective_trial_cap <= 0:
+                # Explicitly resolve effective trial capacity:
+                # 1. Occurrence-level trial capacity override (can be 0)
+                # 2. Branch availability trial capacity override
+                # 3. Class Template default trial capacity
+                if occ.trial_capacity is not None:
+                    effective_trial_cap = occ.trial_capacity
+                elif branch_avail and branch_avail.trial_capacity_override is not None:
+                    effective_trial_cap = branch_avail.trial_capacity_override
+                elif occ.class_template and occ.class_template.default_trial_capacity is not None:
+                    effective_trial_cap = occ.class_template.default_trial_capacity
+                else:
+                    effective_trial_cap = 0
+
+                # Strict trial safety guard:
+                # If template forbids trial or trial capacity is 0, skip this session!
+                if not occ.class_template.allow_trial or effective_trial_cap <= 0:
                     continue
 
                 # Real-time occupancy check
@@ -809,15 +980,29 @@ class VoiceAgentBookTrialView(View):
                 # 3. Atomic Capacity & Concurrency Enforcement
                 effective_capacity = (
                     occurrence.capacity
-                    or (branch_avail.capacity_override if branch_avail and branch_avail.capacity_override else None)
-                    or occurrence.class_template.default_capacity
+                    if occurrence.capacity is not None and occurrence.capacity > 0
+                    else ((branch_avail.capacity_override if branch_avail and branch_avail.capacity_override else None)
+                          or occurrence.class_template.default_capacity or 20)
                 )
-                effective_trial_cap = (
-                    occurrence.trial_capacity
-                    or (branch_avail.trial_capacity_override if branch_avail and branch_avail.trial_capacity_override else None)
-                    or occurrence.class_template.default_trial_capacity
-                    or 2
-                )
+
+                if occurrence.trial_capacity is not None:
+                    effective_trial_cap = occurrence.trial_capacity
+                elif branch_avail and branch_avail.trial_capacity_override is not None:
+                    effective_trial_cap = branch_avail.trial_capacity_override
+                elif occurrence.class_template and occurrence.class_template.default_trial_capacity is not None:
+                    effective_trial_cap = occurrence.class_template.default_trial_capacity
+                else:
+                    effective_trial_cap = 0
+
+                # Strict check: trials permitted and trial capacity > 0
+                if not occurrence.class_template.allow_trial or effective_trial_cap <= 0:
+                    logger.warning("Voice Agent trial booking rejected: trial not allowed or cap is 0 for occurrence %s", occurrence.id)
+                    return JsonResponse({
+                        'status': 'error',
+                        'error_code': 'TRIAL_NOT_PERMITTED',
+                        'message': 'Trial passes are not permitted for this specific class session.',
+                        'spoken_apology': "I'm sorry, complimentary trial spots are not available for that specific session. Let me check another upcoming time that has trial spots open.",
+                    }, status=400)
 
                 regular_booked = Booking.objects.using(alias).filter(
                     occurrence=occurrence,
@@ -847,12 +1032,9 @@ class VoiceAgentBookTrialView(View):
                         "Carry a Fresh Pair of Grip Shoes: Please bring a fresh pair of shoes and socks to maintain hygiene at all times."
                     )
                     spoken_conf = (
-                        f"Good news, {lead.first_name}! You are already booked for {prog_name} ({occurrence.class_template.name}) "
+                        f"Good news, {lead.first_name}! You are already confirmed for {occurrence.class_template.name} "
                         f"at our {branch_short} studio on {ist_dt.strftime('%A at %I:%M %p')}. "
-                        f"As a reminder: Stay Hydrated — carry an empty bottle and get it filled at our studio. "
-                        f"Comfy Clothes — wear anything comfortable like shorts, tracks, or leggings. "
-                        f"Carry a Fresh Pair of Grip Shoes — please bring a fresh pair of shoes and socks to maintain hygiene at all times. "
-                        f"We look forward to seeing you!"
+                        f"I've sent your entry pass and directions straight to your WhatsApp. We look forward to seeing you!"
                     )
                     return JsonResponse({
                         'status': 'success',
@@ -868,9 +1050,8 @@ class VoiceAgentBookTrialView(View):
                         'spoken_confirmation': spoken_conf,
                     })
 
-                # Check if total capacity or trial capacity reached
-                if regular_booked + trial_booked >= effective_capacity or (effective_trial_cap > 0 and trial_booked >= effective_trial_cap):
-                    # Find alternative slot
+                # Check if trial capacity or total capacity reached
+                if trial_booked >= effective_trial_cap:
                     alt_occ = ClassOccurrence.objects.using(alias).filter(
                         branch=occurrence.branch,
                         start_at__gt=occurrence.start_at,
@@ -879,13 +1060,33 @@ class VoiceAgentBookTrialView(View):
                     ).order_by('start_at').first()
                     alt_str = f" on {alt_occ.start_at.astimezone(IST).strftime('%A at %I:%M %p')}" if alt_occ else ""
 
-                    logger.warning("Voice Agent trial booking rejected: capacity reached for occurrence %s", occurrence.id)
+                    logger.warning("Voice Agent trial booking rejected: trial capacity full (%d/%d) for occurrence %s", trial_booked, effective_trial_cap, occurrence.id)
+                    return JsonResponse({
+                        'status': 'error',
+                        'error_code': 'TRIAL_CAPACITY_FULL',
+                        'message': f'All trial spots have been booked for this session ({trial_booked}/{effective_trial_cap}).',
+                        'spoken_apology': (
+                            f"I'm sorry, all the complimentary trial spots for that session at our {branch_short} studio have just been booked! "
+                            f"We do have another open spot{alt_str}. Would that time work for you?"
+                        ),
+                    }, status=409)
+
+                if regular_booked + trial_booked >= effective_capacity:
+                    alt_occ = ClassOccurrence.objects.using(alias).filter(
+                        branch=occurrence.branch,
+                        start_at__gt=occurrence.start_at,
+                        class_template=occurrence.class_template,
+                        status__in=['OPEN', 'SCHEDULED', 'ACTIVE'],
+                    ).order_by('start_at').first()
+                    alt_str = f" on {alt_occ.start_at.astimezone(IST).strftime('%A at %I:%M %p')}" if alt_occ else ""
+
+                    logger.warning("Voice Agent trial booking rejected: total capacity full (%d/%d) for occurrence %s", regular_booked + trial_booked, effective_capacity, occurrence.id)
                     return JsonResponse({
                         'status': 'error',
                         'error_code': 'SLOT_FULL',
-                        'message': 'Capacity reached for this session.',
+                        'message': f'Total capacity reached for this session ({regular_booked + trial_booked}/{effective_capacity} booked).',
                         'spoken_apology': (
-                            f"I'm sorry, that session at our {branch_short} studio just filled up to capacity! "
+                            f"I'm sorry, that session at our {branch_short} studio is completely full! "
                             f"We do have another open spot{alt_str}. Would that time work for you?"
                         ),
                     }, status=409)
@@ -988,10 +1189,10 @@ class VoiceAgentBookTrialView(View):
                     maps_url = f"https://maps.google.com/?q={maps_query}"
                     prog_name = occurrence.class_template.program.name if (occurrence.class_template and occurrence.class_template.program) else occurrence.class_template.name
                     instructor_name = getattr(occurrence.instructor, 'name', None) or getattr(occurrence.instructor, 'first_name', None) or 'Master Studio Trainer'
-                    pass_code = f"SWEAT-VIP-{str(trial.id).replace('-', '')[:6].upper()}"
+                    pass_code = f"SWEAT-TRIAL-{str(trial.id).replace('-', '')[:6].upper()}"
 
                     wa_body = (
-                        f"🎫 *SWEAT VIP TRIAL PASS*\n"
+                        f"🎫 *SWEAT COMPLIMENTARY TRIAL PASS*\n"
                         f"━━━━━━━━━━━━━━━━━━━\n"
                         f"Hi {lead.first_name}! Your complimentary workout pass at SWEAT is confirmed.\n\n"
                         f"🏋️ *Program:* {prog_name}\n"
@@ -1031,15 +1232,8 @@ class VoiceAgentBookTrialView(View):
                 "Carry a Fresh Pair of Grip Shoes: Please bring a fresh pair of shoes and socks to maintain hygiene at all times."
             )
             spoken_conf = (
-                f"You're all set, {lead.first_name}! Before we wrap up, let me reconfirm all your details: "
-                f"Your complimentary trial is booked for {prog_name} ({occurrence.class_template.name}) "
-                f"at our {branch_short} branch on {ist_dt.strftime('%A at %I:%M %p')}. "
-                f"Please keep these instructions in mind before visiting: "
-                f"First, Stay Hydrated: Carry an empty bottle and get it filled at our studio. "
-                f"Second, Comfy Clothes: Wear anything comfortable, such as shorts, tracks, leggings, pants, T-shirts, or tank tops. "
-                f"Third, Carry a Fresh Pair of Grip Shoes: Please bring a fresh pair of shoes and socks to maintain hygiene at all times. "
-                f"I've also sent the confirmation and location details to your WhatsApp. "
-                f"We are excited to see you at SWEAT!"
+                f"You're all set, {lead.first_name}! Your trial for {occurrence.class_template.name} at our {branch_short} studio is confirmed for {ist_dt.strftime('%A at %I:%M %p')}. "
+                f"I've just sent your confirmation pass, Google Maps directions, and what to bring directly to your WhatsApp. We can't wait to see you at SWEAT!"
             )
 
             logger.info("Voice Agent successfully booked trial: lead=%s trial=%s occurrence=%s branch=%s", lead.id, trial.id, occurrence.id, branch_name)
@@ -1927,6 +2121,209 @@ class VoiceAgentCallbackView(View):
                 'due_at_formatted': dt_fmt,
                 'spoken_confirmation': spoken_conf,
             }, status=200)
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class VoiceAgentTransferCallView(View):
+    """
+    Real-Time Human Call Transfer Tool for Sarvam Voice Agents.
+    Called when a prospect explicitly requests to speak with a human agent,
+    front desk, manager, or trainer, or when complex questions/objections require human escalation.
+
+    Guarantees:
+    1. Resolves Lead and Branch from context or incoming parameters.
+    2. Resolves destination phone number (Branch front desk phone or assigned on-duty rep).
+    3. Broadcasts real-time SSE event (push_agent_telephony_event) to all active CRM rep tabs.
+    4. Logs LeadActivity with activity_type='CALL' noting the live transfer.
+    5. Creates a high-priority SalesFollowupTask in case the human transfer fails, is busy, or dropped.
+    6. Returns structured telephony transfer directives for Sarvam Instant Outbound / Voice Gateway.
+    """
+
+    def get(self, request, *args, **kwargs):
+        return self._process(request)
+
+    def post(self, request, *args, **kwargs):
+        return self._process(request)
+
+    def _process(self, request):
+        tenant, _, err_resp = _authenticate_request(request, enforce_token=False)
+        if err_resp:
+            return err_resp
+
+        params = request.GET.dict()
+        if request.method == 'POST' and request.body:
+            try:
+                body_json = json.loads(request.body.decode('utf-8'))
+                params.update(body_json)
+            except Exception:
+                pass
+
+        phone_param = (
+            params.get('phone')
+            or params.get('phone_number')
+            or params.get('user_phone_number')
+            or params.get('caller_phone')
+        )
+        lead_id_param = params.get('lead_id')
+        branch_param = params.get('branch') or params.get('branch_name') or params.get('branch_id')
+        reason_text = (
+            params.get('reason')
+            or params.get('transfer_reason')
+            or params.get('notes')
+            or 'Prospect requested human assistance'
+        ).strip()
+        call_id = params.get('call_id') or params.get('session_id') or ''
+
+        with tenant_database_context(tenant.id):
+            alias = get_tenant_db_alias()
+            from apps.tenant_core.models_org import Branch, Organization
+            from apps.tenant_core.models_crm import Lead, SalesFollowupTask, LeadActivity, LeadSource
+            from apps.tenant_core.models_users import TenantUser
+            from apps.tenant_core.services_voice_calling import VoiceCallingService
+
+            # 1. Resolve Lead
+            lead = None
+            if lead_id_param:
+                try:
+                    lead = Lead.objects.using(alias).filter(id=lead_id_param).first()
+                except Exception:
+                    pass
+            if not lead and phone_param:
+                norm_phone = VoiceCallingService.normalize_phone(phone_param)
+                lead = Lead.objects.using(alias).filter(phone_normalized=norm_phone).first()
+
+            # 2. Resolve Branch
+            resolved_branch = None
+            if branch_param:
+                resolved_branch = _resolve_branch(alias, lead.organization if lead else None, branch_param)
+            if not resolved_branch and lead and lead.branch:
+                resolved_branch = lead.branch
+            if not resolved_branch:
+                resolved_branch = Branch.objects.using(alias).filter(status='ACTIVE').order_by('name').first()
+
+            # 3. Resolve Target Phone Number for Central Sales Team
+            from apps.tenant_core.models_infra import Integration
+            target_phone = ''
+            dest_name = 'SWEAT Sales Team'
+
+            # Primary: Vobiz Sales DID number connected to Zoiper softphones
+            vobiz_int = Integration.objects.using(alias).filter(provider__iexact='VOBIZ', status='ACTIVE').first()
+            if vobiz_int and (vobiz_int.configuration or {}).get('from_number'):
+                target_phone = str(vobiz_int.configuration['from_number']).strip()
+                dest_name = 'SWEAT Sales Team'
+
+            # Fallback 1: Assigned sales user phone
+            if not target_phone and lead and lead.assigned_sales_user and lead.assigned_sales_user.phone:
+                target_phone = lead.assigned_sales_user.phone.strip()
+                dest_name = f"Coach {lead.assigned_sales_user.first_name}"
+
+            # Fallback 2: Active sales rep / admin phone
+            if not target_phone:
+                rep_user = TenantUser.objects.using(alias).filter(
+                    status='ACTIVE'
+                ).exclude(phone='').exclude(phone__isnull=True).first()
+                if rep_user and rep_user.phone:
+                    target_phone = rep_user.phone.strip()
+                    dest_name = f"{rep_user.first_name} (Sales Rep)"
+
+            # Fallback 3: Branch phone if present
+            if not target_phone and resolved_branch and resolved_branch.phone:
+                target_phone = resolved_branch.phone.strip()
+
+            # Clean and normalize target phone
+            if target_phone:
+                target_phone = VoiceCallingService.normalize_phone(target_phone)
+            else:
+                target_phone = os.getenv('VOBIZ_SALES_DID') or os.getenv('VOBIZ_VIRTUAL_DID', '+919240954144')
+
+            branch_short = _get_branch_spoken_name(resolved_branch) if resolved_branch else 'our studio'
+
+            # 4. Create Lead if caller not in CRM yet
+            if not lead and phone_param and not _is_placeholder_phone(phone_param):
+                org = resolved_branch.organization if resolved_branch else Organization.objects.using(alias).first()
+                lead_src = (
+                    LeadSource.objects.using(alias).filter(organization=org, source_type__in=['SARVAM', 'META', 'OTHER'], status='ACTIVE').first()
+                    or LeadSource.objects.using(alias).filter(status='ACTIVE').first()
+                )
+                norm_phone = VoiceCallingService.normalize_phone(phone_param)
+                lead = Lead.objects.using(alias).create(
+                    organization=org,
+                    branch=resolved_branch,
+                    first_name='Caller',
+                    last_name='',
+                    phone_normalized=norm_phone,
+                    lead_source=lead_src,
+                    current_status='HOT_LEAD',
+                )
+
+            # 5. Broadcast Real-Time SSE to CRM Front Desk
+            try:
+                from apps.tenant_core.views_telephony import push_agent_telephony_event
+                push_agent_telephony_event(
+                    user_id=None,
+                    event_type='ai_call_transfer',
+                    payload={
+                        'lead_id': str(lead.id) if lead else '',
+                        'lead_name': f"{lead.first_name} {lead.last_name}".strip() if lead else 'Guest Caller',
+                        'phone': lead.phone_normalized if lead else phone_param,
+                        'branch_name': resolved_branch.name if resolved_branch else '',
+                        'target_phone': target_phone,
+                        'dest_name': dest_name,
+                        'reason': reason_text,
+                        'call_id': call_id,
+                        'timestamp': timezone.now().isoformat(),
+                    }
+                )
+            except Exception as sse_err:
+                logger.warning("Could not dispatch SSE transfer event: %s", sse_err)
+
+            # 6. Log LeadActivity & Create High-Priority Followup Task
+            assigned_user = lead.assigned_sales_user if lead else None
+            if not assigned_user:
+                assigned_user = TenantUser.objects.using(alias).filter(status='ACTIVE').first()
+
+            if lead:
+                LeadActivity.objects.using(alias).create(
+                    lead=lead,
+                    activity_type='CALL',
+                    outcome=f"Transferred to {dest_name}",
+                    notes=f"AI Agent Mahek initiated a live call transfer to {dest_name} ({target_phone}). Reason: {reason_text}",
+                    performed_by_user=assigned_user,
+                )
+
+                # High-priority task in case transfer is missed
+                SalesFollowupTask.objects.using(alias).create(
+                    lead=lead,
+                    assigned_to_user=assigned_user,
+                    task_type='CALL',
+                    priority='URGENT',
+                    due_at=timezone.now() + timedelta(minutes=15),
+                    status='PENDING',
+                    outcome=f"URGENT: Caller requested human transfer. Reason: {reason_text}. Target was {dest_name} ({target_phone}).",
+                    created_by_user=assigned_user,
+                )
+
+            spoken_transfer = (
+                "Of course! Connecting you directly with our sales team right away. "
+                "Please hold on for just a moment."
+            )
+            fallback_msg = (
+                "Our sales team is currently assisting other callers on the line, "
+                "but I've flagged your number for an immediate priority callback within 15 minutes."
+            )
+
+            logger.info("Voice Agent initiated transfer for lead %s to %s (%s)", lead.id if lead else 'UNKNOWN', dest_name, target_phone)
+
+            return JsonResponse({
+                'status': 'transfer_initiated',
+                'action': 'transfer',
+                'target_phone_number': target_phone,
+                'destination_name': dest_name,
+                'branch_name': resolved_branch.name if resolved_branch else '',
+                'lead_id': str(lead.id) if lead else None,
+                'spoken_transfer_message': spoken_transfer,
+                'fallback_message': fallback_msg,
+            })
 
 
 @method_decorator(csrf_exempt, name='dispatch')

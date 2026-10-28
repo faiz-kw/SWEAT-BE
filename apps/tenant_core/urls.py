@@ -19,6 +19,8 @@ from .views_voice_agent import (
     VoiceAgentCancelTrialView,
     VoiceAgentCallOutcomeView,
     VoiceAgentCallbackView,
+    VoiceAgentTransferCallView,
+    VoiceAgentStudioFaqView,
 )
 from .views_storage import (
     FileViewSet,
@@ -33,6 +35,7 @@ from .views_privacy import (
 )
 from .views_integrations import TenantIntegrationViewSet
 from .views_security_policy import SecurityPolicyView
+from . import views_telephony
 from .views_audit_outbox import (
     BusinessAuditEventViewSet,
     IdempotencyRecordViewSet,
@@ -363,11 +366,13 @@ urlpatterns = [
     path('classes/metadata/', ClassesMetadataView.as_view(), name='classes-metadata'),
     path('voice-agent/context/', VoiceAgentLeadContextView.as_view(), name='tenant-voice-agent-context'),
     path('voice-agent/branches/', VoiceAgentBranchesView.as_view(), name='tenant-voice-agent-branches'),
+    path('voice-agent/studio-faq/', VoiceAgentStudioFaqView.as_view(), name='tenant-voice-agent-studio-faq'),
     path('voice-agent/classes/', VoiceAgentClassesView.as_view(), name='tenant-voice-agent-classes'),
     path('voice-agent/book-trial/', VoiceAgentBookTrialView.as_view(), name='tenant-voice-agent-book-trial'),
     path('voice-agent/reschedule-trial/', VoiceAgentRescheduleTrialView.as_view(), name='tenant-voice-agent-reschedule-trial'),
     path('voice-agent/cancel-trial/', VoiceAgentCancelTrialView.as_view(), name='tenant-voice-agent-cancel-trial'),
     path('voice-agent/callback/', VoiceAgentCallbackView.as_view(), name='tenant-voice-agent-callback'),
+    path('voice-agent/transfer/', VoiceAgentTransferCallView.as_view(), name='tenant-voice-agent-transfer'),
     path('voice-agent/call-outcome/', VoiceAgentCallOutcomeView.as_view(), name='tenant-voice-agent-call-outcome'),
     path('access-control/events/bulk/', AccessControlBulkIngestView.as_view(), name='access-control-bulk-ingest'),
     path('access-control/sync/', AccessControlSyncPassesView.as_view(), name='access-control-sync-passes'),
@@ -387,5 +392,19 @@ urlpatterns = [
     path('assessments/<uuid:pk>/capture/', AssessmentSessionViewSet.as_view({'post': 'capture_photos'}), name='assessment-capture'),
     path('assessments/<uuid:pk>/approve-and-send/', AssessmentSessionViewSet.as_view({'post': 'approve_and_send'}), name='assessment-approve'),
     path('assessments/pair/', StudioScreenPairingView.as_view(), name='assessment-pair'),
+
+    # Vobiz & Sales CRM Telephony Routes
+    path('telephony/inbound/', views_telephony.VobizInboundWebhookView.as_view(), name='telephony-inbound'),
+    path('telephony/dial-fallback/', views_telephony.VobizInboundFallbackWebhookView.as_view(), name='telephony-dial-fallback'),
+    path('telephony/hangup/', views_telephony.VobizHangupWebhookView.as_view(), name='telephony-hangup'),
+    path('telephony/agent-answer-bridge/', views_telephony.AgentAnswerBridgeXmlView.as_view(), name='telephony-agent-answer-bridge'),
+    path('crm/telephony/click-to-call/', views_telephony.ClickToCallView.as_view(), name='crm-telephony-click-to-call'),
+    path('crm/telephony/disposition/', views_telephony.CallDispositionView.as_view(), name='crm-telephony-disposition'),
+    path('crm/telephony/events/', views_telephony.TelephonyEventsSseView.as_view(), name='crm-telephony-events'),
+    path('crm/telephony/missed-calls/', views_telephony.MissedCallsQueueView.as_view(), name='crm-telephony-missed-calls'),
+    path('crm/telephony/presence/', views_telephony.AgentPresenceView.as_view(), name='crm-telephony-presence'),
+    path('crm/telephony/active/', views_telephony.ActiveInboundCallPollView.as_view(), name='crm-telephony-active'),
+    path('crm/telephony/recordings/<uuid:session_id>/stream/', views_telephony.CallRecordingStreamView.as_view(), name='crm-telephony-recording-stream'),
+
     path('', include(router.urls)),
 ]

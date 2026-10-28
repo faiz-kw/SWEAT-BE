@@ -73,6 +73,7 @@ from .models_crm import (
     TrialBooking,
     IntakeSubmission,
     IntakeAnswer,
+    CallSession,
 )
 from .models_audit_outbox import BusinessAuditEvent
 from .services_memberships import MembershipLifecycleService
@@ -667,6 +668,58 @@ def build_member_timeline(profile: UserProfile, alias: str = 'default', limit: i
                 'status': sub.status,
             },
         })
+
+    # 8. Call History — inbound & outbound calls involving this member by phone number
+    try:
+        phone_digits = (user.phone or '').replace('+', '').replace(' ', '').lstrip('0')[-10:] if user and user.phone else ''
+        if phone_digits:
+            call_sessions = CallSession.objects.using(alias).filter(
+                user_phone_number__icontains=phone_digits
+            ).order_by('-started_at')[:20]
+            for cs in call_sessions:
+                direction = cs.direction or 'INBOUND'
+                mode = cs.call_mode or 'HUMAN_MANUAL'
+                dur = int(cs.duration_seconds or 0)
+                dur_label = f"{dur}s" if dur < 60 else f"{dur // 60}m {dur % 60}s"
+
+                # Determine status label & badge
+                if cs.status in ('COMPLETED', 'ANSWERED') and dur > 0:
+                    outcome_label = 'ANSWERED'
+                    badge = 'green'
+                elif mode == 'AI_INBOUND':
+                    outcome_label = 'AI HANDLED'
+                    badge = 'violet'
+                else:
+                    outcome_label = 'MISSED'
+                    badge = 'rose'
+
+                rep_name = ''
+                if cs.sales_rep:
+                    rep_name = f" · {cs.sales_rep.first_name or 'Rep'}"
+
+                events.append({
+                    'id': f"call-{cs.id}",
+                    'category': 'CRM',
+                    'event_type': f"CALL_{outcome_label.replace(' ', '_')}",
+                    'title': f"{'Inbound' if direction == 'INBOUND' else 'Outbound'} Call · {outcome_label}",
+                    'description': (
+                        f"{outcome_label}: {'AI handled inquiry' if mode == 'AI_INBOUND' else ('Connected ' + dur_label if dur > 0 else 'No answer')}{rep_name}."
+                        + (f" {cs.disposition_notes}" if cs.disposition_notes else "")
+                    ).strip(),
+                    'occurred_at': cs.started_at.isoformat() if cs.started_at else cs.created_at.isoformat(),
+                    'actor': cs.sales_rep.first_name if cs.sales_rep else ('AI Agent' if mode == 'AI_INBOUND' else 'Sales Rep'),
+                    'badge_color': badge,
+                    'metadata': {
+                        'call_session_id': str(cs.id),
+                        'direction': direction,
+                        'mode': mode,
+                        'duration_seconds': dur,
+                        'hangup_cause': cs.hangup_cause or '',
+                        'recording_url': cs.recording_url or '',
+                    },
+                })
+    except Exception as _call_err:
+        logger.warning("build_member_timeline: call session query failed: %s", _call_err)
 
     # Sort all events chronologically descending
     events.sort(key=lambda x: x['occurred_at'], reverse=True)

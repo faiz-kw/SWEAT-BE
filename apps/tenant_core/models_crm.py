@@ -1348,6 +1348,58 @@ class CallSession(models.Model):
     error_code = models.CharField(max_length=100, blank=True, default='')
     error_message = models.TextField(blank=True, default='')
     
+    # --- HUMAN CALLING & VOBIZ TELEPHONY EXTENSIONS ---
+    CALL_MODES = [
+        ('AI_AUTOMATED', 'AI Automated (Sarvam)'),
+        ('HUMAN_MANUAL', 'Human Manual (Vobiz/Zoiper)'),
+    ]
+    DISPOSITION_CHOICES = [
+        ('TRIAL_BOOKED', 'Trial Booked / Scheduled'),
+        ('INTERESTED_FOLLOWUP', 'Interested (Follow-up Scheduled)'),
+        ('PRICE_OBJECTION', 'Price / Budget Objection'),
+        ('LOCATION_DISTANCE', 'Location / Distance Issue'),
+        ('BUSY_CALLBACK', 'Busy - Asked for Callback'),
+        ('RINGING_NO_ANSWER', 'Ringing / No Answer'),
+        ('INVALID_WRONG_NUMBER', 'Invalid / Wrong Number'),
+        ('NOT_INTERESTED', 'Not Interested'),
+        ('CONVERTED_MEMBER', 'Converted to Member'),
+    ]
+
+    call_mode = models.CharField(max_length=30, choices=CALL_MODES, default='AI_AUTOMATED')
+    sales_rep = models.ForeignKey(
+        TenantUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='handled_call_sessions',
+        help_text='Sales representative who handled this call',
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='call_sessions',
+    )
+    bill_duration_seconds = models.IntegerField(default=0, help_text='Billed seconds based on 60s pulse')
+    is_meaningful = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text='True if connected and duration >= 30 seconds',
+    )
+    disposition = models.CharField(
+        max_length=50,
+        choices=DISPOSITION_CHOICES,
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+    disposition_notes = models.TextField(blank=True, default='')
+    disposition_submitted_at = models.DateTimeField(null=True, blank=True)
+    recording_url = models.URLField(max_length=1000, blank=True, default='')
+    recording_storage_key = models.CharField(max_length=500, blank=True, default='')
+    hangup_cause = models.CharField(max_length=100, blank=True, default='')
+
     idempotency_key = models.CharField(
         max_length=255,
         null=True,
@@ -1366,6 +1418,8 @@ class CallSession(models.Model):
             models.Index(fields=['organization', 'status'], name='idx_call_org_status'),
             models.Index(fields=['lead', 'created_at'], name='idx_call_lead_created'),
             models.Index(fields=['provider', 'provider_attempt_id'], name='idx_call_prov_attempt'),
+            models.Index(fields=['sales_rep', 'created_at'], name='idx_call_rep_created'),
+            models.Index(fields=['organization', 'is_meaningful'], name='idx_call_org_meaningful'),
         ]
         constraints = [
             models.UniqueConstraint(
@@ -1382,6 +1436,56 @@ class CallSession(models.Model):
 
     def __str__(self):
         return f"CallSession({self.id} {self.direction} to {self.user_phone_number} [{self.status}])"
+
+
+class AgentPresence(models.Model):
+    """Tracks real-time telephony availability of sales agents."""
+    STATUS_CHOICES = [
+        ('OFFLINE', 'Offline'),
+        ('AVAILABLE', 'Available'),
+        ('ON_CALL', 'On Active Call'),
+        ('WRAP_UP', 'In Wrap-Up (Completing Notes)'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey(
+        Organization,
+        on_delete=models.CASCADE,
+        related_name='agent_presences',
+        db_column='organization_id',
+    )
+    user = models.OneToOneField(
+        TenantUser,
+        on_delete=models.CASCADE,
+        related_name='telephony_presence',
+        db_column='user_id',
+    )
+    sip_username = models.CharField(max_length=100, unique=True, help_text='e.g. agent_priya')
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default='OFFLINE',
+        db_index=True,
+    )
+    last_heartbeat = models.DateTimeField(auto_now=True)
+    active_session = models.ForeignKey(
+        CallSession,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        db_column='active_session_id',
+    )
+
+    class Meta:
+        app_label = 'tenant_core'
+        db_table = 'crm_telephony_agent_presence'
+        indexes = [
+            models.Index(fields=['organization', 'status'], name='idx_pres_org_status'),
+        ]
+
+    def __str__(self):
+        return f"{self.user.email} [{self.sip_username}]: {self.status}"
+
 
 
 

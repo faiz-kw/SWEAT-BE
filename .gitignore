@@ -90,3 +90,6 @@ celerybeat-schedule*
 
 # Excel exports
 *.xlsx
+
+# Scratch directory
+scratch/

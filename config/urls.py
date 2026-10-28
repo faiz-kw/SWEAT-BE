@@ -29,7 +29,10 @@ from apps.tenant_core.views_voice_agent import (
     VoiceAgentCallOutcomeView,
     VoiceAgentCallbackView,
     VoiceAgentRecordingAudioView,
+    VoiceAgentTransferCallView,
+    VoiceAgentStudioFaqView,
 )
+from apps.tenant_core import views_telephony
 
 # Django admin branding
 admin.site.site_header = "PerformanceOS • Platform Control Panel"
@@ -60,15 +63,31 @@ urlpatterns = [
     # AI Voice Agent CRM Tools (Sarvam Function Calling)
     path('api/v1/voice-agent/context/', VoiceAgentLeadContextView.as_view(), name='voice-agent-context'),
     path('api/v1/voice-agent/branches/', VoiceAgentBranchesView.as_view(), name='voice-agent-branches'),
+    path('api/tenant/voice-agent/branches/', VoiceAgentBranchesView.as_view(), name='voice-agent-branches-tenant'),
+    path('api/v1/voice-agent/studio-faq/', VoiceAgentStudioFaqView.as_view(), name='voice-agent-studio-faq'),
+    path('api/tenant/telephony/voice-agent/studio-faq/', VoiceAgentStudioFaqView.as_view(), name='voice-agent-studio-faq-telephony'),
+    path('api/tenant/voice-agent/studio-faq/', VoiceAgentStudioFaqView.as_view(), name='voice-agent-studio-faq-tenant'),
+    path('api/voice-agent/studio-faq/', VoiceAgentStudioFaqView.as_view(), name='voice-agent-studio-faq-short'),
     path('api/v1/voice-agent/classes/', VoiceAgentClassesView.as_view(), name='voice-agent-classes'),
+    path('api/tenant/voice-agent/classes/', VoiceAgentClassesView.as_view(), name='voice-agent-classes-tenant'),
     path('api/v1/voice-agent/book-trial/', VoiceAgentBookTrialView.as_view(), name='voice-agent-book-trial'),
+    path('api/tenant/voice-agent/book-trial/', VoiceAgentBookTrialView.as_view(), name='voice-agent-book-trial-tenant'),
     path('api/v1/voice-agent/reschedule-trial/', VoiceAgentRescheduleTrialView.as_view(), name='voice-agent-reschedule-trial'),
     path('api/v1/voice-agent/cancel-trial/', VoiceAgentCancelTrialView.as_view(), name='voice-agent-cancel-trial'),
     path('api/v1/voice-agent/callback/', VoiceAgentCallbackView.as_view(), name='voice-agent-callback'),
+    path('api/v1/voice-agent/transfer/', VoiceAgentTransferCallView.as_view(), name='voice-agent-transfer'),
+    path('api/tenant/telephony/voice-agent/transfer/', VoiceAgentTransferCallView.as_view(), name='voice-agent-transfer-telephony'),
+    path('api/tenant/voice-agent/transfer/', VoiceAgentTransferCallView.as_view(), name='voice-agent-transfer-tenant'),
+    path('api/voice-agent/transfer/', VoiceAgentTransferCallView.as_view(), name='voice-agent-transfer-short'),
     path('api/v1/voice-agent/call-outcome/', VoiceAgentCallOutcomeView.as_view(), name='voice-agent-call-outcome'),
     path('api/v1/voice-agent/recordings/<uuid:session_id>/audio/', VoiceAgentRecordingAudioView.as_view(), name='voice-agent-recording-audio'),
     path('api/v1/voice-agent/recordings/<uuid:session_id>/audio.wav', VoiceAgentRecordingAudioView.as_view(), name='voice-agent-recording-audio-wav'),
     path('api/v1/voice-agent/recordings/<uuid:session_id>/audio', VoiceAgentRecordingAudioView.as_view(), name='voice-agent-recording-audio-bare'),
+    # Vobiz Carrier Telephony Direct Webhooks
+    path('api/v1/telephony/inbound/', views_telephony.VobizInboundWebhookView.as_view(), name='vobiz-inbound-root'),
+    path('api/v1/telephony/dial-fallback/', views_telephony.VobizInboundFallbackWebhookView.as_view(), name='vobiz-fallback-root'),
+    path('api/v1/telephony/hangup/', views_telephony.VobizHangupWebhookView.as_view(), name='vobiz-hangup-root'),
+    path('api/v1/telephony/agent-answer-bridge/', views_telephony.AgentAnswerBridgeXmlView.as_view(), name='vobiz-agent-bridge-root'),
 
     # Tenant Admin — Org/Branch/User/RBAC management (scoped to tenant DB)
     path('api/v1/admin/', include('apps.tenant_core.urls')),
