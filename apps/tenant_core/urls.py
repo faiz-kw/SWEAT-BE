@@ -405,6 +405,8 @@ urlpatterns = [
     path('crm/telephony/presence/', views_telephony.AgentPresenceView.as_view(), name='crm-telephony-presence'),
     path('crm/telephony/active/', views_telephony.ActiveInboundCallPollView.as_view(), name='crm-telephony-active'),
     path('crm/telephony/recordings/<uuid:session_id>/stream/', views_telephony.CallRecordingStreamView.as_view(), name='crm-telephony-recording-stream'),
+    path('crm/telephony/webrtc-credentials/', views_telephony.AgentWebRTCCredentialsView.as_view(), name='crm-telephony-webrtc-credentials'),
+    path('crm/telephony/config/', views_telephony.TelephonyConfigView.as_view(), name='crm-telephony-config'),
 
     path('', include(router.urls)),
 ]

@@ -562,9 +562,44 @@ class LeadViewSet(viewsets.ModelViewSet):
             qs = qs.filter(Q(branch_id=branch_id) | Q(branch_id__isnull=True))
         # --- FIX: INCLUDE ORGANIZATION-WIDE LEADS IN SINGLE BRANCH FILTER END ---
 
-        assigned_to_me = self.request.query_params.get('assigned_to_me')
-        if assigned_to_me and str(assigned_to_me).lower() in ('true', '1'):
-            qs = qs.filter(assigned_sales_user=self.request.user)
+        my_day = self.request.query_params.get('my_day')
+        if my_day and str(my_day).lower() in ('true', '1'):
+            today = timezone.localdate()
+            qs = qs.filter(assigned_sales_user=self.request.user).exclude(
+                current_status__in=['CONVERTED', 'DEAL_DONE', 'SUBSCRIBED', 'LOST', 'NOT_INTERESTED']
+            )
+            bucket = str(self.request.query_params.get('my_day_bucket') or 'ALL').upper()
+            if bucket == 'NEW':
+                qs = qs.filter(current_status='NEW_LEAD')
+            elif bucket == 'DUE_TODAY':
+                qs = qs.filter(followup_tasks__status='PENDING', followup_tasks__due_at__date=today).distinct()
+            elif bucket == 'OVERDUE':
+                qs = qs.filter(Q(followup_tasks__status='PENDING', followup_tasks__due_at__date__lt=today) | Q(sla_status='BREACHED')).distinct()
+            else:
+                qs = qs.filter(
+                    Q(current_status='NEW_LEAD') |
+                    Q(followup_tasks__status='PENDING', followup_tasks__due_at__date__lte=today) |
+                    Q(sla_status='BREACHED')
+                ).distinct()
+        else:
+            assigned_to_me = self.request.query_params.get('assigned_to_me')
+            if assigned_to_me and str(assigned_to_me).lower() in ('true', '1'):
+                qs = qs.filter(assigned_sales_user=self.request.user)
+
+            my_team = self.request.query_params.get('my_team')
+            if my_team and str(my_team).lower() in ('true', '1'):
+                from apps.tenant_core.models_users import TenantUser
+                team_ids = [self.request.user.id]
+                try:
+                    emp_prof = getattr(getattr(self.request.user, 'profile', None), 'employee_profile', None)
+                    if emp_prof:
+                        direct_reports = list(TenantUser.objects.using(_get_db(self.request)).filter(
+                            profile__employee_profile__reporting_manager=emp_prof
+                        ).values_list('id', flat=True))
+                        team_ids.extend(direct_reports)
+                except Exception:
+                    pass
+                qs = qs.filter(assigned_sales_user_id__in=team_ids)
 
         unassigned = self.request.query_params.get('unassigned')
         if unassigned and str(unassigned).lower() in ('true', '1'):
@@ -869,12 +904,97 @@ class LeadViewSet(viewsets.ModelViewSet):
 
             trials_count = max(agg['trials_status'] or 0, tb_qs.count())
 
+        # Calculate My Day Focus metrics for the requesting user
+        my_day_metrics = {'total': 0, 'new_leads': 0, 'due_today': 0, 'overdue': 0}
+        if request.user and getattr(request.user, 'is_authenticated', False):
+            try:
+                today = timezone.localdate()
+                my_day_base = Lead.objects.using(alias).filter(
+                    organization=org,
+                    assigned_sales_user=request.user
+                ).exclude(current_status__in=['CONVERTED', 'DEAL_DONE', 'SUBSCRIBED', 'LOST', 'NOT_INTERESTED'])
+
+                my_day_new = my_day_base.filter(current_status='NEW_LEAD').count()
+                my_day_due = my_day_base.filter(followup_tasks__status='PENDING', followup_tasks__due_at__date=today).distinct().count()
+                my_day_over = my_day_base.filter(Q(followup_tasks__status='PENDING', followup_tasks__due_at__date__lt=today) | Q(sla_status='BREACHED')).distinct().count()
+                my_day_tot = my_day_base.filter(
+                    Q(current_status='NEW_LEAD') |
+                    Q(followup_tasks__status='PENDING', followup_tasks__due_at__date__lte=today) |
+                    Q(sla_status='BREACHED')
+                ).distinct().count()
+
+                my_day_metrics = {
+                    'total': my_day_tot,
+                    'new_leads': my_day_new,
+                    'due_today': my_day_due,
+                    'overdue': my_day_over,
+                }
+            except Exception as e:
+                pass
+
+        # Calculate Daily Quota progress for requesting user
+        daily_quota = {
+            'dials_target': 40,
+            'dials_completed': 0,
+            'talk_time_target_minutes': 30,
+            'talk_time_completed_minutes': 0,
+            'trials_target': 2,
+            'trials_completed': 0,
+            'completion_pct': 0,
+        }
+        team_summary = {
+            'has_team': False,
+            'team_members_count': 1,
+        }
+
+        if request.user and getattr(request.user, 'is_authenticated', False):
+            try:
+                from apps.tenant_core.models_crm import CallSession
+                from apps.tenant_core.models_users import TenantUser
+
+                today = timezone.localdate()
+                today_calls = CallSession.objects.using(alias).filter(
+                    organization=org,
+                    sales_rep=request.user,
+                    started_at__date=today,
+                )
+                today_dials = today_calls.count()
+                today_talk_secs = sum(int(c.duration_seconds or 0) for c in today_calls)
+                today_trials = today_calls.filter(disposition='TRIAL_BOOKED').count()
+
+                dials_target = 40
+                daily_quota = {
+                    'dials_target': dials_target,
+                    'dials_completed': today_dials,
+                    'talk_time_target_minutes': 30,
+                    'talk_time_completed_minutes': round(today_talk_secs / 60, 1),
+                    'trials_target': 2,
+                    'trials_completed': today_trials,
+                    'completion_pct': min(100, round((today_dials / dials_target) * 100)) if dials_target else 0,
+                }
+
+                emp_prof = getattr(getattr(request.user, 'profile', None), 'employee_profile', None)
+                if emp_prof:
+                    reports_cnt = TenantUser.objects.using(alias).filter(
+                        profile__employee_profile__reporting_manager=emp_prof
+                    ).count()
+                    if reports_cnt > 0:
+                        team_summary = {
+                            'has_team': True,
+                            'team_members_count': reports_cnt + 1,
+                        }
+            except Exception:
+                pass
+
         return Response({
             'total': total_count,
             'inquiries': inquiries_count,
             'trials': trials_count,
             'converted': converted_count,
             'sla_breaches': 0,
+            'my_day': my_day_metrics,
+            'daily_quota': daily_quota,
+            'team': team_summary,
         })
 
     @action(detail=False, methods=['get'], url_path='summary_metrics')
@@ -1897,6 +2017,32 @@ class LeadViewSet(viewsets.ModelViewSet):
             'status': 'SUCCESS',
             'emitted_events_count': count,
         })
+
+    @action(detail=False, methods=['post'], url_path='recycle-stale')
+    def recycle_stale_leads(self, request):
+        """
+        Admin/Manager action to scan and recycle uncontacted leads (>4h SLA breach)
+        and dormant untouched leads (>7d) to available on-duty sales representatives.
+        """
+        alias = _get_db(request)
+        org = _get_org(request)
+        dry_run = str(request.data.get('dry_run', 'false')).lower() in ('true', '1')
+        sla_hours = int(request.data.get('sla_hours', 4))
+        dormant_days = int(request.data.get('dormant_days', 7))
+
+        from .services_lead_recycling import LeadRecyclingService
+        results = LeadRecyclingService.run_tenant_recycling(
+            organization=org,
+            sla_hours=sla_hours,
+            dormant_days=dormant_days,
+            db_alias=alias,
+            dry_run=dry_run,
+        )
+        return Response({
+            'status': 'SUCCESS',
+            'results': results,
+        })
+
 
     # ------------------------------------------------------------------
     # CRM PHASE 8 — CONVERSION ENDPOINTS

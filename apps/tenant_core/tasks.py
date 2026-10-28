@@ -578,6 +578,60 @@ def process_booking_auto_cancellations_periodic_task(self, tenant_id: str = None
         return {'status': 'FAILED', 'tenant_id': str(tenant_id), 'error': str(exc)}
 
 
+
+
+@shared_task(
+    bind=True,
+    name='apps.tenant_core.tasks.recycle_stale_leads_periodic_task',
+    max_retries=2,
+    acks_late=True,
+)
+def recycle_stale_leads_periodic_task(self, tenant_id: str = None, dry_run: bool = False, **kwargs) -> dict:
+    """
+    Periodic task to scan and auto-recycle stale leads (uncontacted > 4h SLA breach, dormant > 7d)
+    across active tenant organizations.
+    """
+    from .context import tenant_database_context
+    from .models_org import Organization
+    from .services_lead_recycling import LeadRecyclingService
+
+    if tenant_id:
+        tenant_ids = [tenant_id]
+    else:
+        try:
+            from apps.master.models import TenantDataSource
+            tenant_ids = list(
+                TenantDataSource.objects.using('default').filter(
+                    status='ACTIVE'
+                ).values_list('tenant_id', flat=True)
+            )
+        except Exception:
+            tenant_ids = []
+
+    total_results = []
+    for tid in tenant_ids:
+        try:
+            with tenant_database_context(tid) as db_alias:
+                orgs = Organization.objects.using(db_alias).filter(status='ACTIVE')
+                for org in orgs:
+                    res = LeadRecyclingService.run_tenant_recycling(
+                        organization=org,
+                        sla_hours=4,
+                        dormant_days=7,
+                        db_alias=db_alias,
+                        dry_run=dry_run,
+                    )
+                    total_results.append(res)
+        except Exception as exc:
+            logger.error('recycle_stale_leads_periodic_task error for tenant %s: %s', tid, exc)
+
+    return {
+        'status': 'COMPLETED',
+        'tenants_processed': len(tenant_ids),
+        'results': total_results,
+    }
+
+
 # Ensure specialized task modules are loaded and registered when Celery imports tasks.py
 from .tasks_voice_calling import (  # noqa: F401
     trigger_automated_sarvam_call_task,

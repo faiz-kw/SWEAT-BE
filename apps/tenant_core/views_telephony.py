@@ -44,6 +44,7 @@ from apps.tenant_core.models_memberships import Membership
 
 from apps.tenant_core.communication.adapters.voice_vobiz import VobizVoiceAdapter
 from apps.tenant_core.services_voice_calling import VoiceCallingService
+from apps.tenant_core.services_telephony_config import TelephonyConfigService
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +134,8 @@ class VobizInboundWebhookView(APIView):
             data = request.data if isinstance(request.data, dict) else {}
             call_uuid = data.get('CallUUID') or data.get('call_uuid') or request.POST.get('CallUUID', '')
             caller_phone = VoiceCallingService.normalize_phone(data.get('From') or request.POST.get('From', ''))
-            did_number = data.get('To') or request.POST.get('To', '') or os.getenv('VOBIZ_VIRTUAL_DID', '+919240954144')
+            vobiz_cfg = TelephonyConfigService.get_vobiz_config()
+            did_number = data.get('To') or request.POST.get('To', '') or vobiz_cfg['from_number']
 
             logger.info("Vobiz Inbound Call: UUID=%s From=%s To=%s", call_uuid, caller_phone, did_number)
 
@@ -188,49 +190,19 @@ class VobizInboundWebhookView(APIView):
                 xml = """<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>"""
                 return HttpResponse(xml, content_type="application/xml; charset=utf-8")
 
-            # 4. Check Rep Availability — prioritize real registered SIP endpoint (iqra24030269280035568)
+            # 4. Check Rep Availability dynamically (zero hardcoded strings)
             assigned_rep = None
             if lead and lead.assigned_sales_user:
                 assigned_rep = lead.assigned_sales_user
             elif lead and getattr(lead, 'assigned_to', None):
                 assigned_rep = lead.assigned_to
 
-            presence = None
-            if assigned_rep:
-                presence = AgentPresence.objects.filter(
-                    user=assigned_rep,
-                    status='AVAILABLE',
-                ).first()
-
-            if not presence:
-                presence = AgentPresence.objects.filter(
-                    status='AVAILABLE',
-                    sip_username='iqra24030269280035568'
-                ).first()
-
-            if not presence:
-                presence = AgentPresence.objects.filter(
-                    status='AVAILABLE'
-                ).exclude(sip_username__icontains='test').first()
-
-            # Self-healing fallback: auto-recover registered endpoint if in stale state.
-            # Also auto-releases agents stuck in WRAP_UP > 10 minutes (forgotten disposition modal).
-            if not presence:
-                ten_min_ago = timezone.now() - timedelta(minutes=10)
-                stale_wraup = AgentPresence.objects.filter(
-                    sip_username='iqra24030269280035568',
-                    status='WRAP_UP',
-                    last_heartbeat__lt=ten_min_ago,
-                ).first() or AgentPresence.objects.filter(
-                    sip_username='iqra24030269280035568',
-                    status__in=['WRAP_UP', 'OFFLINE'],
-                ).first()
-                if stale_wraup:
-                    logger.info("Self-heal: Releasing stale %s agent presence for %s", stale_wraup.status, stale_wraup.sip_username)
-                    stale_wraup.status = 'AVAILABLE'
-                    stale_wraup.active_session = None
-                    stale_wraup.save(update_fields=['status', 'active_session'])
-                    presence = stale_wraup
+            caller_branch = caller_user.home_branch if caller_user else (lead.branch if lead else None)
+            presence = TelephonyConfigService.get_available_agent(
+                org=org,
+                preferred_user=assigned_rep,
+                caller_branch=caller_branch,
+            )
 
             # 5. Create CallSession in database (idempotent for webhook retries)
             target_rep = presence.user if presence else assigned_rep
@@ -307,14 +279,14 @@ class VobizInboundWebhookView(APIView):
                 # Build VobizXML — dial agent's registered SIP endpoint
                 host = _get_webhook_host(request)
                 fallback_url = f"{host}/api/v1/telephony/dial-fallback/?session_id={session.id}"
-                did_caller_id = did_number if did_number.startswith('+') else "+919240954144"
-                agent_sip = f"sip:{presence.sip_username}@registrar.vobiz.ai"
+                did_caller_id = did_number if did_number.startswith('+') else vobiz_cfg['from_number']
+                agent_sip = f"sip:{presence.sip_username}@{vobiz_cfg['registrar_host']}"
                 xml = VobizVoiceAdapter.build_inbound_dial_xml(
                     agent_sip_uri=agent_sip,
                     caller_id=did_caller_id,
                     fallback_action_url=fallback_url,
-                    timeout=20,
-                    record=True,
+                    timeout=vobiz_cfg['ring_timeout_sec'],
+                    record=vobiz_cfg['record_all_calls'],
                 )
                 logger.info("Generated Inbound Dial XML:\n%s", xml)
                 return HttpResponse(xml, content_type="application/xml; charset=utf-8")
@@ -1084,3 +1056,62 @@ class CallRecordingStreamView(APIView):
         resp['Access-Control-Expose-Headers'] = 'Content-Range, Content-Length, Accept-Ranges'
         return resp
 
+
+
+class AgentWebRTCCredentialsView(APIView):
+    """
+    GET /api/v1/tenant/crm/telephony/webrtc-credentials/
+    Returns the authenticated sales agent's dynamic WebRTC credentials.
+    Used by the in-browser WebPhone to auto-register against the Vobiz WSS gateway.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        # RBAC Check: Ensure user has Sales/CRM permission or is Admin
+        from apps.tenant_core.rbac_engine import RBACAuthorizationEngine
+        allowed, reason, check_code = RBACAuthorizationEngine.evaluate(
+            user=request.user,
+            required_module='crm',
+            required_submodule='leads',
+            required_permission='crm.leads.view',
+            request=request,
+        )
+        if not allowed and not getattr(request.user, 'is_superuser', False) and not getattr(request.user, 'is_staff', False):
+            return Response(
+                {'error': 'User is not authorized for sales telephony. Sales/CRM permission required.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        with resolve_telephony_tenant_context():
+            creds = TelephonyConfigService.get_agent_webrtc_credentials(request.user)
+            return Response(creds, status=status.HTTP_200_OK)
+
+
+class TelephonyConfigView(APIView):
+    """
+    GET / POST /api/v1/tenant/crm/telephony/config/
+    Allows tenant administrators to view and dynamically update Vobiz telephony configuration.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        with resolve_telephony_tenant_context():
+            cfg = TelephonyConfigService.get_vobiz_config()
+            raw_token = cfg.get('auth_token', '')
+            masked_token = f"{raw_token[:4]}••••••••{raw_token[-4:]}" if len(raw_token) > 8 else "••••••••"
+            safe_cfg = dict(cfg)
+            safe_cfg['auth_token_masked'] = masked_token
+            safe_cfg.pop('auth_token', None)
+            return Response(safe_cfg, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        with resolve_telephony_tenant_context():
+            updated = TelephonyConfigService.update_vobiz_config(request.data)
+            safe_updated = dict(updated)
+            safe_updated['auth_token_masked'] = "••••••••"
+            safe_updated.pop('auth_token', None)
+            return Response({
+                'success': True,
+                'message': 'Telephony configuration updated successfully.',
+                'config': safe_updated,
+            }, status=status.HTTP_200_OK)

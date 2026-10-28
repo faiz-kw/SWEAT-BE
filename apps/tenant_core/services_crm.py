@@ -963,11 +963,14 @@ class CRMLeadService:
             elif is_call_act and not has_call_sessions:
                 ev_type = 'VOICE_CALL'
 
+            is_verified = bool(act.external_reference)
             act_metadata = {
                 'activity_type': act.activity_type,
                 'outcome': act.outcome,
                 'notes': act.notes,
                 'is_reminder': is_reminder_act,
+                'is_verified_call': is_verified if is_call_act else None,
+                'call_session_id': act.external_reference if is_verified else None,
             }
             # Only attach audio card metadata to generic LeadActivity if no CallSession exists,
             # preventing duplicate audio players on the unified timeline.
@@ -1152,6 +1155,7 @@ class CRMLeadService:
                     'channel': 'VOICE',
                     'metadata': {
                         'call_session_id': str(cs.id),
+                        'is_verified_call': True,
                         'provider_attempt_id': cs.provider_attempt_id,
                         'status': cs.status,
                         'direction': cs.direction,
