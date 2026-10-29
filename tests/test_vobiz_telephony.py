@@ -92,7 +92,7 @@ class VobizTelephonyTests(TestCase):
         self.assertIn('<Dial', xml)
         self.assertIn('timeout="15"', xml)
         self.assertIn('callerId="+919200000001"', xml)
-        self.assertIn('<User>sip:agent_priya@registrar.vobiz.ai</User>', xml)
+        self.assertIn('<User>agent_priya</User>', xml)
 
     def test_agent_bridge_customer_xml_generation(self):
         """Generates whisper tone and bridges customer on PSTN."""
@@ -117,7 +117,7 @@ class VobizTelephonyTests(TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res['Content-Type'], 'application/xml; charset=utf-8')
         content = res.content.decode('utf-8')
-        self.assertIn('sip:agent_priya@registrar.vobiz.ai', content)
+        self.assertIn('<User>agent_priya</User>', content)
         self.assertIn('timeout="20"', content)
 
         # Verify CallSession created in DB
