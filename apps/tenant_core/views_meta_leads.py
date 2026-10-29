@@ -353,6 +353,7 @@ class MetaAccessMixin:
         'reconnect': 'crm.settings.edit',
         'health': 'crm.settings.view',
         'retry_failed': 'crm.settings.edit',
+        'connect_token': 'crm.settings.edit',
     }
     pagination_class = MetaPagination
 
@@ -961,6 +962,65 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
                 'pages': discovered_pages,
                 'expires_at': expires_at.isoformat(),
             })
+
+    @action(detail=False, methods=['post'], url_path='connect-token')
+    def connect_token(self, request):
+        user_token = (request.data.get('access_token') or request.data.get('user_token') or '').strip()
+        if not user_token:
+            raise ValidationError({'access_token': 'Facebook User Access Token is required.'})
+
+        client = MetaGraphClient()
+        try:
+            user_info = client.fetch_user_profile(user_token)
+            meta_user_id = str(user_info.get('id') or '')
+            meta_user_name = user_info.get('name', 'Facebook User')
+        except Exception as exc:
+            return Response({'error': f'Failed to verify Facebook token: {exc}'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Attempt exchange for long-lived 60d token if possible
+        try:
+            from apps.tenant_core.services_meta_graph import GRAPH_API_BASE
+            resp2 = requests.get(
+                f"{GRAPH_API_BASE}/oauth/access_token",
+                params={
+                    'grant_type': 'fb_exchange_token',
+                    'client_id': client.app_id,
+                    'client_secret': client.app_secret,
+                    'fb_exchange_token': user_token,
+                },
+                timeout=client.timeout,
+            )
+            data2 = resp2.json()
+            if 'access_token' in data2:
+                user_token = data2['access_token']
+        except Exception:
+            pass
+
+        from datetime import timedelta
+        expires_at = timezone.now() + timedelta(days=60)
+        master_tenant_id = self.get_tenant_id()
+
+        discovered_pages = self._persist_meta_connection(
+            db_alias=self.alias,
+            organization=self.organization,
+            tenant_id=master_tenant_id,
+            initiating_user_id=str(request.user.id) if request.user else None,
+            request=request,
+            user_token=user_token,
+            meta_user_id=meta_user_id,
+            meta_user_name=meta_user_name,
+            expires_at=expires_at,
+            client=client,
+        )
+
+        return Response({
+            'status': 'CONNECTED',
+            'meta_user_id': meta_user_id,
+            'meta_user_name': meta_user_name,
+            'pages_count': len(discovered_pages),
+            'pages': discovered_pages,
+            'expires_at': expires_at.isoformat(),
+        })
 
     @action(detail=False, methods=['get'], url_path='connection')
     def connection(self, request):
