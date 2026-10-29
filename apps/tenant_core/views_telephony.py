@@ -542,20 +542,15 @@ class ClickToCallView(APIView):
         if not lead or not lead.phone_normalized:
             return Response({'error': 'Lead not found or has no phone number.'}, status=status.HTTP_404_NOT_FOUND)
 
-        # 2. Resolve Agent Presence & SIP Endpoint — use registered Vobiz endpoint
-        presence = AgentPresence.objects.filter(
-            user=user,
-            sip_username='iqra24030269280035568',
-        ).first()
+        # 2. Resolve Agent Presence & SIP Endpoint — prioritize user's own configured presence
+        presence = AgentPresence.objects.filter(user=user).first()
         if not presence:
-            presence = AgentPresence.objects.filter(sip_username='iqra24030269280035568').first()
-        if not presence:
-            presence = AgentPresence.objects.filter(user=user).first()
+            presence = AgentPresence.objects.filter(sip_username='iqra24090269280035568').first()
         if not presence:
             presence = AgentPresence.objects.create(
                 organization=lead.organization,
                 user=user,
-                sip_username='iqra24030269280035568',
+                sip_username='iqra24090269280035568',
                 status='AVAILABLE',
             )
 
