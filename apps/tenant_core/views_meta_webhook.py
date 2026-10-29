@@ -261,26 +261,18 @@ class MetaLeadWebhookView(APIView):
                                 if workers:
                                     process_meta_lead_import_task.delay(str(tenant.id), str(event.id))
                                     dispatched = True
-                            except Exception:
-                                pass
-
-                            if not dispatched:
-                                try:
-                                    process_live_import(organization=org, event_id=str(event.id), actor_user=None, alias=alias)
-                                except Exception as fallback_exc:
-                                    logger.error("Synchronous inline re-processing failed for MetaLeadImport %s: %s", event.id, fallback_exc)
-                                enqueued_count += 1
-                                log_meta_event(
-                                    EVT_IMPORT_QUEUED,
-                                    "Existing pending MetaLeadImport re-enqueued for processing",
-                                    correlation_id=correlation_id,
-                                    import_id=str(event.id),
-                                    tenant_id=str(tenant.id),
-                                    page_id=change_page_id,
-                                    form_id=form_id,
-                                    leadgen_id=leadgen_id,
-                                    status=event.status,
-                                )
+                                    enqueued_count += 1
+                                    log_meta_event(
+                                        EVT_IMPORT_QUEUED,
+                                        "Existing pending MetaLeadImport re-enqueued for processing",
+                                        correlation_id=correlation_id,
+                                        import_id=str(event.id),
+                                        tenant_id=str(tenant.id),
+                                        page_id=change_page_id,
+                                        form_id=form_id,
+                                        leadgen_id=leadgen_id,
+                                        status=event.status,
+                                    )
                             except Exception as dispatch_exc:
                                 pending_recovery_count += 1
                                 logger.error(
@@ -302,6 +294,13 @@ class MetaLeadWebhookView(APIView):
                                     extra={'dispatch_error': str(dispatch_exc)[:100]},
                                     level=logging.ERROR,
                                 )
+
+                            if not dispatched:
+                                try:
+                                    process_live_import(organization=org, event_id=str(event.id), actor_user=None, alias=alias)
+                                    enqueued_count += 1
+                                except Exception as fallback_exc:
+                                    logger.error("Synchronous inline re-processing failed for MetaLeadImport %s: %s", event.id, fallback_exc)
                         else:
                             duplicate_ignored_count += 1
                             log_meta_event(
