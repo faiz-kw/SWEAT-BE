@@ -36,6 +36,7 @@ from .views_privacy import (
 from .views_integrations import TenantIntegrationViewSet
 from .views_security_policy import SecurityPolicyView
 from . import views_telephony
+from . import views_public_trial
 from .views_audit_outbox import (
     BusinessAuditEventViewSet,
     IdempotencyRecordViewSet,
@@ -397,6 +398,7 @@ urlpatterns = [
     path('telephony/inbound/', views_telephony.VobizInboundWebhookView.as_view(), name='telephony-inbound'),
     path('telephony/dial-fallback/', views_telephony.VobizInboundFallbackWebhookView.as_view(), name='telephony-dial-fallback'),
     path('telephony/hangup/', views_telephony.VobizHangupWebhookView.as_view(), name='telephony-hangup'),
+    path('telephony/recording/', views_telephony.VobizRecordingWebhookView.as_view(), name='telephony-recording'),
     path('telephony/agent-answer-bridge/', views_telephony.AgentAnswerBridgeXmlView.as_view(), name='telephony-agent-answer-bridge'),
     path('crm/telephony/click-to-call/', views_telephony.ClickToCallView.as_view(), name='crm-telephony-click-to-call'),
     path('crm/telephony/disposition/', views_telephony.CallDispositionView.as_view(), name='crm-telephony-disposition'),
@@ -409,6 +411,11 @@ urlpatterns = [
     path('crm/telephony/config/', views_telephony.TelephonyConfigView.as_view(), name='crm-telephony-config'),
     path('crm/telephony/analytics/', views_telephony.TelephonyAnalyticsView.as_view(), name='crm-telephony-analytics'),
     path('crm/telephony/export/', views_telephony.TelephonyExportView.as_view(), name='crm-telephony-export'),
+
+    # 1-Tap Public WhatsApp Action Endpoints (Confirm, Reschedule, Pass)
+    path('trials/public/confirm/<str:token>/', views_public_trial.PublicTrialConfirmationView.as_view(), name='trial-public-confirm'),
+    path('trials/public/reschedule/<str:token>/', views_public_trial.PublicTrialRescheduleView.as_view(), name='trial-public-reschedule'),
+    path('trials/public/pass/<str:token>/', views_public_trial.PublicTrialPassView.as_view(), name='trial-public-pass'),
 
     path('', include(router.urls)),
 ]

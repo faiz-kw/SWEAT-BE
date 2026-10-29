@@ -138,7 +138,7 @@ class WhatsAppAutomationService:
             return None
 
         var_map = policy.trial_confirmation_variable_map or [
-            'lead_name', 'class_name', 'start_datetime', 'trainer_name'
+            'lead_name', 'class_name', 'start_date', 'start_time', 'branch_name', 'branch_address', 'branch_maps_url'
         ]
         resolver = WhatsAppVariableResolver(
             trial=trial,
@@ -147,12 +147,23 @@ class WhatsAppAutomationService:
         )
         resolved_params = resolver.resolve(var_map)
 
+        name = resolved_params[0] if len(resolved_params) > 0 else "there"
+        cname = resolved_params[1] if len(resolved_params) > 1 else "Session"
+        cdate = resolved_params[2] if len(resolved_params) > 2 else ""
+        ctime = resolved_params[3] if len(resolved_params) > 3 else ""
+        bname = resolved_params[4] if len(resolved_params) > 4 else "SWEAT Studio"
+        baddr = resolved_params[5] if len(resolved_params) > 5 else ""
+        bmaps = resolved_params[6] if len(resolved_params) > 6 else ""
+
         preview_body = (
-            f"Hi {resolved_params[0] if len(resolved_params) > 0 else 'there'}, "
-            f"your trial session is booked for {resolved_params[1] if len(resolved_params) > 1 else 'Trial'} "
-            f"at {resolved_params[2] if len(resolved_params) > 2 else ''} "
-            f"with Trainer {resolved_params[3] if len(resolved_params) > 3 else ''}. "
-            "Reply CONFIRM to confirm or RESCHEDULE to change."
+            f"Hey {name}! 🔥\n\n"
+            f"You're locked in for your trial session at SWEAT! Here are your session details:\n\n"
+            f"🏋️ Class: {cname}\n"
+            f"🗓️ Date: {cdate}\n"
+            f"⏰ Time: {ctime}\n"
+            f"📍 Studio: SWEAT {bname} ({baddr})\n"
+            f"🧭 Directions: {bmaps}\n\n"
+            "Get ready to experience the burn. We’ll send your Studio Access Pass 20 minutes before class. See you on the mat! ⚡"
         )
 
         template_name = policy.trial_confirmation_template_name or 'sweat_trial_booking_confirm'
@@ -1181,3 +1192,610 @@ class WhatsAppAutomationService:
         except Exception as exc:
             logger.error("send_unanswered_call_followup failed for session %s: %s", getattr(session, 'id', None), exc, exc_info=True)
             return None
+
+
+    # ── 7-Stage Trial Lifecycle WhatsApp Messaging Engine ──────────────────────
+
+    @classmethod
+    def send_trial_attendance_confirmation_request(
+        cls,
+        trial: TrialBooking,
+        db_alias: Optional[str] = None,
+        force: bool = False,
+    ) -> Optional[CommunicationMessage]:
+        """
+        Stage 2 (Enrich Video Flow): Dispatched at T-90 min (1.5h prior) to request attendance confirmation.
+        Includes two CTA buttons: [Confirm Attendance] and [Reschedule].
+        Template: sweat_trial_attendance_confirmation
+        """
+        org = trial.lead.organization if trial.lead else (trial.branch.organization if trial.branch else None)
+        if not org:
+            return None
+
+        policy = cls.get_policy(org, db_alias=db_alias)
+        if not force and not policy.whatsapp_enabled:
+            return None
+
+        lead = trial.lead
+        recipient = (lead.phone_normalized or lead.phone_raw or '') if lead else ''
+        if not recipient:
+            return None
+
+        # Guard: If trial is already confirmed, cancelled, or attended, skip confirmation request
+        if trial.confirmation_status in ('CONFIRMED', 'CANCELLED') or trial.status in ('CANCELLED', 'ATTENDED'):
+            logger.info("send_trial_attendance_confirmation_request: trial %s already %s/%s; skipping.", trial.id, trial.status, trial.confirmation_status)
+            return None
+
+        var_map = ['lead_name', 'class_name', 'start_time', 'branch_name', 'confirmation_token', 'reschedule_token']
+        resolver = WhatsAppVariableResolver(trial=trial, lead=lead, occurrence=getattr(trial, 'class_occurrence', None))
+        params = resolver.resolve(var_map)
+
+        lead_name = params[0] or "there"
+        class_name = params[1] or "Session"
+        start_time = params[2] or ""
+        branch_name = params[3] or "SWEAT Studio"
+        confirm_token = params[4]
+        resched_token = params[5]
+
+        preview_body = (
+            f"Hey {lead_name}, your session starts soon! ⚡\n"
+            f"Class: {class_name}\n"
+            f"Time: {start_time}\n"
+            f"Studio: SWEAT {branch_name}\n\n"
+            "To hold your reserved spot, please confirm your attendance.\n"
+            "⚠️ Unconfirmed trial spots are automatically released 60 minutes before class to accommodate waitlisted athletes.\n\n"
+            f"Confirm: https://app.sweatfitwellness.com/c/{confirm_token}\n"
+            f"Reschedule: https://app.sweatfitwellness.com/r/{resched_token}"
+        )
+
+        template_name = 'sweat_trial_attendance_confirmation'
+        idempotency_key = f"TRIAL_CONFIRM_REQ:{trial.id}:WHATSAPP"
+
+        try:
+            msg = CommunicationService.send_communication(
+                organization=org,
+                channel='WHATSAPP',
+                recipient=recipient,
+                lead=lead,
+                template_reference=template_name,
+                subject=f"Confirm Your SWEAT Session: {class_name}",
+                body=preview_body,
+                context_data=params,
+                purpose='TRANSACTIONAL',
+                idempotency_key=idempotency_key,
+                trigger_type='TRIAL_CONFIRMATION_REQUEST',
+                related_trial=trial,
+            )
+
+            from apps.tenant_core.models_crm import LeadActivity
+            try:
+                LeadActivity.objects.using(db_alias or 'default').create(
+                    lead=lead,
+                    activity_type='WHATSAPP',
+                    outcome='SENT' if msg.status in ('SENT', 'SUBMITTED', 'QUEUED') else 'FAILED',
+                    notes=f"WhatsApp Attendance Confirmation Request ({template_name}): {preview_body[:200]}",
+                    external_reference=f"MSG:{msg.id}",
+                    activity_at=timezone.now(),
+                )
+            except Exception as act_err:
+                logger.warning("LeadActivity error for trial confirm request: %s", act_err)
+
+            record_business_audit(
+                organization=org,
+                module='COMMUNICATION',
+                action_code='WHATSAPP_TRIAL_CONFIRMATION_REQUEST_SENT',
+                entity_type='TrialBooking',
+                entity_id=trial.id,
+                branch=trial.branch,
+                event_description=f"WhatsApp attendance confirmation request dispatched to {lead_name}",
+                metadata={'trial_id': str(trial.id), 'lead_id': str(lead.id), 'template': template_name},
+                db_alias=db_alias,
+            )
+            return msg
+        except Exception as exc:
+            logger.error("Failed to send WhatsApp confirmation request for trial %s: %s", trial.id, exc)
+            return None
+
+    @classmethod
+    def send_pre_class_reminder(
+        cls,
+        trial: TrialBooking,
+        db_alias: Optional[str] = None,
+        force: bool = False,
+    ) -> Optional[CommunicationMessage]:
+        """
+        Stage 3 (Pre-Class Reminder with QR Code): Dispatched 20 to 30 minutes before class start time.
+        Strict rule: Sent ONLY if confirmation_status == 'CONFIRMED'.
+        Instructs arrival 20 minutes early. Provides turnstile QR entry pass.
+        Template: n2_10_min_before_class_reminder (Revamped)
+        """
+        org = trial.lead.organization if trial.lead else (trial.branch.organization if trial.branch else None)
+        if not org:
+            return None
+
+        policy = cls.get_policy(org, db_alias=db_alias)
+        if not force and not policy.whatsapp_enabled:
+            return None
+
+        # Guard: STRICTLY require confirmed attendance
+        if trial.confirmation_status != 'CONFIRMED':
+            logger.info("send_pre_class_reminder: trial %s is not CONFIRMED (status=%s); suppressing pass.", trial.id, trial.confirmation_status)
+            return None
+
+        lead = trial.lead
+        recipient = (lead.phone_normalized or lead.phone_raw or '') if lead else ''
+        if not recipient:
+            return None
+
+        # Variables matching user sheet:
+        # var 1: 20min (arrival lead) | var 2: member name | var 3: class time | var 4: entrance allowed till | var 5: pass url
+        var_map = ['arrival_lead_time', 'member_name', 'start_time', 'late_lockout_time', 'qr_pass_url']
+        resolver = WhatsAppVariableResolver(trial=trial, lead=lead, occurrence=getattr(trial, 'class_occurrence', None))
+        params = resolver.resolve(var_map)
+
+        arrival_lead = params[0] or "20 minutes"
+        member_name = params[1] or "Athlete"
+        start_time = params[2] or ""
+        lockout_time = params[3] or ""
+        pass_url = params[4]
+
+        preview_body = (
+            f"Ready to SWEAT, {member_name}? 💥\n"
+            f"Your session begins at {start_time}.\n\n"
+            "🔑 IMPORTANT FOR YOUR FIRST VISIT:\n"
+            f"• Arrive {arrival_lead} early for locker setup and coach briefing.\n"
+            "• Bring grip socks and your water bottle.\n"
+            f"• Entry closes strictly at {lockout_time}.\n\n"
+            f"Tap below to access your Studio Entry Pass for turnstile check-in:\n{pass_url}"
+        )
+
+        template_name = 'n2_10_min_before_class_reminder'
+        idempotency_key = f"PRE_CLASS_REMINDER:{trial.id}:WHATSAPP"
+
+        try:
+            msg = CommunicationService.send_communication(
+                organization=org,
+                channel='WHATSAPP',
+                recipient=recipient,
+                lead=lead,
+                template_reference=template_name,
+                subject=f"Studio Entry Pass: Session at {start_time}",
+                body=preview_body,
+                context_data=params,
+                purpose='TRANSACTIONAL',
+                idempotency_key=idempotency_key,
+                trigger_type='PRE_CLASS_REMINDER',
+                related_trial=trial,
+            )
+
+            from apps.tenant_core.models_crm import LeadActivity
+            try:
+                LeadActivity.objects.using(db_alias or 'default').create(
+                    lead=lead,
+                    activity_type='WHATSAPP',
+                    outcome='SENT' if msg.status in ('SENT', 'SUBMITTED', 'QUEUED') else 'FAILED',
+                    notes=f"WhatsApp Pre-Class Reminder & Entry Pass ({template_name})",
+                    external_reference=f"MSG:{msg.id}",
+                    activity_at=timezone.now(),
+                )
+            except Exception as act_err:
+                logger.warning("LeadActivity error for pre-class reminder: %s", act_err)
+
+            record_business_audit(
+                organization=org,
+                module='COMMUNICATION',
+                action_code='WHATSAPP_PRE_CLASS_REMINDER_SENT',
+                entity_type='TrialBooking',
+                entity_id=trial.id,
+                branch=trial.branch,
+                event_description=f"WhatsApp pre-class pass dispatched to {member_name}",
+                metadata={'trial_id': str(trial.id), 'lead_id': str(lead.id), 'template': template_name},
+                db_alias=db_alias,
+            )
+            return msg
+        except Exception as exc:
+            logger.error("Failed to send pre-class reminder for trial %s: %s", trial.id, exc)
+            return None
+
+    @classmethod
+    def send_trial_auto_cancelled_notice(
+        cls,
+        trial: TrialBooking,
+        db_alias: Optional[str] = None,
+        force: bool = False,
+    ) -> Optional[CommunicationMessage]:
+        """
+        Stage 4 (Auto-Cancellation & Real-Time Slot Release): Dispatched when unconfirmed trial hits T-60 min.
+        Notifies user of slot release and offers 1-tap rebook link for their remaining trial.
+        Template: t3_b_trial_class_auto_cancelled
+        """
+        org = trial.lead.organization if trial.lead else (trial.branch.organization if trial.branch else None)
+        if not org:
+            return None
+
+        policy = cls.get_policy(org, db_alias=db_alias)
+        if not force and not policy.whatsapp_enabled:
+            return None
+
+        lead = trial.lead
+        recipient = (lead.phone_normalized or lead.phone_raw or '') if lead else ''
+        if not recipient:
+            return None
+
+        var_map = ['lead_name', 'class_name', 'start_time', 'rebook_token']
+        resolver = WhatsAppVariableResolver(trial=trial, lead=lead, occurrence=getattr(trial, 'class_occurrence', None))
+        params = resolver.resolve(var_map)
+
+        lead_name = params[0] or "there"
+        class_name = params[1] or "Session"
+        start_time = params[2] or ""
+        rebook_token = params[3]
+
+        rebook_link = f"https://app.sweatfitwellness.com/r/{rebook_token}"
+        preview_body = (
+            f"Hi {lead_name},\n\n"
+            f"As we didn't receive your attendance confirmation, your trial reservation for {class_name} at {start_time} "
+            "has been released to waitlisted members.\n\n"
+            "We understand plans change! Because you hadn't checked in, your 1-time complimentary trial reschedule is still saved for you.\n\n"
+            f"Tap below to select another day and time that works best for you:\n{rebook_link}"
+        )
+
+        template_name = 't3_b_trial_class_auto_cancelled'
+        idempotency_key = f"TRIAL_AUTO_CANCEL_NOTIF:{trial.id}:WHATSAPP"
+
+        try:
+            msg = CommunicationService.send_communication(
+                organization=org,
+                channel='WHATSAPP',
+                recipient=recipient,
+                lead=lead,
+                template_reference=template_name,
+                subject=f"SWEAT Trial Released: {class_name}",
+                body=preview_body,
+                context_data=params,
+                purpose='TRANSACTIONAL',
+                idempotency_key=idempotency_key,
+                trigger_type='TRIAL_AUTO_CANCEL_NOTICE',
+                related_trial=trial,
+            )
+
+            from apps.tenant_core.models_crm import LeadActivity
+            try:
+                LeadActivity.objects.using(db_alias or 'default').create(
+                    lead=lead,
+                    activity_type='WHATSAPP',
+                    outcome='SENT' if msg.status in ('SENT', 'SUBMITTED', 'QUEUED') else 'FAILED',
+                    notes=f"WhatsApp Auto-Cancel Notice ({template_name})",
+                    external_reference=f"MSG:{msg.id}",
+                    activity_at=timezone.now(),
+                )
+            except Exception as act_err:
+                logger.warning("LeadActivity error for auto-cancel notice: %s", act_err)
+
+            record_business_audit(
+                organization=org,
+                module='COMMUNICATION',
+                action_code='WHATSAPP_TRIAL_AUTO_CANCEL_SENT',
+                entity_type='TrialBooking',
+                entity_id=trial.id,
+                branch=trial.branch,
+                event_description=f"WhatsApp trial auto-cancel notice dispatched to {lead_name}",
+                metadata={'trial_id': str(trial.id), 'lead_id': str(lead.id), 'template': template_name},
+                db_alias=db_alias,
+            )
+            return msg
+        except Exception as exc:
+            logger.error("Failed to send auto-cancel notice for trial %s: %s", trial.id, exc)
+            return None
+
+    @classmethod
+    def send_class_started_late_notice(
+        cls,
+        trial: TrialBooking,
+        db_alias: Optional[str] = None,
+        force: bool = False,
+    ) -> Optional[CommunicationMessage]:
+        """
+        Stage 5 (Class Started +4 Min Notice): Dispatched 4 minutes after class start for unarrived prospects.
+        Template: n3_4_min_after_class_started_reminder
+        """
+        org = trial.lead.organization if trial.lead else (trial.branch.organization if trial.branch else None)
+        if not org:
+            return None
+
+        policy = cls.get_policy(org, db_alias=db_alias)
+        if not force and not policy.whatsapp_enabled:
+            return None
+
+        # Guard: If already attended, do not send late alert
+        if trial.status == 'ATTENDED':
+            return None
+
+        lead = trial.lead
+        recipient = (lead.phone_normalized or lead.phone_raw or '') if lead else ''
+        if not recipient:
+            return None
+
+        var_map = ['member_name', 'class_name', 'lockout_minutes_left']
+        resolver = WhatsAppVariableResolver(trial=trial, lead=lead, occurrence=getattr(trial, 'class_occurrence', None))
+        params = resolver.resolve(var_map)
+
+        member_name = params[0] or "Athlete"
+        class_name = params[1] or "Session"
+        mins_left = params[2] or "2 minutes"
+
+        preview_body = (
+            f"Hey {member_name}, your {class_name} session has already started! ⏱️\n\n"
+            f"Studio doors lock strictly in {mins_left} for safety and workout focus. If you're nearby, please hurry!"
+        )
+
+        template_name = 'n3_4_min_after_class_started_reminder'
+        idempotency_key = f"CLASS_STARTED_LATE:{trial.id}:WHATSAPP"
+
+        try:
+            msg = CommunicationService.send_communication(
+                organization=org,
+                channel='WHATSAPP',
+                recipient=recipient,
+                lead=lead,
+                template_reference=template_name,
+                subject=f"Class Started: {class_name}",
+                body=preview_body,
+                context_data=params,
+                purpose='TRANSACTIONAL',
+                idempotency_key=idempotency_key,
+                trigger_type='CLASS_STARTED_LATE_NOTICE',
+                related_trial=trial,
+            )
+            return msg
+        except Exception as exc:
+            logger.error("Failed to send class started late notice for trial %s: %s", trial.id, exc)
+            return None
+
+    @classmethod
+    def send_post_trial_feedback_and_review(
+        cls,
+        trial: TrialBooking,
+        db_alias: Optional[str] = None,
+        force: bool = False,
+    ) -> Optional[CommunicationMessage]:
+        """
+        Stage 6 (Post-Trial Feedback & Branch Google Review): Dispatched 60–90 mins after workout.
+        Strict rule: Sent ONLY if status == 'ATTENDED' (verified by physical turnstile QR scan).
+        Dynamically injects branch.get_google_review_url() for multi-branch scaling.
+        Template: ask_for_review_referral_after_trial_02
+        """
+        org = trial.lead.organization if trial.lead else (trial.branch.organization if trial.branch else None)
+        if not org:
+            return None
+
+        policy = cls.get_policy(org, db_alias=db_alias)
+        if not force and not policy.whatsapp_enabled:
+            return None
+
+        # Guard: Attendance must be strictly confirmed
+        if trial.status != 'ATTENDED':
+            logger.info("send_post_trial_feedback_and_review: trial %s is not ATTENDED (status=%s); skipping.", trial.id, trial.status)
+            return None
+
+        lead = trial.lead
+        recipient = (lead.phone_normalized or lead.phone_raw or '') if lead else ''
+        if not recipient:
+            return None
+
+        var_map = ['member_name', 'branch_name', 'branch_review_url']
+        resolver = WhatsAppVariableResolver(trial=trial, lead=lead, occurrence=getattr(trial, 'class_occurrence', None))
+        params = resolver.resolve(var_map)
+
+        member_name = params[0] or "Athlete"
+        branch_name = params[1] or "SWEAT Studio"
+        review_url = params[2] or "https://maps.google.com"
+
+        preview_body = (
+            f"Crushed it today, {member_name}! 💪⚡\n\n"
+            f"Thank you for bringing your energy to SWEAT {branch_name}. How was your session with our coach?\n\n"
+            "If you loved the burn, could you take 30 seconds to drop us a review on Google? "
+            "It means the world to our coaching crew! ⭐\n\n"
+            f"Rate SWEAT: {review_url}"
+        )
+
+        template_name = 'ask_for_review_referral_after_trial_02'
+        idempotency_key = f"POST_TRIAL_REVIEW:{trial.id}:WHATSAPP"
+
+        try:
+            msg = CommunicationService.send_communication(
+                organization=org,
+                channel='WHATSAPP',
+                recipient=recipient,
+                lead=lead,
+                template_reference=template_name,
+                subject=f"How was your session at SWEAT {branch_name}?",
+                body=preview_body,
+                context_data=params,
+                purpose='TRANSACTIONAL',
+                idempotency_key=idempotency_key,
+                trigger_type='POST_TRIAL_REVIEW',
+                related_trial=trial,
+            )
+
+            from apps.tenant_core.models_crm import LeadActivity
+            try:
+                LeadActivity.objects.using(db_alias or 'default').create(
+                    lead=lead,
+                    activity_type='WHATSAPP',
+                    outcome='SENT' if msg.status in ('SENT', 'SUBMITTED', 'QUEUED') else 'FAILED',
+                    notes=f"WhatsApp Post-Trial Review Request ({template_name})",
+                    external_reference=f"MSG:{msg.id}",
+                    activity_at=timezone.now(),
+                )
+            except Exception as act_err:
+                logger.warning("LeadActivity error for post-trial review: %s", act_err)
+
+            record_business_audit(
+                organization=org,
+                module='COMMUNICATION',
+                action_code='WHATSAPP_TRIAL_POST_REVIEW_SENT',
+                entity_type='TrialBooking',
+                entity_id=trial.id,
+                branch=trial.branch,
+                event_description=f"WhatsApp review request dispatched to {member_name}",
+                metadata={'trial_id': str(trial.id), 'lead_id': str(lead.id), 'template': template_name},
+                db_alias=db_alias,
+            )
+            return msg
+        except Exception as exc:
+            logger.error("Failed to send post-trial review request for trial %s: %s", trial.id, exc)
+            return None
+
+    @classmethod
+    def send_late_rebook_reminder(
+        cls,
+        trial: TrialBooking,
+        db_alias: Optional[str] = None,
+        force: bool = False,
+    ) -> Optional[CommunicationMessage]:
+        """
+        Stage 8 (Late Rebook Window Reminder): Sent 24h after cancellation if member hasn't rebooked yet.
+        Template: n4_late_rebook_window_class_reminder
+        """
+        org = trial.lead.organization if trial.lead else (trial.branch.organization if trial.branch else None)
+        if not org:
+            return None
+
+        policy = cls.get_policy(org, db_alias=db_alias)
+        if not force and not policy.whatsapp_enabled:
+            return None
+
+        # Guard: Check if trial is cancelled and hasn't yet rebooked
+        if trial.status != 'CANCELLED' or trial.rescheduled_trials.exists():
+            return None
+
+        lead = trial.lead
+        recipient = (lead.phone_normalized or lead.phone_raw or '') if lead else ''
+        if not recipient:
+            return None
+
+        var_map = ['lead_name', 'rebook_token']
+        resolver = WhatsAppVariableResolver(trial=trial, lead=lead)
+        params = resolver.resolve(var_map)
+
+        lead_name = params[0] or "there"
+        rebook_token = params[1]
+        rebook_url = f"https://app.sweatfitwellness.com/r/{rebook_token}"
+
+        preview_body = (
+            f"Hey {lead_name}, don't let your fitness momentum stop! ⚡\n\n"
+            "Your 1-time complimentary SWEAT trial pass is still saved for you. "
+            f"Rebook your session before your pass expires:\n{rebook_url}"
+        )
+
+        template_name = 'n4_late_rebook_window_class_reminder'
+        idempotency_key = f"LATE_REBOOK_WINDOW:{trial.id}:WHATSAPP"
+
+        try:
+            msg = CommunicationService.send_communication(
+                organization=org,
+                channel='WHATSAPP',
+                recipient=recipient,
+                lead=lead,
+                template_reference=template_name,
+                subject="Don't miss your SWEAT Trial Session",
+                body=preview_body,
+                context_data=params,
+                purpose='TRANSACTIONAL',
+                idempotency_key=idempotency_key,
+                trigger_type='LATE_REBOOK_WINDOW',
+                related_trial=trial,
+            )
+            return msg
+        except Exception as exc:
+            logger.error("Failed to send late rebook reminder for trial %s: %s", trial.id, exc)
+            return None
+
+    @classmethod
+    def process_trial_whatsapp_lifecycle(cls, db_alias: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Authoritative Periodic Scanner for the 7 Trial WhatsApp Touchpoints.
+        Runs every 2-5 minutes in Celery Beat:
+        1. Dispatches Attendance Confirmation Requests (T-90 min).
+        2. Dispatches Pre-Class Reminders with Turnstile QR Pass (T-20 to T-30 min, Confirmed only).
+        3. Dispatches Class Started +4 min Notice for unarrived confirmed participants.
+        4. Dispatches Post-Trial Feedback & Google Reviews (+60 to +90 min, Attended only).
+        5. Dispatches Late Rebook Window Reminders (+24h after cancellation).
+        """
+        now = timezone.now()
+        alias = db_alias or 'default'
+        results = {
+            'confirm_requests_sent': 0,
+            'pre_class_passes_sent': 0,
+            'late_notices_sent': 0,
+            'reviews_sent': 0,
+            'rebook_reminders_sent': 0,
+        }
+
+        # 1. Attendance Confirmation Requests (T-90m to T-65m)
+        pending_trials = TrialBooking.objects.using(alias).filter(
+            status__in=['BOOKED', 'SCHEDULED'],
+            confirmation_status='PENDING',
+            scheduled_start__gt=now + timedelta(minutes=60),
+            scheduled_start__lte=now + timedelta(minutes=95),
+        ).select_related('lead', 'branch', 'branch__organization')
+
+        for trial in pending_trials:
+            sent = cls.send_trial_attendance_confirmation_request(trial, db_alias=alias)
+            if sent:
+                results['confirm_requests_sent'] += 1
+
+        # 2. Pre-Class Reminders with QR Pass (T-30m to T-15m, STRICTLY CONFIRMED)
+        confirmed_trials = TrialBooking.objects.using(alias).filter(
+            status__in=['BOOKED', 'SCHEDULED', 'CONFIRMED'],
+            confirmation_status='CONFIRMED',
+            scheduled_start__gt=now + timedelta(minutes=10),
+            scheduled_start__lte=now + timedelta(minutes=35),
+        ).select_related('lead', 'branch', 'branch__organization')
+
+        for trial in confirmed_trials:
+            sent = cls.send_pre_class_reminder(trial, db_alias=alias)
+            if sent:
+                results['pre_class_passes_sent'] += 1
+
+        # 3. Class Started +4 min Notice (start +4m to start +12m, Confirmed but not yet marked Attended)
+        started_trials = TrialBooking.objects.using(alias).filter(
+            confirmation_status='CONFIRMED',
+            status__in=['BOOKED', 'SCHEDULED', 'CONFIRMED'],
+            scheduled_start__lte=now - timedelta(minutes=4),
+            scheduled_start__gte=now - timedelta(minutes=15),
+        ).exclude(status='ATTENDED').select_related('lead', 'branch', 'branch__organization')
+
+        for trial in started_trials:
+            sent = cls.send_class_started_late_notice(trial, db_alias=alias)
+            if sent:
+                results['late_notices_sent'] += 1
+
+        # 4. Post-Trial Feedback & Google Review (end +60m to end +180m, STRICTLY ATTENDED)
+        attended_trials = TrialBooking.objects.using(alias).filter(
+            status='ATTENDED',
+            scheduled_end__lte=now - timedelta(minutes=60),
+            scheduled_end__gte=now - timedelta(minutes=180),
+        ).select_related('lead', 'branch', 'branch__organization')
+
+        for trial in attended_trials:
+            sent = cls.send_post_trial_feedback_and_review(trial, db_alias=alias)
+            if sent:
+                results['reviews_sent'] += 1
+
+        # 5. Late Rebook Window Reminders (Cancelled 24h to 48h ago)
+        cancelled_trials = TrialBooking.objects.using(alias).filter(
+            status='CANCELLED',
+            confirmation_status='CANCELLED',
+            updated_at__lte=now - timedelta(hours=24),
+            updated_at__gte=now - timedelta(hours=48),
+        ).select_related('lead', 'branch', 'branch__organization')
+
+        for trial in cancelled_trials:
+            sent = cls.send_late_rebook_reminder(trial, db_alias=alias)
+            if sent:
+                results['rebook_reminders_sent'] += 1
+
+        logger.info("process_trial_whatsapp_lifecycle completed on %s: %s", alias, results)
+        return results

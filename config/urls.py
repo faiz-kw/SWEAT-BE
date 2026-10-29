@@ -87,6 +87,7 @@ urlpatterns = [
     path('api/v1/telephony/inbound/', views_telephony.VobizInboundWebhookView.as_view(), name='vobiz-inbound-root'),
     path('api/v1/telephony/dial-fallback/', views_telephony.VobizInboundFallbackWebhookView.as_view(), name='vobiz-fallback-root'),
     path('api/v1/telephony/hangup/', views_telephony.VobizHangupWebhookView.as_view(), name='vobiz-hangup-root'),
+    path('api/v1/telephony/recording/', views_telephony.VobizRecordingWebhookView.as_view(), name='vobiz-recording-root'),
     path('api/v1/telephony/agent-answer-bridge/', views_telephony.AgentAnswerBridgeXmlView.as_view(), name='vobiz-agent-bridge-root'),
 
     # Tenant Admin — Org/Branch/User/RBAC management (scoped to tenant DB)

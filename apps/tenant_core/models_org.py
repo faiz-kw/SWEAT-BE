@@ -92,6 +92,23 @@ class CompanyEntity(models.Model):
             self.legal_name = self.name
         super().save(*args, **kwargs)
 
+    def get_google_maps_url(self) -> str:
+        if self.google_maps_url:
+            return self.google_maps_url
+        if self.latitude and self.longitude:
+            return f"https://www.google.com/maps/search/?api=1&query={self.latitude},{self.longitude}"
+        import urllib.parse
+        addr = f"{self.name} {self.address or self.address_line_1 or ''}".strip()
+        return f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(addr)}"
+
+    def get_google_review_url(self) -> str:
+        if self.google_review_url:
+            return self.google_review_url
+        import urllib.parse
+        city_name = getattr(self.location, 'city', '') if getattr(self, 'location', None) else ''
+        addr = f"SWEAT {self.name} {city_name}".strip()
+        return f"https://www.google.com/search?q={urllib.parse.quote(addr)}+reviews"
+
     def __str__(self):
         return f"{self.name} ({self.code})"
 
@@ -172,6 +189,8 @@ class Branch(models.Model):
     timezone = models.CharField(max_length=100, default='Asia/Kolkata')
     phone = models.CharField(max_length=30, blank=True, default='')
     email = models.EmailField(blank=True, default='')
+    google_maps_url = models.URLField(max_length=500, blank=True, default='', help_text='Direct Google Maps link for studio navigation')
+    google_review_url = models.URLField(max_length=500, blank=True, default='', help_text='Direct Google Review link for post-workout reviews')
     capacity = models.IntegerField(default=0, help_text='Max concurrent members / floor capacity')
     floor_area_sqft = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     business_open_time = models.CharField(max_length=10, blank=True, default='06:00')
@@ -191,5 +210,23 @@ class Branch(models.Model):
         ordering = ['location', 'name']
         verbose_name_plural = 'Branches'
 
+    def get_google_maps_url(self) -> str:
+        if self.google_maps_url:
+            return self.google_maps_url
+        if self.latitude and self.longitude:
+            return f"https://www.google.com/maps/search/?api=1&query={self.latitude},{self.longitude}"
+        import urllib.parse
+        addr = f"{self.name} {self.address or self.address_line_1 or ''}".strip()
+        return f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(addr)}"
+
+    def get_google_review_url(self) -> str:
+        if self.google_review_url:
+            return self.google_review_url
+        import urllib.parse
+        city_name = getattr(self.location, 'city', '') if getattr(self, 'location', None) else ''
+        addr = f"SWEAT {self.name} {city_name}".strip()
+        return f"https://www.google.com/search?q={urllib.parse.quote(addr)}+reviews"
+
     def __str__(self):
-        return f"{self.name} ({self.location.name})"
+        loc_name = getattr(self.location, 'name', '') if getattr(self, 'location', None) else ''
+        return f"{self.name} ({loc_name})"

@@ -641,3 +641,50 @@ from .tasks_meta_leads import (  # noqa: F401
     process_meta_lead_import_task,
     recover_meta_imports_periodic_task,
 )
+
+
+@shared_task(
+    bind=True,
+    name='apps.tenant_core.tasks.process_trial_whatsapp_lifecycle_periodic_task',
+    max_retries=2,
+    acks_late=True,
+)
+def process_trial_whatsapp_lifecycle_periodic_task(self, tenant_id: str = None, **kwargs) -> dict:
+    """
+    Authoritative periodic task for the 7-stage WhatsApp trial messaging engine:
+    1. Attendance confirmation requests with 1-tap Confirm / Reschedule buttons (T-90 min).
+    2. Pre-class reminders with turnstile QR code entry pass (T-20 to T-30 min, Confirmed only).
+    3. Class started +4 min notifications for late arrivals.
+    4. Post-trial feedback & branch-specific Google review requests (Attended only).
+    5. Late rebook window reminders (+24h after unconfirmed auto-cancellation).
+    """
+    from .context import tenant_database_context
+    from apps.tenant_core.communication.whatsapp_automation import WhatsAppAutomationService
+
+    if tenant_id:
+        tenant_ids = [tenant_id]
+    else:
+        try:
+            from apps.master.models import TenantDataSource
+            tenant_ids = list(
+                TenantDataSource.objects.using('default').filter(
+                    status='ACTIVE'
+                ).values_list('tenant_id', flat=True)
+            )
+        except Exception:
+            tenant_ids = []
+
+    total_results = []
+    for tid in tenant_ids:
+        try:
+            with tenant_database_context(tid) as db_alias:
+                res = WhatsAppAutomationService.process_trial_whatsapp_lifecycle(db_alias=db_alias)
+                total_results.append({'tenant_id': str(tid), 'results': res})
+        except Exception as exc:
+            logger.error("process_trial_whatsapp_lifecycle_periodic_task error for tenant %s: %s", tid, exc, exc_info=True)
+
+    return {
+        'status': 'COMPLETED',
+        'tenants_processed': len(tenant_ids),
+        'results': total_results,
+    }

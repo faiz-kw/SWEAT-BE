@@ -803,6 +803,12 @@ class CRMLeadService:
         alias = db_alias or get_tenant_db_alias() or 'default'
         events = []
 
+        import uuid
+        if isinstance(lead, (str, uuid.UUID)):
+            lead = Lead.objects.using(alias).filter(id=lead).first()
+        if not lead:
+            return []
+
         # 1. Lead Created
         events.append({
             'id': f"lead-created-{lead.id}",

@@ -196,7 +196,10 @@ class VobizInboundWebhookView(APIView):
                     agent_presence.save(update_fields=['status', 'active_session', 'last_heartbeat'])
 
                 hangup_url = f"{host}/api/v1/telephony/hangup/?session_id={session.id}"
+                rec_callback_url = f"{host}/api/v1/telephony/recording/?session_id={session.id}"
                 rec_str = "true" if vobiz_cfg.get('record_all_calls', True) else "false"
+                should_record = vobiz_cfg.get('record_all_calls', True)
+                record_tag = f'  <Record action="{rec_callback_url}" callbackUrl="{rec_callback_url}" method="POST" startOnDialAnswer="true" redirect="false" maxLength="7200" />\n' if should_record else ''
 
                 logger.info(
                     "Vobiz Outbound Softphone Bridge: Agent=%s (%s) -> Customer=%s CallerID=%s UUID=%s",
@@ -209,7 +212,7 @@ class VobizInboundWebhookView(APIView):
 
                 xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Dial action="{hangup_url}" callerId="{caller_id}" record="{rec_str}" redirect="false">
+{record_tag}  <Dial action="{hangup_url}" callbackUrl="{hangup_url}" callerId="{caller_id}" record="{rec_str}" redirect="false">
     <Number>{customer_phone}</Number>
   </Dial>
   <Hangup/>
@@ -362,6 +365,8 @@ class VobizInboundWebhookView(APIView):
                 # Build VobizXML — dial agent's registered SIP endpoint
                 host = _get_webhook_host(request)
                 fallback_url = f"{host}/api/v1/telephony/dial-fallback/?session_id={session.id}"
+                rec_callback_url = f"{host}/api/v1/telephony/recording/?session_id={session.id}"
+                hangup_url = f"{host}/api/v1/telephony/hangup/?session_id={session.id}"
                 did_caller_id = did_number if did_number.startswith('+') else vobiz_cfg['from_number']
                 agent_sip = f"sip:{presence.sip_username}@{vobiz_cfg['registrar_host']}"
                 xml = VobizVoiceAdapter.build_inbound_dial_xml(
@@ -370,6 +375,8 @@ class VobizInboundWebhookView(APIView):
                     fallback_action_url=fallback_url,
                     timeout=vobiz_cfg['ring_timeout_sec'],
                     record=vobiz_cfg['record_all_calls'],
+                    recording_callback_url=rec_callback_url,
+                    hangup_url=hangup_url,
                 )
                 logger.info("Generated Inbound Dial XML:\n%s", xml)
                 return HttpResponse(xml, content_type="application/xml; charset=utf-8")
@@ -519,7 +526,16 @@ class VobizHangupWebhookView(APIView):
             call_uuid = data.get('CallUUID') or data.get('call_uuid') or request.POST.get('CallUUID', '')
             call_status = data.get('CallStatus') or request.POST.get('CallStatus', 'completed')
             duration_raw = float(data.get('Duration') or request.POST.get('Duration', 0.0))
-            recording_url = data.get('RecordingUrl') or request.POST.get('RecordingUrl', '')
+            recording_url = (
+                data.get('RecordUrl')
+                or data.get('record_url')
+                or data.get('RecordingUrl')
+                or data.get('recording_url')
+                or request.POST.get('RecordUrl')
+                or request.POST.get('record_url')
+                or request.POST.get('RecordingUrl')
+                or request.POST.get('recording_url', '')
+            )
             hangup_cause = data.get('HangupCause') or request.POST.get('HangupCause', 'NORMAL_CLEARING')
 
             logger.info("Vobiz Hangup Webhook: UUID=%s Duration=%ss Status=%s", call_uuid, duration_raw, call_status)
@@ -607,6 +623,97 @@ class VobizHangupWebhookView(APIView):
 <Response>
   <Hangup/>
 </Response>"""
+            return HttpResponse(xml_resp, content_type="application/xml; charset=utf-8")
+
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class VobizRecordingWebhookView(APIView):
+    """
+    POST /api/v1/telephony/recording/
+    Fired asynchronously by Vobiz/Plivo when a conversation recording finishes processing.
+    Extracts RecordUrl, updates CallSession, downloads the audio file locally to media/recordings/{session_id}.mp3,
+    and alerts connected CRM clients via SSE.
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        with resolve_telephony_tenant_context():
+            data = request.data if isinstance(request.data, dict) else {}
+            session_id = request.GET.get('session_id') or data.get('session_id')
+            call_uuid = (
+                data.get('CallUUID')
+                or data.get('call_uuid')
+                or request.POST.get('CallUUID')
+                or request.POST.get('call_uuid', '')
+            )
+            record_url = (
+                data.get('RecordUrl')
+                or data.get('record_url')
+                or data.get('RecordingUrl')
+                or data.get('recording_url')
+                or request.POST.get('RecordUrl')
+                or request.POST.get('record_url')
+                or request.POST.get('RecordingUrl')
+                or request.POST.get('recording_url', '')
+            )
+            duration_raw = float(
+                data.get('RecordingDuration')
+                or data.get('Duration')
+                or request.POST.get('RecordingDuration')
+                or request.POST.get('Duration', 0.0)
+            )
+
+            logger.info(
+                "Vobiz Recording Webhook: Session=%s CallUUID=%s RecordUrl=%s Duration=%ss",
+                session_id, call_uuid, record_url, duration_raw
+            )
+
+            session = None
+            if session_id:
+                try:
+                    import uuid
+                    session = CallSession.objects.filter(id=uuid.UUID(str(session_id))).first()
+                except Exception:
+                    session = CallSession.objects.filter(id=session_id).first()
+            if not session and call_uuid:
+                session = CallSession.objects.filter(provider_attempt_id=call_uuid).first()
+
+            if session and record_url:
+                session.recording_url = record_url
+                if duration_raw > 0 and (not session.duration_seconds or session.duration_seconds == 0):
+                    session.duration_seconds = duration_raw
+                    session.bill_duration_seconds = VobizVoiceAdapter.calculate_billable_duration(duration_raw)
+
+                # Download conversation recording directly to media/recordings/
+                try:
+                    from django.conf import settings
+                    cache_dir = os.path.join(settings.BASE_DIR, 'media', 'recordings')
+                    os.makedirs(cache_dir, exist_ok=True)
+                    dest_file = os.path.join(cache_dir, f"{session.id}.mp3")
+                    import requests
+                    r = requests.get(record_url, timeout=30, stream=True)
+                    if r.status_code == 200:
+                        with open(dest_file, 'wb') as f:
+                            for chunk in r.iter_content(chunk_size=65536):
+                                if chunk:
+                                    f.write(chunk)
+                        session.recording_storage_key = dest_file
+                        logger.info("Saved Vobiz call recording: %s (%d bytes)", dest_file, os.path.getsize(dest_file))
+                except Exception as dl_err:
+                    logger.warning("Could not download recording in webhook: %s", dl_err)
+
+                session.save(update_fields=['recording_url', 'recording_storage_key', 'duration_seconds', 'bill_duration_seconds'])
+
+                # Broadcast to CRM client tabs so Play Call button becomes active
+                if session.sales_rep:
+                    push_agent_telephony_event(str(session.sales_rep.id), 'RECORDING_AVAILABLE', {
+                        'session_id': str(session.id),
+                        'recording_url': f"/api/v1/tenant/crm/telephony/recordings/{session.id}/stream/",
+                        'lead_id': str(session.lead.id) if session.lead else None,
+                    })
+
+            xml_resp = """<?xml version="1.0" encoding="UTF-8"?><Response/>"""
             return HttpResponse(xml_resp, content_type="application/xml; charset=utf-8")
 
 
@@ -727,11 +834,17 @@ class AgentAnswerBridgeXmlView(APIView):
             lead_name = f"{lead.first_name} {lead.last_name or ''}".strip() or "Member"
             whisper = f"Connecting you to {lead_name}."
 
+            host = _get_webhook_host(request)
+            rec_callback_url = f"{host}/api/v1/telephony/recording/?session_id={session.id}"
+            hangup_url = f"{host}/api/v1/telephony/hangup/?session_id={session.id}"
+
             xml = VobizVoiceAdapter.build_agent_bridge_customer_xml(
                 customer_phone=lead.phone_normalized,
                 caller_id=session.agent_phone_number or "+919200000001",
                 whisper_text=whisper,
                 record=True,
+                recording_callback_url=rec_callback_url,
+                hangup_url=hangup_url,
             )
             return HttpResponse(xml, content_type="application/xml; charset=utf-8")
 
@@ -1466,6 +1579,8 @@ class TelephonyAnalyticsView(APIView):
             elif timeframe == 'last_30_days':
                 start_30d = start_of_today - timedelta(days=30)
                 date_filter = Q(created_at__gte=start_30d)
+            elif timeframe in ('all_time', 'all'):
+                date_filter = Q()
             elif timeframe == 'custom':
                 date_from = request.query_params.get('date_from')
                 date_to = request.query_params.get('date_to')
@@ -1649,10 +1764,21 @@ class TelephonyAnalyticsView(APIView):
                 p = cs.user_phone_number or ''
                 masked_phone = f"+91-XXXXX-{p[-4:]}" if len(p) >= 4 else (p or "+91-XXXXX-XXXX")
                 rep_name = f"{cs.sales_rep.first_name} {cs.sales_rep.last_name}".strip() if cs.sales_rep else "Automated / Pool"
-                lead_name = f"{cs.lead.first_name} {cs.lead.last_name}".strip() if cs.lead else "Unknown Lead"
+                lead_name = f"{cs.lead.first_name} {cs.lead.last_name}".strip() if cs.lead else None
+                lead_id_val = str(cs.lead_id) if cs.lead_id else None
+                if not lead_name and p:
+                    clean_p = p.replace('+', '').replace('-', '').replace(' ', '')
+                    if len(clean_p) >= 10:
+                        matched_lead = Lead.objects.using(alias).filter(phone_normalized__icontains=clean_p[-10:]).first()
+                        if matched_lead:
+                            lead_name = f"{matched_lead.first_name} {matched_lead.last_name}".strip()
+                            lead_id_val = str(matched_lead.id)
+                if not lead_name:
+                    lead_name = "Unknown Lead"
+
                 recent_calls.append({
                     'id': str(cs.id),
-                    'lead_id': str(cs.lead_id) if cs.lead_id else None,
+                    'lead_id': lead_id_val,
                     'lead_name': lead_name,
                     'masked_phone': masked_phone,
                     'sales_rep_name': rep_name,
@@ -1774,6 +1900,8 @@ class TelephonyExportView(APIView):
             elif timeframe == 'last_30_days':
                 start_30d = start_of_today - timedelta(days=30)
                 date_filter = Q(created_at__gte=start_30d)
+            elif timeframe in ('all_time', 'all'):
+                date_filter = Q()
             elif timeframe == 'custom':
                 date_from = request.query_params.get('date_from')
                 date_to = request.query_params.get('date_to')

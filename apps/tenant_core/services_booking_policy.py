@@ -283,15 +283,22 @@ class BookingPolicyService:
                     minutes = policy.get('auto_cancel_unpaid_minutes', 15)
                     return True, 'AUTO_CANCELLED_UNPAID', f"Auto-cancelled: Payment not completed within {minutes} minutes."
 
-        # 2. Evaluate Unconfirmed Auto-Cancellation
+        # 2. Evaluate Unconfirmed Auto-Cancellation (T-60 mins before session or creation fallback)
         if policy.get('auto_cancel_unconfirmed_enabled', True):
             confirmation_status = getattr(booking, 'confirmation_status', 'CONFIRMED')
             is_unconfirmed = (confirmation_status in ['PENDING', 'RESCHEDULE_REQUESTED']) or (booking.status == 'RESERVED')
             if is_unconfirmed and booking.status in ['RESERVED', 'BOOKED']:
-                unconfirmed_deadline = created_time + timedelta(minutes=int(policy.get('auto_cancel_unconfirmed_minutes', 60)))
+                start_time = getattr(booking, 'scheduled_start', None) or (
+                    getattr(booking, 'occurrence', None).start_at if getattr(booking, 'occurrence', None) else None
+                )
+                minutes = int(policy.get('auto_cancel_unconfirmed_minutes', 60))
+                if start_time:
+                    unconfirmed_deadline = start_time - timedelta(minutes=minutes)
+                else:
+                    unconfirmed_deadline = created_time + timedelta(minutes=minutes)
+
                 if current_time >= unconfirmed_deadline:
-                    minutes = policy.get('auto_cancel_unconfirmed_minutes', 60)
-                    return True, 'AUTO_CANCELLED_UNCONFIRMED', f"Auto-cancelled: Booking not confirmed within {minutes} minutes."
+                    return True, 'AUTO_CANCELLED_UNCONFIRMED', f"Auto-cancelled: Booking not confirmed {minutes} minutes before session."
 
         return False, None, None
 
@@ -482,6 +489,13 @@ class BookingPolicyService:
                         metadata={'reason_code': f_code or reason_code, 'notes': f_text or reason_text},
                         db_alias=alias,
                     )
+
+                    # Trigger WhatsApp auto-cancel notice with 1-tap rebook link (t3_b_trial_class_auto_cancelled)
+                    try:
+                        from apps.tenant_core.communication.whatsapp_automation import WhatsAppAutomationService
+                        WhatsAppAutomationService.send_trial_auto_cancelled_notice(locked_t, db_alias=alias)
+                    except Exception as notify_err:
+                        logger.warning("Failed to dispatch WhatsApp auto-cancel notice for trial %s: %s", locked_t.id, notify_err)
 
         results['auto_cancelled_count'] = results['cancelled_unpaid_count'] + results['cancelled_unconfirmed_count']
         logger.info(

@@ -160,18 +160,24 @@ class VobizVoiceAdapter(BaseCommunicationAdapter):
         fallback_action_url: str,
         timeout: int = 15,
         record: bool = True,
+        recording_callback_url: Optional[str] = None,
+        hangup_url: Optional[str] = None,
     ) -> str:
         """
         Builds VobizXML to ring the assigned agent's Zoiper SIP endpoint with a 15s timeout.
         If unanswered, Vobiz fires fallback_action_url to execute the overflow ladder.
+        When record is True and recording_callback_url is provided, injects <Record startOnDialAnswer="true">
+        to record live conversation once answered.
         """
         rec_str = "true" if record else "false"
         agent_user = agent_sip_uri.replace("sip:", "").split("@")[0].strip()
         sip_target = f"sip:{agent_user}@registrar.vobiz.ai"
+        record_tag = f'  <Record action="{recording_callback_url}" callbackUrl="{recording_callback_url}" method="POST" startOnDialAnswer="true" redirect="false" maxLength="7200" />\n' if (record and recording_callback_url) else ""
+        action_callback = f' callbackUrl="{hangup_url}"' if hangup_url else ""
 
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Dial action="{fallback_action_url}" callerId="{caller_id}" record="{rec_str}" timeout="{timeout}" redirect="false">
+{record_tag}  <Dial action="{fallback_action_url}"{action_callback} callerId="{caller_id}" record="{rec_str}" timeout="{timeout}" redirect="false">
     <User>{sip_target}</User>
   </Dial>
 </Response>"""
@@ -267,16 +273,23 @@ class VobizVoiceAdapter(BaseCommunicationAdapter):
         caller_id: str,
         whisper_text: str = "Connecting you to member.",
         record: bool = True,
+        recording_callback_url: Optional[str] = None,
+        hangup_url: Optional[str] = None,
     ) -> str:
         """
         Builds VobizXML for Outbound Click-to-Call.
         Played when the agent picks up Zoiper: whispers caller info, then dials customer on PSTN.
+        Injects <Record startOnDialAnswer="true"> so the conversation is recorded as soon as customer answers.
         """
         rec_str = "true" if record else "false"
+        record_tag = f'  <Record action="{recording_callback_url}" callbackUrl="{recording_callback_url}" method="POST" startOnDialAnswer="true" redirect="false" maxLength="7200" />\n' if (record and recording_callback_url) else ""
+        dial_action = f' action="{hangup_url}"' if hangup_url else ""
+        action_callback = f' callbackUrl="{hangup_url}"' if hangup_url else ""
+
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Speak voice="WOMAN" language="en-IN">{whisper_text}</Speak>
-  <Dial callerId="{caller_id}" record="{rec_str}">
+{record_tag}  <Dial{dial_action}{action_callback} callerId="{caller_id}" record="{rec_str}">
     <Number>{customer_phone}</Number>
   </Dial>
 </Response>"""

@@ -1,11 +1,11 @@
 import logging
 from typing import Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
+from apps.tenant_core.communication.whatsapp_tokens import generate_trial_action_token
 
 logger = logging.getLogger(__name__)
 
-
-EARLY_ARRIVAL_INSTRUCTION = "Please arrive 30 minutes prior to class for your fitness assessment and gear setup."
+EARLY_ARRIVAL_INSTRUCTION = "Please arrive 20 minutes prior to class for your fitness assessment and gear setup."
 
 def fmt_ist_datetime(dt: Optional[datetime], tz_str: str = "Asia/Kolkata") -> str:
     """Format datetime -> 'Monday, 19 Oct at 10:00 AM' in IST."""
@@ -44,9 +44,7 @@ MONTH_NAMES = [
     "July", "August", "September", "October", "November", "December",
 ]
 
-
 def _fmt_dt(dt: Optional[datetime], tz_str: str = "Asia/Kolkata") -> str:
-    """Format datetime -> friendly local string e.g. 'Tomorrow at 6:30 PM'."""
     if not dt:
         return ""
     if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
@@ -70,7 +68,6 @@ def _fmt_dt(dt: Optional[datetime], tz_str: str = "Asia/Kolkata") -> str:
     month = MONTH_NAMES[local_dt.month]
     return f"{weekday}, {local_dt.day} {month} at {time_str}"
 
-
 def _fmt_date(dt: Optional[datetime], tz_str: str = "Asia/Kolkata") -> str:
     if not dt:
         return ""
@@ -79,7 +76,6 @@ def _fmt_date(dt: Optional[datetime], tz_str: str = "Asia/Kolkata") -> str:
     import zoneinfo
     local_dt = dt.astimezone(zoneinfo.ZoneInfo(tz_str))
     return f"{local_dt.day} {MONTH_NAMES[local_dt.month]} {local_dt.year}"
-
 
 def _fmt_time(dt: Optional[datetime], tz_str: str = "Asia/Kolkata") -> str:
     if not dt:
@@ -97,10 +93,8 @@ def _fmt_time(dt: Optional[datetime], tz_str: str = "Asia/Kolkata") -> str:
 
 class WhatsAppVariableResolver:
     """
-    Resolves variable key names into concrete string values for
-    Gupshup positional template parameters (position 0 -> param 1, etc.).
-    Supported keys: member_name, lead_name, class_name, start_datetime,
-                    start_date, start_time, trainer_name, branch_name, booking_number
+    Authoritative variable resolver for Gupshup WhatsApp templates.
+    Supports comprehensive parameters for trial journeys, confirmations, reminders, reviews and notifications.
     """
 
     def __init__(
@@ -135,24 +129,59 @@ class WhatsAppVariableResolver:
 
     def _resolve(self, key: str) -> str:
         occ = self._occurrence()
+        start_dt = self._effective_start_datetime()
+
         mapping = {
-            "member_name":    self._member_name,
-            "lead_name":      self._lead_name,
-            "class_name":     lambda: occ.class_template.name if occ and occ.class_template else "",
-            "start_datetime": lambda: _fmt_dt(occ.start_at if occ else None, self._tz),
-            "start_date":     lambda: _fmt_date(occ.start_at if occ else None, self._tz),
-            "start_time":     lambda: _fmt_time(occ.start_at if occ else None, self._tz),
-            "trainer_name":       self._trainer_name,
-            "branch_name":        self._branch_name,
-            "branch_address":     self._branch_address,
-            "class_datetime_ist": self._class_datetime_ist,
-            "booking_number":     lambda: str(self._booking.booking_number) if self._booking else "",
+            "member_name":          self._member_name,
+            "lead_name":            self._lead_name,
+            "class_name":           self._class_name,
+            "start_datetime":       lambda: _fmt_dt(start_dt, self._tz),
+            "start_date":           lambda: _fmt_date(start_dt, self._tz),
+            "start_time":           lambda: _fmt_time(start_dt, self._tz),
+            "trainer_name":         self._trainer_name,
+            "branch_name":          self._branch_name,
+            "branch_address":       self._branch_address,
+            "class_datetime_ist":   self._class_datetime_ist,
+            "booking_number":       lambda: str(self._booking.booking_number) if self._booking else (str(self._trial.id)[:8] if self._trial else ""),
+            "branch_maps_url":      self._branch_maps_url,
+            "google_maps_url":      self._branch_maps_url,
+            "branch_review_url":    self._branch_review_url,
+            "google_review_url":    self._branch_review_url,
+            "confirmation_token":   self._confirmation_token,
+            "reschedule_token":     self._reschedule_token,
+            "rebook_token":         self._rebook_token,
+            "qr_pass_url":          self._qr_pass_url,
+            "arrival_lead_time":    lambda: "20 minutes",
+            "late_lockout_time":    self._late_lockout_time,
+            "lockout_minutes_left": lambda: "2 minutes",
         }
         fn = mapping.get(key)
         if fn:
             return fn()
         logger.debug("WhatsAppVariableResolver: unknown key %s", key)
         return ""
+
+    def _effective_start_datetime(self) -> Optional[datetime]:
+        if self._occ and getattr(self._occ, 'start_at', None):
+            return self._occ.start_at
+        if self._booking and getattr(self._booking, 'occurrence', None):
+            return self._booking.occurrence.start_at
+        if self._trial and getattr(self._trial, 'scheduled_start', None):
+            return self._trial.scheduled_start
+        return None
+
+    def _class_name(self) -> str:
+        occ = self._occurrence()
+        if occ and getattr(occ, 'class_template', None):
+            return occ.class_template.name
+        if self._trial:
+            prog = getattr(self._trial, 'program', None)
+            if prog and getattr(prog, 'name', None):
+                return prog.name
+            trial_type = getattr(self._trial, 'trial_type', '')
+            if trial_type:
+                return trial_type.replace('_', ' ').title()
+        return "SWEAT Session"
 
     def _occurrence(self):
         if self._occ:
@@ -202,7 +231,7 @@ class WhatsAppVariableResolver:
     def _trainer_name(self) -> str:
         occ = self._occurrence()
         if not occ:
-            return ""
+            return "Coach"
         try:
             asgn = occ.trainer_assignments.filter(status="ACTIVE").first()
             if not asgn:
@@ -212,32 +241,24 @@ class WhatsAppVariableResolver:
                 return f"{user.first_name} {user.last_name}".strip() or user.email
         except Exception:
             pass
-        return ""
+        return "Coach"
+
+    def _branch_instance(self):
+        if self._trial and getattr(self._trial, 'branch', None):
+            return self._trial.branch
+        if self._booking and getattr(self._booking, 'branch', None):
+            return self._booking.branch
+        occ = self._occurrence()
+        if occ and getattr(occ, 'branch', None):
+            return occ.branch
+        return None
 
     def _branch_name(self) -> str:
-        if self._booking:
-            try:
-                return self._booking.branch.name
-            except Exception:
-                pass
-        occ = self._occurrence()
-        if occ and occ.branch:
-            try:
-                return occ.branch.name
-            except Exception:
-                pass
-        return ""
+        branch = self._branch_instance()
+        return branch.name if branch else "SWEAT Studio"
 
     def _branch_address(self) -> str:
-        branch = None
-        if self._trial and getattr(self._trial, 'branch', None):
-            branch = self._trial.branch
-        elif self._booking and getattr(self._booking, 'branch', None):
-            branch = self._booking.branch
-        else:
-            occ = self._occurrence()
-            if occ and getattr(occ, 'branch', None):
-                branch = occ.branch
+        branch = self._branch_instance()
         if branch:
             return (
                 getattr(branch, 'address', '')
@@ -245,12 +266,46 @@ class WhatsAppVariableResolver:
             ).strip()
         return ""
 
+    def _branch_maps_url(self) -> str:
+        branch = self._branch_instance()
+        if branch and hasattr(branch, 'get_google_maps_url'):
+            return branch.get_google_maps_url()
+        return "https://maps.google.com"
+
+    def _branch_review_url(self) -> str:
+        branch = self._branch_instance()
+        if branch and hasattr(branch, 'get_google_review_url'):
+            return branch.get_google_review_url()
+        return "https://g.page/r/sweat-reviews"
+
     def _class_datetime_ist(self) -> str:
-        dt = None
-        if self._trial and getattr(self._trial, 'scheduled_start', None):
-            dt = self._trial.scheduled_start
-        else:
-            occ = self._occurrence()
-            if occ and getattr(occ, 'start_at', None):
-                dt = occ.start_at
+        dt = self._effective_start_datetime()
         return fmt_ist_datetime(dt, self._tz) if dt else ""
+
+    def _late_lockout_time(self) -> str:
+        dt = self._effective_start_datetime()
+        if dt:
+            lockout_dt = dt + timedelta(minutes=5)
+            return _fmt_time(lockout_dt, self._tz)
+        return ""
+
+    def _confirmation_token(self) -> str:
+        if self._trial:
+            return generate_trial_action_token(self._trial.id, 'CONFIRM')
+        return ""
+
+    def _reschedule_token(self) -> str:
+        if self._trial:
+            return generate_trial_action_token(self._trial.id, 'RESCHEDULE')
+        return ""
+
+    def _rebook_token(self) -> str:
+        if self._trial:
+            return generate_trial_action_token(self._trial.id, 'REBOOK')
+        return ""
+
+    def _qr_pass_url(self) -> str:
+        if self._trial:
+            token = generate_trial_action_token(self._trial.id, 'PASS')
+            return f"https://app.sweatfitwellness.com/pass/{token}"
+        return ""
