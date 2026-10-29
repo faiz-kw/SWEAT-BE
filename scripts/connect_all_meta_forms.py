@@ -1,7 +1,7 @@
 """
 backend/scripts/connect_all_meta_forms.py — Automated High-Fidelity Meta Lead Form Integration.
 
-Connects every active lead form across all 7 Facebook Pages under Maahek Nair's Meta account:
+Connects every active lead form across all Facebook Pages under Maahek Nair's Meta account:
 1. Fetches all form definitions and questions from Meta Graph API v21.0.
 2. Intelligently maps:
    - Name fields (full_name, FIRST_NAME, LAST_NAME, Full Name, etc.)
@@ -11,10 +11,12 @@ Connects every active lead form across all 7 Facebook Pages under Maahek Nair's 
    - If studio question is present -> branch_mode='ANSWER' with all studio options mapped to Andheri, Goregaon, Malad
    - If Bootcamp form -> branch_mode='FIXED' targeting SWEAT_GOREGAON (Bootcamp branch) with fallback
    - If General form -> branch_mode='FIXED' targeting SWEAT_ANDHERI (HQ branch) with fallback
-4. Sets active status, CRM lead source, tenant assignment policy, and followup task creation.
+4. Ensures MetaPageRegistry in Master DB is populated for instant O(1) multi-tenant webhook routing.
+5. Subscribes Facebook Page Webhooks for leadgen events.
 """
 import os
 import sys
+import argparse
 import django
 import requests
 
@@ -31,6 +33,7 @@ os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
 django.setup()
 
 from django.utils import timezone
+from django.db.models import Q
 from apps.master.models_tenant import Tenant, MetaPageRegistry
 from apps.tenant_core.context import tenant_database_context
 from apps.tenant_core.models_meta_leads import MetaPageConnection, MetaLeadMapping
@@ -38,27 +41,51 @@ from apps.tenant_core.models_crm import LeadSource
 from apps.tenant_core.models_org import Branch
 from apps.tenant_core.meta_crypto import decrypt_token
 
-tenant = Tenant.objects.using('default').filter(slug='sweat').first()
+parser = argparse.ArgumentParser(description="Connect all active Meta Lead Forms to CRM")
+parser.add_argument("--tenant", type=str, default="", help="Tenant slug or code (default: sweat)")
+args, _ = parser.parse_known_args()
+
+target_slug = args.tenant.strip() if args.tenant else "sweat"
+tenant = (
+    Tenant.objects.using('default').filter(slug__iexact=target_slug).first()
+    or Tenant.objects.using('default').filter(code__icontains=target_slug).first()
+    or Tenant.objects.using('default').filter(status='ACTIVE').first()
+)
 if not tenant:
-    print("Error: SWEAT tenant not found.")
+    print(f"Error: Tenant matching '{target_slug}' not found.")
     sys.exit(1)
+
+print(f"Target Tenant: {tenant.name} (slug: {tenant.slug}, id: {tenant.id})")
 
 with tenant_database_context(tenant.id) as db_alias:
     lead_source = LeadSource.objects.using(db_alias).filter(source_type='META', status='ACTIVE').first()
     if not lead_source:
         lead_source = LeadSource.objects.using(db_alias).filter(source_type='META').first()
+    if not lead_source:
+        lead_source = LeadSource.objects.using(db_alias).first()
     
-    andheri_branch = Branch.objects.using(db_alias).filter(code='SWEAT_ANDHERI').first()
-    goregaon_branch = Branch.objects.using(db_alias).filter(code='SWEAT_GOREGAON').first()
-    malad_branch = Branch.objects.using(db_alias).filter(code='SWEAT_MALAD').first()
+    andheri_branch = (
+        Branch.objects.using(db_alias).filter(code='SWEAT_ANDHERI').first()
+        or Branch.objects.using(db_alias).filter(name__icontains='andheri').first()
+    )
+    goregaon_branch = (
+        Branch.objects.using(db_alias).filter(code='SWEAT_GOREGAON').first()
+        or Branch.objects.using(db_alias).filter(name__icontains='goregaon').first()
+    )
+    malad_branch = (
+        Branch.objects.using(db_alias).filter(code='SWEAT_MALAD').first()
+        or Branch.objects.using(db_alias).filter(name__icontains='malad').first()
+    )
 
-    andheri_id = str(andheri_branch.id)
-    goregaon_id = str(goregaon_branch.id)
-    malad_id = str(malad_branch.id)
+    fallback_branch = andheri_branch or Branch.objects.using(db_alias).first()
+    andheri_id = str(andheri_branch.id) if andheri_branch else (str(fallback_branch.id) if fallback_branch else None)
+    goregaon_id = str(goregaon_branch.id) if goregaon_branch else andheri_id
+    malad_id = str(malad_branch.id) if malad_branch else andheri_id
 
     print("=" * 80)
     print("CONNECTING ALL ACTIVE META LEAD FORMS TO SWEAT CRM")
-    print(f"Lead Source: {lead_source.name} ({lead_source.id})")
+    if lead_source:
+        print(f"Lead Source: {lead_source.name} ({lead_source.id})")
     print(f"Branches: Andheri={andheri_id}, Goregaon={goregaon_id}, Malad={malad_id}")
     print("=" * 80)
 
@@ -69,6 +96,29 @@ with tenant_database_context(tenant.id) as db_alias:
         token = decrypt_token(page.encrypted_page_access_token)
         if not token:
             continue
+
+        # Register in Master MetaPageRegistry for webhook routing
+        MetaPageRegistry.objects.using('default').update_or_create(
+            page_id=page.page_id,
+            defaults={
+                'tenant': tenant,
+                'page_name': page.page_name,
+                'is_active': True,
+            }
+        )
+
+        # Attempt to ensure page webhook subscription on Meta
+        try:
+            sub_res = requests.post(
+                f"https://graph.facebook.com/v21.0/{page.page_id}/subscribed_apps",
+                data={"access_token": token, "subscribed_fields": "leadgen"}
+            ).json()
+            if sub_res.get('success'):
+                page.is_subscribed_to_webhooks = True
+                page.subscribed_at = timezone.now()
+                page.save(using=db_alias, update_fields=['is_subscribed_to_webhooks', 'subscribed_at'])
+        except Exception:
+            pass
 
         forms_res = requests.get(
             f"https://graph.facebook.com/v21.0/{page.page_id}/leadgen_forms",
@@ -87,7 +137,7 @@ with tenant_database_context(tenant.id) as db_alias:
             branch_mode = 'FIXED'
             branch_field = ''
             branch_answers = {}
-            target_branch = andheri_branch
+            target_branch = andheri_branch or fallback_branch
 
             # Inspect questions to map fields
             studio_question_key = None
@@ -162,15 +212,15 @@ with tenant_database_context(tenant.id) as db_alias:
                 branch_answers['andheri'] = andheri_id
                 branch_answers['goregaon'] = goregaon_id
                 branch_answers['malad'] = malad_id
-                target_branch = andheri_branch
+                target_branch = andheri_branch or fallback_branch
             else:
                 # If form is for Bootcamp, route to Goregaon Bootcamp studio
                 if 'bootcamp' in form_name.lower():
                     branch_mode = 'FIXED'
-                    target_branch = goregaon_branch
+                    target_branch = goregaon_branch or fallback_branch
                 else:
                     branch_mode = 'FIXED'
-                    target_branch = andheri_branch
+                    target_branch = andheri_branch or fallback_branch
 
             # Upsert MetaLeadMapping
             mapping, created = MetaLeadMapping.objects.using(db_alias).update_or_create(
@@ -187,7 +237,7 @@ with tenant_database_context(tenant.id) as db_alias:
                     'branch_field': branch_field,
                     'branch_answers': branch_answers,
                     'unmatched_branch_policy': 'FALLBACK_BRANCH',
-                    'fallback_branch': andheri_branch,
+                    'fallback_branch': andheri_branch or fallback_branch,
                     'lead_source': lead_source,
                     'initial_stage': 'NEW_LEAD',
                     'repeat_policy': 'REOPEN',
@@ -199,9 +249,10 @@ with tenant_database_context(tenant.id) as db_alias:
             )
 
             action_str = "Created" if created else "Updated"
+            target_branch_code = getattr(target_branch, 'code', 'DEFAULT') if target_branch else 'DEFAULT'
             print(f"[{action_str}] Form '{form_name}' (ID: {form_id}) on Page '{page.page_name}'")
             print(f"         Fields: {field_mappings}")
-            print(f"         Routing: mode={branch_mode}, branch={target_branch.code}, answers_count={len(branch_answers)}")
+            print(f"         Routing: mode={branch_mode}, branch={target_branch_code}, answers_count={len(branch_answers)}")
             total_connected += 1
 
     print("\n" + "=" * 80)
