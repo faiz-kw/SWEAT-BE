@@ -166,12 +166,12 @@ class VobizVoiceAdapter(BaseCommunicationAdapter):
         If unanswered, Vobiz fires fallback_action_url to execute the overflow ladder.
         """
         rec_str = "true" if record else "false"
-        sip_target = agent_sip_uri if agent_sip_uri.startswith("sip:") else f"sip:{agent_sip_uri}@registrar.vobiz.ai"
+        agent_user = agent_sip_uri.replace("sip:", "").split("@")[0].strip()
 
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Dial action="{fallback_action_url}" callerId="{caller_id}" record="{rec_str}" timeout="{timeout}">
-    <User>{sip_target}</User>
+    <User>{agent_user}</User>
   </Dial>
 </Response>"""
 
@@ -248,13 +248,13 @@ class VobizVoiceAdapter(BaseCommunicationAdapter):
         """
         Builds VobizXML for the overflow fallback leg when the primary agent is busy or unavailable.
         """
-        sip_target = secondary_sip_uri if secondary_sip_uri.startswith("sip:") else f"sip:{secondary_sip_uri}@registrar.vobiz.ai"
+        sec_user = secondary_sip_uri.replace("sip:", "").split("@")[0].strip()
 
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Speak voice="WOMAN" language="en-IN">{whisper_prompt}</Speak>
   <Dial action="{complete_action_url}" callerId="{caller_id}" record="true" timeout="{timeout}">
-    <User>{sip_target}</User>
+    <User>{sec_user}</User>
   </Dial>
 </Response>"""
 
