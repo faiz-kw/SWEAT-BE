@@ -1289,14 +1289,13 @@ class TelephonyAnalyticsView(APIView):
     """
     GET /api/v1/tenant/crm/telephony/analytics/
     Provides comprehensive Sales Calling Analytics, Rep Leaderboard, Dispositions Breakdown,
-    and Hourly Connect Rate Heatmap for managers and sales leads.
+    Hourly Connect Rate Heatmap, and Filtered/Paginated Recent Calls Audit Log.
     """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
         user = request.user
         is_admin = getattr(user, 'is_superuser', False) or getattr(user, 'is_staff', False)
-        # Check permissions
         roles = getattr(user, 'roles', []) or [getattr(user, 'role', '')]
         has_perm = (
             is_admin
@@ -1309,6 +1308,7 @@ class TelephonyAnalyticsView(APIView):
         with resolve_telephony_tenant_context():
             from django.db import models
             from django.db.models import Q
+            import math
             alias = get_tenant_db_alias() or 'default'
             org = getattr(user, 'organization', None)
             if not org:
@@ -1321,6 +1321,10 @@ class TelephonyAnalyticsView(APIView):
             branch_id = request.query_params.get('branch_id')
             rep_id = request.query_params.get('rep_id')
             team_only = str(request.query_params.get('team_only', 'false')).lower() in ('true', '1')
+            direction_filter = request.query_params.get('direction')
+            status_filter = request.query_params.get('status')
+            disposition_filter = request.query_params.get('disposition')
+            search_query = request.query_params.get('search', '').strip()
 
             # Calculate date boundaries in IST (Asia/Kolkata)
             try:
@@ -1357,15 +1361,15 @@ class TelephonyAnalyticsView(APIView):
             else:
                 date_filter = Q(created_at__gte=start_of_today)
 
-            qs = CallSession.objects.using(alias).filter(
+            base_qs = CallSession.objects.using(alias).filter(
                 organization=org
             ).filter(date_filter)
 
             if branch_id and branch_id != 'ALL':
-                qs = qs.filter(branch_id=branch_id)
+                base_qs = base_qs.filter(branch_id=branch_id)
 
             if rep_id and rep_id != 'ALL':
-                qs = qs.filter(sales_rep_id=rep_id)
+                base_qs = base_qs.filter(sales_rep_id=rep_id)
 
             if team_only:
                 from apps.tenant_core.models_workforce import EmployeeProfile
@@ -1374,33 +1378,35 @@ class TelephonyAnalyticsView(APIView):
                         reporting_manager__user_profile__user=user
                     ).values_list('user_profile__user_id', flat=True)
                 )
-                qs = qs.filter(sales_rep_id__in=subordinate_ids)
+                base_qs = base_qs.filter(sales_rep_id__in=subordinate_ids)
 
             # 1. Summary Metrics
-            total_dials = qs.count()
-            connected_calls = qs.filter(status__in=['COMPLETED', 'CONNECTED']).count()
+            total_dials = base_qs.count()
+            connected_calls = base_qs.filter(status__in=['COMPLETED', 'CONNECTED']).count()
             connect_rate_pct = round((connected_calls / total_dials * 100), 1) if total_dials > 0 else 0.0
-            meaningful_calls = qs.filter(is_meaningful=True).count()
+            missed_calls = base_qs.filter(status__in=['NO_ANSWER', 'BUSY', 'FAILED', 'CANCELLED']).count()
+            missed_rate_pct = round((missed_calls / total_dials * 100), 1) if total_dials > 0 else 0.0
+            meaningful_calls = base_qs.filter(is_meaningful=True).count()
             meaningful_rate_pct = round((meaningful_calls / connected_calls * 100), 1) if connected_calls > 0 else 0.0
-            total_talk_sec = qs.aggregate(s=models.Sum('duration_seconds'))['s'] or 0.0
+            total_talk_sec = base_qs.filter(status__in=['COMPLETED', 'CONNECTED']).aggregate(s=models.Sum('duration_seconds'))['s'] or 0.0
             total_talk_minutes = round(total_talk_sec / 60.0, 1)
             avg_duration_sec = round(total_talk_sec / connected_calls, 1) if connected_calls > 0 else 0.0
-            trials_booked = qs.filter(disposition='TRIAL_BOOKED').count()
-            converted_members = qs.filter(disposition='CONVERTED_MEMBER').count()
-            inbound_count = qs.filter(direction='INBOUND').count()
-            outbound_count = qs.filter(direction='OUTBOUND').count()
+            trials_booked = base_qs.filter(disposition='TRIAL_BOOKED').count()
+            converted_members = base_qs.filter(disposition='CONVERTED_MEMBER').count()
+            inbound_count = base_qs.filter(direction='INBOUND').count()
+            outbound_count = base_qs.filter(direction='OUTBOUND').count()
 
             # 2. Leaderboard per Sales Rep
-            reps_qs = qs.filter(sales_rep__isnull=False).values(
+            reps_qs = base_qs.filter(sales_rep__isnull=False).values(
                 'sales_rep__id', 'sales_rep__first_name', 'sales_rep__last_name', 'sales_rep__email'
             ).annotate(
                 dials=models.Count('id'),
                 connected=models.Count('id', filter=Q(status__in=['COMPLETED', 'CONNECTED'])),
                 meaningful=models.Count('id', filter=Q(is_meaningful=True)),
-                talk_seconds=models.Sum('duration_seconds'),
+                talk_seconds=models.Sum('duration_seconds', filter=Q(status__in=['COMPLETED', 'CONNECTED'])),
                 trials=models.Count('id', filter=Q(disposition='TRIAL_BOOKED')),
                 conversions=models.Count('id', filter=Q(disposition='CONVERTED_MEMBER')),
-            ).order_by('-meaningful', '-dials')
+            ).order_by('-meaningful', '-connected', '-dials')
 
             leaderboard = []
             for rank, r in enumerate(reps_qs, start=1):
@@ -1409,6 +1415,7 @@ class TelephonyAnalyticsView(APIView):
                 cr = round((c / d * 100), 1) if d > 0 else 0.0
                 ts = r['talk_seconds'] or 0.0
                 tm = round(ts / 60.0, 1)
+                avg_rep_sec = round(ts / c, 1) if c > 0 else 0.0
                 first = r['sales_rep__first_name'] or ''
                 last = r['sales_rep__last_name'] or ''
                 full_name = f"{first} {last}".strip() or r['sales_rep__email']
@@ -1422,12 +1429,13 @@ class TelephonyAnalyticsView(APIView):
                     'connect_rate_pct': cr,
                     'meaningful_calls': r['meaningful'] or 0,
                     'talk_time_minutes': tm,
+                    'avg_duration_seconds': avg_rep_sec,
                     'trials_booked': r['trials'] or 0,
                     'members_converted': r['conversions'] or 0,
                 })
 
             # 3. Dispositions Breakdown
-            disposition_counts = qs.filter(disposition__isnull=False).values('disposition').annotate(
+            disposition_counts = base_qs.filter(disposition__isnull=False).values('disposition').annotate(
                 count=models.Count('id')
             ).order_by('-count')
 
@@ -1449,7 +1457,7 @@ class TelephonyAnalyticsView(APIView):
             for h in range(9, 21):
                 hourly_stats[h] = {'dials': 0, 'connected': 0}
 
-            for call in qs.values('created_at', 'status'):
+            for call in base_qs.values('created_at', 'status'):
                 cat = call['created_at'].astimezone(tz)
                 h = cat.hour
                 if 9 <= h <= 20:
@@ -1465,7 +1473,7 @@ class TelephonyAnalyticsView(APIView):
                 c = hourly_stats[h]['connected']
                 rate = round((c / d * 100), 1) if d > 0 else 0.0
                 label = f"{h:02d}:00 - {h+1:02d}:00"
-                if d >= 2 and rate > peak_rate:
+                if d >= 1 and rate > peak_rate:
                     peak_rate = rate
                     peak_hour = label
                 heatmap.append({
@@ -1476,12 +1484,53 @@ class TelephonyAnalyticsView(APIView):
                     'connect_rate_pct': rate,
                 })
 
-            # 5. Recent Calls Audit Log (top 50)
-            recent_calls_qs = qs.select_related('lead', 'sales_rep', 'branch').order_by('-created_at')[:50]
+            # 5. Filtered & Paginated Recent Calls Audit Log
+            recent_qs = base_qs.select_related('lead', 'sales_rep', 'branch')
+
+            if direction_filter and direction_filter.upper() in ('INBOUND', 'OUTBOUND'):
+                recent_qs = recent_qs.filter(direction=direction_filter.upper())
+
+            if status_filter and status_filter != 'ALL':
+                if status_filter == 'CONNECTED':
+                    recent_qs = recent_qs.filter(status__in=['COMPLETED', 'CONNECTED'])
+                elif status_filter == 'MISSED':
+                    recent_qs = recent_qs.filter(status__in=['NO_ANSWER', 'BUSY', 'FAILED', 'CANCELLED'])
+                else:
+                    recent_qs = recent_qs.filter(status=status_filter)
+
+            if disposition_filter and disposition_filter != 'ALL':
+                recent_qs = recent_qs.filter(disposition=disposition_filter)
+
+            if search_query:
+                recent_qs = recent_qs.filter(
+                    Q(lead__first_name__icontains=search_query) |
+                    Q(lead__last_name__icontains=search_query) |
+                    Q(lead__phone_normalized__icontains=search_query) |
+                    Q(user_phone_number__icontains=search_query) |
+                    Q(sales_rep__first_name__icontains=search_query) |
+                    Q(sales_rep__last_name__icontains=search_query) |
+                    Q(sales_rep__email__icontains=search_query) |
+                    Q(disposition_notes__icontains=search_query)
+                )
+
+            total_filtered_calls = recent_qs.count()
+            try:
+                page = max(1, int(request.query_params.get('page', 1)))
+            except (TypeError, ValueError):
+                page = 1
+            try:
+                page_size = min(100, max(5, int(request.query_params.get('page_size', 25))))
+            except (TypeError, ValueError):
+                page_size = 25
+
+            total_pages = max(1, math.ceil(total_filtered_calls / page_size))
+            offset = (page - 1) * page_size
+            recent_calls_page = recent_qs.order_by('-created_at')[offset : offset + page_size]
+
             recent_calls = []
-            for cs in recent_calls_qs:
+            for cs in recent_calls_page:
                 p = cs.user_phone_number or ''
-                masked_phone = f"+91-XXXXX-{p[-4:]}" if len(p) >= 4 else "+91-XXXXX-XXXX"
+                masked_phone = f"+91-XXXXX-{p[-4:]}" if len(p) >= 4 else (p or "+91-XXXXX-XXXX")
                 rep_name = f"{cs.sales_rep.first_name} {cs.sales_rep.last_name}".strip() if cs.sales_rep else "Automated / Pool"
                 lead_name = f"{cs.lead.first_name} {cs.lead.last_name}".strip() if cs.lead else "Unknown Lead"
                 recent_calls.append({
@@ -1499,8 +1548,31 @@ class TelephonyAnalyticsView(APIView):
                     'disposition_label': labels_map.get(cs.disposition, cs.disposition) if cs.disposition else 'Pending',
                     'disposition_notes': cs.disposition_notes,
                     'has_recording': bool(cs.recording_url),
+                    'recording_url': cs.recording_url or '',
                     'created_at': cs.created_at.isoformat(),
                 })
+
+            # Active sales reps list for UI filter
+            reps_list_qs = TenantUser.objects.using(alias).filter(
+                organization=org
+            ).filter(
+                Q(telephony_presence__isnull=False) |
+                Q(handled_call_sessions__isnull=False)
+            ).values('id', 'first_name', 'last_name', 'email').distinct()
+
+            sales_reps = [
+                {
+                    'id': str(r['id']),
+                    'name': f"{r['first_name']} {r['last_name']}".strip() or r['email'],
+                    'email': r['email']
+                }
+                for r in reps_list_qs
+            ]
+
+            available_dispositions = [
+                {'code': code, 'label': label}
+                for code, label in CallSession.DISPOSITION_CHOICES
+            ]
 
             return Response({
                 'timeframe': timeframe,
@@ -1508,6 +1580,8 @@ class TelephonyAnalyticsView(APIView):
                     'total_dials': total_dials,
                     'connected_calls': connected_calls,
                     'connect_rate_pct': connect_rate_pct,
+                    'missed_calls': missed_calls,
+                    'missed_rate_pct': missed_rate_pct,
                     'meaningful_calls': meaningful_calls,
                     'meaningful_rate_pct': meaningful_rate_pct,
                     'total_talk_time_minutes': total_talk_minutes,
@@ -1522,4 +1596,145 @@ class TelephonyAnalyticsView(APIView):
                 'dispositions': dispositions,
                 'hourly_heatmap': heatmap,
                 'recent_calls': recent_calls,
+                'sales_reps': sales_reps,
+                'available_dispositions': available_dispositions,
+                'pagination': {
+                    'total_count': total_filtered_calls,
+                    'page': page,
+                    'page_size': page_size,
+                    'total_pages': total_pages,
+                }
             }, status=status.HTTP_200_OK)
+
+
+class TelephonyExportView(APIView):
+    """
+    GET /api/v1/tenant/crm/telephony/export/
+    Exports filtered CallSession records as a CSV download matching active filters.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        with resolve_telephony_tenant_context():
+            from django.db.models import Q
+            import csv
+            alias = get_tenant_db_alias() or 'default'
+            org = getattr(user, 'organization', None)
+            if not org:
+                org = Organization.objects.using(alias).filter(status='ACTIVE').first()
+
+            if not org:
+                return Response({'error': 'No active organization found.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            timeframe = request.query_params.get('timeframe', 'today').lower()
+            branch_id = request.query_params.get('branch_id')
+            rep_id = request.query_params.get('rep_id')
+            direction_filter = request.query_params.get('direction')
+            status_filter = request.query_params.get('status')
+            disposition_filter = request.query_params.get('disposition')
+            search_query = request.query_params.get('search', '').strip()
+
+            try:
+                tz = zoneinfo.ZoneInfo('Asia/Kolkata')
+            except Exception:
+                tz = timezone.get_current_timezone()
+
+            now_ist = timezone.now().astimezone(tz)
+            start_of_today = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+
+            if timeframe == 'today':
+                date_filter = Q(created_at__gte=start_of_today)
+            elif timeframe == 'yesterday':
+                start_yesterday = start_of_today - timedelta(days=1)
+                date_filter = Q(created_at__gte=start_yesterday, created_at__lt=start_of_today)
+            elif timeframe == 'this_week':
+                start_week = start_of_today - timedelta(days=start_of_today.weekday())
+                date_filter = Q(created_at__gte=start_week)
+            elif timeframe == 'this_month':
+                start_month = start_of_today.replace(day=1)
+                date_filter = Q(created_at__gte=start_month)
+            elif timeframe == 'last_30_days':
+                start_30d = start_of_today - timedelta(days=30)
+                date_filter = Q(created_at__gte=start_30d)
+            elif timeframe == 'custom':
+                date_from = request.query_params.get('date_from')
+                date_to = request.query_params.get('date_to')
+                df = Q()
+                if date_from:
+                    df &= Q(created_at__date__gte=date_from)
+                if date_to:
+                    df &= Q(created_at__date__lte=date_to)
+                date_filter = df
+            else:
+                date_filter = Q(created_at__gte=start_of_today)
+
+            qs = CallSession.objects.using(alias).filter(
+                organization=org
+            ).filter(date_filter).select_related('lead', 'sales_rep', 'branch')
+
+            if branch_id and branch_id != 'ALL':
+                qs = qs.filter(branch_id=branch_id)
+            if rep_id and rep_id != 'ALL':
+                qs = qs.filter(sales_rep_id=rep_id)
+            if direction_filter and direction_filter.upper() in ('INBOUND', 'OUTBOUND'):
+                qs = qs.filter(direction=direction_filter.upper())
+            if status_filter and status_filter != 'ALL':
+                if status_filter == 'CONNECTED':
+                    qs = qs.filter(status__in=['COMPLETED', 'CONNECTED'])
+                elif status_filter == 'MISSED':
+                    qs = qs.filter(status__in=['NO_ANSWER', 'BUSY', 'FAILED', 'CANCELLED'])
+                else:
+                    qs = qs.filter(status=status_filter)
+            if disposition_filter and disposition_filter != 'ALL':
+                qs = qs.filter(disposition=disposition_filter)
+            if search_query:
+                qs = qs.filter(
+                    Q(lead__first_name__icontains=search_query) |
+                    Q(lead__last_name__icontains=search_query) |
+                    Q(lead__phone_normalized__icontains=search_query) |
+                    Q(user_phone_number__icontains=search_query) |
+                    Q(sales_rep__first_name__icontains=search_query) |
+                    Q(sales_rep__last_name__icontains=search_query) |
+                    Q(sales_rep__email__icontains=search_query) |
+                    Q(disposition_notes__icontains=search_query)
+                )
+
+            labels_map = dict(CallSession.DISPOSITION_CHOICES)
+            filename = f"sales_calling_report_{timeframe}_{now_ist.strftime('%Y%m%d_%H%M%S')}.csv"
+            response = HttpResponse(content_type='text/csv; charset=utf-8')
+            response['Content-Disposition'] = f'attachment; filename="{filename}"'
+
+            writer = csv.writer(response)
+            writer.writerow([
+                'Call ID', 'Timestamp (IST)', 'Lead Name', 'Phone Number',
+                'Sales Rep', 'Direction', 'Status', 'Duration (Seconds)',
+                'Talk Time Formatted', 'Meaningful (>=30s)', 'Disposition',
+                'Disposition Notes', 'Recording Available'
+            ])
+
+            for cs in qs.order_by('-created_at'):
+                dur = int(cs.duration_seconds or 0)
+                dur_fmt = f"{dur // 60}m {dur % 60}s"
+                time_str = cs.created_at.astimezone(tz).strftime('%Y-%m-%d %H:%M:%S')
+                rep_name = f"{cs.sales_rep.first_name} {cs.sales_rep.last_name}".strip() if cs.sales_rep else "Automated / Pool"
+                lead_name = f"{cs.lead.first_name} {cs.lead.last_name}".strip() if cs.lead else "Unknown Lead"
+                disp_lbl = labels_map.get(cs.disposition, cs.disposition) if cs.disposition else 'Pending'
+
+                writer.writerow([
+                    str(cs.id),
+                    time_str,
+                    lead_name,
+                    cs.user_phone_number or '',
+                    rep_name,
+                    cs.direction,
+                    cs.status,
+                    dur,
+                    dur_fmt,
+                    'YES' if cs.is_meaningful else 'NO',
+                    disp_lbl,
+                    cs.disposition_notes or '',
+                    'YES' if bool(cs.recording_url) else 'NO'
+                ])
+
+            return response

@@ -232,8 +232,8 @@ class CommunityFeedMobileView(APIView):
 
 class CommunityPostCreateMobileView(APIView):
     """
-    POST /api/v1/mobile/community/posts/
-    Publish a transformation post, highlight, or general discussion story.
+    GET  /api/v1/mobile/community/posts/ — Alias to CommunityFeedMobileView
+    POST /api/v1/mobile/community/posts/ — Publish a transformation post, highlight, or general discussion story.
     Directly incorporates fields from mobile screenshot:
     - Before & After photo URLs
     - Duration ('12 Weeks') & Metric Change ('-11.5 kg')
@@ -241,6 +241,18 @@ class CommunityPostCreateMobileView(APIView):
     - Privacy Scope (Studio Public, Members Only, Anonymous)
     """
     permission_classes = [IsAuthenticated]
+
+    def get_permissions(self):
+        if self.request.method in ['GET', 'OPTIONS']:
+            return [AllowAny()]
+        return [IsAuthenticated()]
+
+    def get(self, request, *args, **kwargs):
+        """
+        Alias GET /api/v1/mobile/community/posts/ to CommunityFeedMobileView
+        so mobile clients can fetch the feed using either /feed/ or /posts/.
+        """
+        return CommunityFeedMobileView().get(request, *args, **kwargs)
 
     def post(self, request):
         alias, tenant = _resolve_mobile_tenant_and_db(request)
@@ -480,7 +492,10 @@ class CommunityPostCommentsMobileView(APIView):
         # Check if author is a verified trainer/coach in this tenant
         is_coach = False
         if request.user:
-            is_coach = TrainerProfile.objects.using(alias).filter(user=request.user).exists()
+            is_coach = TrainerProfile.objects.using(alias).filter(
+                employee_profile__user_profile__user=request.user,
+                trainer_status='ACTIVE'
+            ).exists()
 
         with transaction.atomic(using=alias):
             comment = CommunityComment.objects.using(alias).create(

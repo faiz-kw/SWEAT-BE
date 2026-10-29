@@ -408,6 +408,7 @@ urlpatterns = [
     path('crm/telephony/webrtc-credentials/', views_telephony.AgentWebRTCCredentialsView.as_view(), name='crm-telephony-webrtc-credentials'),
     path('crm/telephony/config/', views_telephony.TelephonyConfigView.as_view(), name='crm-telephony-config'),
     path('crm/telephony/analytics/', views_telephony.TelephonyAnalyticsView.as_view(), name='crm-telephony-analytics'),
+    path('crm/telephony/export/', views_telephony.TelephonyExportView.as_view(), name='crm-telephony-export'),
 
     path('', include(router.urls)),
 ]
