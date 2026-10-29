@@ -78,6 +78,13 @@ class TelephonyConfigService:
             or os.getenv("VOBIZ_AUTH_TOKEN", "")
         ).strip()
 
+        endpoint_password = (
+            config_data.get("endpoint_password")
+            or os.getenv("VOBIZ_ENDPOINT_PASSWORD")
+            or os.getenv("VOBIZ_SIP_PASSWORD")
+            or "Sweat@2026!"
+        ).strip()
+
         try:
             ring_timeout = int(config_data.get("ring_timeout_sec") or os.getenv("VOBIZ_RING_TIMEOUT", cls.DEFAULT_TIMEOUT_SEC))
         except (ValueError, TypeError):
@@ -96,6 +103,7 @@ class TelephonyConfigService:
             "webrtc_gateway_url": webrtc_gateway,
             "ring_timeout_sec": ring_timeout,
             "record_all_calls": bool(record_all),
+            "endpoint_password": endpoint_password,
             "status": "ACTIVE" if (auth_id or from_number) else "UNCONFIGURED",
         }
 
@@ -117,7 +125,7 @@ class TelephonyConfigService:
 
         # Merge updates cleanly
         new_cfg = dict(existing_cfg)
-        for key in ["from_number", "auth_id", "registrar_host", "webrtc_gateway_url", "ring_timeout_sec", "record_all_calls"]:
+        for key in ["from_number", "auth_id", "registrar_host", "webrtc_gateway_url", "ring_timeout_sec", "record_all_calls", "endpoint_password"]:
             if key in payload:
                 new_cfg[key] = payload[key]
 
@@ -243,6 +251,8 @@ class TelephonyConfigService:
 
         return {
             "username": sip_user,
+            "password": vobiz_cfg.get("endpoint_password", "Sweat@2026!"),
+            "sip_password": vobiz_cfg.get("endpoint_password", "Sweat@2026!"),
             "sip_domain": sip_domain,
             "sip_uri": sip_uri,
             "wss_url": vobiz_cfg["webrtc_gateway_url"],

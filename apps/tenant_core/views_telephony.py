@@ -406,8 +406,8 @@ class VobizInboundFallbackWebhookView(APIView):
                             'caller_type': 'MEMBER',
                         })
                     # Write CallSession activity note for member 360 timeline
-                    session.notes = f"MISSED Missed inbound call from {session.user_phone_number}. No reps were available to answer."
-                    session.save(update_fields=['notes'])
+                    session.disposition_notes = f"MISSED: Inbound call from {session.user_phone_number}. No reps were available to answer."
+                    session.save(update_fields=['disposition_notes'])
 
             xml = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>

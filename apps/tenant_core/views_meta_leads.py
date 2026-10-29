@@ -924,7 +924,36 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
             )
 
             if is_browser_redirect:
-                return HttpResponseRedirect(f"{frontend_origin}{target_path}&meta_connected=true&pages={len(discovered_pages)}")
+                from django.http import HttpResponse
+                html_resp = f"""<!DOCTYPE html>
+<html>
+<head><title>Facebook Authorization Completed</title></head>
+<body style="font-family:sans-serif;text-align:center;padding:40px;background:#f8fafc;color:#0f172a;">
+  <div style="max-width:420px;margin:0 auto;background:#fff;border-radius:12px;padding:32px;box-shadow:0 4px 12px rgba(0,0,0,0.08);">
+    <h2 style="margin:0 0 12px;color:#16a34a;font-size:20px;">Connection Successful!</h2>
+    <p style="font-size:14px;color:#64748b;margin:0 0 20px;">Facebook account <strong>{meta_user_name}</strong> linked ({len(discovered_pages)} page(s) discovered).</p>
+    <p style="font-size:12px;color:#94a3b8;">This window will close automatically...</p>
+    <a href="{frontend_origin}{target_path}&meta_connected=true&pages={len(discovered_pages)}" style="display:inline-block;margin-top:16px;padding:8px 16px;background:#0284c7;color:#fff;text-decoration:none;border-radius:6px;font-size:12px;">Return to CRM</a>
+  </div>
+  <script>
+    try {{
+      if (window.opener) {{
+        window.opener.postMessage({{
+          type: 'META_OAUTH_SUCCESS',
+          userName: '{meta_user_name}',
+          pagesCount: {len(discovered_pages)}
+        }}, '*');
+        setTimeout(function() {{ window.close(); }}, 800);
+      }} else {{
+        window.location.href = '{frontend_origin}{target_path}&meta_connected=true&pages={len(discovered_pages)}';
+      }}
+    }} catch(e) {{
+      window.location.href = '{frontend_origin}{target_path}&meta_connected=true&pages={len(discovered_pages)}';
+    }}
+  </script>
+</body>
+</html>"""
+                return HttpResponse(html_resp, content_type='text/html')
 
             return Response({
                 'status': 'CONNECTED',

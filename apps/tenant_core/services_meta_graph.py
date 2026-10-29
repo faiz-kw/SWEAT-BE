@@ -275,7 +275,7 @@ class MetaGraphClient:
 
 
 
-    def build_authorize_url(self, state: str, redirect_uri: str) -> str:
+    def build_authorize_url(self, state: str, redirect_uri: str, auth_type: str = "rerequest") -> str:
 
         """Construct Meta OAuth login dialog URL."""
 
@@ -308,6 +308,8 @@ class MetaGraphClient:
             'response_type': 'code',
 
             'scope': ','.join(scopes),
+
+            'auth_type': auth_type,
 
         }
 
