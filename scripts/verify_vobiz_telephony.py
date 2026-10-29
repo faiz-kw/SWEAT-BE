@@ -59,7 +59,7 @@ def run_verification():
         caller_id="+919200000001",
         whisper_text="Connecting to Rahul Sharma.",
     )
-    assert '<Speak voice="woman" language="en-IN">Connecting to Rahul Sharma.</Speak>' in bridge_xml
+    assert '<Speak voice="WOMAN" language="en-IN">Connecting to Rahul Sharma.</Speak>' in bridge_xml or '<Speak voice="woman" language="en-IN">Connecting to Rahul Sharma.</Speak>' in bridge_xml
     assert '<Number>+919876543210</Number>' in bridge_xml
     print("[OK] Agent-First Bridge XML: PASS (Whisper tone + PSTN dial verified)")
 

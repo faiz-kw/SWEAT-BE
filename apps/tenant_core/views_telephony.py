@@ -327,11 +327,10 @@ class VobizInboundFallbackWebhookView(APIView):
             if dial_status.lower() in ('completed', 'answered'):
                 return HttpResponse("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response/>", content_type="application/xml")
 
-            # Find secondary available rep
+            # Find secondary available rep, prioritizing actively connected reps
             secondary_presence = AgentPresence.objects.filter(
-                organization=org,
                 status='AVAILABLE',
-            ).exclude(user=session.sales_rep if session else None).first()
+            ).exclude(user=session.sales_rep if session else None).order_by('-last_heartbeat').first()
 
             host = _get_webhook_host(request)
             caller_id = session.agent_phone_number if session else "+919200000001"
@@ -882,32 +881,77 @@ class AgentPresenceView(APIView):
     """
     GET / PUT /api/v1/tenant/crm/telephony/presence/
     Get or toggle agent presence (AVAILABLE, WRAP_UP, OFFLINE).
+    Includes real-time self-healing to prevent agents from getting locked in ON_CALL or WRAP_UP.
     """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        presence = AgentPresence.objects.filter(user=request.user).first()
-        status_val = presence.status if presence else 'AVAILABLE'
-        return Response({'status': status_val}, status=status.HTTP_200_OK)
+        with resolve_telephony_tenant_context():
+            presence = AgentPresence.objects.filter(user=request.user).first()
+            if presence:
+                # 1. Self-healing check: If agent is marked ON_CALL, verify active session
+                if presence.status == 'ON_CALL':
+                    active = presence.active_session
+                    # If no session assigned, or session is concluded / cancelled, release to AVAILABLE
+                    if not active or active.status in ('COMPLETED', 'NO_ANSWER', 'FAILED', 'BUSY', 'CANCELLED') or active.ended_at is not None:
+                        logger.info("AgentPresenceView: Auto-releasing %s from stale ON_CALL to AVAILABLE", request.user.email)
+                        presence.status = 'AVAILABLE'
+                        presence.active_session = None
+                        presence.last_heartbeat = timezone.now()
+                        presence.save(update_fields=['status', 'active_session', 'last_heartbeat'])
+                elif presence.status == 'WRAP_UP':
+                    # If in WRAP_UP for > 5 minutes without disposition, auto-release to AVAILABLE
+                    five_min_ago = timezone.now() - timedelta(minutes=5)
+                    if not presence.last_heartbeat or presence.last_heartbeat < five_min_ago:
+                        logger.info("AgentPresenceView: Auto-releasing %s from stale WRAP_UP to AVAILABLE", request.user.email)
+                        presence.status = 'AVAILABLE'
+                        presence.active_session = None
+                        presence.last_heartbeat = timezone.now()
+                        presence.save(update_fields=['status', 'active_session', 'last_heartbeat'])
+
+                status_val = presence.status
+                sip_user = presence.sip_username
+                last_hb = presence.last_heartbeat
+                active_id = str(presence.active_session.id) if presence.active_session else None
+            else:
+                status_val = 'AVAILABLE'
+                sip_user = ''
+                last_hb = None
+                active_id = None
+
+            return Response({
+                'status': status_val,
+                'sip_username': sip_user,
+                'last_heartbeat': last_hb,
+                'active_session_id': active_id,
+            }, status=status.HTTP_200_OK)
 
     def put(self, request):
         new_status = request.data.get('status', 'AVAILABLE').upper()
         if new_status not in ('AVAILABLE', 'WRAP_UP', 'OFFLINE'):
             return Response({'error': 'Invalid status.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        presence, _ = AgentPresence.objects.get_or_create(
-            user=request.user,
-            defaults={
-                'organization': Organization.objects.first(),
-                'sip_username': f"agent_{request.user.id.hex[:6]}",
-                'status': new_status,
-            },
-        )
-        presence.status = new_status
-        presence.last_heartbeat = timezone.now()
-        presence.save(update_fields=['status', 'last_heartbeat'])
+        with resolve_telephony_tenant_context():
+            presence, _ = AgentPresence.objects.get_or_create(
+                user=request.user,
+                defaults={
+                    'organization': Organization.objects.first(),
+                    'sip_username': f"agent_{request.user.id.hex[:6]}",
+                    'status': new_status,
+                },
+            )
+            presence.status = new_status
+            if new_status == 'AVAILABLE':
+                presence.active_session = None
+            presence.last_heartbeat = timezone.now()
+            presence.save(update_fields=['status', 'active_session', 'last_heartbeat'])
 
-        return Response({'status': presence.status}, status=status.HTTP_200_OK)
+            return Response({
+                'status': presence.status,
+                'sip_username': presence.sip_username,
+                'last_heartbeat': presence.last_heartbeat,
+                'active_session_id': str(presence.active_session.id) if presence.active_session else None,
+            }, status=status.HTTP_200_OK)
 
 
 class ActiveInboundCallPollView(APIView):
@@ -921,6 +965,7 @@ class ActiveInboundCallPollView(APIView):
         cutoff = timezone.now() - timedelta(seconds=45)
         session = CallSession.objects.filter(
             direction='INBOUND',
+            status__in=['INITIATED', 'RINGING'],
             created_at__gte=cutoff,
         ).order_by('-created_at').first()
 

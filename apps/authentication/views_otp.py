@@ -24,10 +24,15 @@ from rest_framework.response import Response
 from rest_framework.permissions import AllowAny
 from django.db import models
 
+import json
+import os
+import requests
+
 from apps.authentication.views import (
     _build_tenant_token,
     _build_login_response,
     _register_and_resolve_tenant,
+    _get_default_route,
 )
 
 logger = logging.getLogger(__name__)
@@ -134,6 +139,51 @@ def _resolve_tenant_and_db(request):
     return alias, tenant
 
 
+def _dispatch_whatsapp_otp(phone: str, otp_code: str) -> dict:
+    """
+    Dispatches 6-digit OTP to user WhatsApp via Gupshup Enterprise API.
+    Uses approved template: app_send_login_otp (ID: 3ab0455d-bd9f-4266-8e44-83b27daf054a)
+    """
+    api_key = getattr(settings, 'GUPSHUP_API_KEY', '') or os.getenv('GUPSHUP_API_KEY', '')
+    source_number = getattr(settings, 'GUPSHUP_SOURCE_NUMBER', '') or os.getenv('GUPSHUP_SOURCE_NUMBER', '919136344868')
+    template_id = getattr(settings, 'GUPSHUP_OTP_TEMPLATE_ID', '3ab0455d-bd9f-4266-8e44-83b27daf054a')
+
+    clean_phone = re.sub(r'\D', '', str(phone or ''))
+    if len(clean_phone) == 10:
+        clean_phone = '91' + clean_phone
+
+    if not api_key:
+        logger.warning("[WHATSAPP OTP] Gupshup API key not configured; skipping WhatsApp dispatch.")
+        return {'dispatched': False, 'reason': 'GUPSHUP_NOT_CONFIGURED'}
+
+    url = 'https://api.gupshup.io/wa/api/v1/template/msg'
+    headers = {
+        'apikey': api_key,
+        'Content-Type': 'application/x-www-form-urlencoded',
+    }
+    data = {
+        'source': source_number,
+        'destination': clean_phone,
+        'template': json.dumps({
+            'id': template_id,
+            'params': [str(otp_code)]
+        })
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, data=data, timeout=10)
+        logger.info("[WHATSAPP OTP] Gupshup response for %s: %s (status %s)", clean_phone[:6] + '***', resp.text, resp.status_code)
+        if resp.status_code in (200, 201, 202):
+            res_json = resp.json() if resp.headers.get('content-type', '').startswith('application/json') else {}
+            return {'dispatched': True, 'message_id': res_json.get('messageId'), 'status': res_json.get('status')}
+        else:
+            logger.error("[WHATSAPP OTP] Gupshup dispatch failed: %s", resp.text)
+            return {'dispatched': False, 'error': resp.text, 'status_code': resp.status_code}
+    except Exception as exc:
+        logger.exception("[WHATSAPP OTP] Exception dispatching OTP: %s", exc)
+        return {'dispatched': False, 'error': str(exc)}
+
+
 class SendOTPView(APIView):
     """
     POST /api/v1/auth/otp/send/
@@ -205,16 +255,21 @@ class SendOTPView(APIView):
         print(f"[DEV OTP GENERATED] Tenant: {tenant_slug} | Phone: {phone} | OTP: {otp_code}")
         print(f"=======================================================\n")
 
-        # In development / sandbox mode, include dev_otp in the response for easy app & web testing
+        # Dispatch genuine WhatsApp message via Gupshup BpcUAT
+        dispatch_result = _dispatch_whatsapp_otp(phone, otp_code)
+
         response_data = {
             'success': True,
-            'message': 'OTP generated and sent successfully.',
+            'message': 'OTP sent successfully to your WhatsApp.' if dispatch_result.get('dispatched') else 'OTP generated successfully.',
             'phone': phone,
             'org_code': tenant_slug,
             'retry_after_seconds': 60,
+            'whatsapp_dispatched': dispatch_result.get('dispatched', False),
         }
+        if dispatch_result.get('message_id'):
+            response_data['whatsapp_message_id'] = dispatch_result.get('message_id')
 
-        # Include dev_otp if DEBUG or no live SMS provider is active
+        # Include dev_otp if DEBUG or in dev environment
         if getattr(settings, 'DEBUG', True):
             response_data['dev_otp'] = otp_code
 
@@ -479,6 +534,8 @@ class VerifyOTPView(APIView):
             } if user.home_branch else None,
         }
 
+        default_route = _get_default_route('tenant', [user.user_type or 'MEMBER'])
+
         return _build_login_response(
             refresh=tokens,
             user_type='tenant',
@@ -487,6 +544,7 @@ class VerifyOTPView(APIView):
                 'success': True,
                 'message': 'OTP verified successfully. Login granted.',
                 'refresh': str(tokens),
+                'default_route': default_route,
                 'tokens': {
                     'access': str(tokens.access_token),
                     'refresh': str(tokens),

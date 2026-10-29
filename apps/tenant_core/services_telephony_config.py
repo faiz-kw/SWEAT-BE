@@ -12,6 +12,7 @@ import logging
 from datetime import timedelta
 from typing import Optional, Dict, Any
 
+from django.db import models
 from django.utils import timezone
 from config.routers import get_tenant_db_alias
 
@@ -191,27 +192,41 @@ class TelephonyConfigService:
                 logger.info("Telephony dispatch: Selected branch %s rep %s (%s)", caller_branch.name, branch_agent.user.email, branch_agent.sip_username)
                 return branch_agent
 
-        # 3. Any available rep in the organization (excluding test users)
+        # 3. Any available rep in the organization (excluding test users), prioritizing active heartbeats
         org_filter = {"organization": org} if org else {}
         available = AgentPresence.objects.using(alias).filter(
             status="AVAILABLE",
             **org_filter,
-        ).exclude(sip_username__icontains="test").select_related("user").first()
+        ).exclude(sip_username__icontains="test").order_by("-last_heartbeat").select_related("user").first()
+
+        # Resilient fallback across tenant database if org_filter yielded no results
+        if not available and org_filter:
+            available = AgentPresence.objects.using(alias).filter(
+                status="AVAILABLE",
+            ).exclude(sip_username__icontains="test").order_by("-last_heartbeat").select_related("user").first()
 
         if available:
             logger.info("Telephony dispatch: Selected available rep %s (%s)", available.user.email, available.sip_username)
             return available
 
-        # 4. Self-healing fallback: Release stale WRAP_UP agents (> 10 minutes)
-        ten_min_ago = timezone.now() - timedelta(minutes=10)
+        # 4. Self-healing fallback: Release stale ON_CALL or WRAP_UP agents (> 5 minutes or completed sessions)
+        five_min_ago = timezone.now() - timedelta(minutes=5)
         stale_agent = AgentPresence.objects.using(alias).filter(
-            status="WRAP_UP",
-            last_heartbeat__lt=ten_min_ago,
-            **org_filter,
-        ).select_related("user").first()
+            status__in=["WRAP_UP", "ON_CALL"],
+            last_heartbeat__lt=five_min_ago,
+        ).exclude(sip_username__icontains="test").order_by("-last_heartbeat").select_related("user").first()
+
+        if not stale_agent:
+            # Check agents marked ON_CALL whose active session is already finished or None
+            stale_agent = AgentPresence.objects.using(alias).filter(
+                status="ON_CALL",
+            ).filter(
+                models.Q(active_session__isnull=True) |
+                models.Q(active_session__status__in=["COMPLETED", "NO_ANSWER", "FAILED", "BUSY"])
+            ).exclude(sip_username__icontains="test").order_by("-last_heartbeat").select_related("user").first()
 
         if stale_agent:
-            logger.info("Self-heal: Auto-releasing stale WRAP_UP agent %s (%s) to AVAILABLE", stale_agent.user.email, stale_agent.sip_username)
+            logger.info("Self-heal: Auto-releasing stale %s agent %s (%s) to AVAILABLE", stale_agent.status, stale_agent.user.email, stale_agent.sip_username)
             stale_agent.status = "AVAILABLE"
             stale_agent.active_session = None
             stale_agent.save(using=alias, update_fields=["status", "active_session"])
