@@ -22,7 +22,7 @@ class TelephonyConfigService:
     """Authoritative service for resolving and updating telephony configurations dynamically."""
 
     DEFAULT_REGISTRAR = "registrar.vobiz.ai"
-    DEFAULT_WSS_URL = "wss://registrar.vobiz.ai"
+    DEFAULT_WSS_URL = "wss://registrar.vobiz.ai:5063"
     DEFAULT_DID = "+919240954144"
     DEFAULT_TIMEOUT_SEC = 20
 
@@ -58,7 +58,7 @@ class TelephonyConfigService:
         webrtc_gateway = (
             config_data.get("webrtc_gateway_url")
             or os.getenv("VOBIZ_WEBRTC_WSS_URL")
-            or f"wss://{registrar_host}"
+            or (f"wss://{registrar_host}:5063" if ":" not in registrar_host else f"wss://{registrar_host}")
         ).strip()
 
         from_number = (
