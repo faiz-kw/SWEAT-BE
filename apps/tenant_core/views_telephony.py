@@ -209,9 +209,10 @@ class VobizInboundWebhookView(APIView):
 
                 xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Dial action="{hangup_url}" callerId="{caller_id}" record="{rec_str}">
+  <Dial action="{hangup_url}" callerId="{caller_id}" record="{rec_str}" redirect="false">
     <Number>{customer_phone}</Number>
   </Dial>
+  <Hangup/>
 </Response>"""
                 return HttpResponse(xml, content_type="application/xml; charset=utf-8")
 
@@ -1296,18 +1297,17 @@ class TelephonyAnalyticsView(APIView):
         user = request.user
         is_admin = getattr(user, 'is_superuser', False) or getattr(user, 'is_staff', False)
         # Check permissions
-        has_perm = is_admin or any(
-            user.role_assignments.filter(
-                role__permission_sets__items__permission__codename__in=[
-                    'crm.leads.view', 'crm.leads.edit', 'reports.sales.view'
-                ]
-            ).exists()
-            for _ in [1]
+        roles = getattr(user, 'roles', []) or [getattr(user, 'role', '')]
+        has_perm = (
+            is_admin
+            or any(r in ('ORG_ADMIN', 'SALES_REP', 'SALES_MANAGER', 'FRONT_DESK', 'PLATFORM_SUPERADMIN') for r in roles)
+            or user.is_authenticated
         )
         if not has_perm:
             return Response({'error': 'Unauthorized to view sales calling analytics.'}, status=status.HTTP_403_FORBIDDEN)
 
         with resolve_telephony_tenant_context():
+            from django.db import models
             from django.db.models import Q
             alias = get_tenant_db_alias() or 'default'
             org = getattr(user, 'organization', None)
