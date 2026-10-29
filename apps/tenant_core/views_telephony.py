@@ -545,12 +545,12 @@ class ClickToCallView(APIView):
         # 2. Resolve Agent Presence & SIP Endpoint — prioritize user's own configured presence
         presence = AgentPresence.objects.filter(user=user).first()
         if not presence:
-            presence = AgentPresence.objects.filter(sip_username='iqra24090269280035568').first()
+            presence = AgentPresence.objects.filter(sip_username='sweatagent104201155654570218059').first() or AgentPresence.objects.filter(sip_username='iqra24030269280035568').first()
         if not presence:
             presence = AgentPresence.objects.create(
                 organization=lead.organization,
                 user=user,
-                sip_username='iqra24090269280035568',
+                sip_username='sweatagent104201155654570218059',
                 status='AVAILABLE',
             )
 
