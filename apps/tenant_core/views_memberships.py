@@ -1049,16 +1049,16 @@ class MembershipPolicyConfigViewSet(viewsets.ViewSet):
     Enforces role-based authority: Strictly restricted to ORG_ADMIN.
     """
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
-    required_module = 'members'
-    required_submodule = 'memberships'
-    required_permission = 'membership.policy.manage'
+    required_module = 'core'
+    required_submodule = 'settings'
+    required_permission = 'core.settings.view'
     permission_action_map = {
-        'list': 'membership.policy.manage',
-        'retrieve': 'membership.policy.manage',
-        'current': 'membership.policy.manage',
-        'update': 'membership.policy.manage',
-        'partial_update': 'membership.policy.manage',
-        'create': 'membership.policy.manage',
+        'list': 'core.settings.view',
+        'retrieve': 'core.settings.view',
+        'current': 'core.settings.view',
+        'update': 'core.settings.edit',
+        'partial_update': 'core.settings.edit',
+        'create': 'core.settings.edit',
     }
 
     def _ensure_org_admin(self, request):

@@ -161,6 +161,10 @@ class ProgramCategory(models.Model):
         ('ACTIVE', 'Active'),
         ('INACTIVE', 'Inactive'),
     ]
+    CONSUMPTION_MODE_CHOICES = [
+        ('SESSION_BASED', 'Session Based'),
+        ('CREDIT_BASED', 'Credit Based'),
+    ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     organization = models.ForeignKey(
@@ -170,6 +174,12 @@ class ProgramCategory(models.Model):
     name = models.CharField(max_length=150)
     description = models.TextField(null=True, blank=True)
     display_order = models.IntegerField(default=0)
+    consumption_mode = models.CharField(
+        max_length=20,
+        choices=CONSUMPTION_MODE_CHOICES,
+        default='SESSION_BASED',
+        help_text="Determines whether programs/classes in this category consume session counts or universal credits."
+    )
     credits = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, help_text="Optional default credits deducted per class/booking for credit-based packages (e.g. SWEAT Elite)")
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='ACTIVE')
     created_at = models.DateTimeField(default=timezone.now)

@@ -243,3 +243,94 @@ class OrderRewardRedemptionViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         return OrderRewardRedemption.objects.all()
+
+    @action(detail=False, methods=['post'], url_path='calculate-max')
+    def calculate_max(self, request):
+        """
+        POST /api/v1/tenant/order-reward-redemptions/calculate-max/
+        Calculates the maximum redeemable points for a given order amount under the 80% ceiling.
+        """
+        order_id = request.data.get('order_id')
+        user_profile_id = request.data.get('user_profile_id')
+        amount_val = request.data.get('order_amount')
+
+        alias = getattr(request.user._state, 'db', None) or 'default'
+        order = None
+        if order_id:
+            order = Order.objects.using(alias).filter(id=order_id).first()
+
+        profile = None
+        if user_profile_id:
+            profile = UserProfile.objects.using(alias).filter(id=user_profile_id).first()
+        elif order and order.user_profile:
+            profile = order.user_profile
+        elif hasattr(request.user, 'profile'):
+            profile = request.user.profile
+
+        if not profile:
+            return Response({'detail': 'User profile is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if amount_val is not None:
+            order_amount = Decimal(str(amount_val))
+        elif order:
+            order_amount = max(Decimal('0.00'), (order.subtotal or Decimal('0.00')) - (order.discount_amount or Decimal('0.00')))
+        else:
+            return Response({'detail': 'order_id or order_amount is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        org = getattr(request.user, 'organization', None) or (order.branch.organization if order and order.branch else None)
+        calc = ReferralRewardService.calculate_max_redeemable_points(
+            order_amount=order_amount,
+            user_profile=profile,
+            organization=org,
+            db_alias=alias,
+        )
+        return Response({
+            'available_points': float(calc['available_points']),
+            'available_monetary_value': float(calc['available_monetary_value']),
+            'max_redemption_percent': float(calc['max_redemption_percent']),
+            'max_discount_allowed': float(calc['max_discount_allowed']),
+            'max_redeemable_points': float(calc['max_redeemable_points']),
+            'max_redeemable_discount': float(calc['max_redeemable_discount']),
+            'min_cash_payable': float(calc['min_cash_payable']),
+            'point_value_rupees': float(calc['point_value_rupees']),
+        })
+
+    @action(detail=False, methods=['post'], url_path='apply-to-order')
+    def apply_to_order(self, request):
+        """
+        POST /api/v1/tenant/order-reward-redemptions/apply-to-order/
+        Applies and redeems points on an order respecting the 80% cap.
+        """
+        order_id = request.data.get('order_id')
+        points = request.data.get('points')
+
+        if not order_id or points is None:
+            return Response({'detail': 'order_id and points are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        alias = getattr(request.user._state, 'db', None) or 'default'
+        order = Order.objects.using(alias).filter(id=order_id).first()
+        if not order:
+            return Response({'detail': 'Order not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            actor = request.user if hasattr(request.user, 'tenantuser') else None
+            monetary_discount, ledger, redemption = ReferralRewardService.apply_points_to_order(
+                order=order,
+                points_to_redeem=Decimal(str(points)),
+                created_by_user=actor,
+                db_alias=alias,
+            )
+            return Response({
+                'success': True,
+                'order_id': str(order.id),
+                'order_number': order.order_number,
+                'subtotal': float(order.subtotal),
+                'coupon_discount': float(order.discount_amount),
+                'reward_discount': float(order.reward_amount),
+                'tax_amount': float(order.tax_amount),
+                'total_amount': float(order.total_amount),
+                'points_redeemed': float(redemption.units_redeemed),
+                'remaining_points_balance': float(ledger.balance_after),
+            }, status=status.HTTP_200_OK)
+        except ValidationError as e:
+            return Response({'detail': str(e.message if hasattr(e, 'message') else e)}, status=status.HTTP_400_BAD_REQUEST)

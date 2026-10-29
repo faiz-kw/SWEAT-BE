@@ -330,6 +330,7 @@ class AssessmentEngineService:
     def calculate_capability_matrix(cls, tests_payload: Dict[str, Any]) -> Dict[str, str]:
         """
         Evaluates domain capabilities (Beginner, Developing, Established) from logged test data.
+        Supports Option B multi-test battery (assessed_tests list) as well as single test format.
         """
         matrix = {
             'lower_body': 'Developing',
@@ -343,21 +344,55 @@ class AssessmentEngineService:
 
         # Lower body evaluation
         lb = tests_payload.get('lower_body', {})
-        lb_reps = int(lb.get('reps') or 0)
-        lb_var = str(lb.get('variation') or '').lower()
-        if 'box' in lb_var or lb_reps < 8:
-            matrix['lower_body'] = 'Beginner'
-        elif lb_reps >= 15 or 'goblet' in lb_var or 'single' in lb_var:
-            matrix['lower_body'] = 'Established'
+        assessed_lb = []
+        if isinstance(lb, dict):
+            if isinstance(lb.get('assessed_tests'), list):
+                assessed_lb = [t for t in lb['assessed_tests'] if t.get('active')]
+            if not assessed_lb and (lb.get('reps') is not None or lb.get('variation')):
+                assessed_lb = [lb]
+
+        if assessed_lb:
+            has_established = any(
+                (int(t.get('reps') or 0) >= 15 or 'goblet' in str(t.get('name') or t.get('variation') or '').lower())
+                and t.get('movement_quality') == 'Meets criteria'
+                for t in assessed_lb
+            )
+            has_beginner = any(
+                'box' in str(t.get('name') or t.get('variation') or '').lower() or int(t.get('reps') or 0) < 8
+                for t in assessed_lb
+            )
+            if has_established:
+                matrix['lower_body'] = 'Established'
+            elif has_beginner and not any(int(t.get('reps') or 0) >= 12 for t in assessed_lb):
+                matrix['lower_body'] = 'Beginner'
+            else:
+                matrix['lower_body'] = 'Developing'
 
         # Upper body evaluation
         ub = tests_payload.get('upper_body', {})
-        ub_reps = int(ub.get('pushup_reps') or 0)
-        ub_var = str(ub.get('pushup_variation') or '').lower()
-        if 'wall' in ub_var or ub_reps < 6:
-            matrix['upper_body'] = 'Beginner'
-        elif 'floor' in ub_var and ub_reps >= 12:
-            matrix['upper_body'] = 'Established'
+        assessed_ub = []
+        if isinstance(ub, dict):
+            if isinstance(ub.get('assessed_tests'), list):
+                assessed_ub = [t for t in ub['assessed_tests'] if t.get('active')]
+            if not assessed_ub and (ub.get('pushup_reps') is not None or ub.get('pushup_variation')):
+                assessed_ub = [ub]
+
+        if assessed_ub:
+            has_established_ub = any(
+                (('floor' in str(t.get('name') or t.get('pushup_variation') or '').lower() and int(t.get('pushup_reps') or t.get('reps') or 0) >= 12)
+                 or ('pull' in str(t.get('name') or '').lower() and int(t.get('reps') or 0) >= 8))
+                for t in assessed_ub
+            )
+            has_beginner_ub = any(
+                'wall' in str(t.get('name') or t.get('pushup_variation') or '').lower() or int(t.get('pushup_reps') or t.get('reps') or 0) < 6
+                for t in assessed_ub
+            )
+            if has_established_ub:
+                matrix['upper_body'] = 'Established'
+            elif has_beginner_ub and not any(int(t.get('pushup_reps') or t.get('reps') or 0) >= 10 for t in assessed_ub):
+                matrix['upper_body'] = 'Beginner'
+            else:
+                matrix['upper_body'] = 'Developing'
 
         # Core evaluation
         core = tests_payload.get('core', {})

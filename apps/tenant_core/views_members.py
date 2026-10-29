@@ -1455,19 +1455,19 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
     for sub in intake_subs:
         answers = []
         if can_view_health:
+            def _fmt_val(v):
+                if v is None:
+                    return ''
+                if isinstance(v, bool):
+                    return 'Yes' if v else 'No'
+                if isinstance(v, (list, tuple)):
+                    return ', '.join(_fmt_val(x) for x in v if x is not None and _fmt_val(x))
+                if isinstance(v, dict):
+                    return str(v.get('label') or v.get('value') or v.get('answer') or ', '.join(f"{k}: {_fmt_val(sub_v)}" for k, sub_v in v.items() if _fmt_val(sub_v)))
+                return str(v).strip()
+
             snapshot_questions = sub.form_snapshot.get('questions') if isinstance(getattr(sub, 'form_snapshot', None), dict) else None
             if snapshot_questions:
-                def _fmt_val(v):
-                    if v is None:
-                        return ''
-                    if isinstance(v, bool):
-                        return 'Yes' if v else 'No'
-                    if isinstance(v, (list, tuple)):
-                        return ', '.join(_fmt_val(x) for x in v if x is not None and _fmt_val(x))
-                    if isinstance(v, dict):
-                        return str(v.get('label') or v.get('value') or v.get('answer') or ', '.join(f"{k}: {_fmt_val(sub_v)}" for k, sub_v in v.items() if _fmt_val(sub_v)))
-                    return str(v).strip()
-
                 for sq in snapshot_questions:
                     ans_val = sq.get('submitted_answer')
                     disp = _fmt_val(ans_val)
@@ -1633,9 +1633,9 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
     # Reward Points / Coins
     from .models_rewards import RewardAccount
     from .models_govern import OrganizationSettings
+    from .services_rewards import ReferralRewardService
     reward_acc = RewardAccount.objects.using(alias).filter(user_profile=profile).first()
     
-    earn_rate = 100
     current_org = _get_org(request) if request else (getattr(profile, 'organization', None) or Organization.objects.using(alias).filter(status='ACTIVE').first())
     org_settings = None
     if current_org:
@@ -1643,8 +1643,9 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
     if not org_settings:
         org_settings = OrganizationSettings.objects.using(alias).first()
 
-    if org_settings and isinstance(org_settings.membership_config, dict):
-        earn_rate = int(org_settings.membership_config.get('reward_points', {}).get('earn_rate_rupees', 100) or 100)
+    reward_cfg = ReferralRewardService.get_reward_config(organization=current_org, db_alias=alias)
+    earn_rate = reward_cfg['earn_rate_rupees']
+    point_value = float(reward_cfg['point_value_rupees'])
 
     pts_balance = float(reward_acc.points_balance) if (reward_acc and reward_acc.points_balance > 0) else 0.0
     lifetime_earned = float(reward_acc.lifetime_earned) if (reward_acc and reward_acc.lifetime_earned > 0) else 0.0
@@ -1653,17 +1654,21 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
 
     if pts_balance == 0.0:
         total_spent = sum(float(p['amount']) for p in payments_data if p['status'] == 'SUCCESS')
-        pts_balance = float(int(total_spent // earn_rate))
+        pts_balance = float(int(total_spent // earn_rate) * reward_cfg['points_per_rate'])
         lifetime_earned = pts_balance
-        credit_balance = pts_balance * 1.0  # 1 point = 1 rupee standard
+        credit_balance = pts_balance * point_value
 
     rewards_data = {
         'points_balance': pts_balance,
         'credit_balance': credit_balance,
+        'points_monetary_value': pts_balance * point_value,
         'lifetime_earned': lifetime_earned,
         'lifetime_redeemed': lifetime_redeemed,
         'status': reward_acc.status if reward_acc else 'ACTIVE',
         'earn_rate_rupees': earn_rate,
+        'points_per_rate': reward_cfg['points_per_rate'],
+        'point_value_rupees': point_value,
+        'is_enabled': reward_cfg['is_enabled'],
     }
 
     # Passport / Cross-Branch Sessions
@@ -1754,17 +1759,46 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         'passport': passport_data,
     }
 
-    m_cfg = (org_settings.membership_config if org_settings and isinstance(org_settings.membership_config, dict) else {})
+    # Retrieve operational policy configuration (extension, freeze, upgrade rules)
+    try:
+        from .services_memberships import MembershipLifecycleService
+        policy_cfg = MembershipLifecycleService.get_policy_config(current_org, db_alias=alias)
+        ext_per_day = float(policy_cfg.extension_per_day_fee)
+        ext_act = float(policy_cfg.extension_activation_fee)
+        frz_per_day = float(policy_cfg.freeze_per_day_fee)
+        ext_min = policy_cfg.extension_min_days
+        ext_max = policy_cfg.extension_max_days
+        frz_min = policy_cfg.freeze_min_days
+        frz_max = policy_cfg.freeze_max_days
+        upg_window = getattr(policy_cfg, 'upgrade_allowed_window_days', 15)
+    except Exception:
+        ext_per_day = 35.0
+        ext_act = 200.0
+        frz_per_day = 25.0
+        ext_min = 1
+        ext_max = 90
+        frz_min = 3
+        frz_max = 60
+        upg_window = 15
+
     pricing_config = {
-        'extension_tiers': m_cfg.get('extension_tiers', [
-            {'days': 15, 'fee': 500},
-            {'days': 30, 'fee': 1000},
-            {'days': 45, 'fee': 1500},
-            {'days': 60, 'fee': 2000}
-        ]),
-        'extension_fee_per_30_days': float(m_cfg.get('extension_fee_per_30_days', 1000)),
-        'freeze_fee': float(m_cfg.get('freeze_fee', 500)),
-        'membership_activation_fee': float(m_cfg.get('membership_activation_fee', 1500)),
+        'extension_per_day_fee': ext_per_day,
+        'extension_activation_fee': ext_act,
+        'extension_min_days': ext_min,
+        'extension_max_days': ext_max,
+        'freeze_per_day_fee': frz_per_day,
+        'freeze_min_days': frz_min,
+        'freeze_max_days': frz_max,
+        'upgrade_allowed_window_days': upg_window,
+        'extension_tiers': [
+            {'days': 15, 'fee': round(15 * ext_per_day)},
+            {'days': 30, 'fee': round(30 * ext_per_day)},
+            {'days': 45, 'fee': round(45 * ext_per_day)},
+            {'days': 60, 'fee': round(60 * ext_per_day)},
+        ],
+        'extension_fee_per_30_days': round(30 * ext_per_day),
+        'freeze_fee': round(14 * frz_per_day),
+        'membership_activation_fee': ext_act,
     }
 
     return {

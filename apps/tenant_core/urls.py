@@ -354,6 +354,9 @@ router.register(r'suppliers', SupplierViewSet, basename='supplier')
 from .views_assessment import AssessmentSessionViewSet, StudioScreenPairingView
 router.register(r'assessments', AssessmentSessionViewSet, basename='assessment')
 
+from .views_tickets import SupportTicketViewSet
+router.register(r'tickets', SupportTicketViewSet, basename='ticket')
+
 app_name = 'tenant_core'
 
 urlpatterns = [

@@ -24,6 +24,8 @@ from .views_mobile import (
     MobileQRPassView,
     MobilePackagesView,
     MobileMyCreditsView,
+    MobileRewardWalletView,
+    MobileRewardHistoryView,
     MobileDiscountCouponsView,
     MobileValidateCouponView,
     MobileCheckoutOrderView,
@@ -40,6 +42,8 @@ from .views_mobile import (
     MobileMembershipFreezeView,
     MobileMembershipUnfreezeView,
     MobileDirectTurnstileOpenView,
+    MobilePassportTopupView,
+    MobileTicketsView,
 )
 
 app_name = 'mobile_api'
@@ -95,9 +99,14 @@ urlpatterns = [
     path('memberships/extend/', MobileMembershipExtendView.as_view(), name='mobile-membership-extend'),
     path('memberships/freeze/', MobileMembershipFreezeView.as_view(), name='mobile-membership-freeze'),
     path('memberships/unfreeze/', MobileMembershipUnfreezeView.as_view(), name='mobile-membership-unfreeze'),
+    path('memberships/passport-topup/', MobilePassportTopupView.as_view(), name='mobile-membership-passport-topup'),
+    path('tickets/', MobileTicketsView.as_view(), name='mobile-tickets'),
     path('packages/', MobilePackagesView.as_view(), name='mobile-packages'),
     path('my-credits/', MobileMyCreditsView.as_view(), name='mobile-my-credits'),
     path('credits/', MobileMyCreditsView.as_view(), name='mobile-credits-direct'),
+    path('rewards/wallet/', MobileRewardWalletView.as_view(), name='mobile-rewards-wallet'),
+    path('rewards/history/', MobileRewardHistoryView.as_view(), name='mobile-rewards-history'),
+    path('loyalty/wallet/', MobileRewardWalletView.as_view(), name='mobile-loyalty-wallet-direct'),
     path('coupons/', MobileDiscountCouponsView.as_view(), name='mobile-coupons'),
     path('discounts/', MobileDiscountCouponsView.as_view(), name='mobile-discounts'),
     path('coupons/validate/', MobileValidateCouponView.as_view(), name='mobile-validate-coupon'),

@@ -486,6 +486,7 @@ class MembershipPolicyConfigSerializer(serializers.ModelSerializer):
             'freeze_min_days',
             'freeze_max_days',
             'freeze_max_count_per_cycle',
+            'upgrade_allowed_window_days',
             'updated_by_user',
             'updated_by_name',
             'created_at',

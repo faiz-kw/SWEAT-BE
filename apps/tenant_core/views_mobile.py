@@ -1310,6 +1310,11 @@ class MobileScheduleView(APIView):
         user_booking_map = {}
         included_class_ids = None
         active_mem = None
+        is_credit_based_user = False
+        user_credit_ent = None
+        user_passport_ent = None
+        user_home_ent = None
+
         if request.user and request.user.is_authenticated:
             user_profile = _get_or_create_user_profile(request.user, alias)
             if not user_profile and getattr(request.user, 'email', None):
@@ -1322,13 +1327,27 @@ class MobileScheduleView(APIView):
                     .order_by('-created_at')
                     .first()
                 )
-                if active_mem and active_mem.package_version_id:
-                    rules = PackageClassAccessRule.objects.using(alias).filter(
-                        package_version_id=active_mem.package_version_id, access_type='INCLUDED'
-                    )
-                    rule_ids = {str(r.class_template_id) for r in rules if r.class_template_id}
-                    if rule_ids:
-                        included_class_ids = rule_ids
+                if active_mem:
+                    mem_ents = list(active_mem.entitlements.using(alias).filter(status='ACTIVE'))
+                    for e in mem_ents:
+                        if e.entitlement_type == 'CREDIT_WALLET':
+                            user_credit_ent = e
+                        elif e.entitlement_type in ('CROSS_BRANCH_SESSION', 'CROSS_BRANCH'):
+                            user_passport_ent = e
+                        elif e.entitlement_type == 'HOME_BRANCH_SESSION':
+                            user_home_ent = e
+                    if not user_home_ent:
+                        user_home_ent = next((e for e in mem_ents if e.entitlement_type not in ('CROSS_BRANCH_SESSION', 'CROSS_BRANCH', 'CREDIT_WALLET')), None)
+
+                    is_credit_based_user = bool(user_credit_ent and (user_credit_ent.is_unlimited or (user_credit_ent.remaining_units and user_credit_ent.remaining_units > 0) or user_credit_ent.allocated_units))
+
+                    if not is_credit_based_user and active_mem.package_version_id:
+                        rules = PackageClassAccessRule.objects.using(alias).filter(
+                            package_version_id=active_mem.package_version_id, access_type='INCLUDED'
+                        )
+                        rule_ids = {str(r.class_template_id) for r in rules if r.class_template_id}
+                        if rule_ids:
+                            included_class_ids = rule_ids
 
                 user_bookings = Booking.objects.using(alias).filter(
                     user_profile=user_profile,
@@ -1467,12 +1486,58 @@ class MobileScheduleView(APIView):
                         trainer_photo = t_user.avatar_url or ''
 
             user_booking = user_booking_map.get(str(occ.id))
-            is_included = (str(template.id) in included_class_ids) if (included_class_ids is not None and template) else True
+
+            # Compute category credits
+            cat_credits = None
+            if template and template.program and template.program.category:
+                cat_credits = template.program.category.credits
+            elif template and getattr(template, 'category', None):
+                cat_credits = getattr(template.category, 'credits', None)
+            required_credits = float(cat_credits) if (cat_credits is not None and float(cat_credits) > 0) else 1.0
+
+            is_cross_branch = bool(active_mem and active_mem.home_branch and occ.branch_id != active_mem.home_branch_id)
+            can_raise_ticket = False
+            can_purchase_passport = False
+            is_included = True
             ineligible_reason = None
             allowed_pkg_name = active_mem.package.name if (active_mem and active_mem.package) else None
-            if not is_included and template:
-                ineligible_reason = f"Class '{template.name}' is not included in package version {active_mem.package_version.version_number if (active_mem and active_mem.package_version) else 1}."
 
+            if active_mem:
+                if is_credit_based_user:
+                    # Full access to all classes across all programs
+                    is_included = True
+                    ineligible_reason = None
+                    if user_credit_ent and not user_credit_ent.is_unlimited and float(user_credit_ent.remaining_units or 0) < required_credits:
+                        is_included = False
+                        ineligible_reason = f"Insufficient credits. This class requires {required_credits} credits, but you have {float(user_credit_ent.remaining_units or 0)} remaining."
+                else:
+                    # Session based membership
+                    if is_cross_branch:
+                        if not user_passport_ent or (not user_passport_ent.is_unlimited and (user_passport_ent.allocated_units is None or user_passport_ent.allocated_units <= 0)):
+                            is_included = False
+                            ineligible_reason = "Your package does not include any passport session. Raise a ticket for purchase."
+                            can_raise_ticket = True
+                        elif not user_passport_ent.is_unlimited and (user_passport_ent.remaining_units or 0) <= 0:
+                            home_rem = float(user_home_ent.remaining_units or 0) if (user_home_ent and not user_home_ent.is_unlimited) else (999.0 if (user_home_ent and user_home_ent.is_unlimited) else 0.0)
+                            if home_rem > 0:
+                                is_included = False
+                                ineligible_reason = "All passport sessions have been consumed. You can purchase additional passport sessions to book at this branch."
+                                can_purchase_passport = True
+                            else:
+                                is_included = False
+                                ineligible_reason = "No remaining session credits in your active pack. Please renew or purchase a new pack."
+                        elif user_home_ent and not user_home_ent.is_unlimited and (user_home_ent.remaining_units or 0) <= 0:
+                            is_included = False
+                            ineligible_reason = "No remaining session credits in your active pack. Please renew or purchase a new pack."
+                        else:
+                            is_included = True
+                            ineligible_reason = None
+                    else:
+                        is_included = (str(template.id) in included_class_ids) if (included_class_ids is not None and template) else True
+                        if not is_included and template:
+                            ineligible_reason = f"Class '{template.name}' is not included in package version {active_mem.package_version.version_number if (active_mem and active_mem.package_version) else 1}."
+
+            can_book_flag = is_bookable and is_included and not is_full and not has_started and not has_ended
 
             results.append({
                 'id': str(occ.id),
@@ -1515,7 +1580,7 @@ class MobileScheduleView(APIView):
                 },
                 'booking_state': booking_state,
                 'is_bookable': is_bookable,
-                'can_book': is_bookable and not is_full and not has_started and not has_ended,
+                'can_book': can_book_flag,
                 'can_waitlist': is_bookable and is_full and is_waitlist_open and not has_started and not has_ended,
                 'has_started': has_started,
                 'has_ended': has_ended,
@@ -1526,6 +1591,11 @@ class MobileScheduleView(APIView):
                 'is_included_in_plan': is_included,
                 'ineligible_reason': ineligible_reason,
                 'allowed_package_name': allowed_pkg_name,
+                'required_credits': required_credits,
+                'is_credit_based': is_credit_based_user,
+                'is_cross_branch': is_cross_branch,
+                'can_raise_ticket': can_raise_ticket,
+                'can_purchase_passport': can_purchase_passport,
             })
 
         all_categories = [
@@ -1973,11 +2043,18 @@ class MobileBookClassView(APIView):
             detail = e.messages[0] if hasattr(e, 'messages') and e.messages else str(e)
             is_full = 'capacity and waitlist' in detail.lower() or 'completely full' in detail.lower()
             is_pkg_mismatch = 'not included in package' in detail.lower()
-            err_code = 'CLASS_AND_WAITLIST_FULL' if is_full else ('PACKAGE_CLASS_NOT_INCLUDED' if is_pkg_mismatch else 'BOOKING_VALIDATION_ERROR')
-            return Response({
+            err_code = getattr(e, 'code', None) or ('CLASS_AND_WAITLIST_FULL' if is_full else ('PACKAGE_CLASS_NOT_INCLUDED' if is_pkg_mismatch else 'BOOKING_VALIDATION_ERROR'))
+            resp = {
                 'detail': detail,
                 'code': err_code,
-            }, status=status.HTTP_400_BAD_REQUEST)
+            }
+            if err_code == 'NO_PASSPORT_INCLUDED' or 'raise a ticket' in detail.lower():
+                resp['code'] = 'NO_PASSPORT_INCLUDED'
+                resp['can_raise_ticket'] = True
+            elif err_code == 'PASSPORT_EXHAUSTED_PURCHASE_ALLOWED' or 'purchase additional passport' in detail.lower():
+                resp['code'] = 'PASSPORT_EXHAUSTED_PURCHASE_ALLOWED'
+                resp['can_purchase_passport'] = True
+            return Response(resp, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
             return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -2649,10 +2726,140 @@ class MobileMyCreditsView(APIView):
                 'can_renew': effective_status in ('ACTIVE', 'EXPIRED'),
             })
 
+        # Loyalty & Reward Points Account
+        from .models_rewards import RewardAccount
+        from .services_rewards import ReferralRewardService
+        reward_acc = RewardAccount.objects.using(alias).filter(user_profile=profile).first()
+        org = getattr(user, 'organization', None) or (profile.user.organization if hasattr(profile, 'user') else None)
+        reward_cfg = ReferralRewardService.get_reward_config(organization=org, db_alias=alias)
+
+        pts_balance = float(reward_acc.points_balance) if (reward_acc and reward_acc.points_balance > 0) else 0.0
+        credit_balance = float(reward_acc.credit_balance) if (reward_acc and reward_acc.credit_balance > 0) else 0.0
+        lifetime_earned = float(reward_acc.lifetime_earned) if (reward_acc and reward_acc.lifetime_earned > 0) else 0.0
+        lifetime_redeemed = float(reward_acc.lifetime_redeemed) if (reward_acc and reward_acc.lifetime_redeemed > 0) else 0.0
+        point_value = float(reward_cfg['point_value_rupees'])
+
+        rewards_wallet = {
+            'points_balance': pts_balance,
+            'credit_balance': credit_balance,
+            'points_monetary_value': pts_balance * point_value,
+            'lifetime_earned': lifetime_earned,
+            'lifetime_redeemed': lifetime_redeemed,
+            'earn_rate_rupees': reward_cfg['earn_rate_rupees'],
+            'points_per_rate': reward_cfg['points_per_rate'],
+            'point_value_rupees': point_value,
+            'is_enabled': reward_cfg['is_enabled'],
+        }
+
         return Response({
             'total_credits_available': total_remaining_credits,
             'active_packs_count': len(packs),
             'packs': packs,
+            'rewards_wallet': rewards_wallet,
+            'reward_points': rewards_wallet,
+        })
+
+
+class MobileRewardWalletView(APIView):
+    """
+    GET /api/v1/mobile/rewards/wallet/
+    Returns member's reward points balance, redemption value, policy config, and recent transactions.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
+        profile = _get_or_create_user_profile(user, alias)
+
+        from .models_rewards import RewardAccount, RewardLedger
+        from .services_rewards import ReferralRewardService
+
+        reward_acc = RewardAccount.objects.using(alias).filter(user_profile=profile).first()
+        org = getattr(user, 'organization', None) or (profile.user.organization if hasattr(profile, 'user') else None)
+        reward_cfg = ReferralRewardService.get_reward_config(organization=org, db_alias=alias)
+
+        pts_balance = float(reward_acc.points_balance) if (reward_acc and reward_acc.points_balance > 0) else 0.0
+        credit_balance = float(reward_acc.credit_balance) if (reward_acc and reward_acc.credit_balance > 0) else 0.0
+        lifetime_earned = float(reward_acc.lifetime_earned) if (reward_acc and reward_acc.lifetime_earned > 0) else 0.0
+        lifetime_redeemed = float(reward_acc.lifetime_redeemed) if (reward_acc and reward_acc.lifetime_redeemed > 0) else 0.0
+        point_value = float(reward_cfg['point_value_rupees'])
+
+        # Recent transactions
+        recent_entries = []
+        if reward_acc:
+            ledgers = RewardLedger.objects.using(alias).filter(
+                reward_account=reward_acc
+            ).order_by('-created_at')[:20]
+
+            for entry in ledgers:
+                recent_entries.append({
+                    'id': str(entry.id),
+                    'transaction_type': entry.transaction_type,
+                    'reward_type': entry.reward_type,
+                    'quantity': float(entry.quantity),
+                    'reason_code': entry.reason_code or '',
+                    'reason': entry.reason or '',
+                    'balance_after': float(entry.balance_after),
+                    'order_id': str(entry.order_id) if entry.order_id else None,
+                    'created_at': entry.created_at.isoformat() if entry.created_at else None,
+                })
+
+        return Response({
+            'points_balance': pts_balance,
+            'credit_balance': credit_balance,
+            'points_monetary_value': pts_balance * point_value,
+            'lifetime_earned': lifetime_earned,
+            'lifetime_redeemed': lifetime_redeemed,
+            'status': reward_acc.status if reward_acc else 'ACTIVE',
+            'earn_rate_rupees': reward_cfg['earn_rate_rupees'],
+            'points_per_rate': reward_cfg['points_per_rate'],
+            'point_value_rupees': point_value,
+            'is_enabled': reward_cfg['is_enabled'],
+            'recent_activity': recent_entries,
+        })
+
+
+class MobileRewardHistoryView(APIView):
+    """
+    GET /api/v1/mobile/rewards/history/
+    Paginated or listed transaction ledger for loyalty reward points and wallet credits.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
+        profile = _get_or_create_user_profile(user, alias)
+
+        from .models_rewards import RewardAccount, RewardLedger
+
+        reward_acc = RewardAccount.objects.using(alias).filter(user_profile=profile).first()
+        if not reward_acc:
+            return Response({'count': 0, 'results': []})
+
+        limit = min(int(request.query_params.get('limit', 50)), 100)
+        ledgers = RewardLedger.objects.using(alias).filter(
+            reward_account=reward_acc
+        ).order_by('-created_at')[:limit]
+
+        results = []
+        for entry in ledgers:
+            results.append({
+                'id': str(entry.id),
+                'transaction_type': entry.transaction_type,
+                'reward_type': entry.reward_type,
+                'quantity': float(entry.quantity),
+                'reason_code': entry.reason_code or '',
+                'reason': entry.reason or '',
+                'balance_after': float(entry.balance_after),
+                'order_id': str(entry.order_id) if entry.order_id else None,
+                'created_at': entry.created_at.isoformat() if entry.created_at else None,
+            })
+
+        return Response({
+            'count': len(results),
+            'results': results,
         })
 
 
@@ -2782,6 +2989,7 @@ class MobileCheckoutOrderView(APIView):
         package_id = request.data.get('package_id')
         package_version_id = request.data.get('package_version_id')
         coupon_code = request.data.get('coupon_code')
+        points_to_redeem = request.data.get('points_to_redeem') or request.data.get('points')
 
         package = None
         latest_version = None
@@ -2819,7 +3027,40 @@ class MobileCheckoutOrderView(APIView):
             if v_res.get('is_valid'):
                 discount_amount = Decimal(str(v_res.get('discount_amount', 0)))
 
-        final_amount = max(Decimal('0.00'), subtotal - discount_amount)
+        net_before_points = max(Decimal('0.00'), subtotal - discount_amount)
+        reward_discount = Decimal('0.00')
+        points_redeemed = Decimal('0.00')
+
+        from .services_rewards import ReferralRewardService
+        if points_to_redeem:
+            try:
+                requested_pts = Decimal(str(points_to_redeem))
+                calc = ReferralRewardService.calculate_max_redeemable_points(
+                    order_amount=net_before_points,
+                    user_profile=profile,
+                    organization=user.home_branch.organization if user.home_branch else None,
+                    db_alias=alias,
+                )
+                if requested_pts > calc['max_redeemable_points']:
+                    return Response({
+                        'detail': f"Maximum {calc['max_redemption_percent']}% of the order amount can be paid with coins. "
+                                  f"Max allowed coins: {calc['max_redeemable_points']}. Requested: {requested_pts}."
+                    }, status=status.HTTP_400_BAD_REQUEST)
+
+                if requested_pts > calc['available_points']:
+                    return Response({
+                        'detail': f"Insufficient coins. Available: {calc['available_points']}, Requested: {requested_pts}."
+                    }, status=status.HTTP_400_BAD_REQUEST)
+
+                points_redeemed = requested_pts
+                reward_discount = min(
+                    (requested_pts * calc['point_value_rupees']).quantize(Decimal('0.01')),
+                    calc['max_discount_allowed']
+                )
+            except Exception as e:
+                return Response({'detail': f"Coin redemption error: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        final_amount = max(Decimal('0.00'), net_before_points - reward_discount)
 
         branch = user.home_branch or Branch.objects.using(alias).filter(status='ACTIVE').first()
         org = Organization.objects.using(alias).filter(status='ACTIVE').first()
@@ -2834,6 +3075,7 @@ class MobileCheckoutOrderView(APIView):
                 status='PENDING_PAYMENT',
                 subtotal=subtotal,
                 discount_amount=discount_amount,
+                reward_amount=reward_discount,
                 tax_amount=subtotal * (tax_pct / Decimal('100.0')),
                 total_amount=final_amount,
                 currency='INR',
@@ -2853,6 +3095,19 @@ class MobileCheckoutOrderView(APIView):
                 tax_amount=subtotal * (tax_pct / Decimal('100.0')),
                 total_amount=final_amount,
             )
+
+            # If coins were redeemed, execute ledger debit
+            if points_redeemed > Decimal('0.00'):
+                ReferralRewardService.redeem_rewards(
+                    user_profile=profile,
+                    reward_type='POINTS',
+                    quantity=points_redeemed,
+                    monetary_value=reward_discount,
+                    order=order,
+                    reason_code='ORDER_REDEMPTION',
+                    reason=f"Redeemed {points_redeemed} coins on Order #{order.order_number}",
+                    db_alias=alias,
+                )
 
         # Generate Razorpay order (or sandbox simulation if unconfigured)
         from .services_razorpay import RazorpayService
@@ -2893,6 +3148,10 @@ class MobileCheckoutOrderView(APIView):
             'razorpay_order_id': rzp_order_id,
             'amount_in_paise': amount_paise,
             'amount': float(final_amount),
+            'subtotal': float(subtotal),
+            'coupon_discount': float(discount_amount),
+            'coins_discount': float(reward_discount),
+            'coins_redeemed': float(points_redeemed),
             'currency': order.currency,
             'package_name': package.name,
             'key_id': key_id,
@@ -3010,6 +3269,17 @@ class MobileCheckoutVerifyView(APIView):
                 order.status = 'PAID'
                 order.paid_at = timezone.now()
                 order.save(using=alias)
+
+                # Accrue reward points for mobile package purchase / renewal
+                try:
+                    from .services_rewards import ReferralRewardService
+                    ReferralRewardService.process_order_reward_accrual(
+                        order=order,
+                        user_profile=profile,
+                        db_alias=alias,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to accrue reward points in MobileCheckoutVerifyView for order %s: %s", order.id, e)
 
                 meta = {}
                 if order.notes:
@@ -5332,3 +5602,203 @@ class MobileDirectTurnstileOpenView(APIView):
         except Exception as e:
             return Response({"success": False, "error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+
+
+class MobilePassportTopupView(APIView):
+    """
+    POST /api/v1/mobile/memberships/passport-topup/
+    Allows an active member whose passport sessions are exhausted to purchase additional passport sessions,
+    provided they have active home sessions remaining.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
+        profile = _get_or_create_user_profile(user, alias)
+
+        try:
+            quantity = int(request.data.get('quantity', 1) or 1)
+        except (ValueError, TypeError):
+            quantity = 1
+
+        if quantity <= 0:
+            return Response({'error': 'Quantity must be at least 1.', 'code': 'INVALID_QUANTITY'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # 1. Resolve active membership
+        active_mem = (
+            Membership.objects.using(alias)
+            .filter(
+                user_profile=profile,
+                status='ACTIVE',
+                end_date__gte=timezone.now().date(),
+            )
+            .select_related('package', 'package_version')
+            .order_by('-created_at')
+            .first()
+        )
+        if not active_mem:
+            return Response({
+                'error': 'An active membership is required to purchase passport sessions.',
+                'code': 'NO_ACTIVE_MEMBERSHIP'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # 2. Verify home sessions remain
+        ent_qs = active_mem.entitlements.using(alias).filter(status='ACTIVE')
+        home_ent = ent_qs.filter(entitlement_type='HOME_BRANCH_SESSION').first() or ent_qs.exclude(
+            entitlement_type__in=['CROSS_BRANCH_SESSION', 'CROSS_BRANCH', 'CREDIT_WALLET']
+        ).first()
+
+        if not home_ent or (not home_ent.is_unlimited and (home_ent.remaining_units or 0) <= 0):
+            return Response({
+                'error': 'No remaining home sessions in your active membership. Please renew or purchase a new pack.',
+                'code': 'NO_HOME_SESSIONS_REMAINING'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # 3. Determine price per passport session
+        from decimal import Decimal
+        unit_price = Decimal('500.00')
+        if active_mem.package_version:
+            pdef = active_mem.package_version.entitlement_definitions.using(alias).filter(
+                entitlement_type__in=['CROSS_BRANCH_SESSION', 'CROSS_BRANCH']
+            ).first()
+            if pdef and pdef.extra_unit_price and pdef.extra_unit_price > 0:
+                unit_price = pdef.extra_unit_price
+
+        total_price = unit_price * Decimal(str(quantity))
+
+        # 4. Top up passport session entitlement
+        from django.db import transaction
+        from .models_memberships import MembershipEntitlement, MembershipEntitlementLedger
+
+        with transaction.atomic(using=alias):
+            passport_ent = ent_qs.filter(
+                models.Q(entitlement_type='CROSS_BRANCH_SESSION') | models.Q(entitlement_type='CROSS_BRANCH')
+            ).first()
+
+            if passport_ent:
+                passport_ent.allocated_units = (passport_ent.allocated_units or Decimal('0.00')) + Decimal(str(quantity))
+                passport_ent.status = 'ACTIVE'
+                passport_ent.save(using=alias, update_fields=['allocated_units', 'status', 'updated_at'])
+            else:
+                passport_ent = MembershipEntitlement.objects.using(alias).create(
+                    membership=active_mem,
+                    entitlement_type='CROSS_BRANCH_SESSION',
+                    allocated_units=Decimal(str(quantity)),
+                    consumed_units=Decimal('0.00'),
+                    valid_from=active_mem.start_date,
+                    valid_until=active_mem.end_date,
+                    status='ACTIVE',
+                )
+
+            MembershipEntitlementLedger.objects.using(alias).create(
+                membership_entitlement=passport_ent,
+                transaction_type='ALLOCATION',
+                units=Decimal(str(quantity)),
+                reason_code='PASSPORT_TOPUP_PURCHASE',
+                reason_text=f"Purchased {quantity} passport session(s) at ₹{unit_price} each",
+                balance_after=passport_ent.remaining_units,
+                created_by_user=user,
+            )
+
+        return Response({
+            'success': True,
+            'message': f"Successfully added {quantity} passport session(s).",
+            'quantity_added': quantity,
+            'unit_price': float(unit_price),
+            'total_price': float(total_price),
+            'passport_sessions_remaining': float(passport_ent.remaining_units or 0),
+            'home_sessions_remaining': float(home_ent.remaining_units or 0) if not home_ent.is_unlimited else 'UNLIMITED',
+        }, status=status.HTTP_200_OK)
+
+
+class MobileTicketsView(APIView):
+    """
+    GET, POST /api/v1/mobile/tickets/
+    Allows authenticated members to view their tickets and raise new support or passport purchase tickets.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
+        profile = _get_or_create_user_profile(user, alias)
+
+        from .models_tickets import SupportTicket
+        tickets = (
+            SupportTicket.objects.using(alias)
+            .filter(user_profile=profile)
+            .select_related('branch')
+            .order_by('-created_at')
+        )
+        data = []
+        for t in tickets:
+            data.append({
+                'id': str(t.id),
+                'ticket_number': t.ticket_number,
+                'category': t.category,
+                'category_display': t.get_category_display(),
+                'priority': t.priority,
+                'status': t.status,
+                'subject': t.subject,
+                'description': t.description,
+                'resolution_notes': t.resolution_notes,
+                'branch_name': t.branch.name if t.branch else None,
+                'created_at': t.created_at.isoformat(),
+                'resolved_at': t.resolved_at.isoformat() if t.resolved_at else None,
+            })
+        return Response(data, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        user = request.user
+        alias, tenant = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
+        profile = _get_or_create_user_profile(user, alias)
+        org = getattr(user, 'organization', None)
+        if not org and tenant:
+            from .models_org import Organization
+            org = Organization.objects.using(alias).filter(tenant_id=tenant.id).first() or Organization.objects.using(alias).first()
+
+        category = request.data.get('category', 'GENERAL_INQUIRY')
+        subject = (request.data.get('subject') or 'Member Support Request').strip()
+        description = (request.data.get('description') or '').strip()
+        branch_id = request.data.get('branch_id')
+
+        from .models_org import Branch
+        branch = None
+        if branch_id:
+            branch = Branch.objects.using(alias).filter(id=branch_id).first()
+        if not branch:
+            branch = getattr(profile, 'preferred_branch', None) or getattr(user, 'home_branch', None)
+
+        from .models_tickets import SupportTicket
+        import uuid
+        date_str = timezone.now().strftime('%Y%m%d')
+        unique_tkt_num = f"TKT-{date_str}-{uuid.uuid4().hex[:6].upper()}"
+
+        ticket = SupportTicket.objects.using(alias).create(
+            organization=org,
+            branch=branch,
+            user_profile=profile,
+            ticket_number=unique_tkt_num,
+            category=category,
+            priority=request.data.get('priority', 'MEDIUM'),
+            status='OPEN',
+            subject=subject,
+            description=description,
+            metadata=request.data.get('metadata', {}),
+        )
+
+        return Response({
+            'success': True,
+            'message': 'Support ticket submitted successfully.',
+            'ticket_id': str(ticket.id),
+            'ticket_number': ticket.ticket_number,
+            'status': ticket.status,
+            'created_at': ticket.created_at.isoformat(),
+        }, status=status.HTTP_201_CREATED)

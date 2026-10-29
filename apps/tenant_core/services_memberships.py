@@ -432,7 +432,7 @@ class MembershipLifecycleService:
         config, _ = MembershipPolicyConfig.objects.using(alias).get_or_create(
             organization=org,
             defaults={
-                'extension_per_day_fee': Decimal('50.00'),
+                'extension_per_day_fee': Decimal('35.00'),
                 'extension_activation_fee': Decimal('200.00'),
                 'extension_min_days': 1,
                 'extension_max_days': 90,
@@ -441,6 +441,7 @@ class MembershipLifecycleService:
                 'freeze_min_days': 3,
                 'freeze_max_days': 60,
                 'freeze_max_count_per_cycle': 3,
+                'upgrade_allowed_window_days': 15,
             }
         )
         return config

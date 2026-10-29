@@ -378,5 +378,8 @@ __all__ += [
     'CommunityAuditLog',
     'PostPrivacyScope',
     'PostStatus',
-     'MemberAssessment',
+    'MemberAssessment',
+    'SupportTicket',
 ]
+
+from .models_tickets import SupportTicket
