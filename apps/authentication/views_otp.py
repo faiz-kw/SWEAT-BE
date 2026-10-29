@@ -39,8 +39,29 @@ logger = logging.getLogger(__name__)
 
 PHONE_REGEX = re.compile(r'^\+?[1-9]\d{7,14}$')
 
-# Fallback in-memory storage if cache backend is unavailable or flushed
+# Persistent Redis + In-Memory Dual OTP Store
 _FALLBACK_OTP_STORE = {}
+_REDIS_CLIENT = None
+
+def _get_redis():
+    global _REDIS_CLIENT
+    if _REDIS_CLIENT is not None:
+        return _REDIS_CLIENT
+    try:
+        import redis
+        client = redis.Redis(
+            host=os.getenv('REDIS_HOST', '127.0.0.1'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
+            db=0,
+            socket_timeout=2.0,
+            decode_responses=False
+        )
+        client.ping()
+        _REDIS_CLIENT = client
+        return _REDIS_CLIENT
+    except Exception as exc:
+        logger.warning("[OTP STORE] Redis not available, using in-memory cache: %s", exc)
+        return None
 
 
 def normalize_phone(phone: str) -> str:
@@ -59,37 +80,97 @@ def normalize_phone(phone: str) -> str:
     return clean
 
 
-def _get_otp_record(phone: str) -> dict | None:
-    cache_key = f"sweat_otp_{phone}"
-    record = cache.get(cache_key)
-    if not record:
-        record = _FALLBACK_OTP_STORE.get(phone)
-    return record
-
-
-def _get_cache_key(phone: str, tenant_slug: str = '') -> str:
+def _generate_candidate_keys(phone: str, tenant_slug: str = '') -> list[str]:
+    """Generates all plausible cache keys for phone and tenant to prevent lookup mismatches."""
+    clean_digits = re.sub(r'\D', '', str(phone))
+    last10 = clean_digits[-10:] if len(clean_digits) >= 10 else clean_digits
+    e164 = f"+91{last10}" if len(last10) == 10 else f"+{clean_digits}"
     slug = (tenant_slug or 'default').lower().strip()
-    return f"sweat_otp_{slug}_{phone}"
+
+    keys = [
+        f"sweat_otp_{slug}_{e164}",
+        f"sweat_otp_{slug}_{last10}",
+        f"sweat_otp_sweat_{e164}",
+        f"sweat_otp_sweat_{last10}",
+        f"sweat_otp_default_{e164}",
+        f"sweat_otp_default_{last10}",
+        f"sweat_otp_{e164}",
+        f"sweat_otp_{last10}",
+    ]
+    # Remove duplicates while preserving order
+    seen = set()
+    return [k for k in keys if not (k in seen or seen.add(k))]
 
 
 def _get_otp_record(phone: str, tenant_slug: str = '') -> dict | None:
-    cache_key = _get_cache_key(phone, tenant_slug)
-    record = cache.get(cache_key)
-    if not record:
-        record = _FALLBACK_OTP_STORE.get(cache_key)
-    return record
+    from datetime import datetime
+    candidate_keys = _generate_candidate_keys(phone, tenant_slug)
+
+    # 1. Try Redis first (survives Django server reloads and process restarts)
+    r = _get_redis()
+    if r:
+        for k in candidate_keys:
+            try:
+                raw = r.get(k)
+                if raw:
+                    data = json.loads(raw.decode('utf-8'))
+                    return {
+                        'hash': data['hash'],
+                        'expires_at': datetime.fromisoformat(data['expires_at']),
+                        'attempts': int(data.get('attempts', 0)),
+                        'last_sent': datetime.fromisoformat(data['last_sent']),
+                        'otp_code': data.get('otp_code', ''),
+                    }
+            except Exception:
+                pass
+
+    # 2. Fallback to cache and in-memory store
+    for k in candidate_keys:
+        record = cache.get(k) or _FALLBACK_OTP_STORE.get(k)
+        if record:
+            return record
+
+    return None
 
 
 def _save_otp_record(phone: str, record: dict, tenant_slug: str = '', ttl_seconds: int = 300) -> None:
-    cache_key = _get_cache_key(phone, tenant_slug)
-    cache.set(cache_key, record, timeout=ttl_seconds)
-    _FALLBACK_OTP_STORE[cache_key] = record
+    candidate_keys = _generate_candidate_keys(phone, tenant_slug)
+    ser = {
+        'hash': record['hash'],
+        'expires_at': record['expires_at'].isoformat() if hasattr(record['expires_at'], 'isoformat') else str(record['expires_at']),
+        'attempts': record.get('attempts', 0),
+        'last_sent': record['last_sent'].isoformat() if hasattr(record['last_sent'], 'isoformat') else str(record['last_sent']),
+        'otp_code': record.get('otp_code', ''),
+    }
+    ser_json = json.dumps(ser)
+
+    # 1. Save to Redis
+    r = _get_redis()
+    if r:
+        for k in candidate_keys:
+            try:
+                r.set(k, ser_json, ex=ttl_seconds)
+            except Exception as exc:
+                logger.warning("[OTP REDIS SET ERROR] %s: %s", k, exc)
+
+    # 2. Save to cache & fallback memory
+    for k in candidate_keys:
+        cache.set(k, record, timeout=ttl_seconds)
+        _FALLBACK_OTP_STORE[k] = record
 
 
 def _delete_otp_record(phone: str, tenant_slug: str = '') -> None:
-    cache_key = _get_cache_key(phone, tenant_slug)
-    cache.delete(cache_key)
-    _FALLBACK_OTP_STORE.pop(cache_key, None)
+    candidate_keys = _generate_candidate_keys(phone, tenant_slug)
+    r = _get_redis()
+    if r:
+        for k in candidate_keys:
+            try:
+                r.delete(k)
+            except Exception:
+                pass
+    for k in candidate_keys:
+        cache.delete(k)
+        _FALLBACK_OTP_STORE.pop(k, None)
 
 
 def _resolve_tenant_and_db(request):
@@ -269,9 +350,8 @@ class SendOTPView(APIView):
         if dispatch_result.get('message_id'):
             response_data['whatsapp_message_id'] = dispatch_result.get('message_id')
 
-        # Include dev_otp if DEBUG or in dev environment
-        if getattr(settings, 'DEBUG', True):
-            response_data['dev_otp'] = otp_code
+        # For production security, do not expose plaintext OTP in response payload
+        # (OTP is dispatched exclusively via Gupshup WhatsApp)
 
         return Response(response_data, status=status.HTTP_200_OK)
 

@@ -133,9 +133,91 @@ class VobizInboundWebhookView(APIView):
         with resolve_telephony_tenant_context():
             data = request.data if isinstance(request.data, dict) else {}
             call_uuid = data.get('CallUUID') or data.get('call_uuid') or request.POST.get('CallUUID', '')
-            caller_phone = VoiceCallingService.normalize_phone(data.get('From') or request.POST.get('From', ''))
+            raw_from = str(data.get('From') or request.POST.get('From', '')).strip()
+            raw_to = str(data.get('To') or request.POST.get('To', '')).strip()
             vobiz_cfg = TelephonyConfigService.get_vobiz_config()
-            did_number = data.get('To') or request.POST.get('To', '') or vobiz_cfg['from_number']
+            host = _get_webhook_host(request)
+
+            # ── DETECT IF CALL IS AGENT SOFTPHONE DIALING OUT ──
+            clean_from_sip = raw_from.replace('sip:', '').split('@')[0]
+            from django.db import models
+            agent_presence = AgentPresence.objects.filter(
+                models.Q(sip_username=clean_from_sip) | models.Q(sip_username=raw_from)
+            ).select_related('user', 'organization').first()
+
+            is_softphone_outbound = bool(agent_presence) or raw_from.startswith('sip:') or '@registrar.vobiz.ai' in raw_from
+
+            if is_softphone_outbound:
+                # ── OUTBOUND CALL FROM AGENT SOFTPHONE ──
+                digits_to = ''.join(c for c in raw_to if c.isdigit())
+                if len(digits_to) >= 10:
+                    customer_phone = f"+91{digits_to[-10:]}"
+                else:
+                    customer_phone = f"+{digits_to}" if digits_to else raw_to
+
+                caller_id = vobiz_cfg.get('from_number') or "+919240954144"
+                rep_user = agent_presence.user if agent_presence else None
+                org = agent_presence.organization if agent_presence else Organization.objects.first()
+
+                # Match existing Lead by last 10 digits
+                lead = None
+                dest_digits = digits_to[-10:] if len(digits_to) >= 10 else digits_to
+                if dest_digits:
+                    lead = Lead.objects.filter(phone_normalized__icontains=dest_digits).order_by('-created_at').first()
+
+                session = CallSession.objects.filter(provider_attempt_id=call_uuid).first()
+                if not session:
+                    session = CallSession.objects.create(
+                        organization=org,
+                        lead=lead,
+                        sales_rep=rep_user,
+                        branch=rep_user.home_branch if rep_user else (lead.branch if lead else None),
+                        provider='VOBIZ',
+                        provider_attempt_id=call_uuid,
+                        direction='OUTBOUND',
+                        call_mode='HUMAN_MANUAL',
+                        status='RINGING',
+                        user_phone_number=customer_phone,
+                        agent_phone_number=caller_id,
+                        started_at=timezone.now(),
+                    )
+                else:
+                    session.direction = 'OUTBOUND'
+                    session.sales_rep = rep_user
+                    session.lead = lead
+                    session.user_phone_number = customer_phone
+                    session.status = 'RINGING'
+                    session.save(update_fields=['direction', 'sales_rep', 'lead', 'user_phone_number', 'status'])
+
+                if agent_presence:
+                    agent_presence.status = 'ON_CALL'
+                    agent_presence.active_session = session
+                    agent_presence.last_heartbeat = timezone.now()
+                    agent_presence.save(update_fields=['status', 'active_session', 'last_heartbeat'])
+
+                hangup_url = f"{host}/api/v1/telephony/hangup/?session_id={session.id}"
+                rec_str = "true" if vobiz_cfg.get('record_all_calls', True) else "false"
+
+                logger.info(
+                    "Vobiz Outbound Softphone Bridge: Agent=%s (%s) -> Customer=%s CallerID=%s UUID=%s",
+                    rep_user.email if rep_user else clean_from_sip,
+                    clean_from_sip,
+                    customer_phone,
+                    caller_id,
+                    call_uuid
+                )
+
+                xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial action="{hangup_url}" callerId="{caller_id}" record="{rec_str}">
+    <Number>{customer_phone}</Number>
+  </Dial>
+</Response>"""
+                return HttpResponse(xml, content_type="application/xml; charset=utf-8")
+
+            # ── INBOUND CALL FROM REAL CUSTOMER TO VIRTUAL DID ──
+            caller_phone = VoiceCallingService.normalize_phone(raw_from)
+            did_number = raw_to or vobiz_cfg['from_number']
 
             logger.info("Vobiz Inbound Call: UUID=%s From=%s To=%s", call_uuid, caller_phone, did_number)
 
@@ -491,8 +573,9 @@ class VobizHangupWebhookView(APIView):
                             'duration_seconds': int(duration_raw),
                             'bill_duration_seconds': bill_duration,
                             'is_meaningful': is_meaningful,
+                            'direction': session.direction,
                             'lead_id': session.lead.id if session.lead else None,
-                            'lead_name': f"{session.lead.first_name} {session.lead.last_name or ''}".strip() if session.lead else "Customer",
+                            'lead_name': f"{session.lead.first_name} {session.lead.last_name or ''}".strip() if session.lead else (session.user_phone_number or "Customer"),
                             'recording_url': recording_url,
                         })
                     else:
@@ -501,13 +584,20 @@ class VobizHangupWebhookView(APIView):
                             status='AVAILABLE',
                             active_session=None,
                         )
-                        push_agent_telephony_event(rep_id, 'MISSED_CALL', {
-                            'session_id': str(session.id),
-                            'call_uuid': call_uuid,
-                            'caller_phone': session.user_phone_number,
-                        })
+                        # Only push MISSED_CALL notification for real INBOUND calls, never for agent's own outbound calls!
+                        if session.direction == 'INBOUND':
+                            push_agent_telephony_event(rep_id, 'MISSED_CALL', {
+                                'session_id': str(session.id),
+                                'call_uuid': call_uuid,
+                                'caller_phone': session.user_phone_number,
+                            })
 
-            return Response({'status': 'PROCESSED', 'call_uuid': call_uuid}, status=status.HTTP_200_OK)
+            # Return valid VobizXML rather than JSON to avoid 8012 Invalid Action XML carrier errors
+            xml_resp = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Hangup/>
+</Response>"""
+            return HttpResponse(xml_resp, content_type="application/xml; charset=utf-8")
 
 
 # ============================================================================
