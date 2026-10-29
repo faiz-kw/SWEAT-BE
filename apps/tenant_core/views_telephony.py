@@ -832,8 +832,28 @@ class CallDispositionView(APIView):
                         session.lead = lead
                         session.save(update_fields=['lead'])
 
-            # Create LeadActivity and update status
+            # Create LeadActivity, audit stage history, and advance status
             if lead:
+                old_status = lead.current_status
+                target_status = None
+                if disposition == 'TRIAL_BOOKED':
+                    target_status = 'TRIAL_BOOKED'
+                elif disposition == 'INTERESTED' and old_status in ('NEW_LEAD', 'UNASSIGNED'):
+                    target_status = 'INTERESTED'
+
+                if target_status and target_status != old_status:
+                    lead.current_status = target_status
+                    lead.save(update_fields=['current_status', 'updated_at'])
+                    from apps.tenant_core.models_crm import LeadStatusHistory
+                    LeadStatusHistory.objects.using(get_tenant_db_alias() or 'default').create(
+                        lead=lead,
+                        from_status=old_status,
+                        to_status=target_status,
+                        reason_code='CALL_DISPOSITION',
+                        reason_text=f"Advanced via Call Outcome: {disposition.replace('_', ' ').title()}" + (f" - {notes}" if notes else ""),
+                        changed_by_user=user if getattr(user, 'is_authenticated', False) else None,
+                    )
+
                 LeadActivity.objects.create(
                     lead=lead,
                     activity_type='CALL',
@@ -842,14 +862,6 @@ class CallDispositionView(APIView):
                     performed_by_user=user if getattr(user, 'is_authenticated', False) else None,
                     external_reference=str(session.id),
                 )
-
-                # Auto-advance lead stage (TRIAL_BOOKED matches CRM status)
-                if disposition == 'TRIAL_BOOKED':
-                    lead.current_status = 'TRIAL_BOOKED'
-                    lead.save(update_fields=['current_status', 'updated_at'])
-                elif disposition == 'INTERESTED' and lead.current_status in ('NEW_LEAD', 'UNASSIGNED'):
-                    lead.current_status = 'INTERESTED'
-                    lead.save(update_fields=['current_status', 'updated_at'])
 
                 # Create Follow-up Task if requested
                 if followup_date_str:
@@ -1620,8 +1632,8 @@ class TelephonyAnalyticsView(APIView):
                     'disposition': cs.disposition,
                     'disposition_label': labels_map.get(cs.disposition, cs.disposition) if cs.disposition else 'Pending',
                     'disposition_notes': cs.disposition_notes,
-                    'has_recording': bool(cs.recording_url),
-                    'recording_url': cs.recording_url or '',
+                    'has_recording': bool(cs.recording_url or cs.recording_storage_key),
+                    'recording_url': f"/api/v1/tenant/crm/telephony/recordings/{cs.id}/stream/" if (cs.recording_url or cs.recording_storage_key) else '',
                     'created_at': cs.created_at.isoformat(),
                 })
 

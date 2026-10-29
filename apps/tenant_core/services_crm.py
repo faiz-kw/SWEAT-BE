@@ -1107,35 +1107,41 @@ class CRMLeadService:
                         elif line.startswith("Disposition:") and not disp:
                             disp = line.replace("Disposition:", "").strip()
 
-                # Determine accurate disposition
-                if has_trial_booking:
+                # Determine accurate disposition (preserve agent entered disposition)
+                if cs.disposition:
+                    disp = cs.disposition
+                elif has_trial_booking:
                     disp = 'TRIAL_BOOKED'
-                elif not disp or disp == 'TRIAL_BOOKED':
+                elif not disp:
                     if cs.status in ('NO_ANSWER', 'MISSED', 'UNANSWERED'):
                         disp = 'NO_ANSWER'
                     elif cs.status == 'BUSY':
                         disp = 'BUSY'
                     elif cs.status in ('FAILED', 'REJECTED'):
                         disp = 'CALL_FAILED'
-                    elif cs.duration_seconds and cs.duration_seconds < 25:
-                        disp = 'DISCONNECTED_EARLY'
                     elif cs.status == 'COMPLETED':
                         disp = 'CALL_COMPLETED'
                     else:
                         disp = cs.status
 
                 is_unanswered = cs.status in ('NO_ANSWER', 'MISSED', 'UNANSWERED', 'BUSY', 'FAILED', 'REJECTED')
-                rec_url = call_meta.get('recording_url') or call_meta.get('audio_url') or call_meta.get('recording')
-                if not rec_url and not is_unanswered and cs.status == 'COMPLETED':
-                    rec_url = f"/api/v1/voice-agent/recordings/{cs.id}/audio/"
+                has_rec = bool(cs.recording_url or cs.recording_storage_key or call_meta.get('recording_url') or call_meta.get('audio_url'))
+                rec_url = None
+                if has_rec:
+                    if cs.provider == 'VOBIZ' or cs.call_mode == 'HUMAN_MANUAL':
+                        rec_url = f"/api/v1/tenant/crm/telephony/recordings/{cs.id}/stream/"
+                    else:
+                        rec_url = call_meta.get('recording_url') or f"/api/v1/voice-agent/recordings/{cs.id}/audio/"
 
+                dir_name = 'Inbound' if cs.direction == 'INBOUND' else 'Outbound'
                 if is_human:
                     actor_label = f"{cs.sales_rep.first_name} {cs.sales_rep.last_name or ''}".strip() if cs.sales_rep else 'Sales Rep'
                     dur = int(cs.duration_seconds or 0)
                     dur_label = f"{dur}s" if dur < 60 else f"{dur // 60}m {dur % 60}s"
                     desc = call_summary or (
-                        (f"Inbound call: Connected {dur_label} with {actor_label}." if dur > 0 else f"Inbound call: {status_label} (no answer).")
-                        + (f" {cs.disposition_notes}" if cs.disposition_notes else "")
+                        (f"{dir_name} call: Connected {dur_label} with {actor_label}." if dur > 0 else f"{dir_name} call: {status_label}.")
+                        + (f" Outcome: {disp.replace('_', ' ').title()}." if disp else "")
+                        + (f" Notes: {cs.disposition_notes}" if cs.disposition_notes else "")
                     ).strip()
                 else:
                     actor_label = f"{cs.provider.title()} Voice Agent (Mahek)"
