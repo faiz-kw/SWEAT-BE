@@ -1241,32 +1241,64 @@ class CallRecordingStreamView(APIView):
 
         cache_dir = os.path.join(settings.BASE_DIR, 'media', 'recordings')
         os.makedirs(cache_dir, exist_ok=True)
-        local_path = os.path.join(cache_dir, f"{session_id}.mp3")
 
         with resolve_telephony_tenant_context():
             session = CallSession.objects.filter(id=session_id).first()
             if not session:
                 raise Http404("Call session not found.")
 
-        # If not cached locally, attempt to download from recording_url
-        if not (os.path.exists(local_path) and os.path.getsize(local_path) > 1024):
-            if session.recording_url:
-                try:
-                    r = requests.get(session.recording_url, timeout=30, stream=True)
-                    if r.status_code == 200:
-                        with open(local_path, 'wb') as f:
-                            for chunk in r.iter_content(chunk_size=65536):
-                                if chunk:
-                                    f.write(chunk)
-                        with resolve_telephony_tenant_context():
-                            CallSession.objects.filter(id=session_id).update(
-                                recording_storage_key=local_path
-                            )
-                except Exception as dl_err:
-                    logger.warning("Could not download recording on the fly: %s", dl_err)
+        # Find authoritative audio recording file (storage key, wav, mp3, ogg)
+        local_path = None
+        if session.recording_storage_key and os.path.exists(session.recording_storage_key) and os.path.getsize(session.recording_storage_key) > 100:
+            local_path = session.recording_storage_key
+        else:
+            for ext in ['.wav', '.mp3', '.ogg', '.m4a']:
+                cand = os.path.join(cache_dir, f"{session_id}{ext}")
+                if os.path.exists(cand) and os.path.getsize(cand) > 100:
+                    local_path = cand
+                    break
 
-        if not os.path.exists(local_path) or os.path.getsize(local_path) < 100:
+        # If not cached locally, attempt to download from external recording_url
+        if not local_path and session.recording_url and session.recording_url.startswith('http'):
+            download_dest = os.path.join(cache_dir, f"{session_id}.mp3")
+            try:
+                r = requests.get(session.recording_url, timeout=30, stream=True)
+                if r.status_code == 200:
+                    with open(download_dest, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=65536):
+                            if chunk:
+                                f.write(chunk)
+                    local_path = download_dest
+                    with resolve_telephony_tenant_context():
+                        CallSession.objects.filter(id=session_id).update(
+                            recording_storage_key=download_dest
+                        )
+            except Exception as dl_err:
+                logger.warning("Could not download recording on the fly: %s", dl_err)
+
+        if not local_path or not os.path.exists(local_path) or os.path.getsize(local_path) < 100:
             return HttpResponse("Recording audio not available or still processing.", status=404)
+
+        # Detect real audio MIME type from file header
+        content_type = 'audio/mpeg'
+        ext_label = 'mp3'
+        try:
+            with open(local_path, 'rb') as f:
+                head = f.read(16)
+                if head.startswith(b'RIFF'):
+                    content_type = 'audio/wav'
+                    ext_label = 'wav'
+                elif head.startswith(b'OggS'):
+                    content_type = 'audio/ogg'
+                    ext_label = 'ogg'
+                elif head.startswith(b'\xff\xfb') or head.startswith(b'\xff\xf3') or head.startswith(b'ID3'):
+                    content_type = 'audio/mpeg'
+                    ext_label = 'mp3'
+                elif local_path.endswith('.wav'):
+                    content_type = 'audio/wav'
+                    ext_label = 'wav'
+        except Exception:
+            pass
 
         file_size = os.path.getsize(local_path)
         http_range = request.META.get('HTTP_RANGE', '')
@@ -1296,12 +1328,12 @@ class CallRecordingStreamView(APIView):
                     remaining -= len(chunk)
                     yield chunk
 
-        resp = StreamingHttpResponse(stream_chunks(), status=status_code, content_type='audio/mpeg')
+        resp = StreamingHttpResponse(stream_chunks(), status=status_code, content_type=content_type)
         resp['Accept-Ranges'] = 'bytes'
         resp['Content-Length'] = str(length)
         if status_code == 206:
             resp['Content-Range'] = f'bytes {start}-{end}/{file_size}'
-        resp['Content-Disposition'] = f'inline; filename="call_{session_id}.mp3"'
+        resp['Content-Disposition'] = f'inline; filename="call_{session_id}.{ext_label}"'
         resp['Access-Control-Allow-Origin'] = '*'
         resp['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
         resp['Access-Control-Allow-Headers'] = 'Range, Content-Type, Accept'
