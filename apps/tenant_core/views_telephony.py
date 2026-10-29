@@ -26,7 +26,7 @@ from django.db import transaction
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
 
-from rest_framework import status, permissions
+from rest_framework import status, permissions, renderers
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from contextlib import contextmanager
@@ -755,6 +755,15 @@ class CallDispositionView(APIView):
 # 5. REAL-TIME EVENT STREAM (SERVER-SENT EVENTS) & QUEUES
 # ============================================================================
 
+class ServerSentEventRenderer(renderers.BaseRenderer):
+    """Renderer to satisfy text/event-stream Accept header for SSE streams."""
+    media_type = 'text/event-stream'
+    format = 'txt'
+
+    def render(self, data, accepted_media_type=None, renderer_context=None):
+        return data
+
+
 class TelephonyEventsSseView(APIView):
     """
     GET /api/v1/tenant/crm/telephony/events/
@@ -762,6 +771,7 @@ class TelephonyEventsSseView(APIView):
     Pushes screen-pop alerts, call-ended triggers, and missed-call notifications.
     """
     permission_classes = [permissions.AllowAny]
+    renderer_classes = [ServerSentEventRenderer, renderers.JSONRenderer]
 
     def get(self, request):
         user = request.user
