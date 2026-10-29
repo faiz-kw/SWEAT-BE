@@ -563,22 +563,31 @@ class VobizHangupWebhookView(APIView):
                 if session.sales_rep:
                     rep_id = str(session.sales_rep.id)
                     if duration_raw > 0:
-                        # Connected call: place in WRAP_UP for post-call notes & disposition
-                        AgentPresence.objects.filter(user=session.sales_rep).update(
-                            status='WRAP_UP',
-                            active_session=session,
-                        )
-                        push_agent_telephony_event(rep_id, 'CALL_ENDED', {
-                            'session_id': str(session.id),
-                            'call_uuid': call_uuid,
-                            'duration_seconds': int(duration_raw),
-                            'bill_duration_seconds': bill_duration,
-                            'is_meaningful': is_meaningful,
-                            'direction': session.direction,
-                            'lead_id': session.lead.id if session.lead else None,
-                            'lead_name': f"{session.lead.first_name} {session.lead.last_name or ''}".strip() if session.lead else (session.user_phone_number or "Customer"),
-                            'recording_url': recording_url,
-                        })
+                        # If disposition was ALREADY submitted by agent from the browser WebRTC phone:
+                        if session.disposition:
+                            logger.info("Call %s already disposed as %s. Setting rep to AVAILABLE and skipping duplicate CALL_ENDED broadcast.", session.id, session.disposition)
+                            AgentPresence.objects.filter(user=session.sales_rep).update(
+                                status='AVAILABLE',
+                                active_session=None,
+                            )
+                        else:
+                            # Connected call: place in WRAP_UP for post-call notes & disposition
+                            AgentPresence.objects.filter(user=session.sales_rep).update(
+                                status='WRAP_UP',
+                                active_session=session,
+                            )
+                            push_agent_telephony_event(rep_id, 'CALL_ENDED', {
+                                'session_id': str(session.id),
+                                'call_uuid': call_uuid,
+                                'duration_seconds': int(duration_raw),
+                                'bill_duration_seconds': bill_duration,
+                                'is_meaningful': is_meaningful,
+                                'direction': session.direction,
+                                'caller_phone': session.user_phone_number or '',
+                                'lead_id': session.lead.id if session.lead else None,
+                                'lead_name': f"{session.lead.first_name} {session.lead.last_name or ''}".strip() if session.lead else (session.user_phone_number or "Customer"),
+                                'recording_url': recording_url,
+                            })
                     else:
                         # Unanswered / cancelled call: instantly return to AVAILABLE
                         AgentPresence.objects.filter(user=session.sales_rep).update(
@@ -751,18 +760,79 @@ class CallDispositionView(APIView):
             if not session_id or not disposition:
                 return Response({'error': 'session_id and disposition are required.'}, status=status.HTTP_400_BAD_REQUEST)
 
-            session = CallSession.objects.filter(id=session_id).first()
+            # Robust session lookup (supports UUID id, provider_attempt_id, and latest agent call fallback)
+            session = None
+            import uuid
+            try:
+                val = uuid.UUID(str(session_id))
+                session = CallSession.objects.filter(id=val).first()
+            except (ValueError, TypeError, Exception):
+                pass
+
             if not session:
-                return Response({'error': 'Call session not found.'}, status=status.HTTP_404_NOT_FOUND)
+                session = CallSession.objects.filter(provider_attempt_id=session_id).first()
+
+            if not session and user:
+                session = CallSession.objects.filter(
+                    sales_rep=user,
+                    created_at__gte=timezone.now() - timedelta(minutes=15)
+                ).order_by('-created_at').first()
+
+            caller_phone = str(request.data.get('caller_phone', '')).strip()
+
+            if not session:
+                # Ensure the call session is captured so the agent's logged work is NEVER lost
+                org = getattr(user, 'organization', None) or Organization.objects.first()
+                branch = getattr(user, 'home_branch', None) or Branch.objects.filter(organization=org).first()
+                session = CallSession.objects.create(
+                    organization=org,
+                    sales_rep=user if getattr(user, 'is_authenticated', False) else None,
+                    branch=branch,
+                    provider='VOBIZ',
+                    direction=request.data.get('direction', 'OUTBOUND'),
+                    call_mode='HUMAN_MANUAL',
+                    status='COMPLETED',
+                    user_phone_number=caller_phone,
+                    duration_seconds=float(request.data.get('duration_seconds', 0.0) or 0.0),
+                    disposition=disposition,
+                    disposition_notes=notes,
+                    disposition_submitted_at=timezone.now(),
+                )
 
             # Update CallSession
             session.disposition = disposition
             session.disposition_notes = notes
             session.disposition_submitted_at = timezone.now()
-            session.save(update_fields=['disposition', 'disposition_notes', 'disposition_submitted_at'])
+            if not session.user_phone_number and caller_phone:
+                session.user_phone_number = caller_phone
+            session.save(update_fields=['disposition', 'disposition_notes', 'disposition_submitted_at', 'user_phone_number'])
 
-            # Create LeadActivity
+            # Match or auto-create Lead if session has no lead
             lead = session.lead
+            phone_to_check = session.user_phone_number or caller_phone
+            if not lead and phone_to_check:
+                clean_phone = phone_to_check.replace('+', '').replace('-', '').replace(' ', '')
+                if len(clean_phone) >= 10:
+                    last10 = clean_phone[-10:]
+                    lead = Lead.objects.filter(phone_normalized__icontains=last10).first()
+                    if not lead and disposition in ('TRIAL_BOOKED', 'INTERESTED', 'CALLBACK_REQUESTED', 'FOLLOW_UP_NEEDED'):
+                        org = session.organization or getattr(user, 'organization', None) or Organization.objects.first()
+                        branch = session.branch or getattr(user, 'home_branch', None) or Branch.objects.filter(organization=org).first()
+                        lead = Lead.objects.create(
+                            organization=org,
+                            branch=branch,
+                            first_name=f"Prospect {last10[-4:]}",
+                            last_name="",
+                            phone_normalized=phone_to_check if phone_to_check.startswith('+') else f"+91{last10}",
+                            current_status='TRIAL_BOOKED' if disposition == 'TRIAL_BOOKED' else ('INTERESTED' if disposition == 'INTERESTED' else 'NEW_LEAD'),
+                            first_touch_source='OUTBOUND_CALL',
+                            assigned_sales_user=user if getattr(user, 'is_authenticated', False) else None,
+                        )
+                    if lead:
+                        session.lead = lead
+                        session.save(update_fields=['lead'])
+
+            # Create LeadActivity and update status
             if lead:
                 LeadActivity.objects.create(
                     lead=lead,
@@ -773,9 +843,12 @@ class CallDispositionView(APIView):
                     external_reference=str(session.id),
                 )
 
-                # Auto-advance lead stage if Trial Booked
+                # Auto-advance lead stage (TRIAL_BOOKED matches CRM status)
                 if disposition == 'TRIAL_BOOKED':
-                    lead.current_status = 'TRIAL_SCHEDULED'
+                    lead.current_status = 'TRIAL_BOOKED'
+                    lead.save(update_fields=['current_status', 'updated_at'])
+                elif disposition == 'INTERESTED' and lead.current_status in ('NEW_LEAD', 'UNASSIGNED'):
+                    lead.current_status = 'INTERESTED'
                     lead.save(update_fields=['current_status', 'updated_at'])
 
                 # Create Follow-up Task if requested
