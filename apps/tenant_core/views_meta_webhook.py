@@ -29,7 +29,7 @@ from apps.tenant_core.context import tenant_database_context
 from apps.tenant_core.models_org import Organization
 from apps.tenant_core.meta_lead_rules import verify_signature
 from apps.tenant_core.services_meta_graph import get_meta_app_credentials
-from apps.tenant_core.services_meta_leads import receive_live_webhook_event
+from apps.tenant_core.services_meta_leads import receive_live_webhook_event, process_live_import
 from apps.tenant_core.tasks_meta_leads import process_meta_lead_import_task
 from apps.tenant_core.meta_logging import (
     log_meta_event,
@@ -216,11 +216,15 @@ class MetaLeadWebhookView(APIView):
                                 )
                             except Exception as dispatch_exc:
                                 pending_recovery_count += 1
-                                logger.error(
-                                    "Celery dispatch failed for MetaLeadImport %s (tenant %s): %s. "
-                                    "Record safely committed as PENDING in PostgreSQL for background recovery.",
+                                logger.warning(
+                                    "Celery dispatch unavailable for MetaLeadImport %s (tenant %s): %s. "
+                                    "Executing synchronous inline fallback processing.",
                                     event.id, tenant.slug, dispatch_exc,
                                 )
+                                try:
+                                    process_live_import(organization=org, event_id=str(event.id), actor_user=None, alias=alias)
+                                except Exception as fallback_exc:
+                                    logger.error("Synchronous inline processing failed for MetaLeadImport %s: %s", event.id, fallback_exc)
                                 log_meta_event(
                                     EVT_PROCESSING_FAILED,
                                     f"Celery task dispatch failed ({type(dispatch_exc).__name__}). Import preserved as PENDING for background recovery.",
