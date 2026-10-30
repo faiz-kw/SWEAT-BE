@@ -383,3 +383,16 @@ __all__ += [
 ]
 
 from .models_tickets import SupportTicket
+
+
+from .models_pos import (
+    POSProviderConfig,
+    POSTerminal,
+    POSTransaction,
+)
+
+__all__ += [
+    'POSProviderConfig',
+    'POSTerminal',
+    'POSTransaction',
+]

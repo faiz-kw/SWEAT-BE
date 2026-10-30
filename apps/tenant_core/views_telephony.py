@@ -201,10 +201,7 @@ class VobizInboundWebhookView(APIView):
                     agent_presence.save(update_fields=['status', 'active_session', 'last_heartbeat'])
 
                 hangup_url = f"{host}/api/v1/telephony/hangup/?session_id={session.id}"
-                rec_callback_url = f"{host}/api/v1/telephony/recording/?session_id={session.id}"
                 rec_str = "true" if vobiz_cfg.get('record_all_calls', True) else "false"
-                should_record = vobiz_cfg.get('record_all_calls', True)
-                record_tag = f'  <Record action="{rec_callback_url}" callbackUrl="{rec_callback_url}" method="POST" startOnDialAnswer="true" redirect="false" maxLength="7200" />\n' if should_record else ''
 
                 logger.info(
                     "Vobiz Outbound Softphone Bridge: Agent=%s (%s) -> Customer=%s CallerID=%s UUID=%s",
@@ -217,7 +214,7 @@ class VobizInboundWebhookView(APIView):
 
                 xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-{record_tag}  <Dial action="{hangup_url}" callbackUrl="{hangup_url}" callerId="{caller_id}" record="{rec_str}" redirect="false">
+  <Dial action="{hangup_url}" callbackUrl="{hangup_url}" callerId="{caller_id}" record="{rec_str}">
     <Number>{customer_phone}</Number>
   </Dial>
   <Hangup/>
@@ -374,9 +371,10 @@ class VobizInboundWebhookView(APIView):
                 hangup_url = f"{host}/api/v1/telephony/hangup/?session_id={session.id}"
                 did_caller_id = did_number if did_number.startswith('+') else vobiz_cfg['from_number']
                 agent_sip = f"sip:{presence.sip_username}@{vobiz_cfg['registrar_host']}"
+                caller_display_id = did_caller_id
                 xml = VobizVoiceAdapter.build_inbound_dial_xml(
                     agent_sip_uri=agent_sip,
-                    caller_id=did_caller_id,
+                    caller_id=caller_display_id,
                     fallback_action_url=fallback_url,
                     timeout=vobiz_cfg['ring_timeout_sec'],
                     record=vobiz_cfg['record_all_calls'],
@@ -389,6 +387,16 @@ class VobizInboundWebhookView(APIView):
             # Fallback: No rep available -> play prompt and record missed call
             session.status = 'NO_ANSWER'
             session.save(update_fields=['status'])
+
+            # Broadcast missed call to all reps in org so the queue / desk badge updates
+            for pres in AgentPresence.objects.filter(organization=org):
+                push_agent_telephony_event(str(pres.user_id), 'MISSED_CALL', {
+                    'session_id': str(session.id),
+                    'call_uuid': call_uuid,
+                    'caller_phone': session.user_phone_number,
+                    'caller_type': caller_type,
+                })
+
             xml = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Speak voice="WOMAN" language="en-IN">Welcome to SWEAT Elite. All our fitness consultants are currently on active calls. We have logged your priority callback.</Speak>
@@ -484,24 +492,17 @@ class VobizInboundFallbackWebhookView(APIView):
                         notes=f"Missed inbound call from {session.user_phone_number}. No reps were available to answer.",
                         external_reference=str(session.id),
                     )
-                # Also log to Member timeline (CallSession) even when no lead is linked
-                # This ensures member call history in the CRM timeline stays accurate
-                elif session.user_phone_number:
-                    logger.info(
-                        "Missed inbound call from MEMBER %s (no lead linked). Session=%s",
-                        session.user_phone_number, session.id
-                    )
-                    # Push a MISSED_CALL SSE event so CRM shows the missed call badge
-                    if session.sales_rep:
-                        push_agent_telephony_event(str(session.sales_rep.id), 'MISSED_CALL', {
-                            'session_id': str(session.id),
-                            'call_uuid': call_uuid,
-                            'caller_phone': session.user_phone_number,
-                            'caller_type': 'MEMBER',
-                        })
-                    # Write CallSession activity note for member 360 timeline
-                    session.disposition_notes = f"MISSED: Inbound call from {session.user_phone_number}. No reps were available to answer."
-                    session.save(update_fields=['disposition_notes'])
+                # Write CallSession activity note for timeline
+                session.disposition_notes = f"MISSED: Inbound call from {session.user_phone_number}. No reps were available to answer."
+                session.save(update_fields=['disposition_notes'])
+
+                # Broadcast MISSED_CALL to reps so the Missed Calls Desk updates in real-time
+                for pres in AgentPresence.objects.filter(organization=org):
+                    push_agent_telephony_event(str(pres.user_id), 'MISSED_CALL', {
+                        'session_id': str(session.id),
+                        'call_uuid': call_uuid,
+                        'caller_phone': session.user_phone_number,
+                    })
 
             xml = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -939,21 +940,21 @@ class CallDispositionView(APIView):
                     if not is_member:
                         lead = Lead.objects.filter(phone_normalized__icontains=last10).first()
                         if not lead and disposition in ('TRIAL_BOOKED', 'INTERESTED', 'CALLBACK_REQUESTED', 'FOLLOW_UP_NEEDED'):
-                        org = session.organization or getattr(user, 'organization', None) or Organization.objects.first()
-                        branch = session.branch or getattr(user, 'home_branch', None) or Branch.objects.filter(organization=org).first()
-                        lead = Lead.objects.create(
-                            organization=org,
-                            branch=branch,
-                            first_name=f"Prospect {last10[-4:]}",
-                            last_name="",
-                            phone_normalized=phone_to_check if phone_to_check.startswith('+') else f"+91{last10}",
-                            current_status='TRIAL_BOOKED' if disposition == 'TRIAL_BOOKED' else ('INTERESTED' if disposition == 'INTERESTED' else 'NEW_LEAD'),
-                            first_touch_source='OUTBOUND_CALL',
-                            assigned_sales_user=user if getattr(user, 'is_authenticated', False) else None,
-                        )
-                    if lead:
-                        session.lead = lead
-                        session.save(update_fields=['lead'])
+                            org = session.organization or getattr(user, 'organization', None) or Organization.objects.first()
+                            branch = session.branch or getattr(user, 'home_branch', None) or Branch.objects.filter(organization=org).first()
+                            lead = Lead.objects.create(
+                                organization=org,
+                                branch=branch,
+                                first_name=f"Prospect {last10[-4:]}",
+                                last_name="",
+                                phone_normalized=phone_to_check if phone_to_check.startswith('+') else f"+91{last10}",
+                                current_status='TRIAL_BOOKED' if disposition == 'TRIAL_BOOKED' else ('INTERESTED' if disposition == 'INTERESTED' else 'NEW_LEAD'),
+                                first_touch_source='OUTBOUND_CALL',
+                                assigned_sales_user=user if getattr(user, 'is_authenticated', False) else None,
+                            )
+                        if lead:
+                            session.lead = lead
+                            session.save(update_fields=['lead'])
 
             # Create LeadActivity, audit stage history, and advance status
             if lead:
@@ -1150,30 +1151,52 @@ class MissedCallsQueueView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        user = request.user
-        cutoff = timezone.now() - timedelta(days=7)
+        with resolve_telephony_tenant_context():
+            cutoff = timezone.now() - timedelta(days=7)
 
-        missed = CallSession.objects.filter(
-            direction='INBOUND',
-            status='NO_ANSWER',
-            created_at__gte=cutoff,
-        ).select_related('lead', 'sales_rep').order_by('-created_at')[:30]
+            missed = CallSession.objects.filter(
+                direction='INBOUND',
+                status__in=['NO_ANSWER', 'FAILED', 'BUSY', 'RINGING'],
+                created_at__gte=cutoff,
+            ).filter(
+                disposition_submitted_at__isnull=True
+            ).select_related('lead', 'sales_rep', 'lead__branch').order_by('-created_at')[:50]
 
-        results = []
-        for s in missed:
-            lead = s.lead
-            phone = s.user_phone_number
-            masked_phone = f"+91-XXXXX-{phone[-4:]}" if len(phone) >= 4 else "+91-XXXXX-XXXX"
-            results.append({
-                'session_id': str(s.id),
-                'lead_id': lead.id if lead else None,
-                'lead_name': f"{lead.first_name} {lead.last_name or ''}".strip() if lead else "Unknown Prospect",
-                'masked_phone': masked_phone,
-                'branch_name': lead.branch.name if (lead and lead.branch) else "General",
-                'called_at': s.created_at.isoformat(),
-            })
+            results = []
+            for s in missed:
+                lead = s.lead
+                phone = s.user_phone_number or ""
+                masked_phone = f"+91-XXXXX-{phone[-4:]}" if len(phone) >= 4 else "+91-XXXXX-XXXX"
+                lead_data = {
+                    'id': str(lead.id),
+                    'first_name': lead.first_name,
+                    'last_name': lead.last_name or '',
+                    'masked_phone': masked_phone,
+                    'branch_name': lead.branch.name if lead.branch else "General",
+                    'status': lead.current_status,
+                } if lead else None
 
-        return Response({'results': results, 'count': len(results)}, status=status.HTTP_200_OK)
+                results.append({
+                    'id': str(s.id),
+                    'session_id': str(s.id),
+                    'started_at': s.started_at.isoformat() if s.started_at else s.created_at.isoformat(),
+                    'called_at': s.created_at.isoformat(),
+                    'user_phone_number': phone,
+                    'masked_phone': masked_phone,
+                    'status': s.status,
+                    'direction': s.direction,
+                    'sales_rep_name': f"{s.sales_rep.first_name} {s.sales_rep.last_name or ''}".strip() if s.sales_rep else "Unassigned",
+                    'lead': lead_data,
+                    'lead_id': str(lead.id) if lead else None,
+                    'lead_name': f"{lead.first_name} {lead.last_name or ''}".strip() if lead else "New Prospect",
+                    'branch_name': lead.branch.name if (lead and lead.branch) else "General",
+                })
+
+            return Response({
+                'missed_calls': results,
+                'results': results,
+                'count': len(results),
+            }, status=status.HTTP_200_OK)
 
 
 class AgentPresenceView(APIView):
@@ -1207,6 +1230,10 @@ class AgentPresenceView(APIView):
                         presence.active_session = None
                         presence.last_heartbeat = timezone.now()
                         presence.save(update_fields=['status', 'active_session', 'last_heartbeat'])
+                elif presence.status == 'AVAILABLE':
+                    # Active tab polling keeps the agent's heartbeat fresh so they are prioritized for routing
+                    presence.last_heartbeat = timezone.now()
+                    presence.save(update_fields=['last_heartbeat'])
 
                 status_val = presence.status
                 sip_user = presence.sip_username
@@ -1261,7 +1288,8 @@ class ActiveInboundCallPollView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        cutoff = timezone.now() - timedelta(seconds=45)
+        with resolve_telephony_tenant_context():
+            cutoff = timezone.now() - timedelta(seconds=45)
         session = CallSession.objects.filter(
             direction='INBOUND',
             status__in=['INITIATED', 'RINGING'],
@@ -1269,6 +1297,10 @@ class ActiveInboundCallPollView(APIView):
         ).order_by('-created_at').first()
 
         if not session:
+            return Response({'active': False}, status=status.HTTP_200_OK)
+
+        # Only pop for the designated sales rep
+        if session.sales_rep and session.sales_rep != request.user:
             return Response({'active': False}, status=status.HTTP_200_OK)
 
         caller_phone = session.user_phone_number or ""

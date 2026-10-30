@@ -151,6 +151,7 @@ class WhatsAppVariableResolver:
             "reschedule_token":     self._reschedule_token,
             "rebook_token":         self._rebook_token,
             "qr_pass_url":          self._qr_pass_url,
+            "pass_token":           self._pass_token,
             "arrival_lead_time":    lambda: "20 minutes",
             "late_lockout_time":    self._late_lockout_time,
             "lockout_minutes_left": lambda: "2 minutes",
@@ -304,8 +305,13 @@ class WhatsAppVariableResolver:
             return generate_trial_action_token(self._trial.id, 'REBOOK')
         return ""
 
+    def _pass_token(self) -> str:
+        if self._trial:
+            return generate_trial_action_token(self._trial.id, 'PASS')
+        return ""
+
     def _qr_pass_url(self) -> str:
         if self._trial:
-            token = generate_trial_action_token(self._trial.id, 'PASS')
-            return f"https://app.sweatfitwellness.com/pass/{token}"
+            token = self._pass_token()
+            return f"https://app.sweatfitwellness.com/api/v1/tenant/trials/public/pass/{token}"
         return ""

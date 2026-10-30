@@ -194,10 +194,21 @@ class TelephonyConfigService:
 
         # 3. Any available rep in the organization (excluding test users), prioritizing active heartbeats
         org_filter = {"organization": org} if org else {}
+
+        # Prioritize agents with active heartbeats within the last 3 minutes (active browser tab)
+        three_min_ago = timezone.now() - timedelta(minutes=3)
         available = AgentPresence.objects.using(alias).filter(
             status="AVAILABLE",
+            last_heartbeat__gte=three_min_ago,
             **org_filter,
         ).exclude(sip_username__icontains="test").order_by("-last_heartbeat").select_related("user").first()
+
+        if not available:
+            # Fallback if no recent heartbeat
+            available = AgentPresence.objects.using(alias).filter(
+                status="AVAILABLE",
+                **org_filter,
+            ).exclude(sip_username__icontains="test").order_by("-last_heartbeat").select_related("user").first()
 
         # Resilient fallback across tenant database if org_filter yielded no results
         if not available and org_filter:

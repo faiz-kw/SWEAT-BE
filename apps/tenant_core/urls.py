@@ -37,6 +37,7 @@ from .views_integrations import TenantIntegrationViewSet
 from .views_security_policy import SecurityPolicyView
 from . import views_telephony
 from . import views_public_trial
+from . import views_pos
 from .views_audit_outbox import (
     BusinessAuditEventViewSet,
     IdempotencyRecordViewSet,
@@ -417,8 +418,17 @@ urlpatterns = [
 
     # 1-Tap Public WhatsApp Action Endpoints (Confirm, Reschedule, Pass)
     path('trials/public/confirm/<str:token>/', views_public_trial.PublicTrialConfirmationView.as_view(), name='trial-public-confirm'),
+    path('trials/public/confirm/<str:token>', views_public_trial.PublicTrialConfirmationView.as_view(), name='trial-public-confirm-noslash'),
     path('trials/public/reschedule/<str:token>/', views_public_trial.PublicTrialRescheduleView.as_view(), name='trial-public-reschedule'),
+    path('trials/public/reschedule/<str:token>', views_public_trial.PublicTrialRescheduleView.as_view(), name='trial-public-reschedule-noslash'),
     path('trials/public/pass/<str:token>/', views_public_trial.PublicTrialPassView.as_view(), name='trial-public-pass'),
+    path('trials/public/pass/<str:token>', views_public_trial.PublicTrialPassView.as_view(), name='trial-public-pass-noslash'),
+
+    # POS Card Machine Routes
+    path('pos/terminals/', views_pos.BranchPOSTerminalsView.as_view(), name='pos-branch-terminals'),
+    path('pos/initiate/', views_pos.InitiatePOSPaymentView.as_view(), name='pos-initiate-payment'),
+    path('pos/status/<str:external_ref_id>/', views_pos.POSPaymentStatusView.as_view(), name='pos-payment-status'),
+    path('pos/cancel/<str:external_ref_id>/', views_pos.CancelPOSPaymentView.as_view(), name='pos-cancel-payment'),
 
     path('', include(router.urls)),
 ]

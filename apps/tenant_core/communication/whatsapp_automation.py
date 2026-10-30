@@ -163,7 +163,7 @@ class WhatsAppAutomationService:
             f"⏰ Time: {ctime}\n"
             f"📍 Studio: SWEAT {bname} ({baddr})\n"
             f"🧭 Directions: {bmaps}\n\n"
-            "Get ready to experience the burn. We’ll send your Studio Access Pass 20 minutes before class. See you on the mat! ⚡"
+            "Get ready to experience the burn. We’ll send your Studio Access Pass 20 minutes before class. See you at the studio! ⚡"
         )
 
         template_name = policy.trial_confirmation_template_name or 'sweat_trial_booking_confirm'
@@ -1148,7 +1148,7 @@ class WhatsAppAutomationService:
         default_body = f"Hi {first_name}, I tried reaching you from SWEAT Elite regarding your fitness inquiry. When is a convenient time to speak?"
         final_body = (message_text or '').strip() or default_body
 
-        template_name = 'sweat_call_missed_followup'
+        template_name = 'when_user_misses_the_call_from_telecmi_01'
         params = {
             '1': first_name,
             'name': first_name,
@@ -1329,7 +1329,7 @@ class WhatsAppAutomationService:
 
         # Variables matching user sheet:
         # var 1: 20min (arrival lead) | var 2: member name | var 3: class time | var 4: entrance allowed till | var 5: pass url
-        var_map = ['arrival_lead_time', 'member_name', 'start_time', 'late_lockout_time', 'qr_pass_url']
+        var_map = ['arrival_lead_time', 'member_name', 'start_time', 'late_lockout_time', 'pass_token']
         resolver = WhatsAppVariableResolver(trial=trial, lead=lead, occurrence=getattr(trial, 'class_occurrence', None))
         params = resolver.resolve(var_map)
 

@@ -110,6 +110,23 @@ class RazorpayWebhookView(APIView):
                 order_entity = data.get('payload', {}).get('order', {}).get('entity', {})
                 rzp_order_id = order_entity.get('id')
 
+            # Check if this is an in-person physical POS machine transaction
+            pos_notes = payment_entity.get('notes') or {}
+            ext_pos_ref = pos_notes.get('external_ref_id') or pos_notes.get('externalRefNumber') or data.get('externalRefNumber')
+            if ext_pos_ref:
+                from .models_pos import POSTransaction
+                from .services_pos import POSOrchestratorService
+                pos_tx = POSTransaction.objects.using(db_alias).filter(external_ref_id=ext_pos_ref).first()
+                if pos_tx:
+                    logger.info("Routing webhook %s to POSOrchestratorService for ref=%s", event, ext_pos_ref)
+                    pos_tx, _ = POSOrchestratorService.poll_and_finalize_status(ext_pos_ref, db_alias=db_alias)
+                    return Response({
+                        'status': 'ok',
+                        'event': event,
+                        'pos_transaction': pos_tx.external_ref_id,
+                        'order_status': pos_tx.order.status,
+                    }, status=status.HTTP_200_OK)
+
             if not rzp_payment_id or not rzp_order_id:
                 logger.warning("Webhook %s missing payment_id or order_id in payload", event)
                 return Response({'error': 'Missing payment or order entity.'}, status=status.HTTP_400_BAD_REQUEST)
