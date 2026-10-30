@@ -159,11 +159,16 @@ class VobizInboundWebhookView(APIView):
                 rep_user = agent_presence.user if agent_presence else None
                 org = agent_presence.organization if agent_presence else Organization.objects.first()
 
-                # Match existing Lead by last 10 digits
+                # Match existing Lead by last 10 digits (skip if destination is an existing Member)
                 lead = None
                 dest_digits = digits_to[-10:] if len(digits_to) >= 10 else digits_to
                 if dest_digits:
-                    lead = Lead.objects.filter(phone_normalized__icontains=dest_digits).order_by('-created_at').first()
+                    is_dest_member = (
+                        TenantUser.objects.filter(phone__icontains=dest_digits, user_type='MEMBER').exists()
+                        or UserProfile.objects.filter(user__phone__icontains=dest_digits).exists()
+                    )
+                    if not is_dest_member:
+                        lead = Lead.objects.filter(phone_normalized__icontains=dest_digits).order_by('-created_at').first()
 
                 session = CallSession.objects.filter(provider_attempt_id=call_uuid).first()
                 if not session:
@@ -920,15 +925,20 @@ class CallDispositionView(APIView):
                 session.user_phone_number = caller_phone
             session.save(update_fields=['disposition', 'disposition_notes', 'disposition_submitted_at', 'user_phone_number'])
 
-            # Match or auto-create Lead if session has no lead
+            # Match or auto-create Lead if session has no lead (never auto-create if phone belongs to an existing Member)
             lead = session.lead
             phone_to_check = session.user_phone_number or caller_phone
             if not lead and phone_to_check:
                 clean_phone = phone_to_check.replace('+', '').replace('-', '').replace(' ', '')
                 if len(clean_phone) >= 10:
                     last10 = clean_phone[-10:]
-                    lead = Lead.objects.filter(phone_normalized__icontains=last10).first()
-                    if not lead and disposition in ('TRIAL_BOOKED', 'INTERESTED', 'CALLBACK_REQUESTED', 'FOLLOW_UP_NEEDED'):
+                    is_member = (
+                        TenantUser.objects.filter(phone__icontains=last10, user_type='MEMBER').exists()
+                        or UserProfile.objects.filter(user__phone__icontains=last10).exists()
+                    )
+                    if not is_member:
+                        lead = Lead.objects.filter(phone_normalized__icontains=last10).first()
+                        if not lead and disposition in ('TRIAL_BOOKED', 'INTERESTED', 'CALLBACK_REQUESTED', 'FOLLOW_UP_NEEDED'):
                         org = session.organization or getattr(user, 'organization', None) or Organization.objects.first()
                         branch = session.branch or getattr(user, 'home_branch', None) or Branch.objects.filter(organization=org).first()
                         lead = Lead.objects.create(
@@ -1769,12 +1779,21 @@ class TelephonyAnalyticsView(APIView):
                 if not lead_name and p:
                     clean_p = p.replace('+', '').replace('-', '').replace(' ', '')
                     if len(clean_p) >= 10:
-                        matched_lead = Lead.objects.using(alias).filter(phone_normalized__icontains=clean_p[-10:]).first()
-                        if matched_lead:
-                            lead_name = f"{matched_lead.first_name} {matched_lead.last_name}".strip()
-                            lead_id_val = str(matched_lead.id)
+                        last10_digits = clean_p[-10:]
+                        member_user = TenantUser.objects.using(alias).filter(phone__icontains=last10_digits, user_type='MEMBER').first()
+                        if not member_user:
+                            m_prof = UserProfile.objects.using(alias).filter(user__phone__icontains=last10_digits).first()
+                            if m_prof:
+                                member_user = m_prof.user
+                        if member_user:
+                            lead_name = f"{member_user.first_name} {member_user.last_name or ''}".strip()
+                        else:
+                            matched_lead = Lead.objects.using(alias).filter(phone_normalized__icontains=last10_digits).first()
+                            if matched_lead:
+                                lead_name = f"{matched_lead.first_name} {matched_lead.last_name}".strip()
+                                lead_id_val = str(matched_lead.id)
                 if not lead_name:
-                    lead_name = "Unknown Lead"
+                    lead_name = "Unknown Caller"
 
                 recent_calls.append({
                     'id': str(cs.id),
