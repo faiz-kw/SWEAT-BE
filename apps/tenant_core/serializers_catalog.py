@@ -195,7 +195,7 @@ class ProgramCategorySerializer(serializers.ModelSerializer):
         model = ProgramCategory
         fields = [
             'id', 'organization', 'code', 'name', 'description',
-            'display_order', 'credits', 'status', 'programs_count', 'created_at', 'updated_at',
+            'display_order', 'consumption_mode', 'credits', 'status', 'programs_count', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
         extra_kwargs = {
@@ -1066,7 +1066,7 @@ class CategoryCatalogTreeSerializer(serializers.ModelSerializer):
         model = ProgramCategory
         fields = [
             'id', 'code', 'name', 'description',
-            'display_order', 'status', 'programs_count', 'programs'
+            'display_order', 'consumption_mode', 'credits', 'status', 'programs_count', 'programs'
         ]
 
     def get_programs(self, obj):

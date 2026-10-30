@@ -215,6 +215,7 @@ class MemberAssessment(models.Model):
     month_1_image_url = models.CharField(max_length=500, null=True, blank=True)
     month_2_image_url = models.CharField(max_length=500, null=True, blank=True)
     month_3_image_url = models.CharField(max_length=500, null=True, blank=True)
+    milestone_metadata = models.JSONField(default=dict, blank=True)
 
     # =========================================================================
     # COACH REVIEW & UNLOCK GATE
@@ -228,6 +229,7 @@ class MemberAssessment(models.Model):
     coach_areas_to_develop = models.TextField(null=True, blank=True)
     workout_prescription = models.TextField(null=True, blank=True)
     diet_prescription = models.TextField(null=True, blank=True)
+    whatsapp_dispatch_status = models.CharField(max_length=30, default='NOT_REQUESTED')
     reassessment_interval_weeks = models.PositiveIntegerField(default=6)
 
     # Consents (Section 16)

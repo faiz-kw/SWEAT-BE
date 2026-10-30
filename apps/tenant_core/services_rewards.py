@@ -33,6 +33,7 @@ from .models_crm import UserProfile
 from .models_users import TenantUser
 from .models_commerce import Order
 from .models_memberships import Membership
+from .models_govern import OrganizationSettings
 from .services_reliability import record_business_audit, enqueue_outbox_event
 from .context import get_current_tenant_db_alias
 
@@ -265,6 +266,255 @@ class ReferralRewardService:
             )
 
             return ledger, redemption
+
+    @classmethod
+    def get_reward_config(cls, organization=None, db_alias: Optional[str] = None) -> dict:
+        """
+        Retrieves the reward points policy from OrganizationSettings.membership_config['reward_points'].
+        Defaults to enabled, 100 INR = 1 point, 1 point = 1.0 INR redemption value.
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        org_settings = None
+        if organization:
+            org_settings = OrganizationSettings.objects.using(alias).filter(organization=organization).first()
+        if not org_settings:
+            org_settings = OrganizationSettings.objects.using(alias).first()
+
+        cfg = {}
+        if org_settings and isinstance(org_settings.membership_config, dict):
+            cfg = org_settings.membership_config.get('reward_points') or {}
+
+        return {
+            'is_enabled': cfg.get('is_enabled', True),
+            'earn_rate_rupees': int(cfg.get('earn_rate_rupees', 100) or 100),
+            'points_per_rate': int(cfg.get('points_per_rate', 1) or 1),
+            'point_value_rupees': Decimal(str(cfg.get('point_value_rupees', '1.0') or '1.0')),
+            'max_redemption_percent': Decimal(str(cfg.get('max_redemption_percent', '80') or '80')),
+        }
+
+    @classmethod
+    def calculate_max_redeemable_points(
+        cls,
+        order_amount: Decimal,
+        user_profile: UserProfile,
+        organization=None,
+        db_alias: Optional[str] = None,
+    ) -> dict:
+        """
+        Calculates the maximum reward points a member is allowed to redeem on an order.
+        Enforces:
+        1. Maximum 80% of net order amount can be paid using points (or org config max_redemption_percent).
+        2. Member must always pay at least the remaining 20% via cash/UPI/POS/Razorpay.
+        3. Cannot redeem more points than currently available in RewardAccount.
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        config = cls.get_reward_config(organization=organization, db_alias=alias)
+        account = cls.get_or_create_reward_account(user_profile, db_alias=alias)
+
+        point_value = config['point_value_rupees']
+        max_pct = config['max_redemption_percent'] / Decimal('100.00')
+
+        available_points = account.points_balance
+        available_monetary_value = (available_points * point_value).quantize(Decimal('0.01'))
+
+        # Maximum monetary discount allowed by the 80% ceiling
+        net_payable_base = max(Decimal('0.00'), order_amount)
+        max_discount_allowed = (net_payable_base * max_pct).quantize(Decimal('0.01'))
+
+        # Maximum points that translate to at most max_discount_allowed
+        if point_value > Decimal('0.00'):
+            max_points_by_ceiling = (max_discount_allowed / point_value).quantize(Decimal('1.00'))
+        else:
+            max_points_by_ceiling = Decimal('0.00')
+
+        # Allowed points is min(available, ceiling)
+        allowed_points = max(Decimal('0.00'), min(available_points, max_points_by_ceiling))
+        allowed_monetary_discount = (allowed_points * point_value).quantize(Decimal('0.01'))
+        # Ensure discount does not exceed 80% due to any rounding
+        allowed_monetary_discount = min(allowed_monetary_discount, max_discount_allowed)
+        min_cash_payable = max(Decimal('0.00'), net_payable_base - allowed_monetary_discount)
+
+        return {
+            'available_points': available_points,
+            'available_monetary_value': available_monetary_value,
+            'max_redemption_percent': config['max_redemption_percent'],
+            'max_discount_allowed': max_discount_allowed,
+            'max_redeemable_points': allowed_points,
+            'max_redeemable_discount': allowed_monetary_discount,
+            'min_cash_payable': min_cash_payable,
+            'point_value_rupees': point_value,
+        }
+
+    @classmethod
+    def apply_points_to_order(
+        cls,
+        order: Order,
+        points_to_redeem: Decimal,
+        user_profile: Optional[UserProfile] = None,
+        created_by_user: Optional[TenantUser] = None,
+        db_alias: Optional[str] = None,
+    ) -> Tuple[Decimal, RewardLedger, OrderRewardRedemption]:
+        """
+        Applies and redeems points on an order, strictly enforcing the 80% ceiling.
+        Stacks with any existing coupon discount on the order:
+        order.subtotal -> minus coupon discount_amount -> net amount -> apply at most 80% points.
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        with transaction.atomic(using=alias):
+            order = Order.objects.using(alias).select_for_update().get(id=order.id)
+        target_profile = user_profile or order.user_profile
+        if not target_profile:
+            raise ValidationError("Order must have a valid UserProfile to redeem reward points.")
+
+        # Prevent double redemption on the same order
+        existing_redemption = OrderRewardRedemption.objects.using(alias).filter(order=order).first()
+        if existing_redemption:
+            raise ValidationError(
+                f"Reward points already redeemed for Order #{order.order_number} "
+                f"({existing_redemption.units_redeemed} points)."
+            )
+
+        org = getattr(target_profile.user, 'organization', None) or (
+            order.branch.organization if getattr(order, 'branch', None) else None
+        )
+        # Net amount subject to the 80% cap is order.subtotal minus any coupon discount (plus taxes if applicable)
+        net_before_points = max(Decimal('0.00'), (order.subtotal or Decimal('0.00')) - (order.discount_amount or Decimal('0.00')))
+        if net_before_points <= Decimal('0.00'):
+            raise ValidationError("Order payable amount is zero; no points can be redeemed.")
+
+        calc = cls.calculate_max_redeemable_points(
+            order_amount=net_before_points,
+            user_profile=target_profile,
+            organization=org,
+            db_alias=alias,
+        )
+
+        requested_pts = Decimal(str(points_to_redeem or '0.00'))
+        if requested_pts <= Decimal('0.00'):
+            raise ValidationError("Points to redeem must be greater than zero.")
+
+        if requested_pts > calc['available_points']:
+            raise ValidationError(
+                f"Insufficient points. Available: {calc['available_points']}, Requested: {requested_pts}."
+            )
+
+        if requested_pts > calc['max_redeemable_points']:
+            raise ValidationError(
+                f"Maximum {calc['max_redemption_percent']}% of the order amount can be paid with points. "
+                f"Max allowed points for this order: {calc['max_redeemable_points']} "
+                f"(INR {calc['max_redeemable_discount']}). Requested: {requested_pts}."
+            )
+
+        monetary_discount = (requested_pts * calc['point_value_rupees']).quantize(Decimal('0.01'))
+        monetary_discount = min(monetary_discount, calc['max_discount_allowed'])
+
+        # Debit points from account and record immutable ledger entry
+        ledger, redemption = cls.redeem_rewards(
+            user_profile=target_profile,
+            reward_type='POINTS',
+            quantity=requested_pts,
+            monetary_value=monetary_discount,
+            order=order,
+            reason_code='ORDER_REDEMPTION',
+            reason=f"Redeemed {requested_pts} points (₹{monetary_discount}) on Order #{order.order_number}",
+            created_by_user=created_by_user,
+            db_alias=alias,
+        )
+
+        # Update order with reward discount and recalculate total
+        order.reward_amount = monetary_discount
+        order.total_amount = max(Decimal('0.00'), (order.subtotal - order.discount_amount - monetary_discount + order.tax_amount).quantize(Decimal('0.01')))
+        order.save(using=alias, update_fields=['reward_amount', 'total_amount', 'updated_at'])
+
+        return monetary_discount, ledger, redemption
+
+    @classmethod
+    def process_order_reward_accrual(
+        cls,
+        order: Order,
+        user_profile: Optional[UserProfile] = None,
+        actor_user: Optional[TenantUser] = None,
+        db_alias: Optional[str] = None,
+    ) -> Optional[RewardLedger]:
+        """
+        Calculates and credits reward points for paid orders (package purchase, boutique retail inventory, etc.)
+        strictly following the tenant's admin reward configuration (default: 1 point per 100 INR).
+        Ensures idempotent execution: if points were already accrued for this order, skips to prevent double-crediting.
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        target_profile = user_profile or getattr(order, 'user_profile', None)
+        if not target_profile:
+            logger.info(
+                "Skipping reward points accrual for order %s: No associated UserProfile found.",
+                getattr(order, 'order_number', getattr(order, 'id', ''))
+            )
+            return None
+
+        # Lock/atomic check to ensure idempotency across concurrent webhooks or retries
+        with transaction.atomic(using=alias):
+            already_accrued = RewardLedger.objects.using(alias).filter(
+                order=order,
+                transaction_type='EARN',
+                reward_type='POINTS',
+                reason_code='PURCHASE_EARN',
+            ).exists()
+
+            if already_accrued:
+                logger.info(
+                    "Reward points already accrued for order %s. Skipping duplicate accrual.",
+                    getattr(order, 'order_number', getattr(order, 'id', ''))
+                )
+                return None
+
+            org = getattr(target_profile.user, 'organization', None) or (
+                order.branch.organization if getattr(order, 'branch', None) else None
+            )
+            config = cls.get_reward_config(organization=org, db_alias=alias)
+
+            if not config['is_enabled']:
+                logger.info(
+                    "Reward points are disabled for organization %s. Skipping accrual for order %s.",
+                    org, getattr(order, 'id', '')
+                )
+                return None
+
+            earn_rate = config['earn_rate_rupees']
+            points_per_rate = config['points_per_rate']
+            if earn_rate <= 0:
+                earn_rate = 100
+
+            total_amount = Decimal(str(order.total_amount or '0.00'))
+            if total_amount <= Decimal('0.00'):
+                return None
+
+            points_to_earn = int(total_amount // Decimal(str(earn_rate))) * points_per_rate
+            if points_to_earn <= 0:
+                logger.debug(
+                    "Order %s total amount %s is below earn threshold (%s INR). No points accrued.",
+                    order.id, total_amount, earn_rate
+                )
+                return None
+
+            points_decimal = Decimal(str(points_to_earn))
+            order_num = getattr(order, 'order_number', str(order.id)[:8])
+            order_type_desc = getattr(order, 'order_type', 'PURCHASE') or 'PURCHASE'
+
+            ledger = cls.earn_rewards(
+                user_profile=target_profile,
+                reward_type='POINTS',
+                quantity=points_decimal,
+                reason_code='PURCHASE_EARN',
+                reason=f"Earned {points_to_earn} points on {order_type_desc} Order #{order_num} (₹{total_amount:.2f} spent)",
+                order=order,
+                created_by_user=actor_user,
+                db_alias=alias,
+            )
+
+            logger.info(
+                "Successfully credited %s reward points to member %s for order %s (total ₹%s).",
+                points_to_earn, target_profile.id, order_num, total_amount
+            )
+            return ledger
 
     # -------------------------------------------------------------------------
     # REFERRAL LIFECYCLE

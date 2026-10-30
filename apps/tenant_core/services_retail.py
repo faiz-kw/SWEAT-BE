@@ -575,6 +575,18 @@ class RetailCommerceService:
                 }
             )
 
+            # Accrue reward points for boutique retail inventory merchandise purchase
+            if order.user_profile:
+                try:
+                    from .services_rewards import ReferralRewardService
+                    ReferralRewardService.process_order_reward_accrual(
+                        order=order,
+                        user_profile=order.user_profile,
+                        db_alias=db_alias,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to accrue reward points for retail order %s: %s", order.id, e)
+
         logger.info("Successfully confirmed payment for order %s.", order.order_number)
         return {
             'success': True,
@@ -776,6 +788,18 @@ class RetailCommerceService:
                     'issued_at': now,
                 }
             )
+
+            # Accrue reward points for boutique retail inventory merchandise purchase
+            if order.user_profile:
+                try:
+                    from .services_rewards import ReferralRewardService
+                    ReferralRewardService.process_order_reward_accrual(
+                        order=order,
+                        user_profile=order.user_profile,
+                        db_alias=db_alias,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to accrue reward points for retail order %s: %s", order.id, e)
 
         logger.info("Successfully confirmed payment via webhook for retail order %s.", order.order_number)
         return {

@@ -300,6 +300,19 @@ class AdminApprovalService:
                     status='PAID',
                     issued_at=timezone.now(),
                 )
+
+            # Accrue reward points upon approval
+            if order.user_profile:
+                try:
+                    from .services_rewards import ReferralRewardService
+                    ReferralRewardService.process_order_reward_accrual(
+                        order=order,
+                        user_profile=order.user_profile,
+                        actor_user=action_record.approver_user,
+                        db_alias=alias,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to accrue reward points for approved order %s: %s", order.id, e)
         else:
             order.status = 'PARTIALLY_PAID'
             order.save(using=alias)

@@ -272,6 +272,18 @@ class CommerceService:
                     issued_at=timezone.now(),
                 )
                 invoice.save(using=alias)
+
+                # Accrue reward points according to admin policy
+                try:
+                    from .services_rewards import ReferralRewardService
+                    ReferralRewardService.process_order_reward_accrual(
+                        order=order,
+                        user_profile=order.user_profile,
+                        actor_user=actor,
+                        db_alias=alias,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to accrue reward points for order %s in record_payment: %s", order.id, e)
             else:
                 order.status = 'PARTIALLY_PAID'
                 order.save(using=alias)

@@ -453,43 +453,95 @@ class BookingWaitlistAttendanceService:
                         'reason_message': f"Your package is not valid at '{occurrence.branch.name}'.",
                     }
 
-            # Package Class Access Rule
-            if membership.package_version:
-                access_res = cls.resolve_package_class_access(membership.package_version, occurrence, db_alias=alias)
-                if not access_res.get('allowed'):
-                    return {
-                        'eligible': False,
-                        'reason_code': 'PACKAGE_CLASS_EXCLUDED',
-                        'reason_message': access_res.get('reason') or "Membership package does not include this class.",
-                    }
-
-            # Cross-branch Entitlement
-            is_cross_branch = bool(membership.home_branch and occurrence.branch_id != membership.home_branch_id)
+            # Resolve if membership is Credit-Based (Elite) vs Session-Based
             ent_qs = membership.entitlements.using(alias).filter(status='ACTIVE')
-            if is_cross_branch:
-                cross_ent = ent_qs.filter(
-                    models.Q(entitlement_type='CROSS_BRANCH_SESSION') | models.Q(entitlement_type='CROSS_BRANCH'),
-                    models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
-                ).first()
-                if not cross_ent:
+            credit_ent = ent_qs.filter(entitlement_type='CREDIT_WALLET').first()
+            is_credit_based = bool(credit_ent and (credit_ent.is_unlimited or (credit_ent.remaining_units and credit_ent.remaining_units > 0) or credit_ent.allocated_units))
+
+            if is_credit_based:
+                # Credit-based membership: Universal access to all classes across all programs
+                template = occurrence.class_template
+                cat_credits = None
+                if template and template.program and template.program.category:
+                    cat_credits = template.program.category.credits
+                elif template and getattr(template, 'category', None):
+                    cat_credits = getattr(template.category, 'credits', None)
+                required_credits = Decimal(str(cat_credits)) if (cat_credits is not None and Decimal(str(cat_credits)) > 0) else Decimal('1.00')
+
+                if not credit_ent or (not credit_ent.is_unlimited and credit_ent.remaining_units < required_credits):
                     return {
                         'eligible': False,
-                        'reason_code': 'NO_CROSS_BRANCH_ENTITLEMENT',
-                        'reason_message': f"No cross-branch session entitlements available for '{occurrence.branch.name}'.",
+                        'reason_code': 'INSUFFICIENT_CREDITS',
+                        'reason_message': f"Insufficient credits. This class requires {required_credits} credits, but you have {credit_ent.remaining_units if credit_ent else 0} remaining.",
                     }
             else:
-                home_ent = ent_qs.filter(
-                    models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units')),
-                    entitlement_type='HOME_BRANCH_SESSION'
-                ).first() or ent_qs.filter(
-                    models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
-                ).first()
-                if not home_ent:
-                    return {
-                        'eligible': False,
-                        'reason_code': 'NO_ENTITLEMENT_REMAINING',
-                        'reason_message': 'No remaining sessions available in membership.',
-                    }
+                # Session-based membership
+                # Package Class Access Rule
+                if membership.package_version:
+                    access_res = cls.resolve_package_class_access(membership.package_version, occurrence, db_alias=alias)
+                    if not access_res.get('allowed'):
+                        return {
+                            'eligible': False,
+                            'reason_code': 'PACKAGE_CLASS_EXCLUDED',
+                            'reason_message': access_res.get('reason') or "Membership package does not include this class.",
+                        }
+
+                is_cross_branch = bool(membership.home_branch and occurrence.branch_id != membership.home_branch_id)
+                if is_cross_branch:
+                    passport_ent = ent_qs.filter(
+                        models.Q(entitlement_type='CROSS_BRANCH_SESSION') | models.Q(entitlement_type='CROSS_BRANCH')
+                    ).first()
+                    home_ent = ent_qs.filter(entitlement_type='HOME_BRANCH_SESSION').first() or ent_qs.exclude(
+                        entitlement_type__in=['CROSS_BRANCH_SESSION', 'CROSS_BRANCH', 'CREDIT_WALLET']
+                    ).first()
+
+                    # Case A: Package never had passport sessions configured
+                    if not passport_ent or (not passport_ent.is_unlimited and (passport_ent.allocated_units is None or passport_ent.allocated_units <= 0)):
+                        return {
+                            'eligible': False,
+                            'reason_code': 'NO_PASSPORT_INCLUDED',
+                            'reason_message': "Your package does not include any passport session. Raise a ticket for purchase.",
+                            'can_raise_ticket': True,
+                        }
+
+                    # Case B: Passport sessions exhausted, check if home sessions remain
+                    if not passport_ent.is_unlimited and passport_ent.remaining_units <= 0:
+                        home_rem = home_ent.remaining_units if home_ent and not home_ent.is_unlimited else (Decimal('999') if home_ent and home_ent.is_unlimited else Decimal('0'))
+                        if home_rem > 0:
+                            return {
+                                'eligible': False,
+                                'reason_code': 'PASSPORT_EXHAUSTED_PURCHASE_ALLOWED',
+                                'reason_message': "All passport sessions have been consumed. You can purchase additional passport sessions to book at this branch.",
+                                'can_purchase_passport': True,
+                            }
+                        else:
+                            return {
+                                'eligible': False,
+                                'reason_code': 'NO_ENTITLEMENT_REMAINING',
+                                'reason_message': 'No remaining session credits in your active pack. Please renew or purchase a new pack.',
+                            }
+
+                    # Case C: Passport sessions available, check home session pool
+                    if home_ent and not home_ent.is_unlimited and home_ent.remaining_units <= 0:
+                        return {
+                            'eligible': False,
+                            'reason_code': 'NO_ENTITLEMENT_REMAINING',
+                            'reason_message': 'No remaining session credits in your active pack. Please renew or purchase a new pack.',
+                        }
+                else:
+                    # Home branch
+                    home_ent = ent_qs.filter(
+                        models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units')),
+                        entitlement_type='HOME_BRANCH_SESSION'
+                    ).first() or ent_qs.filter(
+                        models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
+                    ).exclude(entitlement_type__in=['CROSS_BRANCH_SESSION', 'CROSS_BRANCH', 'CREDIT_WALLET']).first()
+                    if not home_ent:
+                        return {
+                            'eligible': False,
+                            'reason_code': 'NO_ENTITLEMENT_REMAINING',
+                            'reason_message': 'No remaining session credits in your active pack. Please renew or purchase a new pack.',
+                        }
 
         # 5. User Duplicate Booking Check
         if user_profile:
@@ -807,13 +859,28 @@ class BookingWaitlistAttendanceService:
                         form=membership.parq_form
                     )
 
-                # Validate PackageClassAccessRule against member's package_version
-                access_res = cls.resolve_package_class_access(membership.package_version, occurrence, db_alias=alias)
-                if not access_res['allowed']:
-                    raise ValidationError(access_res['reason'])
+                # Check if membership is Credit-Based (Elite) vs Session-Based
+                ent_qs = membership.entitlements.using(alias).filter(status='ACTIVE')
+                credit_ent = ent_qs.filter(entitlement_type='CREDIT_WALLET').first()
+                is_credit_based = bool(credit_ent and (credit_ent.is_unlimited or (credit_ent.remaining_units and credit_ent.remaining_units > 0) or credit_ent.allocated_units))
 
-                units_to_consume = access_res.get('units') or Decimal('1.00')
-                ent_type_filter = access_res.get('entitlement_type')
+                if is_credit_based:
+                    template = occurrence.class_template
+                    cat_credits = None
+                    if template and template.program and template.program.category:
+                        cat_credits = template.program.category.credits
+                    elif template and getattr(template, 'category', None):
+                        cat_credits = getattr(template.category, 'credits', None)
+                    units_to_consume = Decimal(str(cat_credits)) if (cat_credits is not None and Decimal(str(cat_credits)) > 0) else Decimal('1.00')
+                    ent_type_filter = 'CREDIT_WALLET'
+                else:
+                    # Validate PackageClassAccessRule against member's package_version
+                    access_res = cls.resolve_package_class_access(membership.package_version, occurrence, db_alias=alias)
+                    if not access_res['allowed']:
+                        raise ValidationError(access_res['reason'])
+
+                    units_to_consume = access_res.get('units') or Decimal('1.00')
+                    ent_type_filter = access_res.get('entitlement_type')
 
             # Generate unique booking number
             booking_number = f"BK-{timezone.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
@@ -867,54 +934,117 @@ class BookingWaitlistAttendanceService:
             if is_capacity_available:
                 entitlement = None
                 if booking_type == 'MEMBER':
-                    is_cross_branch = bool(membership.home_branch and occurrence.branch_id != membership.home_branch_id)
-                    if is_cross_branch:
-                        from .models_catalog import PackageBranchAvailability
-                        pkg = membership.package_version.package if membership.package_version else membership.package
-                        if pkg:
-                            pba_qs = PackageBranchAvailability.objects.using(alias).filter(package=pkg)
-                            if pba_qs.exists() and not pba_qs.filter(branch=occurrence.branch, status='ENABLED').exists():
-                                raise ValidationError(f"Membership package does not permit access to '{occurrence.branch.name}'.")
-
                     ent_qs = membership.entitlements.using(alias).filter(status='ACTIVE')
-                    if ent_type_filter:
-                        ent_qs = ent_qs.filter(entitlement_type=ent_type_filter)
+                    credit_ent = ent_qs.filter(entitlement_type='CREDIT_WALLET').first()
+                    is_credit_based = bool(credit_ent and (credit_ent.is_unlimited or (credit_ent.remaining_units and credit_ent.remaining_units > 0) or credit_ent.allocated_units))
 
-                    if is_cross_branch and not ent_type_filter:
-                        cross_ent = ent_qs.filter(
-                            models.Q(entitlement_type='CROSS_BRANCH_SESSION') | models.Q(entitlement_type='CROSS_BRANCH'),
-                            models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
-                        ).first()
-                        if not cross_ent:
-                            raise ValidationError("No cross-branch session entitlements available for booking outside home branch.")
-                        ent = cross_ent
+                    if is_credit_based:
+                        if not credit_ent or (not credit_ent.is_unlimited and credit_ent.remaining_units < units_to_consume):
+                            avail = credit_ent.remaining_units if credit_ent else Decimal('0.00')
+                            raise ValidationError(
+                                f"Insufficient credits. This class requires {units_to_consume} credits, but you have {avail} remaining.",
+                                code="INSUFFICIENT_CREDITS"
+                            )
+                        cls_title = occurrence.class_template.name if (occurrence and occurrence.class_template) else "Class"
+                        consumption_ledger = MembershipLifecycleService.consume_entitlement(
+                            membership=membership,
+                            entitlement_type='CREDIT_WALLET',
+                            units=units_to_consume,
+                            reason_text=f"Elite credit deduction ({units_to_consume} credits for {cls_title})",
+                            created_by_user=created_by_user,
+                            db_alias=alias,
+                        )
+                        entitlement = credit_ent
                     else:
-                        if not ent_type_filter:
+                        is_cross_branch = bool(membership.home_branch and occurrence.branch_id != membership.home_branch_id)
+                        if is_cross_branch:
+                            from .models_catalog import PackageBranchAvailability
+                            pkg = membership.package_version.package if membership.package_version else membership.package
+                            if pkg:
+                                pba_qs = PackageBranchAvailability.objects.using(alias).filter(package=pkg)
+                                if pba_qs.exists() and not pba_qs.filter(branch=occurrence.branch, status='ENABLED').exists():
+                                    raise ValidationError(f"Membership package does not permit access to '{occurrence.branch.name}'.")
+
+                            passport_ent = ent_qs.filter(
+                                models.Q(entitlement_type='CROSS_BRANCH_SESSION') | models.Q(entitlement_type='CROSS_BRANCH')
+                            ).first()
+                            home_ent = ent_qs.filter(entitlement_type='HOME_BRANCH_SESSION').first() or ent_qs.exclude(
+                                entitlement_type__in=['CROSS_BRANCH_SESSION', 'CROSS_BRANCH', 'CREDIT_WALLET']
+                            ).first()
+
+                            # Case A: Package never had passport sessions configured
+                            if not passport_ent or (not passport_ent.is_unlimited and (passport_ent.allocated_units is None or passport_ent.allocated_units <= 0)):
+                                raise ValidationError(
+                                    "Your package does not include any passport session. Raise a ticket for purchase.",
+                                    code="NO_PASSPORT_INCLUDED"
+                                )
+
+                            # Case B: Passport sessions exhausted, check if home sessions remain
+                            if not passport_ent.is_unlimited and passport_ent.remaining_units <= 0:
+                                home_rem = home_ent.remaining_units if home_ent and not home_ent.is_unlimited else (Decimal('999') if home_ent and home_ent.is_unlimited else Decimal('0'))
+                                if home_rem > 0:
+                                    raise ValidationError(
+                                        "All passport sessions have been consumed. You can purchase additional passport sessions to book at this branch.",
+                                        code="PASSPORT_EXHAUSTED_PURCHASE_ALLOWED"
+                                    )
+                                else:
+                                    raise ValidationError(
+                                        "No remaining session credits in your active pack. Please renew or purchase a new pack.",
+                                        code="ZERO_CREDITS_REMAINING"
+                                    )
+
+                            # Case C: Passport sessions available, check home session pool
+                            if home_ent and not home_ent.is_unlimited and home_ent.remaining_units <= 0:
+                                raise ValidationError(
+                                    "No remaining session credits in your active pack. Please renew or purchase a new pack.",
+                                    code="ZERO_CREDITS_REMAINING"
+                                )
+
+                            # DUAL DEDUCTION: Deduct from passport AND deduct from home pool
+                            cls_title = occurrence.class_template.name if (occurrence and occurrence.class_template) else "Class"
+                            consumption_ledger = MembershipLifecycleService.consume_entitlement(
+                                membership=membership,
+                                entitlement_type=passport_ent.entitlement_type,
+                                units=units_to_consume,
+                                reason_text=f"Passport session reservation ({cls_title} at {occurrence.branch.name})",
+                                created_by_user=created_by_user,
+                                db_alias=alias,
+                            )
+                            if home_ent and not home_ent.is_unlimited:
+                                MembershipLifecycleService.consume_entitlement(
+                                    membership=membership,
+                                    entitlement_type=home_ent.entitlement_type,
+                                    units=units_to_consume,
+                                    reason_text=f"Home session pool reservation for cross-branch booking ({cls_title})",
+                                    created_by_user=created_by_user,
+                                    db_alias=alias,
+                                )
+                            entitlement = passport_ent
+                        else:
+                            # Home branch booking
                             home_ent = ent_qs.filter(
                                 models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units')),
                                 entitlement_type='HOME_BRANCH_SESSION'
-                            ).first()
-                            ent = home_ent or ent_qs.filter(
+                            ).first() or ent_qs.filter(
                                 models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
-                            ).first()
-                        else:
-                            ent = ent_qs.filter(
-                                models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
-                            ).first()
+                            ).exclude(entitlement_type__in=['CROSS_BRANCH_SESSION', 'CROSS_BRANCH', 'CREDIT_WALLET']).first()
 
-                    if not ent:
-                        raise ValidationError("No membership entitlement sessions available.")
+                            if not home_ent:
+                                raise ValidationError(
+                                    "No remaining session credits in your active pack. Please renew or purchase a new pack.",
+                                    code="ZERO_CREDITS_REMAINING"
+                                )
 
-                    cls_title = occurrence.class_template.name if (occurrence and occurrence.class_template) else "Class"
-                    consumption_ledger = MembershipLifecycleService.consume_entitlement(
-                        membership=membership,
-                        entitlement_type=ent.entitlement_type,
-                        units=units_to_consume,
-                        reason_text=f"Class booking reservation ({cls_title})",
-                        created_by_user=created_by_user,
-                        db_alias=alias,
-                    )
-                    entitlement = ent
+                            cls_title = occurrence.class_template.name if (occurrence and occurrence.class_template) else "Class"
+                            consumption_ledger = MembershipLifecycleService.consume_entitlement(
+                                membership=membership,
+                                entitlement_type=home_ent.entitlement_type,
+                                units=units_to_consume,
+                                reason_text=f"Class booking reservation ({cls_title})",
+                                created_by_user=created_by_user,
+                                db_alias=alias,
+                            )
+                            entitlement = home_ent
 
                 resolved_status = initial_status or ('CONFIRMED' if confirmation_status == 'CONFIRMED' else 'RESERVED')
                 booking = Booking.objects.using(alias).create(
@@ -1094,6 +1224,21 @@ class BookingWaitlistAttendanceService:
                         created_by_user=cancelled_by_user,
                         db_alias=alias,
                     )
+                    # If it was a dual-deducted cross-branch booking, also restore the home session unit!
+                    if booking.entitlement.entitlement_type in ['CROSS_BRANCH_SESSION', 'CROSS_BRANCH']:
+                        home_ent = booking.membership.entitlements.using(alias).filter(
+                            entitlement_type='HOME_BRANCH_SESSION'
+                        ).first()
+                        if home_ent and not home_ent.is_unlimited:
+                            MembershipLifecycleService.reverse_entitlement(
+                                membership=booking.membership,
+                                entitlement_type=home_ent.entitlement_type,
+                                units=session_units,
+                                booking_id=booking.id,
+                                reason_text=f"Home session pool restoration for cross-branch cancellation ({reason_code})",
+                                created_by_user=cancelled_by_user,
+                                db_alias=alias,
+                            )
 
             elif old_status == 'WAITLISTED':
                 session_action = 'NO_ACTION'
@@ -1357,56 +1502,93 @@ class BookingWaitlistAttendanceService:
                     units_to_consume = access_res.get('units') or Decimal('1.00')
                     ent_type_filter = access_res.get('entitlement_type')
 
-                    is_cross_branch = bool(membership.home_branch and occurrence.branch_id != membership.home_branch_id)
                     ent_qs = membership.entitlements.using(alias).filter(status='ACTIVE')
-                    if ent_type_filter:
-                        ent_qs = ent_qs.filter(entitlement_type=ent_type_filter)
+                    credit_ent = ent_qs.filter(entitlement_type='CREDIT_WALLET').first()
+                    is_credit_based = bool(credit_ent and (credit_ent.is_unlimited or (credit_ent.remaining_units and credit_ent.remaining_units > 0) or credit_ent.allocated_units))
 
-                    if is_cross_branch and not ent_type_filter:
-                        cross_ent = ent_qs.filter(
-                            models.Q(entitlement_type='CROSS_BRANCH_SESSION') | models.Q(entitlement_type='CROSS_BRANCH'),
-                            models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
-                        ).first()
-                        ent = cross_ent
-                    else:
-                        if not ent_type_filter:
-                            home_ent = ent_qs.filter(
-                                models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units')),
-                                entitlement_type='HOME_BRANCH_SESSION'
-                            ).first()
-                            ent = home_ent or ent_qs.filter(
-                                models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
-                            ).first()
-                        else:
-                            ent = ent_qs.filter(
-                                models.Q(is_unlimited=True) | models.Q(allocated_units__gt=models.F('consumed_units'))
-                            ).first()
+                    if is_credit_based:
+                        template = occurrence.class_template
+                        cat_credits = None
+                        if template and template.program and template.program.category:
+                            cat_credits = template.program.category.credits
+                        elif template and getattr(template, 'category', None):
+                            cat_credits = getattr(template.category, 'credits', None)
+                        units_to_consume = Decimal(str(cat_credits)) if (cat_credits is not None and Decimal(str(cat_credits)) > 0) else Decimal('1.00')
 
-                    if not ent:
-                        candidate.status = 'CANCELLED'
-                        candidate.waitlist_position = None
-                        candidate.save(using=alias, update_fields=['status', 'waitlist_position', 'updated_at'])
-                        BookingWaitlistEvent.objects.using(alias).create(
-                            booking=candidate,
-                            occurrence=occurrence,
-                            event_type='AUTO_CANCELLED',
-                            reason='No available session entitlement at promotion time',
-                            triggered_by_type='SYSTEM',
-                            created_at=timezone.now()
+                        if not credit_ent or (not credit_ent.is_unlimited and credit_ent.remaining_units < units_to_consume):
+                            candidate.status = 'CANCELLED'
+                            candidate.waitlist_position = None
+                            candidate.save(using=alias, update_fields=['status', 'waitlist_position', 'updated_at'])
+                            continue
+
+                        MembershipLifecycleService.consume_entitlement(
+                            membership=membership,
+                            entitlement_type='CREDIT_WALLET',
+                            units=units_to_consume,
+                            booking_id=candidate.id,
+                            reason_text="Promoted from waitlist to confirmed (credits)",
+                            created_by_user=None,
+                            db_alias=alias,
                         )
-                        continue
+                        entitlement = credit_ent
+                    else:
+                        is_cross_branch = bool(membership.home_branch and occurrence.branch_id != membership.home_branch_id)
+                        passport_ent = ent_qs.filter(
+                            models.Q(entitlement_type='CROSS_BRANCH_SESSION') | models.Q(entitlement_type='CROSS_BRANCH')
+                        ).first()
+                        home_ent = ent_qs.filter(entitlement_type='HOME_BRANCH_SESSION').first() or ent_qs.exclude(
+                            entitlement_type__in=['CROSS_BRANCH_SESSION', 'CROSS_BRANCH', 'CREDIT_WALLET']
+                        ).first()
 
-                    # Consume entitlement atomically
-                    MembershipLifecycleService.consume_entitlement(
-                        membership=membership,
-                        entitlement_type=ent.entitlement_type,
-                        units=units_to_consume,
-                        booking_id=candidate.id,
-                        reason_text="Promoted from waitlist to confirmed",
-                        created_by_user=None,
-                        db_alias=alias,
-                    )
-                    entitlement = ent
+                        if is_cross_branch:
+                            if not passport_ent or (not passport_ent.is_unlimited and passport_ent.remaining_units <= 0):
+                                candidate.status = 'CANCELLED'
+                                candidate.waitlist_position = None
+                                candidate.save(using=alias, update_fields=['status', 'waitlist_position', 'updated_at'])
+                                continue
+                            if home_ent and not home_ent.is_unlimited and home_ent.remaining_units <= 0:
+                                candidate.status = 'CANCELLED'
+                                candidate.waitlist_position = None
+                                candidate.save(using=alias, update_fields=['status', 'waitlist_position', 'updated_at'])
+                                continue
+
+                            MembershipLifecycleService.consume_entitlement(
+                                membership=membership,
+                                entitlement_type=passport_ent.entitlement_type,
+                                units=units_to_consume,
+                                booking_id=candidate.id,
+                                reason_text="Promoted from waitlist to confirmed (passport)",
+                                created_by_user=None,
+                                db_alias=alias,
+                            )
+                            if home_ent and not home_ent.is_unlimited:
+                                MembershipLifecycleService.consume_entitlement(
+                                    membership=membership,
+                                    entitlement_type=home_ent.entitlement_type,
+                                    units=units_to_consume,
+                                    booking_id=candidate.id,
+                                    reason_text="Promoted from waitlist to confirmed (home pool)",
+                                    created_by_user=None,
+                                    db_alias=alias,
+                                )
+                            entitlement = passport_ent
+                        else:
+                            if not home_ent or (not home_ent.is_unlimited and home_ent.remaining_units <= 0):
+                                candidate.status = 'CANCELLED'
+                                candidate.waitlist_position = None
+                                candidate.save(using=alias, update_fields=['status', 'waitlist_position', 'updated_at'])
+                                continue
+
+                            MembershipLifecycleService.consume_entitlement(
+                                membership=membership,
+                                entitlement_type=home_ent.entitlement_type,
+                                units=units_to_consume,
+                                booking_id=candidate.id,
+                                reason_text="Promoted from waitlist to confirmed (sessions)",
+                                created_by_user=None,
+                                db_alias=alias,
+                            )
+                            entitlement = home_ent
 
                 # Candidate is verified and eligible! Confirm booking:
                 old_position = candidate.waitlist_position

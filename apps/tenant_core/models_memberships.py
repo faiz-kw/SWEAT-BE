@@ -632,7 +632,7 @@ class MembershipPolicyConfig(models.Model):
 
     # Validity Extension Settings
     extension_per_day_fee = models.DecimalField(
-        max_digits=12, decimal_places=2, default=Decimal('50.00'),
+        max_digits=12, decimal_places=2, default=Decimal('35.00'),
         help_text="Standard per-day validity extension fee"
     )
     extension_activation_fee = models.DecimalField(
@@ -668,6 +668,12 @@ class MembershipPolicyConfig(models.Model):
     freeze_max_count_per_cycle = models.IntegerField(
         default=3,
         help_text="Maximum number of freezes permitted across package lifetime"
+    )
+
+    # Upgrade Window Settings
+    upgrade_allowed_window_days = models.IntegerField(
+        default=15,
+        help_text="Days from 1st package purchase during which upgrading by paying only difference is permitted"
     )
 
     updated_by_user = models.ForeignKey(TenantUser, on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
