@@ -32,7 +32,7 @@ from apps.tenant_core.services_access_control import (
     BASE62_ALPHABET,
 )
 from apps.tenant_core.services_bookings import BookingWaitlistAttendanceService
-from apps.tenant_core.views_bookings import AccessControlBulkIngestView, AccessControlSyncPassesView
+from apps.tenant_core.views_bookings import AccessControlBulkIngestView, AccessControlSyncPassesView, TurnstileVerifyPunchView
 from apps.tenant_core.views_mobile import MobileQRPassView
 
 
@@ -499,3 +499,114 @@ class TimeWatchTurnstileV2Tests(TestCase):
         self.assertIn('passes', res.data)
 
 
+
+    def test_turnstile_verify_punch_health_check(self):
+        """GET /api/v1/tenant/access/turnstile/verify-punch/ responds with 200 ONLINE."""
+        view = TurnstileVerifyPunchView.as_view()
+        req = self.factory.get('/api/v1/tenant/access/turnstile/verify-punch/')
+        req._tenant_alias = self.db
+        res = view(req)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data.get('status'), 'ONLINE')
+
+    def test_turnstile_verify_punch_entry_then_exit_lifecycle(self):
+        """Complete Turnstile lifecycle: 1. Entry scan grants access -> 2. Duplicate entry denied -> 3. Exit scan checks out -> 4. Subsequent scan denied."""
+        token = generate_compact_qr_token()
+        t_hash = hash_qr_token(token)
+        now = timezone.now()
+
+        pass_obj = AccessPass.objects.using(self.db).create(
+            user_profile=self.profile,
+            booking=self.booking,
+            branch=self.branch,
+            token_hash=t_hash,
+            valid_from=now - timedelta(minutes=10),
+            valid_until=now + timedelta(hours=1),
+            status='ACTIVE'
+        )
+
+        view = TurnstileVerifyPunchView.as_view()
+
+        # STEP 1: Entry Scan at Turnstile
+        entry_payload = {
+            'card_no': token,
+            'device_id': 'TIMEWATCH-ENTRY-01',
+            'direction': 'ENTRY',
+            'branch_id': str(self.branch.id)
+        }
+        req_entry = self.factory.post('/api/v1/tenant/access/turnstile/verify-punch/', entry_payload, format='json')
+        req_entry._tenant_alias = self.db
+        res_entry = view(req_entry)
+
+        self.assertEqual(res_entry.status_code, 200)
+        self.assertTrue(res_entry.data.get('allow_access'))
+        self.assertEqual(res_entry.data.get('status'), 'GRANTED')
+        self.assertEqual(res_entry.data.get('direction'), 'ENTRY')
+        self.assertEqual(res_entry.data.get('member_number'), self.profile.member_number)
+
+        # Verify pass transitioned to CONSUMED_ENTERED
+        pass_obj.refresh_from_db(using=self.db)
+        self.assertEqual(pass_obj.status, 'CONSUMED_ENTERED')
+        self.assertIsNotNone(pass_obj.consumed_at)
+
+        # Verify attendance marked PRESENT
+        att = AttendanceRecord.objects.using(self.db).filter(booking=self.booking).first()
+        self.assertIsNotNone(att)
+        self.assertEqual(att.status, 'PRESENT')
+        self.assertEqual(att.check_in_method, 'QR')
+        self.assertIsNone(att.check_out_at)
+
+        # STEP 2: Replay ENTRY Attempt (Trying to scan same QR again at entry gate)
+        req_replay = self.factory.post('/api/v1/tenant/access/turnstile/verify-punch/', entry_payload, format='json')
+        req_replay._tenant_alias = self.db
+        res_replay = view(req_replay)
+
+        self.assertEqual(res_replay.status_code, 200)
+        self.assertFalse(res_replay.data.get('allow_access'))
+        self.assertEqual(res_replay.data.get('reason'), 'REPLAY_ATTEMPT')
+
+        # STEP 3: Exit Scan at Turnstile
+        exit_payload = {
+            'card_no': token,
+            'device_id': 'TIMEWATCH-EXIT-01',
+            'direction': 'EXIT',
+            'branch_id': str(self.branch.id)
+        }
+        req_exit = self.factory.post('/api/v1/tenant/access/turnstile/verify-punch/', exit_payload, format='json')
+        req_exit._tenant_alias = self.db
+        res_exit = view(req_exit)
+
+        self.assertEqual(res_exit.status_code, 200)
+        self.assertTrue(res_exit.data.get('allow_access'))
+        self.assertEqual(res_exit.data.get('status'), 'GRANTED')
+        self.assertEqual(res_exit.data.get('direction'), 'EXIT')
+
+        # Verify pass transitioned to CONSUMED_EXITED
+        pass_obj.refresh_from_db(using=self.db)
+        self.assertEqual(pass_obj.status, 'CONSUMED_EXITED')
+
+        # Verify attendance completed with check_out_at recorded
+        att.refresh_from_db(using=self.db)
+        self.assertIsNotNone(att.check_out_at)
+        self.assertTrue(att.attendance_completed)
+
+        # STEP 4: Post-Exit Scan Attempt -> strictly DENIED
+        req_post_exit = self.factory.post('/api/v1/tenant/access/turnstile/verify-punch/', exit_payload, format='json')
+        req_post_exit._tenant_alias = self.db
+        res_post_exit = view(req_post_exit)
+
+        self.assertEqual(res_post_exit.status_code, 200)
+        self.assertFalse(res_post_exit.data.get('allow_access'))
+        self.assertEqual(res_post_exit.data.get('reason'), 'REPLAY_ATTEMPT')
+
+    def test_turnstile_verify_punch_unrecognized_token_denied(self):
+        """Unrecognized token returns allow_access=False and logs UNAUTHORIZED."""
+        view = TurnstileVerifyPunchView.as_view()
+        payload = {'card_no': 'fake_unrecognized_token_123', 'device_id': 'TIMEWATCH-MALAD-01'}
+        req = self.factory.post('/api/v1/tenant/access/turnstile/verify-punch/', payload, format='json')
+        req._tenant_alias = self.db
+        res = view(req)
+
+        self.assertEqual(res.status_code, 200)
+        self.assertFalse(res.data.get('allow_access'))
+        self.assertEqual(res.data.get('reason'), 'INVALID_PASS')

@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional, Set
-from django.db import models
+from django.db import models, transaction
 from rest_framework import viewsets, status, permissions
 from rest_framework.views import APIView
 from rest_framework.decorators import action
@@ -1336,6 +1336,344 @@ class AccessControlSyncPassesView(APIView):
             'total_passes': len(passes_data),
             'passes': passes_data,
         }, status=status.HTTP_200_OK)
+
+
+class TurnstileVerifyPunchView(APIView):
+    """
+    POST /api/v1/tenant/access/turnstile/verify-punch/
+    POST /api/v1/access/turnstile/verify-punch/
+    POST /api/v1/access-control/turnstile/verify-punch/
+
+    Real-time webhook receiver for TimeWatch / Dahua face and QR turnstile access terminals.
+    Hardware synchronously calls this endpoint when a member presents their QR pass.
+
+    Protocol:
+    - Input: JSON or form payload containing card_no, CardNo, qr_code, token, szCardNo, etc.
+    - Output:
+      {
+        "allow_access": true,   # Triggers turnstile relay unlock for 5-7 seconds
+        "status": "GRANTED",
+        "user_name": "Faiz Khan",
+        "member_number": "MEM-97BE4D",
+        "class_name": "Sweat Total",
+        "message": "Welcome Faiz Khan! Access Granted."
+      }
+      or
+      {
+        "allow_access": false,  # Keeps gate locked, beeps error
+        "status": "DENIED",
+        "reason": "REPLAY_ATTEMPT" | "EXPIRED" | "INVALID_PASS" | "EARLY",
+        "message": "..."
+      }
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request, *args, **kwargs):
+        """Health check endpoint for device setup verification."""
+        return Response({
+            "service": "SWEAT Turnstile Verify Punch Gateway",
+            "status": "ONLINE",
+            "endpoint": "/api/v1/tenant/access/turnstile/verify-punch/",
+            "timestamp": timezone.now().isoformat(),
+        }, status=status.HTTP_200_OK)
+
+    def post(self, request, *args, **kwargs):
+        alias = self._resolve_db_alias(request)
+        raw_token = self._extract_token(request)
+        if not raw_token:
+            return Response({
+                "allow_access": False,
+                "status": "DENIED",
+                "reason": "MISSING_TOKEN",
+                "message": "No card or QR token found in request payload.",
+            }, status=status.HTTP_200_OK)
+
+        device_ref = self._extract_device_ref(request)
+        direction = str(
+            request.data.get('direction', 'ENTRY')
+            if hasattr(request, 'data') and isinstance(request.data, dict)
+            else 'ENTRY'
+        ).upper()
+        if direction not in ('ENTRY', 'EXIT'):
+            direction = 'ENTRY'
+
+        now = timezone.now()
+
+        from .services_access_control import hash_qr_token
+        from .models_attendance import AccessPass, AttendanceRecord, AccessEvent
+        from .models_org import Branch
+        from .models_crm import UserProfile
+        from .services_bookings import BookingWaitlistAttendanceService
+
+        token_str = str(raw_token).strip()
+        # Compute SHA-256 hash if raw token; if already a 64-char hex hash, use directly
+        if len(token_str) == 64 and all(c in '0123456789abcdefABCDEF' for c in token_str):
+            token_hash = token_str.lower()
+        else:
+            token_hash = hash_qr_token(token_str)
+
+        # Lookup AccessPass
+        access_pass = (
+            AccessPass.objects.using(alias)
+            .filter(token_hash=token_hash)
+            .select_related('user_profile__user', 'booking__occurrence__class_template', 'branch')
+            .first()
+        )
+
+        # If not found by token_hash, check if token_str matches booking_number
+        if not access_pass:
+            access_pass = (
+                AccessPass.objects.using(alias)
+                .filter(booking__booking_number=token_str)
+                .select_related('user_profile__user', 'booking__occurrence__class_template', 'branch')
+                .first()
+            )
+
+        # Default branch resolution
+        branch = None
+        if access_pass and access_pass.branch:
+            branch = access_pass.branch
+        else:
+            branch_id = (request.data.get('branch_id') if isinstance(request.data, dict) else None) or request.query_params.get('branch_id')
+            if branch_id:
+                branch = Branch.objects.using(alias).filter(id=branch_id).first()
+            if not branch:
+                branch = Branch.objects.using(alias).filter(status='ACTIVE').first() or Branch.objects.using(alias).first()
+
+        # 1. Unknown / Invalid Pass
+        if not access_pass:
+            fallback_user = UserProfile.objects.using(alias).first()
+            if fallback_user and branch:
+                BookingWaitlistAttendanceService.log_access_event(
+                    user_profile=fallback_user,
+                    branch=branch,
+                    event_type='DENIED',
+                    direction=direction,
+                    device_reference=device_ref,
+                    provider_reference='TIMEWATCH_TURNSTILE',
+                    reconciliation_status='UNAUTHORIZED',
+                    token_hash=token_hash,
+                    db_alias=alias,
+                )
+            return Response({
+                "allow_access": False,
+                "status": "DENIED",
+                "reason": "INVALID_PASS",
+                "message": "Invalid or unrecognized access pass.",
+            }, status=status.HTTP_200_OK)
+
+        target_user = access_pass.user_profile
+        target_booking = access_pass.booking
+        user_name = (
+            f"{getattr(target_user, 'first_name_snapshot', '')} {getattr(target_user, 'last_name_snapshot', '')}"
+        ).strip() or "Valued Member"
+        member_num = getattr(target_user, 'member_number', '') or ''
+        class_name = (
+            target_booking.occurrence.class_template.name
+            if target_booking and target_booking.occurrence and target_booking.occurrence.class_template
+            else "SWEAT Session"
+        )
+
+        # 2. Check if pass has already completed both ENTRY and EXIT
+        if access_pass.status == 'CONSUMED_EXITED':
+            BookingWaitlistAttendanceService.log_access_event(
+                user_profile=target_user,
+                branch=branch,
+                booking=target_booking,
+                event_type='DENIED',
+                direction=direction,
+                device_reference=device_ref,
+                provider_reference='TIMEWATCH_TURNSTILE',
+                reconciliation_status='REPLAY_ATTEMPT',
+                token_hash=token_hash,
+                db_alias=alias,
+            )
+            return Response({
+                "allow_access": False,
+                "status": "DENIED",
+                "reason": "REPLAY_ATTEMPT",
+                "user_name": user_name,
+                "member_number": member_num,
+                "message": "Access pass has already been consumed for entry and exit. Re-entry denied.",
+            }, status=status.HTTP_200_OK)
+
+        # Determine direction:
+        # Check explicit request payload/query param, or device name containing 'exit',
+        # or state machine: if pass is already CONSUMED_ENTERED, next valid punch is EXIT.
+        explicit_dir = None
+        if hasattr(request, 'data') and isinstance(request.data, dict) and request.data.get('direction'):
+            explicit_dir = str(request.data.get('direction')).upper()
+        elif request.query_params.get('direction'):
+            explicit_dir = str(request.query_params.get('direction')).upper()
+
+        if explicit_dir in ('ENTRY', 'EXIT'):
+            direction = explicit_dir
+        elif 'exit' in device_ref.lower():
+            direction = 'EXIT'
+        elif access_pass.status == 'CONSUMED_ENTERED':
+            direction = 'EXIT'
+        else:
+            direction = 'ENTRY'
+
+        # If duplicate ENTRY attempted when member is already inside:
+        if direction == 'ENTRY' and access_pass.status == 'CONSUMED_ENTERED':
+            BookingWaitlistAttendanceService.log_access_event(
+                user_profile=target_user,
+                branch=branch,
+                booking=target_booking,
+                event_type='DENIED',
+                direction='ENTRY',
+                device_reference=device_ref,
+                provider_reference='TIMEWATCH_TURNSTILE',
+                reconciliation_status='REPLAY_ATTEMPT',
+                token_hash=token_hash,
+                db_alias=alias,
+            )
+            return Response({
+                "allow_access": False,
+                "status": "DENIED",
+                "reason": "REPLAY_ATTEMPT",
+                "user_name": user_name,
+                "member_number": member_num,
+                "message": "Member is already inside the studio. Duplicate entry denied.",
+            }, status=status.HTTP_200_OK)
+
+        # 3. Expired or Cancelled
+        if access_pass.status in ('CANCELLED', 'EXPIRED') or (access_pass.valid_until and now > access_pass.valid_until):
+            if access_pass.status != 'EXPIRED':
+                access_pass.status = 'EXPIRED'
+                access_pass.save(using=alias, update_fields=['status'])
+
+            BookingWaitlistAttendanceService.log_access_event(
+                user_profile=target_user,
+                branch=branch,
+                booking=target_booking,
+                event_type='DENIED',
+                direction=direction,
+                device_reference=device_ref,
+                provider_reference='TIMEWATCH_TURNSTILE',
+                reconciliation_status='EXPIRED',
+                token_hash=token_hash,
+                db_alias=alias,
+            )
+            return Response({
+                "allow_access": False,
+                "status": "DENIED",
+                "reason": "EXPIRED",
+                "user_name": user_name,
+                "member_number": member_num,
+                "message": "Access pass has expired. Entry denied.",
+            }, status=status.HTTP_200_OK)
+
+        # 4. Early scan (before activation window) - only applies to initial ENTRY
+        if direction == 'ENTRY' and access_pass.valid_from and now < access_pass.valid_from:
+            BookingWaitlistAttendanceService.log_access_event(
+                user_profile=target_user,
+                branch=branch,
+                booking=target_booking,
+                event_type='DENIED',
+                direction=direction,
+                device_reference=device_ref,
+                provider_reference='TIMEWATCH_TURNSTILE',
+                reconciliation_status='EARLY',
+                token_hash=token_hash,
+                db_alias=alias,
+            )
+            return Response({
+                "allow_access": False,
+                "status": "DENIED",
+                "reason": "EARLY",
+                "user_name": user_name,
+                "member_number": member_num,
+                "message": "Access window not yet open. Please arrive during your scheduled class window.",
+            }, status=status.HTTP_200_OK)
+
+        # 5. GRANTED ACCESS (ENTRY or EXIT)
+        with transaction.atomic(using=alias):
+            BookingWaitlistAttendanceService.log_access_event(
+                user_profile=target_user,
+                branch=branch,
+                booking=target_booking,
+                event_type=direction,
+                direction=direction,
+                device_reference=device_ref,
+                provider_reference='TIMEWATCH_TURNSTILE',
+                reconciliation_status='NORMAL',
+                token_hash=token_hash,
+                db_alias=alias,
+            )
+            if direction == 'ENTRY':
+                access_pass.status = 'CONSUMED_ENTERED'
+                access_pass.consumed_at = now
+            else:
+                access_pass.status = 'CONSUMED_EXITED'
+            access_pass.save(using=alias, update_fields=['status', 'consumed_at', 'updated_at'])
+
+        if direction == 'ENTRY':
+            welcome_msg = f"Welcome {user_name}! Access Granted."
+        else:
+            welcome_msg = f"Goodbye {user_name}! Workout completed. Have a great day!"
+
+        return Response({
+            "allow_access": True,
+            "status": "GRANTED",
+            "direction": direction,
+            "user_name": user_name,
+            "member_number": member_num,
+            "class_name": class_name,
+            "message": welcome_msg,
+        }, status=status.HTTP_200_OK)
+
+    def _resolve_db_alias(self, request):
+        from apps.master.models import Tenant
+        from apps.authentication.views import _register_and_resolve_tenant
+        from apps.tenant_core.context import set_tenant_db_alias, get_tenant_db_alias
+
+        alias = get_tenant_db_alias()
+        if alias and alias != 'default':
+            return alias
+
+        explicit_slug = (
+            (request.headers.get('X-Tenant-Slug') if hasattr(request, 'headers') else None)
+            or request.META.get('HTTP_X_TENANT_SLUG')
+            or (getattr(request, 'query_params', None) or getattr(request, 'GET', {})).get('tenant')
+            or (request.data.get('tenant_slug') if hasattr(request, 'data') and isinstance(request.data, dict) else None)
+        )
+        if explicit_slug:
+            slug = str(explicit_slug).strip().lower()
+            if slug in ('sweat-demo', 'sweat_demo', 'sweat-staging', 'sweat-dev'):
+                slug = 'sweat'
+            tenant = Tenant.objects.using('default').filter(slug=slug, status='ACTIVE').first()
+        else:
+            tenant = Tenant.objects.using('default').filter(slug='sweat', status='ACTIVE').first()
+            if not tenant:
+                tenant = Tenant.objects.using('default').filter(status='ACTIVE').first()
+
+        if tenant:
+            alias = _register_and_resolve_tenant(tenant)
+            set_tenant_db_alias(alias)
+            return alias
+        return 'default'
+
+    def _extract_token(self, request):
+        data = request.data if hasattr(request, 'data') and isinstance(request.data, dict) else {}
+        params = getattr(request, 'query_params', None) or getattr(request, 'GET', {})
+        for key in ('card_no', 'CardNo', 'cardNo', 'token', 'qr_code', 'qrcode', 'code', 'szCardNo', 'user_id', 'userId', 'UserNo'):
+            val = data.get(key) or params.get(key)
+            if val:
+                return str(val).strip()
+        if hasattr(request, 'data') and isinstance(request.data, (str, int)):
+            return str(request.data).strip()
+        return None
+
+    def _extract_device_ref(self, request):
+        data = request.data if hasattr(request, 'data') and isinstance(request.data, dict) else {}
+        params = getattr(request, 'query_params', None) or getattr(request, 'GET', {})
+        for key in ('device_reference', 'device_id', 'sn', 'device_sn', 'mac', 'ip', 'terminal_id'):
+            val = data.get(key) or params.get(key)
+            if val:
+                return str(val).strip()
+        return 'TIMEWATCH-GATE-01'
 
 
 class BookingPolicyViewSet(viewsets.ViewSet):

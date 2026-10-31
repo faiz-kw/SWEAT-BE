@@ -166,6 +166,7 @@ from .views_bookings import (
     AccessEventViewSet,
     AccessControlBulkIngestView,
     AccessControlSyncPassesView,
+    TurnstileVerifyPunchView,
 )
 from .views_rewards import (
     ReferralProgramViewSet,
@@ -381,6 +382,7 @@ urlpatterns = [
     path('voice-agent/call-outcome/', VoiceAgentCallOutcomeView.as_view(), name='tenant-voice-agent-call-outcome'),
     path('access-control/events/bulk/', AccessControlBulkIngestView.as_view(), name='access-control-bulk-ingest'),
     path('access-control/sync/', AccessControlSyncPassesView.as_view(), name='access-control-sync-passes'),
+    path('access/turnstile/verify-punch/', TurnstileVerifyPunchView.as_view(), name='tenant-turnstile-verify-punch'),
 
     # Admin Community & Social Transformations Engine
     path('community/overview/', views_community.CommunityAdminOverviewView.as_view(), name='admin-community-overview'),
