@@ -53,6 +53,7 @@ DEFAULT_ROLES_CONFIG: Dict[str, dict] = {
             'crm.trials.view', 'crm.trials.create', 'crm.trials.edit',
             'crm.follow-ups.view', 'crm.follow-ups.create', 'crm.follow-ups.edit',
             'crm.communications.view', 'crm.communications.send',
+            'crm.telephony.access',
             'crm.settings.view',
             'crm.settings.edit',
             'automation.workflows.view',
@@ -155,6 +156,7 @@ DEFAULT_ROLES_CONFIG: Dict[str, dict] = {
             'crm.campaigns.view',
             'crm.follow-ups.view', 'crm.follow-ups.create', 'crm.follow-ups.edit',
             'crm.communications.view', 'crm.communications.send',
+            'crm.telephony.access',
             'crm.settings.view',
             # Members Read
             'members.client-360.view', 'members.client-360.create',

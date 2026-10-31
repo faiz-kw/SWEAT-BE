@@ -376,7 +376,7 @@ class VobizInboundWebhookView(APIView):
                     agent_sip_uri=agent_sip,
                     caller_id=caller_display_id,
                     fallback_action_url=fallback_url,
-                    timeout=vobiz_cfg['ring_timeout_sec'],
+                    timeout=max(35, int(vobiz_cfg.get('ring_timeout_sec') or 35)),
                     record=vobiz_cfg['record_all_calls'],
                     recording_callback_url=rec_callback_url,
                     hangup_url=hangup_url,
@@ -426,13 +426,22 @@ class VobizInboundFallbackWebhookView(APIView):
 
             org = session.organization if session else Organization.objects.first()
 
-            # If primary call completed successfully, return empty Response
+            # If primary call completed successfully, return Hangup Response
             if dial_status.lower() in ('completed', 'answered'):
-                return HttpResponse("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response/>", content_type="application/xml")
+                if session and session.status != 'COMPLETED':
+                    duration_val = float(request.data.get('DialBLegDuration') or request.POST.get('DialBLegDuration') or request.data.get('Duration') or 0.0)
+                    session.duration_seconds = duration_val
+                    session.bill_duration_seconds = VobizVoiceAdapter.calculate_billable_duration(duration_val)
+                    session.status = 'COMPLETED'
+                    session.ended_at = timezone.now()
+                    session.save(update_fields=['duration_seconds', 'bill_duration_seconds', 'status', 'ended_at'])
+                return HttpResponse("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Hangup/></Response>", content_type="application/xml; charset=utf-8")
 
-            # Find secondary available rep, prioritizing actively connected reps
+            # Find secondary available rep, prioritizing actively online connected reps
+            active_window = timezone.now() - timedelta(minutes=3)
             secondary_presence = AgentPresence.objects.filter(
                 status='AVAILABLE',
+                last_heartbeat__gte=active_window,
             ).exclude(user=session.sales_rep if session else None).order_by('-last_heartbeat').first()
 
             host = _get_webhook_host(request)
@@ -1222,10 +1231,11 @@ class AgentPresenceView(APIView):
                         presence.last_heartbeat = timezone.now()
                         presence.save(update_fields=['status', 'active_session', 'last_heartbeat'])
                 elif presence.status == 'WRAP_UP':
-                    # If in WRAP_UP for > 5 minutes without disposition, auto-release to AVAILABLE
-                    five_min_ago = timezone.now() - timedelta(minutes=5)
-                    if not presence.last_heartbeat or presence.last_heartbeat < five_min_ago:
-                        logger.info("AgentPresenceView: Auto-releasing %s from stale WRAP_UP to AVAILABLE", request.user.email)
+                    active = presence.active_session
+                    two_min_ago = timezone.now() - timedelta(minutes=2)
+                    is_session_done = not active or active.status in ('COMPLETED', 'NO_ANSWER', 'FAILED', 'BUSY', 'CANCELLED') or active.ended_at is not None
+                    if is_session_done or (not presence.last_heartbeat or presence.last_heartbeat < two_min_ago):
+                        logger.info("AgentPresenceView: Auto-releasing %s from WRAP_UP to AVAILABLE", request.user.email)
                         presence.status = 'AVAILABLE'
                         presence.active_session = None
                         presence.last_heartbeat = timezone.now()

@@ -25,7 +25,7 @@ class TelephonyConfigService:
     DEFAULT_REGISTRAR = "registrar.vobiz.ai"
     DEFAULT_WSS_URL = "wss://registrar.vobiz.ai:5063"
     DEFAULT_DID = "+919240954144"
-    DEFAULT_TIMEOUT_SEC = 20
+    DEFAULT_TIMEOUT_SEC = 35
 
     @classmethod
     def get_vobiz_config(cls, db_alias: Optional[str] = None) -> Dict[str, Any]:
@@ -88,6 +88,7 @@ class TelephonyConfigService:
 
         try:
             ring_timeout = int(config_data.get("ring_timeout_sec") or os.getenv("VOBIZ_RING_TIMEOUT", cls.DEFAULT_TIMEOUT_SEC))
+            ring_timeout = max(35, ring_timeout)
         except (ValueError, TypeError):
             ring_timeout = cls.DEFAULT_TIMEOUT_SEC
 
@@ -172,22 +173,33 @@ class TelephonyConfigService:
         alias = db_alias or get_tenant_db_alias() or "default"
         from apps.tenant_core.models_crm import AgentPresence
 
-        # 1. Preferred user check
+        active_window = timezone.now() - timedelta(minutes=8)
+
+        # 1. Preferred user check (must be actively online in WebPhone)
         if preferred_user:
             assigned_presence = AgentPresence.objects.using(alias).filter(
                 user=preferred_user,
-                status="AVAILABLE",
             ).select_related("user").first()
             if assigned_presence:
-                logger.info("Telephony dispatch: Selected preferred assigned rep %s (%s)", preferred_user.email, assigned_presence.sip_username)
-                return assigned_presence
+                is_online = bool(assigned_presence.last_heartbeat and assigned_presence.last_heartbeat >= active_window)
+                if assigned_presence.status == "AVAILABLE":
+                    logger.info("Telephony dispatch: Selected preferred assigned rep %s (%s)", preferred_user.email, assigned_presence.sip_username)
+                    return assigned_presence
+                elif assigned_presence.status in ("ON_CALL", "WRAP_UP"):
+                    act = assigned_presence.active_session
+                    if not act or act.status in ("COMPLETED", "NO_ANSWER", "FAILED", "BUSY", "CANCELLED") or act.ended_at is not None:
+                        assigned_presence.status = "AVAILABLE"
+                        assigned_presence.active_session = None
+                        assigned_presence.save(using=alias, update_fields=["status", "active_session"])
+                        logger.info("Telephony dispatch: Auto-released preferred rep %s (%s) from completed %s to AVAILABLE", preferred_user.email, assigned_presence.sip_username, assigned_presence.status)
+                        return assigned_presence
 
         # 2. Branch-specific available agent
         if caller_branch:
             branch_agent = AgentPresence.objects.using(alias).filter(
                 user__home_branch=caller_branch,
                 status="AVAILABLE",
-            ).select_related("user").first()
+            ).exclude(sip_username__icontains="test").order_by("-last_heartbeat").select_related("user").first()
             if branch_agent:
                 logger.info("Telephony dispatch: Selected branch %s rep %s (%s)", caller_branch.name, branch_agent.user.email, branch_agent.sip_username)
                 return branch_agent
@@ -195,23 +207,22 @@ class TelephonyConfigService:
         # 3. Any available rep in the organization (excluding test users), prioritizing active heartbeats
         org_filter = {"organization": org} if org else {}
 
-        # Prioritize agents with active heartbeats within the last 3 minutes (active browser tab)
-        three_min_ago = timezone.now() - timedelta(minutes=3)
+        # First priority: Agents with active heartbeats within the last 8 minutes
         available = AgentPresence.objects.using(alias).filter(
             status="AVAILABLE",
-            last_heartbeat__gte=three_min_ago,
+            last_heartbeat__gte=active_window,
             **org_filter,
         ).exclude(sip_username__icontains="test").order_by("-last_heartbeat").select_related("user").first()
 
+        # Second priority: Fall back to ANY agent marked AVAILABLE in the organization (even if heartbeat was missed)
         if not available:
-            # Fallback if no recent heartbeat
             available = AgentPresence.objects.using(alias).filter(
                 status="AVAILABLE",
                 **org_filter,
             ).exclude(sip_username__icontains="test").order_by("-last_heartbeat").select_related("user").first()
 
         # Resilient fallback across tenant database if org_filter yielded no results
-        if not available and org_filter:
+        if not available:
             available = AgentPresence.objects.using(alias).filter(
                 status="AVAILABLE",
             ).exclude(sip_username__icontains="test").order_by("-last_heartbeat").select_related("user").first()
@@ -228,12 +239,12 @@ class TelephonyConfigService:
         ).exclude(sip_username__icontains="test").order_by("-last_heartbeat").select_related("user").first()
 
         if not stale_agent:
-            # Check agents marked ON_CALL whose active session is already finished or None
+            # Check agents marked ON_CALL or WRAP_UP whose active session is already finished or None
             stale_agent = AgentPresence.objects.using(alias).filter(
-                status="ON_CALL",
+                status__in=["ON_CALL", "WRAP_UP"],
             ).filter(
                 models.Q(active_session__isnull=True) |
-                models.Q(active_session__status__in=["COMPLETED", "NO_ANSWER", "FAILED", "BUSY"])
+                models.Q(active_session__status__in=["COMPLETED", "NO_ANSWER", "FAILED", "BUSY", "CANCELLED"])
             ).exclude(sip_username__icontains="test").order_by("-last_heartbeat").select_related("user").first()
 
         if stale_agent:
