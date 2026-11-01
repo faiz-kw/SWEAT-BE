@@ -188,6 +188,9 @@ class BookingListSerializer(serializers.ModelSerializer):
             'branch', 'branch_name',
             'membership', 'package_name',
             'entitlement',
+            'total_sessions',
+            'consumed_sessions',
+            'remaining_sessions',
             'parq_status', 'attendance_record',
             'created_at', 'updated_at',
         ]
@@ -233,6 +236,45 @@ class BookingListSerializer(serializers.ModelSerializer):
             return obj.membership.package.program.name
         if obj.occurrence and obj.occurrence.class_template and obj.occurrence.class_template.category:
             return obj.occurrence.class_template.category.name
+        return None
+
+    def get_total_sessions(self, obj):
+        mem = getattr(obj, 'membership', None)
+        if not mem:
+            return None
+        # Check entitlements first
+        ent = getattr(obj, 'entitlement', None)
+        if ent and ent.allocated_units is not None:
+            return int(float(ent.allocated_units))
+        if hasattr(mem, 'entitlements'):
+            alias = obj._state.db or 'default'
+            first_ent = mem.entitlements.using(alias).filter(allocated_units__isnull=False).first()
+            if first_ent and first_ent.allocated_units is not None:
+                return int(float(first_ent.allocated_units))
+        pkg = getattr(mem, 'package', None)
+        if pkg and getattr(pkg, 'total_sessions', None) is not None:
+            return int(pkg.total_sessions)
+        return None
+
+    def get_consumed_sessions(self, obj):
+        mem = getattr(obj, 'membership', None)
+        if not mem:
+            return None
+        ent = getattr(obj, 'entitlement', None)
+        if ent and ent.consumed_units is not None:
+            return int(float(ent.consumed_units))
+        if hasattr(mem, 'entitlements'):
+            alias = obj._state.db or 'default'
+            first_ent = mem.entitlements.using(alias).filter(consumed_units__isnull=False).first()
+            if first_ent and first_ent.consumed_units is not None:
+                return int(float(first_ent.consumed_units))
+        return 0
+
+    def get_remaining_sessions(self, obj):
+        total = self.get_total_sessions(obj)
+        consumed = self.get_consumed_sessions(obj) or 0
+        if total is not None:
+            return max(0, total - consumed)
         return None
 
     def get_booked_by_name(self, obj):
