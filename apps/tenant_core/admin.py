@@ -1078,8 +1078,8 @@ class AgentPresenceAdmin(TenantModelAdmin):
 
 @admin.register(CallSession)
 class CallSessionAdmin(TenantModelAdmin):
-    list_display = ['id', 'direction', 'user_phone_number', 'agent_user', 'status', 'started_at', 'ended_at']
-    search_fields = ['user_phone_number', 'vobiz_call_uuid']
+    list_display = ['id', 'direction', 'user_phone_number', 'sales_rep', 'status', 'started_at', 'ended_at']
+    search_fields = ['user_phone_number', 'provider_attempt_id']
     list_filter = ['direction', 'status']
 admin.site.register(LegacyEntityMap, TenantModelAdmin)
 admin.site.register(PackageBranchAvailability, TenantModelAdmin)
