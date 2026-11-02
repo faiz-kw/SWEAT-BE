@@ -65,11 +65,13 @@ else:
 if DEBUG:
     ALLOWED_HOSTS = ['*']
 else:
-    ALLOWED_HOSTS = [
+    allowed_list = [
         h.strip()
         for h in os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1,testserver').split(',')
         if h.strip()
     ]
+    prod_defaults = ['localhost', '127.0.0.1', 'testserver', 'api.sweatfitwellness.com', 'crm.sweatfitwellness.com', '.sweatfitwellness.com']
+    ALLOWED_HOSTS = list(dict.fromkeys(allowed_list + prod_defaults))
 
 # ---------------------------------------------------------------------------
 # Application definition
@@ -316,6 +318,14 @@ _cors_origins_env = os.getenv(
 CORS_ALLOWED_ORIGINS = [
     o.strip() for o in _cors_origins_env.split(',') if o.strip()
 ]
+PROD_DOMAINS = [
+    'https://crm.sweatfitwellness.com',
+    'https://sweatfitwellness.com',
+    'https://api.sweatfitwellness.com',
+]
+for origin in PROD_DOMAINS:
+    if origin not in CORS_ALLOWED_ORIGINS:
+        CORS_ALLOWED_ORIGINS.append(origin)
 
 if DEBUG:
     CORS_ALLOWED_ORIGIN_REGEXES = [
@@ -353,6 +363,9 @@ _csrf_origins_env = os.getenv(
 CSRF_TRUSTED_ORIGINS = [
     o.strip() for o in _csrf_origins_env.split(',') if o.strip()
 ]
+for origin in PROD_DOMAINS:
+    if origin not in CSRF_TRUSTED_ORIGINS:
+        CSRF_TRUSTED_ORIGINS.append(origin)
 
 # ---------------------------------------------------------------------------
 # Security hardening — applied in non-DEBUG environments

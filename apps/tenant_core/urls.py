@@ -360,6 +360,9 @@ router.register(r'assessments', AssessmentSessionViewSet, basename='assessment')
 from .views_tickets import SupportTicketViewSet
 router.register(r'tickets', SupportTicketViewSet, basename='ticket')
 
+from .views_import_engine import UniversalImportViewSet
+router.register(r'excel-imports', UniversalImportViewSet, basename='excel-imports')
+
 app_name = 'tenant_core'
 
 urlpatterns = [

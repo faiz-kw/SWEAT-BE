@@ -97,10 +97,13 @@ def push_agent_telephony_event(user_id: str, event_type: str, payload: dict) -> 
 
 def _get_webhook_host(request) -> str:
     """Returns authoritative public HTTPS host for Vobiz callbacks to avoid 301/307 redirects."""
+    override = os.getenv("BACKEND_URL") or os.getenv("PUBLIC_API_URL")
+    if override:
+        return override.rstrip('/')
     host = request.build_absolute_uri('/')[:-1]
-    if host.startswith('http://') and ('ngrok' in host or request.is_secure() or request.META.get('HTTP_X_FORWARDED_PROTO') == 'https'):
+    if host.startswith('http://') and ('ngrok' in host or request.is_secure() or request.META.get('HTTP_X_FORWARDED_PROTO') == 'https' or 'sweatfitwellness.com' in host):
         host = 'https://' + host[7:]
-    elif not host.startswith('https://') and 'ngrok' in host:
+    elif not host.startswith('https://') and ('ngrok' in host or 'sweatfitwellness.com' in host):
         host = host.replace('http://', 'https://')
     return host
 
