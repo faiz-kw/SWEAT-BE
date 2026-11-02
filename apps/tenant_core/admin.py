@@ -1067,6 +1067,20 @@ admin.site.register(ProcessingPurpose, TenantModelAdmin)
 admin.site.register(ConsentRecord, TenantModelAdmin)
 admin.site.register(PrivacyRequest, TenantModelAdmin)
 admin.site.register(Integration, TenantModelAdmin)
+
+from .models_crm import AgentPresence, CallSession
+
+@admin.register(AgentPresence)
+class AgentPresenceAdmin(TenantModelAdmin):
+    list_display = ['user', 'sip_username', 'status', 'last_heartbeat']
+    search_fields = ['user__email', 'user__first_name', 'sip_username']
+    list_filter = ['status']
+
+@admin.register(CallSession)
+class CallSessionAdmin(TenantModelAdmin):
+    list_display = ['id', 'direction', 'user_phone_number', 'agent_user', 'status', 'started_at', 'ended_at']
+    search_fields = ['user_phone_number', 'vobiz_call_uuid']
+    list_filter = ['direction', 'status']
 admin.site.register(LegacyEntityMap, TenantModelAdmin)
 admin.site.register(PackageBranchAvailability, TenantModelAdmin)
 

@@ -269,11 +269,27 @@ class TelephonyConfigService:
 
         vobiz_cfg = cls.get_vobiz_config(alias)
 
+        # Primary registered endpoints on Vobiz account
+        primary_endpoint = (
+            os.getenv("VOBIZ_DEFAULT_SIP_USER")
+            or "iqra24030269280035568"
+        )
+        fallback_endpoints = [
+            primary_endpoint,
+            "sweatagent104201155654570218059",
+        ]
+
         # Look up or initialize AgentPresence for this user
         presence = AgentPresence.objects.using(alias).filter(user=user).first()
         if not presence:
             user_org = getattr(user, 'organization', None) or Organization.objects.using(alias).first()
-            default_sip_user = f"agent_{user.id.hex[:8]}"
+            assigned_ep = None
+            for ep in fallback_endpoints:
+                if not AgentPresence.objects.using(alias).filter(sip_username=ep).exists():
+                    assigned_ep = ep
+                    break
+            default_sip_user = assigned_ep or primary_endpoint
+
             presence = AgentPresence.objects.using(alias).create(
                 organization=user_org,
                 user=user,
@@ -281,6 +297,18 @@ class TelephonyConfigService:
                 status="AVAILABLE",
             )
             logger.info("Provisioned new AgentPresence for user %s with sip_username=%s", user.email, default_sip_user)
+        elif not presence.sip_username or presence.sip_username.startswith("agent_"):
+            # Auto-heal: replace unregistered random dummy username with registered Vobiz endpoint
+            assigned_ep = None
+            for ep in fallback_endpoints:
+                if not AgentPresence.objects.using(alias).filter(sip_username=ep).exclude(id=presence.id).exists():
+                    assigned_ep = ep
+                    break
+            chosen_ep = assigned_ep or primary_endpoint
+            presence.sip_username = chosen_ep
+            presence.status = "AVAILABLE"
+            presence.save(using=alias, update_fields=["sip_username", "status"])
+            logger.info("Auto-healed placeholder SIP username for user %s -> %s", user.email, chosen_ep)
 
         sip_user = presence.sip_username
         sip_domain = vobiz_cfg["registrar_host"]
