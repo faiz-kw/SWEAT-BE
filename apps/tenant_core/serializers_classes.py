@@ -562,9 +562,11 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
             if end_time <= start_time:
                 raise serializers.ValidationError({"end_time": "end_time must be strictly greater than start_time."})
             import datetime
+            import zoneinfo
             from django.utils import timezone
-            attrs['start_at'] = timezone.make_aware(datetime.datetime.combine(occ_date, start_time))
-            attrs['end_at'] = timezone.make_aware(datetime.datetime.combine(occ_date, end_time))
+            branch_tz = zoneinfo.ZoneInfo(getattr(branch, 'timezone', None) or 'Asia/Kolkata')
+            attrs['start_at'] = timezone.make_aware(datetime.datetime.combine(occ_date, start_time), timezone=branch_tz)
+            attrs['end_at'] = timezone.make_aware(datetime.datetime.combine(occ_date, end_time), timezone=branch_tz)
 
         start_at = attrs.get('start_at') or (self.instance.start_at if self.instance else None)
         end_at = attrs.get('end_at') or (self.instance.end_at if self.instance else None)

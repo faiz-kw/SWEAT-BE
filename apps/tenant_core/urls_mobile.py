@@ -2,6 +2,7 @@ from django.urls import path
 from apps.authentication.views_otp import SendOTPView, VerifyOTPView
 from . import views_wellness
 from . import views_community
+from . import views_inventory
 from .views_assessment import AssessmentEligibilityMobileView, AssessmentSessionViewSet
 from .views_mobile import (
     MobileRegisterView,
@@ -113,6 +114,13 @@ urlpatterns = [
     path('checkout/create-order/', MobileCheckoutOrderView.as_view(), name='mobile-checkout-create-order'),
     path('checkout/verify/', MobileCheckoutVerifyView.as_view(), name='mobile-checkout-verify'),
     path('orders/', MobileOrdersView.as_view(), name='mobile-orders'),
+
+    # 5.1 Retail Store & Inventory Products
+    path('products/', views_inventory.ProductViewSet.as_view({'get': 'list'}), name='mobile-products'),
+    path('products/<uuid:pk>/', views_inventory.ProductViewSet.as_view({'get': 'retrieve'}), name='mobile-product-detail'),
+    path('retail-orders/', views_inventory.RetailOrderViewSet.as_view({'get': 'list', 'post': 'create'}), name='mobile-retail-orders'),
+    path('retail-orders/<uuid:pk>/', views_inventory.RetailOrderViewSet.as_view({'get': 'retrieve'}), name='mobile-retail-order-detail'),
+    path('retail-orders/<uuid:pk>/confirm-payment/', views_inventory.RetailOrderViewSet.as_view({'post': 'confirm_payment'}), name='mobile-retail-order-confirm'),
 
     # 6. Onboarding & Health Assessments / PAR-Q
     path('onboarding/survey/', MobileOnboardingSurveyView.as_view(), name='mobile-onboarding-survey'),

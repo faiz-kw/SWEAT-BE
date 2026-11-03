@@ -24,6 +24,16 @@ def _get_db(request):
     if alias and alias != 'default':
         return alias
 
+    # Mobile tenant resolution via headers / params / token
+    if request:
+        try:
+            from .views_mobile import _resolve_mobile_tenant_and_db
+            resolved_alias, _ = _resolve_mobile_tenant_and_db(request)
+            if resolved_alias:
+                return resolved_alias
+        except Exception:
+            pass
+
     # Fallback resolution for local development or background requests
     from django.db import connections
     for active_alias in list(connections.databases.keys()):
@@ -45,12 +55,10 @@ def _get_db(request):
 
 
 def _get_org(request):
+    alias = _get_db(request)
     org = getattr(request, 'organization', None)
     if not org:
         user = getattr(request, 'user', None)
-        if user and hasattr(user, 'organization') and user.organization:
-            return user.organization
-        alias = _get_db(request)
         from .models_org import Organization
         if user and getattr(user, 'organization_id', None):
             return Organization.objects.using(alias).filter(id=user.organization_id).first()

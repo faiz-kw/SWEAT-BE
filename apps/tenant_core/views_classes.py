@@ -15,7 +15,7 @@ from django.core.exceptions import ValidationError
 class ClassesPagination(PageNumberPagination):
     page_size = 500
     page_size_query_param = 'page_size'
-    max_page_size = 2000
+    max_page_size = 5000
 
     def get_paginated_response(self, data):
         summary = getattr(self, '_classes_summary', None) or {}
@@ -757,12 +757,22 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
 
         template_name = occurrence.class_template.name if occurrence.class_template else ''
 
+        import re
+        category_code = (
+            occurrence.class_template.category.code 
+            if (occurrence.class_template and occurrence.class_template.category) 
+            else ''
+        )
+        occ_date = occurrence.occurrence_date
+        occ_date_str = occ_date.strftime('%Y-%m-%d') if occ_date else ''
+
         # 1. Check direct content assignment linked to this occurrence from Content Studio
         direct_assignment = occurrence.content_assignments.using(alias).select_related('content_item').first()
         video_url = ''
         instructions = ''
         description = occurrence.class_template.description if occurrence.class_template else ''
         movement_title = template_name
+        tags = []
 
         if direct_assignment and direct_assignment.content_item:
             ci = direct_assignment.content_item
@@ -770,26 +780,60 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             instructions = getattr(ci, 'description', '') or ''
             movement_title = getattr(ci, 'title', template_name)
 
-        # 2. Fall back to WorkoutContentItem (WOD Library) by template name or active item
+        # 2. Date-Aware Lookup in WorkoutContentItem (WOD Library)
         workout_item = None
-        if not video_url:
+        if not video_url and occ_date_str:
+            matching_items = list(WorkoutContentItem.objects.using(alias).filter(
+                raw_import_data__date=occ_date_str,
+                status='ACTIVE'
+            ))
+            for itm in matching_items:
+                raw_cat = str(itm.raw_import_data.get('category_code', '')).upper()
+                raw_sheet = str(itm.raw_import_data.get('sheet', '')).upper()
+                name_upper = itm.movement_name.upper()
+                
+                if (category_code and category_code in raw_cat) or                    ('STRETCH' in category_code and ('STRETCH' in raw_sheet or 'STRETCH' in name_upper)) or                    ('TOTAL' in category_code and 'PILATES' in category_code and ('SWEAT TOTAL' in raw_sheet or 'PILATES TOTAL' in name_upper or 'SWEAT TOTAL' in name_upper)) or                    ('ATHLETIC' in category_code and ('ATHLETIC' in raw_sheet or 'ATHLETIC' in name_upper)) or                    ('BOOTCAMP' in category_code and ('BOOTCAMP' in raw_sheet or 'BOOTCAMP' in name_upper or raw_sheet == '01. TOTAL')):
+                    workout_item = itm
+                    break
+
+            # Fallback by shot_date if raw_import_data not matched
+            if not workout_item:
+                workout_item = WorkoutContentItem.objects.using(alias).filter(
+                    shot_date=occ_date,
+                    movement_name__icontains=template_name,
+                    status='ACTIVE'
+                ).first()
+
+        # 3. Fall back to generic template match if no date-matched video exists
+        if not video_url and not workout_item:
             workout_item = (
                 WorkoutContentItem.objects.using(alias)
                 .filter(movement_name__icontains=template_name, status='ACTIVE')
                 .order_by('-created_at')
                 .first()
             )
-            if not workout_item:
-                workout_item = WorkoutContentItem.objects.using(alias).filter(status='ACTIVE').order_by('-created_at').first()
 
-            if workout_item:
-                video_url = workout_item.video_url or ''
-                if not instructions:
-                    instructions = workout_item.description or ''
-                movement_title = workout_item.movement_name or template_name
+        if workout_item:
+            video_url = workout_item.video_url or ''
+            if not instructions:
+                instructions = workout_item.description or ''
+            movement_title = workout_item.movement_name or template_name
+            
+            # Extract targeted muscles from raw_import_data or tags
+            raw_muscles = workout_item.raw_import_data.get('muscles') if workout_item.raw_import_data else None
+            if raw_muscles:
+                if isinstance(raw_muscles, list):
+                    tags = [str(m).strip() for m in raw_muscles if str(m).strip()]
+                elif isinstance(raw_muscles, str):
+                    tags = [m.strip() for m in re.split(r'[,|&/]', raw_muscles) if m.strip()]
 
-        # 3. Extract YouTube Video ID if applicable
-        import re
+            if not tags:
+                try:
+                    tags = [ct.tag.name for ct in workout_item.content_tags.using(alias).select_related('tag').all() if ct.tag]
+                except Exception:
+                    tags = []
+
+        # 4. Extract YouTube Video ID if applicable
         yt_id = None
         if video_url:
             patterns = [
@@ -806,13 +850,6 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             f"https://www.youtube-nocookie.com/embed/{yt_id}?rel=0&modestbranding=1&controls=1&showinfo=0&iv_load_policy=3&fs=0"
             if yt_id else (video_url or '')
         )
-
-        tags = []
-        if workout_item:
-            try:
-                tags = [ct.tag.name for ct in workout_item.content_tags.using(alias).select_related('tag').all() if ct.tag]
-            except Exception:
-                tags = []
 
         return Response({
             'occurrence_id': str(occurrence.id),
