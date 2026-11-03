@@ -63,10 +63,10 @@ class RazorpayService:
                 code="RAZORPAY_NOT_CONFIGURED"
             )
 
-        # Enforce Test Mode key format
-        if not key_id.startswith('rzp_test_'):
+        # Enforce valid Razorpay Key ID format (supports both test and live keys)
+        if not (key_id.startswith('rzp_test_') or key_id.startswith('rzp_live_')):
             raise RazorpayConfigError(
-                "Invalid Razorpay Key ID format for test mode. Key ID must start with 'rzp_test_'.",
+                "Invalid Razorpay Key ID format. Key ID must start with 'rzp_test_' or 'rzp_live_'.",
                 code="RAZORPAY_INVALID_KEY_FORMAT"
             )
 

@@ -280,7 +280,7 @@ REST_FRAMEWORK = {
 # ---------------------------------------------------------------------------
 # SimpleJWT
 # ---------------------------------------------------------------------------
-JWT_ACCESS_MINUTES = int(os.getenv('JWT_ACCESS_TOKEN_LIFETIME_MINUTES', '15'))
+JWT_ACCESS_MINUTES = int(os.getenv('JWT_ACCESS_TOKEN_LIFETIME_MINUTES', str(24 * 60)))  # Default 24 hours (1440 minutes)
 JWT_REFRESH_DAYS = int(os.getenv('JWT_REFRESH_TOKEN_LIFETIME_DAYS', '7'))
 
 SIMPLE_JWT = {
