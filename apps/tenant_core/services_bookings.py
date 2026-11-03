@@ -488,6 +488,36 @@ class BookingWaitlistAttendanceService:
 
                 is_cross_branch = bool(membership.home_branch and occurrence.branch_id != membership.home_branch_id)
                 if is_cross_branch:
+                    # Check Central Administration Passport Policy
+                    from .models_govern import OrganizationSettings
+                    org_settings = OrganizationSettings.objects.using(alias).filter(organization=membership.organization).first()
+                    passport_cfg = (org_settings.membership_config or {}).get('passport_config', {}) if org_settings else {}
+
+                    # If passport access is explicitly disabled in Administration
+                    if passport_cfg.get('is_enabled') is False or passport_cfg.get('allow_cross_branch_booking') is False:
+                        return {
+                            'eligible': False,
+                            'reason_code': 'PASSPORT_DISABLED',
+                            'reason_message': "Cross-branch studio access is currently disabled by administration policy.",
+                            'can_raise_ticket': False,
+                        }
+
+                    # If administration grants unlimited cross-branch access
+                    if passport_cfg.get('is_unlimited_cross') is True:
+                        home_ent = ent_qs.filter(entitlement_type='HOME_BRANCH_SESSION').first() or ent_qs.exclude(
+                            entitlement_type__in=['CROSS_BRANCH_SESSION', 'CROSS_BRANCH', 'CREDIT_WALLET']
+                        ).first()
+                        if home_ent and not home_ent.is_unlimited and home_ent.remaining_units <= 0:
+                            return {
+                                'eligible': False,
+                                'reason_code': 'NO_ENTITLEMENT_REMAINING',
+                                'reason_message': 'No remaining session credits in your active pack.',
+                            }
+                        return {
+                            'eligible': True,
+                            'can_raise_ticket': False,
+                        }
+
                     passport_ent = ent_qs.filter(
                         models.Q(entitlement_type='CROSS_BRANCH_SESSION') | models.Q(entitlement_type='CROSS_BRANCH')
                     ).first()
@@ -958,6 +988,14 @@ class BookingWaitlistAttendanceService:
                     else:
                         is_cross_branch = bool(membership.home_branch and occurrence.branch_id != membership.home_branch_id)
                         if is_cross_branch:
+                            # Check Central Administration Passport Policy
+                            from .models_govern import OrganizationSettings
+                            org_settings = OrganizationSettings.objects.using(alias).filter(organization=membership.organization).first()
+                            passport_cfg = (org_settings.membership_config or {}).get('passport_config', {}) if org_settings else {}
+
+                            if passport_cfg.get('is_enabled') is False or passport_cfg.get('allow_cross_branch_booking') is False:
+                                raise ValidationError("Cross-branch studio access is currently disabled by administration policy.", code="PASSPORT_DISABLED")
+
                             from .models_catalog import PackageBranchAvailability
                             pkg = membership.package_version.package if membership.package_version else membership.package
                             if pkg:
