@@ -20,9 +20,14 @@ import zoneinfo
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
+import asyncio
+import redis
+import redis.asyncio as aioredis
+from django.conf import settings
+from django.db import connections, transaction
 from django.http import HttpResponse, StreamingHttpResponse
+from django.views import View
 from django.utils import timezone
-from django.db import transaction
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
 
@@ -73,25 +78,77 @@ def resolve_telephony_tenant_context():
             else:
                 yield
 
-# Real-time in-memory event bus for SSE client streams
-# Key: user_id (str), Value: list of pending event dicts
-_AGENT_EVENT_QUEUES: Dict[str, list] = {}
+def resolve_tenant_id_for_channel(tenant_id: str = None, user=None, payload: dict = None) -> str:
+    """
+    Resolves the authoritative tenant ID string for channel isolation.
+    """
+    if tenant_id:
+        return str(tenant_id).lower()
+    if payload and isinstance(payload, dict):
+        if payload.get('tenant_id'):
+            return str(payload['tenant_id']).lower()
+        if payload.get('organization_id'):
+            return str(payload['organization_id']).lower()
+    if user:
+        tid = getattr(user, '_tenant_id', None)
+        if tid:
+            return str(tid).lower()
+        if hasattr(user, 'organization_id') and user.organization_id:
+            return str(user.organization_id).lower()
+    current_alias = get_tenant_db_alias()
+    if current_alias and current_alias.startswith('tenant_'):
+        raw = current_alias[len('tenant_'):]
+        if len(raw) == 32:
+            return f"{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}".lower()
+        return raw.lower()
+    try:
+        active_tenant = Tenant.objects.filter(status='ACTIVE').first()
+        if active_tenant:
+            return str(active_tenant.id).lower()
+    except Exception:
+        pass
+    return "global"
 
 
-def push_agent_telephony_event(user_id: str, event_type: str, payload: dict) -> None:
-    """Dispatches a real-time event to the target agent and broadcasts to all active CRM browser tabs."""
-    u_key = str(user_id) if user_id else ""
+def get_telephony_channel(user_id: str, tenant_id: str = None) -> str:
+    """
+    Builds an isolated Redis Pub/Sub channel name.
+    Naming convention: sweat:{env}:{tenant_id}:{user_id}
+    Ensures environment isolation so testing events never leak into production.
+    """
+    env = getattr(settings, 'DEPLOYMENT_ENVIRONMENT', 'development').lower()
+    t_id = resolve_tenant_id_for_channel(tenant_id=tenant_id)
+    u_id = str(user_id or 'unknown').lower()
+    return f"sweat:{env}:{t_id}:{u_id}"
+
+
+def push_agent_telephony_event(user_id: str, event_type: str, payload: dict, tenant_id: str = None) -> None:
+    """
+    Dispatches a real-time event strictly to the target agent's isolated Redis channel.
+    Step 1: Uses settings.REDIS_URL.
+    Step 3: Environment & tenant isolated channel naming sweat:{env}:{tenant}:{user}.
+    Step 4: Strict recipient delivery (no AllowAny broadcast).
+    Protected with short timeouts and try/except so Redis failures NEVER interrupt call webhooks.
+    """
+    if not user_id:
+        logger.warning("push_agent_telephony_event called without user_id; skipping publish.")
+        return
+
+    resolved_tenant = resolve_tenant_id_for_channel(tenant_id=tenant_id, payload=payload)
+    channel = get_telephony_channel(user_id, tenant_id=resolved_tenant)
     evt = {
         'event': event_type,
         'data': payload,
         'timestamp': timezone.now().isoformat(),
     }
-    if u_key and u_key not in _AGENT_EVENT_QUEUES:
-        _AGENT_EVENT_QUEUES[u_key] = []
 
-    # Broadcast to all connected client queues so every open rep/admin tab updates instantly
-    for k, q in list(_AGENT_EVENT_QUEUES.items()):
-        q.append(dict(evt))
+    try:
+        redis_url = getattr(settings, 'REDIS_URL', 'redis://localhost:6379/0')
+        r = redis.from_url(redis_url, socket_timeout=1.0, socket_connect_timeout=1.0)
+        r.publish(channel, json.dumps(evt))
+        logger.info("Published telephony event '%s' to channel '%s'", event_type, channel)
+    except Exception as e:
+        logger.error("Failed to publish telephony event '%s' to Redis (%s): %s", event_type, channel, e)
 
 
 
@@ -1075,82 +1132,96 @@ class ServerSentEventRenderer(renderers.BaseRenderer):
         return data
 
 
-class TelephonyEventsSseView(APIView):
+class TelephonyEventsSseView(View):
     """
     GET /api/v1/tenant/crm/telephony/events/
-    Server-Sent Events (SSE) endpoint streamed to the sales rep's open CRM tab.
-    Pushes screen-pop alerts, call-ended triggers, and missed-call notifications.
+    Asynchronous Server-Sent Events (SSE) endpoint.
+    Step 2: Calls connections.close_all() at the start and on exit so DB connections are released immediately.
+    Step 3: Subscribes strictly to the isolated Redis channel sweat:{env}:{tenant}:{user}.
+    Step 4: Enforces authentication (token query param or Bearer header). No AllowAny or crm_frontend fallback.
+    Step 5: Uses an async view, async generator, and redis.asyncio with zero thread blocking.
     """
-    permission_classes = [permissions.AllowAny]
-    renderer_classes = [ServerSentEventRenderer, renderers.JSONRenderer]
 
-    def get(self, request):
-        user = request.user
-        if not (user and getattr(user, 'is_authenticated', False)):
-            token_str = request.GET.get('token')
-            if token_str:
-                # 1. Try TenantJWTAuthentication or PlatformJWTAuthentication
-                try:
-                    from apps.authentication.backends import TenantJWTAuthentication, PlatformJWTAuthentication
-                    request.META['HTTP_AUTHORIZATION'] = f'Bearer {token_str}'
-                    auth_res = TenantJWTAuthentication().authenticate(request) or PlatformJWTAuthentication().authenticate(request)
-                    if auth_res:
-                        user = auth_res[0]
-                except Exception:
-                    pass
+    async def get(self, request):
+        token_str = request.GET.get('token')
+        if not token_str:
+            auth_header = request.headers.get('Authorization', '')
+            if auth_header.startswith('Bearer '):
+                token_str = auth_header.split(' ', 1)[1].strip()
 
-                # 2. Direct simplejwt AccessToken inspection
-                if not (user and getattr(user, 'is_authenticated', False)):
-                    try:
-                        from rest_framework_simplejwt.tokens import AccessToken
-                        tok = AccessToken(token_str)
-                        sub = tok.get('sub')
-                        if sub:
-                            with resolve_telephony_tenant_context():
-                                user = TenantUser.objects.filter(id=sub).first()
-                    except Exception:
-                        pass
+        if not token_str:
+            return HttpResponse("Authentication required", status=401, content_type="text/plain")
 
-        # For browser SSE screens, allow connection so screen-pop is never blocked
-        u_key = str(user.id) if (user and hasattr(user, 'id')) else "crm_frontend"
+        try:
+            from rest_framework_simplejwt.tokens import AccessToken
+            tok = AccessToken(token_str)
+            user_id = str(tok.get('sub') or '')
+            tenant_id = str(tok.get('tid') or '')
+            if not user_id:
+                return HttpResponse("Invalid token claims", status=401, content_type="text/plain")
+        except Exception as auth_err:
+            logger.warning("TelephonyEventsSseView: token authentication failed: %s", auth_err)
+            return HttpResponse("Unauthorized", status=401, content_type="text/plain")
 
-        # Initialize event queue immediately for this client connection
-        if u_key not in _AGENT_EVENT_QUEUES:
-            _AGENT_EVENT_QUEUES[u_key] = []
+        resolved_tenant = resolve_tenant_id_for_channel(tenant_id=tenant_id)
+        channel = get_telephony_channel(user_id, tenant_id=resolved_tenant)
 
-        # Update presence heartbeat if user is resolved
-        if user and getattr(user, 'is_authenticated', False):
-            with resolve_telephony_tenant_context():
-                AgentPresence.objects.filter(user=user).update(last_heartbeat=timezone.now())
+        async def event_stream():
+            # Step 2: Release DB connection immediately before entering long-lived stream
+            connections.close_all()
 
-        def event_stream():
-            if u_key not in _AGENT_EVENT_QUEUES:
-                _AGENT_EVENT_QUEUES[u_key] = []
+            # Initial connection handshake
+            yield f"event: CONNECTED\ndata: {json.dumps({'status': 'ONLINE', 'user_id': user_id, 'channel': channel})}\n\n"
 
-            # Initial connect handshake
-            yield f"event: CONNECTED\ndata: {json.dumps({'status': 'ONLINE', 'user_id': u_key})}\n\n"
+            redis_url = getattr(settings, 'REDIS_URL', 'redis://localhost:6379/0')
+            aioredis_client = aioredis.from_url(
+                redis_url,
+                socket_timeout=15.0,
+                socket_connect_timeout=3.0,
+            )
+            pubsub = aioredis_client.pubsub()
+            await pubsub.subscribe(channel)
 
-            heartbeat_counter = 0
             try:
                 while True:
-                    time.sleep(1)
-                    heartbeat_counter += 1
+                    try:
+                        msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=15.0)
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as poll_err:
+                        logger.error("SSE Redis PubSub read error on channel %s: %s", channel, poll_err)
+                        await asyncio.sleep(1.0)
+                        msg = None
 
-                    # Drain pending events from agent queue
-                    if u_key in _AGENT_EVENT_QUEUES and _AGENT_EVENT_QUEUES[u_key]:
-                        while _AGENT_EVENT_QUEUES[u_key]:
-                            evt = _AGENT_EVENT_QUEUES[u_key].pop(0)
-                            yield f"event: {evt['event']}\ndata: {json.dumps(evt['data'])}\n\n"
-
-                    # Send 15-second heartbeat ping to keep connection alive through proxies
-                    if heartbeat_counter >= 15:
-                        heartbeat_counter = 0
+                    if msg and msg.get('type') == 'message':
+                        raw_data = msg.get('data')
+                        if isinstance(raw_data, bytes):
+                            raw_data = raw_data.decode('utf-8')
+                        try:
+                            parsed = json.loads(raw_data)
+                            evt_type = parsed.get('event', 'MESSAGE')
+                            evt_payload = parsed.get('data', {})
+                            yield f"event: {evt_type}\ndata: {json.dumps(evt_payload)}\n\n"
+                        except Exception as parse_err:
+                            logger.error("Failed to parse SSE event message: %s", parse_err)
+                    else:
+                        # 15s heartbeat to keep connection alive through proxies
                         yield f": heartbeat {timezone.now().isoformat()}\n\n"
-            finally:
+            except asyncio.CancelledError:
                 pass
+            finally:
+                try:
+                    await pubsub.unsubscribe(channel)
+                    await pubsub.aclose()
+                    await aioredis_client.aclose()
+                except Exception:
+                    pass
+                # Step 2: Close DB connections on stream teardown
+                connections.close_all()
 
         response = StreamingHttpResponse(event_stream(), content_type='text/event-stream')
-        response['Cache-Control'] = 'no-cache'
+        response['Cache-Control'] = 'no-cache, no-transform'
+        response['Content-Type'] = 'text/event-stream'
         response['X-Accel-Buffering'] = 'no'
         return response
 

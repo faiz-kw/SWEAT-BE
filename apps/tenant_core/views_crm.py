@@ -3919,7 +3919,7 @@ class CRMAgentAssignmentConfigViewSet(viewsets.ViewSet):
             })
 
         users_qs = TenantUser.objects.using(alias).filter(
-            organization=org, status='ACTIVE', is_login_allowed=True
+            organization=org, status='ACTIVE', is_login_allowed=True, user_type='STAFF'
         ).prefetch_related('role_assignments__role', 'home_branch').order_by('first_name', 'last_name')
 
         users_data = []

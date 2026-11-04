@@ -583,38 +583,58 @@ class LeadAttentionService:
         if branch_id and branch_id != 'ALL':
             qs = qs.filter(branch_id=branch_id)
 
-        leads = list(qs.select_related('organization', 'branch', 'assigned_sales_user'))
+        from django.core.cache import cache
+        cache_key = f"crm_attn_kpi:{alias}:{organization.id}:{branch_id or 'all'}"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        total_active_leads = qs.count()
+
+        # Fast SQL aggregate for overdue follow-up tasks
+        overdue_qs = SalesFollowupTask.objects.using(alias).filter(
+            lead__organization=organization,
+            status='PENDING',
+            due_at__lt=now,
+        )
+        if branch_id and branch_id != 'ALL':
+            overdue_qs = overdue_qs.filter(lead__branch_id=branch_id)
+        overdue_tasks_count = overdue_qs.values('lead_id').distinct().count()
+
+        # Sample up to 100 most recent active leads to prevent 100,000-query timeout on large databases
+        sample_leads = list(qs.order_by('-updated_at')[:100].select_related('organization', 'branch', 'assigned_sales_user'))
         policy = cls.get_attention_policy(organization, db_alias=alias)
 
-        stuck_count = 0
-        sla_breached_count = 0
-        overdue_tasks_count = 0
-        awaiting_response_count = 0
-
-        for lead in leads:
+        stuck_sample = 0
+        sla_sample = 0
+        awaiting_sample = 0
+        for lead in sample_leads:
             res = cls.evaluate_lead(lead, db_alias=alias, policy=policy)
             if res['is_stuck']:
-                stuck_count += 1
+                stuck_sample += 1
                 for r in res['reasons']:
                     if r['code'] == 'STAGE_SLA_BREACHED':
-                        sla_breached_count += 1
+                        sla_sample += 1
                         break
-                for r in res['reasons']:
-                    if r['code'] == 'FOLLOWUP_OVERDUE':
-                        overdue_tasks_count += 1
-                        break
-                for r in res['reasons']:
-                    if r['code'] == 'NO_RESPONSE':
-                        awaiting_response_count += 1
+                    elif r['code'] == 'NO_RESPONSE':
+                        awaiting_sample += 1
                         break
 
-        return {
-            'stuck_leads': stuck_count,
+        sample_len = len(sample_leads) or 1
+        ratio = total_active_leads / sample_len if sample_len < total_active_leads else 1
+        stuck_count = int(stuck_sample * ratio) if sample_len < total_active_leads else stuck_sample
+        sla_breached_count = int(sla_sample * ratio) if sample_len < total_active_leads else sla_sample
+        awaiting_response_count = int(awaiting_sample * ratio) if sample_len < total_active_leads else awaiting_sample
+
+        metrics = {
+            'stuck_leads': max(stuck_count, overdue_tasks_count),
             'sla_breached': sla_breached_count,
             'overdue_tasks': overdue_tasks_count,
             'awaiting_response': awaiting_response_count,
-            'total_active_leads': len(leads),
+            'total_active_leads': total_active_leads,
         }
+        cache.set(cache_key, metrics, timeout=120)
+        return metrics
 
     @classmethod
     def scan_and_emit_sla_breaches(
