@@ -8,6 +8,7 @@ import os
 import django
 
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+os.environ['ROOT_URLCONF'] = 'config.urls_telephony_asgi'
 
 # Initialize Django
 django.setup()
@@ -23,4 +24,3 @@ if hasattr(settings, 'DATABASES'):
 from django.core.asgi import get_asgi_application
 
 application = get_asgi_application()
-

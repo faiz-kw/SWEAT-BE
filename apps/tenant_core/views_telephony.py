@@ -1132,14 +1132,13 @@ class ServerSentEventRenderer(renderers.BaseRenderer):
         return data
 
 
-class TelephonyEventsSseView(View):
+class TelephonyEventsAsgiSseView(View):
     """
-    GET /api/v1/tenant/crm/telephony/events/
-    Asynchronous Server-Sent Events (SSE) endpoint.
-    Step 2: Calls connections.close_all() at the start and on exit so DB connections are released immediately.
+    Dedicated ASGI async view for /telephony/events/.
+    Step 2: Calls connections.close_all() at start and teardown.
     Step 3: Subscribes strictly to the isolated Redis channel sweat:{env}:{tenant}:{user}.
-    Step 4: Enforces authentication (token query param or Bearer header). No AllowAny or crm_frontend fallback.
-    Step 5: Uses an async view, async generator, and redis.asyncio with zero thread blocking.
+    Step 4: Enforces authentication (token query param or Bearer header). No AllowAny.
+    Step 5: Pure async view, async generator, and redis.asyncio. Zero thread blocking.
     """
 
     async def get(self, request):
@@ -1217,6 +1216,88 @@ class TelephonyEventsSseView(View):
                 except Exception:
                     pass
                 # Step 2: Close DB connections on stream teardown
+                connections.close_all()
+
+        response = StreamingHttpResponse(event_stream(), content_type='text/event-stream')
+        response['Cache-Control'] = 'no-cache, no-transform'
+        response['Content-Type'] = 'text/event-stream'
+        response['X-Accel-Buffering'] = 'no'
+        return response
+
+
+class TelephonyEventsSseView(View):
+    """
+    WSGI-compatible Server-Sent Events (SSE) endpoint for /telephony/events/.
+    Step 2: Releases DB connections immediately on connect and teardown.
+    Step 3: Subscribes to isolated Redis channel sweat:{env}:{tenant}:{user}.
+    Step 4: Enforces authentication (token query param or Bearer header).
+    Uses synchronous generator and redis to prevent WSGI async_to_sync thread exhaustion.
+    """
+    def get(self, request):
+        token_str = request.GET.get('token')
+        if not token_str:
+            auth_header = request.headers.get('Authorization', '')
+            if auth_header.startswith('Bearer '):
+                token_str = auth_header.split(' ', 1)[1].strip()
+
+        if not token_str:
+            return HttpResponse("Authentication required", status=401, content_type="text/plain")
+
+        try:
+            from rest_framework_simplejwt.tokens import AccessToken
+            tok = AccessToken(token_str)
+            user_id = str(tok.get('sub') or '')
+            tenant_id = str(tok.get('tid') or '')
+            if not user_id:
+                return HttpResponse("Invalid token claims", status=401, content_type="text/plain")
+        except Exception as auth_err:
+            logger.warning("TelephonyEventsSseView: token authentication failed: %s", auth_err)
+            return HttpResponse("Unauthorized", status=401, content_type="text/plain")
+
+        resolved_tenant = resolve_tenant_id_for_channel(tenant_id=tenant_id)
+        channel = get_telephony_channel(user_id, tenant_id=resolved_tenant)
+
+        def event_stream():
+            connections.close_all()
+            yield f"event: CONNECTED\ndata: {json.dumps({'status': 'ONLINE', 'user_id': user_id, 'channel': channel})}\n\n"
+
+            redis_url = getattr(settings, 'REDIS_URL', 'redis://localhost:6379/0')
+            import redis
+            sync_redis = redis.from_url(redis_url, socket_timeout=15.0, socket_connect_timeout=3.0)
+            pubsub = sync_redis.pubsub()
+            pubsub.subscribe(channel)
+
+            try:
+                while True:
+                    try:
+                        msg = pubsub.get_message(ignore_subscribe_messages=True, timeout=15.0)
+                    except Exception as poll_err:
+                        logger.error("SSE Redis PubSub read error on channel %s: %s", channel, poll_err)
+                        time.sleep(1.0)
+                        msg = None
+
+                    if msg and msg.get('type') == 'message':
+                        raw_data = msg.get('data')
+                        if isinstance(raw_data, bytes):
+                            raw_data = raw_data.decode('utf-8')
+                        try:
+                            parsed = json.loads(raw_data)
+                            evt_type = parsed.get('event', 'MESSAGE')
+                            evt_payload = parsed.get('data', {})
+                            yield f"event: {evt_type}\ndata: {json.dumps(evt_payload)}\n\n"
+                        except Exception as parse_err:
+                            logger.error("Failed to parse SSE event message: %s", parse_err)
+                    else:
+                        yield f": heartbeat {timezone.now().isoformat()}\n\n"
+            except GeneratorExit:
+                pass
+            finally:
+                try:
+                    pubsub.unsubscribe(channel)
+                    pubsub.close()
+                    sync_redis.close()
+                except Exception:
+                    pass
                 connections.close_all()
 
         response = StreamingHttpResponse(event_stream(), content_type='text/event-stream')
