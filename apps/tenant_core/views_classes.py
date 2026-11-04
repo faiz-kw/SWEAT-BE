@@ -187,7 +187,11 @@ class ClassCategoryViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         alias = _get_db(self.request)
         org = _get_org(self.request)
-        return ClassCategory.objects.using(alias).filter(organization=org).order_by('display_order')
+        qs = ClassCategory.objects.using(alias).filter(organization=org)
+        status_filter = self.request.query_params.get('status')
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        return qs.order_by('display_order')
 
     def perform_create(self, serializer):
         org = _get_org(self.request)
@@ -237,6 +241,9 @@ class ClassTemplateViewSet(viewsets.ModelViewSet):
         category_id = self.request.query_params.get('category_id')
         if category_id:
             qs = qs.filter(category_id=category_id)
+        status_filter = self.request.query_params.get('status')
+        if status_filter:
+            qs = qs.filter(status=status_filter)
         return qs.order_by('name')
 
     def perform_create(self, serializer):

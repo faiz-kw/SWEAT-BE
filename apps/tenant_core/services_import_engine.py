@@ -1301,8 +1301,10 @@ class UniversalImportEngine:
         or unspecified data (capacity, trial capacity, duration, delivery mode, category, room)
         directly from the matched ClassTemplate.
         """
-        branches_list = list(Branch.objects.using(db_alias).all())
-        templates_list = list(ClassTemplate.objects.using(db_alias).select_related('category').all())
+        active_branches = list(Branch.objects.using(db_alias).filter(status='ACTIVE'))
+        branches_list = active_branches if active_branches else list(Branch.objects.using(db_alias).all())
+        active_templates = list(ClassTemplate.objects.using(db_alias).filter(status='ACTIVE').select_related('category'))
+        templates_list = active_templates if active_templates else list(ClassTemplate.objects.using(db_alias).select_related('category').all())
 
         branches_by_id = {str(b.id): b for b in branches_list}
         templates_by_id = {str(t.id): t for t in templates_list}
@@ -1722,8 +1724,10 @@ class UniversalImportEngine:
         from .models_org import Branch
         from .models import TrainerProfile, ClassOccurrenceTrainer
 
-        branches_list = list(Branch.objects.using(db_alias).all())
-        trainers_list = list(TrainerProfile.objects.using(db_alias).all().select_related('employee_profile'))
+        active_branches = list(Branch.objects.using(db_alias).filter(status='ACTIVE'))
+        branches_list = active_branches if active_branches else list(Branch.objects.using(db_alias).all())
+        active_trainers = list(TrainerProfile.objects.using(db_alias).filter(trainer_status='ACTIVE').select_related('employee_profile'))
+        trainers_list = active_trainers if active_trainers else list(TrainerProfile.objects.using(db_alias).all().select_related('employee_profile'))
 
         stop_words = {'sweat', 'fitness', 'west', 'east', 'north', 'south', 'studio', 'branch', 'club', 'center', 'gym', 'hq'}
 
@@ -1809,10 +1813,31 @@ class UniversalImportEngine:
             if not matched_branch:
                 continue
 
-            # Parse shift times & hours
+            # Parse shift times & hours dynamically
             na_filled = []
             shift_lower = raw_shift.lower()
-            if 'morning' in shift_lower:
+            m_time = re.search(r'(\d{1,2}:\d{2})\s*[-to]+\s*(\d{1,2}:\d{2})', raw_shift)
+            if m_time:
+                t1_str, t2_str = m_time.group(1), m_time.group(2)
+                try:
+                    t1_dt = datetime.strptime(t1_str, "%H:%M")
+                    t2_dt = datetime.strptime(t2_str, "%H:%M")
+                    if t2_dt < t1_dt:
+                        diff_hrs = (t2_dt + timedelta(days=1) - t1_dt).total_seconds() / 3600.0
+                    else:
+                        diff_hrs = (t2_dt - t1_dt).total_seconds() / 3600.0
+                    start_time_str = t1_str
+                    end_time_str = t2_str
+                    time_slot = f"{t1_dt.strftime('%I:%M %p')} - {t2_dt.strftime('%I:%M %p')}"
+                    duration_hours = round(diff_hrs, 1)
+                except Exception:
+                    start_time_str = '06:30'
+                    end_time_str = '13:30'
+                    time_slot = '06:30 AM - 01:30 PM'
+                    duration_hours = 7.0
+                clean_name = re.sub(r'\(.*?\)', '', raw_shift).strip()
+                shift_name = clean_name.title() if clean_name else ('Morning Shift' if 'morning' in shift_lower else ('Evening Shift' if 'evening' in shift_lower else 'Custom Shift'))
+            elif 'morning' in shift_lower:
                 shift_name = 'Morning Shift'
                 start_time_str = '06:30'
                 end_time_str = '13:30'
