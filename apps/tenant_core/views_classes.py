@@ -829,9 +829,26 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
 
             if not tags:
                 try:
-                    tags = [ct.tag.name for ct in workout_item.content_tags.using(alias).select_related('tag').all() if ct.tag]
+                    tags = [ct.tag.name for ct in workout_item.content_tags.using(alias).select_related('tag').filter(tag__tag_group='MUSCLE_GROUP') if ct.tag]
                 except Exception:
                     tags = []
+
+            # Extract equipment required from raw_import_data or tags
+            raw_equip = workout_item.raw_import_data.get('equipment') if workout_item.raw_import_data else None
+            equipment_tags = []
+            if raw_equip:
+                if isinstance(raw_equip, list):
+                    equipment_tags = [str(e).strip() for e in raw_equip if str(e).strip()]
+                elif isinstance(raw_equip, str):
+                    equipment_tags = [e.strip() for e in re.split(r'[,+/&|]', raw_equip) if e.strip()]
+
+            if not equipment_tags:
+                try:
+                    equipment_tags = [
+                        ct.tag.name for ct in workout_item.content_tags.using(alias).select_related('tag').filter(tag__tag_group='EQUIPMENT') if ct.tag
+                    ]
+                except Exception:
+                    equipment_tags = []
 
         # 4. Extract YouTube Video ID if applicable
         yt_id = None
@@ -860,6 +877,8 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             'youtube_video_id': yt_id,
             'embed_player_url': embed_player_url,
             'targeted_muscles': tags,
+            'equipment_required': equipment_tags,
+            'raw_equipment': str(raw_equip or ''),
             'instructions': instructions,
             'is_assigned_trainer': True,
             'player_security': {

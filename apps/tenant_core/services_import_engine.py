@@ -331,7 +331,7 @@ class MatrixNormalizer:
         return time_slot_count >= 4
 
     @classmethod
-    def unpivot_timetable(cls, sheet: Worksheet, target_month_tuple: Optional[Tuple[int, int]] = None) -> List[Dict[str, Any]]:
+    def unpivot_timetable(cls, sheet: Worksheet, target_month_tuple: Optional[Tuple[int, int]] = None, branches_list: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
         """
         Unpivots a 2D timetable grid into:
         [{'row_number': ..., 'branch': ..., 'room': ..., 'day_pattern': ..., 'time_slot': ..., 'start_time': ..., 'end_time': ..., 'class_name': ...}]
@@ -372,7 +372,7 @@ class MatrixNormalizer:
 
         # Scan for branch and room labels above time slots
         col_meta = {}
-        current_branch = "Andheri"
+        current_branch = branches_list[0].name if branches_list else "Andheri"
         for c in range(1, max_c + 1):
             r1 = str(sheet.cell(row=1, column=c).value or '').strip()
             r_sec1 = str(sheet.cell(row=start_row, column=c).value or '').strip()
@@ -380,7 +380,20 @@ class MatrixNormalizer:
             r_sec3 = str(sheet.cell(row=start_row + 2, column=c).value or '').strip()
 
             combined = f"{r1} {r_sec1} {r_sec2} {r_sec3}".lower()
-            if 'malad' in combined:
+
+            matched_b = None
+            if branches_list:
+                for b in branches_list:
+                    tokens = [t.lower() for t in re.split(r'[\s\-_\/]+', b.name) if len(t) >= 3]
+                    if getattr(b, 'code', None):
+                        tokens.append(b.code.lower())
+                    if any(tok in combined for tok in tokens):
+                        matched_b = b.name
+                        break
+
+            if matched_b:
+                current_branch = matched_b
+            elif 'malad' in combined:
                 current_branch = "Malad"
             elif 'goregaon' in combined or 'spg' in combined:
                 current_branch = "Goregaon"
@@ -444,6 +457,44 @@ class MatrixNormalizer:
 
 
 class UniversalImportEngine:
+    @classmethod
+    def _resolve_category_and_program(cls, sheet_title: str, user_category: Optional[str], db_alias: str) -> Tuple[str, str]:
+        """
+        Dynamically resolves or provisions workout categories and programs from the database.
+        Zero hardcoding: automatically handles Bootcamp, Pilates, Glutes, HIIT, Core, etc.
+        """
+        categories = list(ClassCategory.objects.using(db_alias).all())
+        templates = list(ClassTemplate.objects.using(db_alias).all())
+
+        target_input = (user_category or '').strip()
+        clean_sheet = re.sub(r'^\d+\s*[\.\-_]\s*', '', sheet_title).strip()
+
+        # 1. Match explicit user input from edit modal
+        if target_input:
+            for c in categories:
+                if target_input.lower() in c.name.lower() or target_input.lower() == c.code.lower():
+                    return c.code, c.name
+            for t in templates:
+                if target_input.lower() in t.name.lower() or target_input.lower() == t.code.lower():
+                    code = t.category.code if t.category else slugify(t.name).upper().replace('-', '_')
+                    return code, t.name
+
+        # 2. Match sheet title against existing database categories
+        for c in categories:
+            if c.name.lower() in clean_sheet.lower() or c.code.lower() in clean_sheet.lower():
+                return c.code, c.name
+
+        for t in templates:
+            if t.name.lower() in clean_sheet.lower() or t.code.lower() in clean_sheet.lower():
+                code = t.category.code if t.category else slugify(t.name).upper().replace('-', '_')
+                return code, t.name
+
+        # 3. Dynamic fallback for any new workout category (e.g. Glutes, Boxing, Yoga)
+        display_name = clean_sheet.title() if clean_sheet else 'Custom Workout'
+        code = slugify(display_name).upper().replace('-', '_')
+        prog_name = f"Sweat {display_name}"
+        return code, prog_name
+
     """
     Production-ready generic service handling preview, simulation, validation,
     and atomic commit for all entity types.
@@ -579,12 +630,37 @@ class UniversalImportEngine:
             found_in_sheet = 0
             skipped_other_months = 0
 
+            found_target_section = False
             for r in range(header_row_idx + 1, max_r + 1):
+                raw_col1 = sheet.cell(row=r, column=1).value
+                raw_col2 = sheet.cell(row=r, column=2).value
                 raw_date = sheet.cell(row=r, column=header_map.get('date', 2)).value if 'date' in header_map else None
                 raw_vol = sheet.cell(row=r, column=header_map.get('volume', 3)).value if 'volume' in header_map else None
                 raw_url = sheet.cell(row=r, column=header_map.get('url', 4)).value if 'url' in header_map else None
                 raw_muscle = sheet.cell(row=r, column=header_map.get('muscle', 5)).value if 'muscle' in header_map else None
                 raw_equip = sheet.cell(row=r, column=header_map.get('equipment', 6)).value if 'equipment' in header_map else None
+
+                # Month section boundary detection: check if this row is a month section banner (e.g. October 2026, November 2026)
+                banner_date = None
+                for candidate in (raw_col1, raw_col2):
+                    if isinstance(candidate, (datetime.date, datetime.datetime)):
+                        banner_date = candidate
+                        break
+                    elif isinstance(candidate, str) and any(m in candidate.lower() for m in ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december']):
+                        parsed_m = SmartMonthParser.parse_month_string(candidate)
+                        if parsed_m:
+                            banner_date = datetime.date(parsed_m[0], parsed_m[1], 1)
+                            break
+
+                # If this row is a banner without a workout video URL
+                if banner_date and not (raw_url and 'youtu' in str(raw_url)):
+                    b_year, b_month = banner_date.year, banner_date.month
+                    if target_month_tuple and (b_year == target_month_tuple[0] and b_month == target_month_tuple[1]):
+                        found_target_section = True
+                        continue
+                    elif found_target_section:
+                        # Encountered next month section header - strictly stop reading this sheet!
+                        break
 
                 if not raw_url and not raw_date:
                     continue
@@ -673,7 +749,7 @@ class UniversalImportEngine:
 
         for sheet in wb.worksheets:
             if MatrixNormalizer.is_timetable_matrix(sheet):
-                matrix_rows = MatrixNormalizer.unpivot_timetable(sheet, target_month_tuple=target_month_tuple)
+                matrix_rows = MatrixNormalizer.unpivot_timetable(sheet, target_month_tuple=target_month_tuple, branches_list=branches_list)
                 for mr in matrix_rows:
                     status = 'VALID'
                     messages = []
@@ -861,18 +937,7 @@ class UniversalImportEngine:
                     equip_str = str(r.get('equipment') or '').strip()
                     s_title = str(r.get('sheet') or '').upper()
 
-                    if 'STRETCH' in s_title:
-                        cat_code = 'PILATES_STRETCH'
-                        prog_name = 'Sweat Stretch'
-                    elif 'ATHLETIC' in s_title and 'BOOTCAMP' not in s_title:
-                        cat_code = 'PILATES_ATHLETIC'
-                        prog_name = 'Sweat Athletic'
-                    elif 'BOOTCAMP' in s_title or s_title.startswith('01. TOTAL') or 'DTP' in s_title:
-                        cat_code = 'BOOTCAMP_TOTAL'
-                        prog_name = 'Sweat Bootcamp'
-                    else:
-                        cat_code = 'PILATES_TOTAL'
-                        prog_name = 'Sweat Total'
+                    cat_code, prog_name = cls._resolve_category_and_program(s_title, r.get('category_name') or r.get('program'), db_alias)
 
                     title = f"{prog_name} - {vol_str} ({muscle_str})" if vol_str else f"{prog_name} - {muscle_str}"
 
@@ -916,6 +981,23 @@ class UniversalImportEngine:
                         }
                         item.save(using=db_alias)
                         updated_count += 1
+
+                    # Attach equipment tags
+                    if equip_str:
+                        equip_tokens = [eq.strip() for eq in re.split(r'[,+/&|]', equip_str) if eq.strip()]
+                        for eq_name in equip_tokens:
+                            eq_code = slugify(eq_name).upper().replace('-', '_')[:50] or 'EQUIPMENT'
+                            eq_tag, _ = WorkoutTag.objects.using(db_alias).get_or_create(
+                                organization=org,
+                                tag_group='EQUIPMENT',
+                                code=eq_code,
+                                defaults={'name': eq_name.title(), 'status': 'ACTIVE'}
+                            )
+                            WorkoutContentTag.objects.using(db_alias).get_or_create(
+                                organization=org,
+                                content_item=item,
+                                tag=eq_tag,
+                            )
             elif entity_type == EntityType.CLASS_SCHEDULE:
                 branches_list = list(Branch.objects.using(db_alias).all())
                 templates_list = list(ClassTemplate.objects.using(db_alias).all())
@@ -1145,25 +1227,36 @@ class UniversalImportEngine:
 
             # Determine category from sheet title
             s_title = sheet.title.upper()
-            if 'STRETCH' in s_title:
-                cat_code = 'PILATES_STRETCH'
-                prog_name = 'Sweat Stretch'
-            elif 'ATHLETIC' in s_title and 'BOOTCAMP' not in s_title:
-                cat_code = 'PILATES_ATHLETIC'
-                prog_name = 'Sweat Athletic'
-            elif 'BOOTCAMP' in s_title or s_title.startswith('01. TOTAL') or 'DTP' in s_title or 'FOUNDATION' in s_title:
-                cat_code = 'BOOTCAMP_TOTAL'
-                prog_name = 'Sweat Bootcamp'
-            else:
-                cat_code = 'PILATES_TOTAL'
-                prog_name = 'Sweat Total'
+            cat_code, prog_name = cls._resolve_category_and_program(sheet.title, None, db_alias)
 
+            found_target_section = False
             for r in range(header_row_idx + 1, max_r + 1):
+                raw_col1 = sheet.cell(row=r, column=1).value
+                raw_col2 = sheet.cell(row=r, column=2).value
                 raw_date = sheet.cell(row=r, column=header_map.get('date', 2)).value if 'date' in header_map else None
                 raw_vol = sheet.cell(row=r, column=header_map.get('volume', 3)).value if 'volume' in header_map else None
                 raw_url = sheet.cell(row=r, column=header_map.get('url', 4)).value if 'url' in header_map else None
                 raw_muscle = sheet.cell(row=r, column=header_map.get('muscle', 5)).value if 'muscle' in header_map else None
                 raw_equip = sheet.cell(row=r, column=header_map.get('equipment', 6)).value if 'equipment' in header_map else None
+
+                banner_date = None
+                for candidate in (raw_col1, raw_col2):
+                    if isinstance(candidate, (datetime.date, datetime.datetime)):
+                        banner_date = candidate
+                        break
+                    elif isinstance(candidate, str) and any(m in candidate.lower() for m in ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december']):
+                        parsed_m = SmartMonthParser.parse_month_string(candidate)
+                        if parsed_m:
+                            banner_date = datetime.date(parsed_m[0], parsed_m[1], 1)
+                            break
+
+                if banner_date and not (raw_url and 'youtu' in str(raw_url)):
+                    b_year, b_month = banner_date.year, banner_date.month
+                    if target_month_tuple and (b_year == target_month_tuple[0] and b_month == target_month_tuple[1]):
+                        found_target_section = True
+                        continue
+                    elif found_target_section:
+                        break
 
                 if not raw_url and not raw_date:
                     continue
@@ -1233,9 +1326,27 @@ class UniversalImportEngine:
                         defaults={'name': muscle_str, 'status': 'ACTIVE'}
                     )
                     WorkoutContentTag.objects.using(db_alias).get_or_create(
+                        organization=org,
                         content_item=item,
                         tag=tag,
                     )
+
+                # Attach equipment tags
+                if equip_str:
+                    equip_tokens = [eq.strip() for eq in re.split(r'[,+/&|]', equip_str) if eq.strip()]
+                    for eq_name in equip_tokens:
+                        eq_code = slugify(eq_name).upper().replace('-', '_')[:50] or 'EQUIPMENT'
+                        eq_tag, _ = WorkoutTag.objects.using(db_alias).get_or_create(
+                            organization=org,
+                            tag_group='EQUIPMENT',
+                            code=eq_code,
+                            defaults={'name': eq_name.title(), 'status': 'ACTIVE'}
+                        )
+                        WorkoutContentTag.objects.using(db_alias).get_or_create(
+                            organization=org,
+                            content_item=item,
+                            tag=eq_tag,
+                        )
 
         return created, updated, errors
 
@@ -1250,7 +1361,7 @@ class UniversalImportEngine:
 
         for sheet in wb.worksheets:
             if MatrixNormalizer.is_timetable_matrix(sheet):
-                matrix_rows = MatrixNormalizer.unpivot_timetable(sheet, target_month_tuple=target_month_tuple)
+                matrix_rows = MatrixNormalizer.unpivot_timetable(sheet, target_month_tuple=target_month_tuple, branches_list=list(branches.values()))
                 for mr in matrix_rows:
                     br_name = mr['branch'].lower()
                     matched_branch = next((b for k, b in branches.items() if br_name in k), None)
