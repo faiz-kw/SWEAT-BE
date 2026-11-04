@@ -125,7 +125,7 @@ class EntityClassifier:
                         yt_found = True
 
                     # Time slot pattern (e.g. 06:30 - 07:30 or 6:30 - 11:30)
-                    if re.search(r'\b\d{1,2}[:.]\d{2}\s*[-–]\s*\d{1,2}[:.]\d{2}\b', sval):
+                    if re.search(r'\b\d{1,2}[:.]\d{2}\s*[--]\s*\d{1,2}[:.]\d{2}\b', sval):
                         scores[EntityType.CLASS_SCHEDULE] += 25
                         time_slot_found = True
 
@@ -277,7 +277,7 @@ class MatrixNormalizer:
     @classmethod
     def parse_time_slot_string(cls, slot_str: str, passed_noon: bool = False):
         clean = str(slot_str or '').strip().replace(';', ':')
-        m = re.search(r'(\d{1,2}[:.]\d{2})\s*(am|pm)?\s*[-–—]\s*(\d{1,2}[:.]\d{2})\s*(am|pm)?', clean, re.IGNORECASE)
+        m = re.search(r'(\d{1,2}[:.]\d{2})\s*(am|pm)?\s*[---]\s*(\d{1,2}[:.]\d{2})\s*(am|pm)?', clean, re.IGNORECASE)
         if not m:
             return None, None, passed_noon
         
@@ -326,7 +326,7 @@ class MatrixNormalizer:
         for r in range(1, max_r + 1):
             for c in range(1, 4):
                 val = str(sheet.cell(row=r, column=c).value or '')
-                if re.search(r'\b\d{1,2}[:.]\d{2}\s*[-–]\s*\d{1,2}[:.]\d{2}\b', val):
+                if re.search(r'\b\d{1,2}[:.]\d{2}\s*[--]\s*\d{1,2}[:.]\d{2}\b', val):
                     time_slot_count += 1
         return time_slot_count >= 4
 
@@ -364,7 +364,7 @@ class MatrixNormalizer:
             matches = 0
             for r in range(start_row, min(end_row + 1, start_row + 20)):
                 val = str(sheet.cell(row=r, column=c).value or '')
-                if re.search(r'\b\d{1,2}[:.]\d{2}\s*[-–]\s*\d{1,2}[:.]\d{2}\b', val):
+                if re.search(r'\b\d{1,2}[:.]\d{2}\s*[--]\s*\d{1,2}[:.]\d{2}\b', val):
                     matches += 1
             if matches >= 3:
                 time_col = c
@@ -372,7 +372,9 @@ class MatrixNormalizer:
 
         # Scan for branch and room labels above time slots
         col_meta = {}
+        stop_words = {'sweat', 'west', 'east', 'north', 'south', 'studio', 'branch', 'club', 'fitness', 'center', 'gym', 'hq'}
         current_branch = branches_list[0].name if branches_list else "Andheri"
+        current_room = "Pilates"
         for c in range(1, max_c + 1):
             r1 = str(sheet.cell(row=1, column=c).value or '').strip()
             r_sec1 = str(sheet.cell(row=start_row, column=c).value or '').strip()
@@ -384,10 +386,11 @@ class MatrixNormalizer:
             matched_b = None
             if branches_list:
                 for b in branches_list:
-                    tokens = [t.lower() for t in re.split(r'[\s\-_\/]+', b.name) if len(t) >= 3]
+                    tokens = [t.lower() for t in re.split(r'[\s\-_\/]+', b.name) if len(t) >= 3 and t.lower() not in stop_words]
                     if getattr(b, 'code', None):
-                        tokens.append(b.code.lower())
-                    if any(tok in combined for tok in tokens):
+                        code_tokens = [t.lower() for t in re.split(r'[\s\-_\/]+', b.code) if len(t) >= 3 and t.lower() not in stop_words]
+                        tokens.extend(code_tokens)
+                    if tokens and any(tok in combined for tok in tokens):
                         matched_b = b.name
                         break
 
@@ -400,7 +403,11 @@ class MatrixNormalizer:
             elif 'andheri' in combined or 'hq' in combined:
                 current_branch = "Andheri"
 
-            room = "Bootcamp" if 'bootcamp' in combined else "Pilates"
+            if 'bootcamp' in combined:
+                current_room = "Bootcamp"
+            elif 'pilates' in combined:
+                current_room = "Pilates"
+            room = current_room
             
             day_pattern = "MWF"
             if 'tt' in combined:
@@ -430,7 +437,7 @@ class MatrixNormalizer:
                 if not class_val or class_val in ('-', 'Break', 'break'):
                     continue
                 # If cell is itself a time string e.g. '8:00 - 9:00' or '04;30 - 05:00', skip
-                if re.search(r'\b\d{1,2}[:.;]\d{2}\s*[-–—]\s*\d{1,2}[:.;]\d{2}\b', class_val):
+                if re.search(r'\b\d{1,2}[:.;]\d{2}\s*[---]\s*\d{1,2}[:.;]\d{2}\b', class_val):
                     continue
 
                 # Determine correct time for this slot (use weekend column time for SS if available)
@@ -731,15 +738,28 @@ class UniversalImportEngine:
         branches_list = list(Branch.objects.using(db_alias).all())
         templates_list = list(ClassTemplate.objects.using(db_alias).all())
 
+        stop_words = {'sweat', 'west', 'east', 'north', 'south', 'studio', 'branch', 'club', 'fitness', 'center', 'gym', 'hq'}
         def resolve_branch(br_str):
             raw = str(br_str or '').lower().strip()
             for b in branches_list:
-                if raw in b.name.lower() or raw in b.code.lower():
+                if raw == b.name.lower() or raw == b.code.lower():
+                    return b
+            for b in branches_list:
+                tokens = [t.lower() for t in re.split(r'[\s\-_\/]+', b.name) if len(t) >= 3 and t.lower() not in stop_words]
+                if getattr(b, 'code', None):
+                    tokens.extend([t.lower() for t in re.split(r'[\s\-_\/]+', b.code) if len(t) >= 3 and t.lower() not in stop_words])
+                if tokens and any(tok in raw for tok in tokens):
                     return b
             return branches_list[0] if branches_list else None
 
-        def resolve_template(t_str):
+        def resolve_template(t_str, room=None):
             raw = str(t_str or '').lower().strip()
+            if room:
+                for t in templates_list:
+                    cat_name = t.category.name.lower() if getattr(t, 'category', None) else ''
+                    if room.lower() in cat_name or room.lower() in t.name.lower():
+                        if raw in t.name.lower() or raw in t.code.lower():
+                            return t
             for t in templates_list:
                 if raw in t.name.lower() or raw in t.code.lower():
                     return t
@@ -761,7 +781,7 @@ class UniversalImportEngine:
                         messages.append(f"Branch '{mr['branch']}' resolved with fallback.")
 
                     # Resolve template
-                    matched_tpl = resolve_template(mr['class_name'])
+                    matched_tpl = resolve_template(mr['class_name'], room=mr.get('room'))
                     if not matched_tpl:
                         status = 'ERROR'
                         messages.append(f"Class template for '{mr['class_name']}' not found.")
@@ -1056,7 +1076,7 @@ class UniversalImportEngine:
                     t_slot = str(r.get('time_slot') or '')
                     st, et, _ = MatrixNormalizer.parse_time_slot_string(t_slot)
                     if not st or not et:
-                        m = re.search(r'(\d{1,2}:\d{2})\s*[-–]\s*(\d{1,2}:\d{2})', t_slot)
+                        m = re.search(r'(\d{1,2}:\d{2})\s*[--]\s*(\d{1,2}:\d{2})', t_slot)
                         if not m:
                             continue
                         sh, sm = [int(x) for x in m.group(1).split(':')]
@@ -1119,29 +1139,1007 @@ class UniversalImportEngine:
 
             elif entity_type == EntityType.TRAINER_ROSTER:
                 target_tuple = SmartMonthParser.parse_month_string(target_month) or (2026, 11)
-                wb = None
-                if uploaded_file:
-                    try:
-                        content = uploaded_file.read()
-                        uploaded_file.seek(0)
-                        wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
-                    except Exception:
-                        wb = None
-                if not wb:
-                    candidates = [
-                        'backend/media/november_sheets/01_SWEAT_Roster_And_Class_Times_November_2026.xlsx',
-                        'media/november_sheets/01_SWEAT_Roster_And_Class_Times_November_2026.xlsx',
-                    ]
-                    for cand in candidates:
-                        if os.path.exists(cand):
-                            wb = openpyxl.load_workbook(cand, data_only=True)
-                            break
-                if wb:
-                    c_cnt, u_cnt, errs = cls._commit_trainer_roster(wb, org, db_alias, options={}, target_month_tuple=target_tuple)
-                    created_count += c_cnt
-                    updated_count += u_cnt
-                    errors.extend(errs)
+        year, month = target_tuple
 
+        from django.core.exceptions import ValidationError
+        from datetime import timedelta
+
+        # 1. High-Performance Bulk Prefetching & Indexed Lookup
+        all_trainers = list(TrainerProfile.objects.using(db_alias).select_related('employee_profile__user_profile'))
+        trainers_by_id = {str(t.id): t for t in all_trainers}
+        trainers_by_code = {t.trainer_code.lower(): t for t in all_trainers if t.trainer_code}
+        trainers_by_first_name = {}
+        for t in all_trainers:
+            name = (
+                getattr(t, 'first_name_snapshot', '') or
+                (t.employee_profile.user_profile.first_name_snapshot if getattr(t, 'employee_profile', None) and getattr(t.employee_profile, 'user_profile', None) else '') or ''
+            )
+            if name:
+                trainers_by_first_name[name.lower()] = t
+
+        all_occurrences = list(
+            ClassOccurrence.objects.using(db_alias).filter(
+                occurrence_date__year=year,
+                occurrence_date__month=month,
+            )
+        )
+
+        # Precompute timezone times & bucket by (branch_id, day) for instant O(1) lookups
+        occ_by_branch_day = {}
+        for occ in all_occurrences:
+            if not occ.start_at or not occ.end_at:
+                continue
+            occ._calc_time = occ.start_at.astimezone(tz).time()
+            occ._calc_weekday = occ.occurrence_date.isoweekday()
+            key = (str(occ.branch_id), occ.occurrence_date.day)
+            occ_by_branch_day.setdefault(key, []).append(occ)
+
+        existing_cots = list(
+            ClassOccurrenceTrainer.objects.using(db_alias).filter(
+                occurrence__occurrence_date__year=year,
+                occurrence__occurrence_date__month=month,
+            ).select_related('occurrence')
+        )
+        existing_cot_map = {
+            (cot.occurrence_id, cot.trainer_profile_id): cot for cot in existing_cots
+        }
+        # In-memory collision tracker: trainer_id -> list of (start_at, end_at, occ_id)
+        trainer_intervals = {}
+        for cot in existing_cots:
+            if cot.status in ['ASSIGNED', 'CONFIRMED'] and cot.occurrence and cot.occurrence.start_at and cot.occurrence.end_at:
+                trainer_intervals.setdefault(cot.trainer_profile_id, []).append(
+                    (cot.occurrence.start_at, cot.occurrence.end_at, cot.occurrence_id)
+                )
+
+        cots_to_create = []
+        cots_to_update = []
+        seen_creates = set()
+
+        with transaction.atomic(using=db_alias):
+            for s in shifts:
+                if s.get('status') == 'DELETED':
+                    continue
+
+                branch_id = str(s.get('branch_id') or '')
+                trainer_id = str(s.get('trainer_id') or '')
+                trainer_code = str(s.get('trainer_code', '')).lower()
+                trainer_display = str(s.get('trainer_name', ''))
+                shift_name = s.get('shift_name', '')
+                shift_lower = shift_name.lower()
+                start_day = s.get('start_day', 1)
+                end_day = s.get('end_day', 31)
+
+                tp = trainers_by_id.get(trainer_id)
+                if not tp and trainer_code:
+                    tp = trainers_by_code.get(trainer_code)
+                if not tp and trainer_display:
+                    first_part = trainer_display.split()[0].strip().lower()
+                    tp = trainers_by_first_name.get(first_part)
+
+                if not tp:
+                    continue
+
+                buffer_min = getattr(tp, 'minimum_schedule_buffer_minutes', 0) or 0
+                buffer_delta = timedelta(minutes=buffer_min)
+                assigned_list = trainer_intervals.setdefault(tp.id, [])
+
+                # Scan ONLY occurrences belonging to this exact branch and this week's days
+                for d in range(start_day, end_day + 1):
+                    day_classes = occ_by_branch_day.get((branch_id, d), [])
+                    for occ in day_classes:
+                        occ_time = occ._calc_time
+                        weekday = occ._calc_weekday
+
+                        if 'morning' in shift_lower:
+                            if not (occ_time < datetime.time(13, 30) and weekday < 6):
+                                continue
+                        elif 'evening' in shift_lower:
+                            if not (occ_time >= datetime.time(13, 30) and weekday < 6):
+                                continue
+                        elif 'sunday' in shift_lower:
+                            if weekday != 7:
+                                continue
+                        elif 'saturday' in shift_lower:
+                            if weekday != 6:
+                                continue
+
+                        # In-memory overlap check
+                        target_start = occ.start_at - buffer_delta
+                        target_end = occ.end_at + buffer_delta
+                        has_overlap = any(
+                            (iv_start < target_end and iv_end > target_start and iv_occ_id != occ.id)
+                            for iv_start, iv_end, iv_occ_id in assigned_list
+                        )
+                        if has_overlap:
+                            continue
+
+                        key = (occ.id, tp.id)
+                        existing_cot = existing_cot_map.get(key)
+                        if not existing_cot:
+                            if key not in seen_creates:
+                                seen_creates.add(key)
+                                new_cot = ClassOccurrenceTrainer(
+                                    occurrence=occ,
+                                    trainer_profile=tp,
+                                    trainer_role='LEAD',
+                                    status='CONFIRMED',
+                                    assigned_by_user=user,
+                                )
+                                cots_to_create.append(new_cot)
+                                assigned_list.append((occ.start_at, occ.end_at, occ.id))
+                                created_count += 1
+                        else:
+                            if existing_cot.trainer_role != 'LEAD' or existing_cot.status != 'CONFIRMED':
+                                existing_cot.trainer_role = 'LEAD'
+                                existing_cot.status = 'CONFIRMED'
+                                cots_to_update.append(existing_cot)
+                            updated_count += 1
+
+            if cots_to_create:
+                ClassOccurrenceTrainer.objects.using(db_alias).bulk_create(cots_to_create, batch_size=500, ignore_conflicts=True)
+            if cots_to_update:
+                ClassOccurrenceTrainer.objects.using(db_alias).bulk_update(cots_to_update, ['trainer_role', 'status'], batch_size=500)
+
+        return {
+            'success': len(errors) == 0,
+            'created_count': created_count,
+            'updated_count': updated_count,
+            'errors': errors,
+        }
+
+    @classmethod
+    def simulate_class_occurrences(
+        cls,
+        rules: List[Dict[str, Any]],
+        target_month: Optional[str] = None,
+        org: Optional[Organization] = None,
+        db_alias: str = 'default'
+    ) -> Dict[str, Any]:
+        """
+        Intermediate Phase: Generates concrete calendar ClassOccurrences from curated schedule rules.
+        Intelligently resolves ClassTemplates and Branches, and automatically fetches any 'NA'
+        or unspecified data (capacity, trial capacity, duration, delivery mode, category, room)
+        directly from the matched ClassTemplate.
+        """
+        branches_list = list(Branch.objects.using(db_alias).all())
+        templates_list = list(ClassTemplate.objects.using(db_alias).select_related('category').all())
+
+        branches_by_id = {str(b.id): b for b in branches_list}
+        templates_by_id = {str(t.id): t for t in templates_list}
+
+        stop_words = {'sweat', 'west', 'east', 'north', 'south', 'studio', 'branch', 'club', 'fitness', 'center', 'gym', 'hq'}
+        def resolve_branch(br_str, br_id=None):
+            if br_id and str(br_id) in branches_by_id:
+                return branches_by_id[str(br_id)]
+            raw = str(br_str or '').lower().strip()
+            for b in branches_list:
+                if raw == b.name.lower() or raw == b.code.lower():
+                    return b
+            for b in branches_list:
+                tokens = [t.lower() for t in re.split(r'[\s\-_\/]+', b.name) if len(t) >= 3 and t.lower() not in stop_words]
+                if getattr(b, 'code', None):
+                    tokens.extend([t.lower() for t in re.split(r'[\s\-_\/]+', b.code) if len(t) >= 3 and t.lower() not in stop_words])
+                if tokens and any(tok in raw for tok in tokens):
+                    return b
+            return branches_list[0] if branches_list else None
+
+        def resolve_template(t_str, t_id=None, room=None):
+            if t_id and str(t_id) in templates_by_id:
+                return templates_by_id[str(t_id)]
+            raw = str(t_str or '').lower().strip()
+            for t in templates_list:
+                if raw == t.name.lower() or raw == t.code.lower():
+                    return t
+            if room:
+                for t in templates_list:
+                    cat_name = t.category.name.lower() if getattr(t, 'category', None) else ''
+                    if room.lower() in cat_name or room.lower() in t.name.lower():
+                        if raw in t.name.lower() or raw in t.code.lower():
+                            return t
+            if 'stretch' in raw:
+                for t in templates_list:
+                    if 'stretch' in t.code.lower() or 'stretch' in t.name.lower():
+                        return t
+            if 'athletic' in raw:
+                for t in templates_list:
+                    if 'athletic' in t.code.lower() or 'athletic' in t.name.lower():
+                        return t
+            if 'bootcamp' in raw:
+                for t in templates_list:
+                    if 'bootcamp' in t.code.lower() or 'bootcamp' in t.name.lower():
+                        return t
+            if 'total' in raw:
+                for t in templates_list:
+                    if 'total' in t.code.lower() or 'total' in t.name.lower():
+                        return t
+            return templates_list[0] if templates_list else None
+
+        target_tuple = SmartMonthParser.parse_month_string(target_month) or (2026, 11)
+        year, month = target_tuple
+        num_days = calendar.monthrange(year, month)[1]
+        month_label = f"{calendar.month_name[month]} {year}"
+
+        occurrences = []
+        total_na_fields_filled = 0
+        seen_occurrence_keys = set()
+
+        # Query existing occurrences from DB for target month to prevent duplicates
+        existing_db_keys = set()
+        try:
+            from .models import ClassOccurrence
+            existing_occs = ClassOccurrence.objects.using(db_alias).filter(
+                occurrence_date__year=year,
+                occurrence_date__month=month
+            ).values_list('occurrence_date', 'start_at', 'branch_id')
+            for ed, sa, bid in existing_occs:
+                existing_db_keys.add((ed, sa.time().replace(second=0, microsecond=0), str(bid)))
+        except Exception:
+            pass
+
+        for r in rules:
+            if r.get('status') == 'ERROR':
+                continue
+            matched_branch = resolve_branch(r.get('branch'), r.get('branch_id'))
+            matched_tpl = resolve_template(r.get('class_type') or r.get('class_name'), r.get('template_id'), room=r.get('room'))
+            if not matched_branch or not matched_tpl:
+                continue
+
+            # Time Slot resolution
+            t_slot = str(r.get('time_slot') or '')
+            st, et, _ = MatrixNormalizer.parse_time_slot_string(t_slot)
+            if not st or not et:
+                m = re.search(r'(\d{1,2}:\d{2})\s*[--]\s*(\d{1,2}:\d{2})', t_slot)
+                if m:
+                    sh, sm = [int(x) for x in m.group(1).split(':')]
+                    eh, em = [int(x) for x in m.group(2).split(':')]
+                    st = time(sh, sm)
+                    et = time(eh, em)
+                else:
+                    st = time(6, 30)
+                    dur = matched_tpl.default_duration_minutes or 60
+                    et = (datetime.datetime.combine(datetime.date.today(), st) + timedelta(minutes=dur)).time()
+
+            # Automatic Template Data Fetching for "NA" / unspecified values
+            na_filled = []
+
+            # Capacity
+            raw_cap = r.get('capacity')
+            if raw_cap in (None, '', 'NA', 'na', 'N/A', '-', 0, '0'):
+                cap = matched_tpl.default_capacity or (8 if 'malad' in matched_branch.code.lower() else 12)
+                na_filled.append('Capacity')
+            else:
+                try:
+                    cap = int(raw_cap)
+                except (ValueError, TypeError):
+                    cap = matched_tpl.default_capacity or 12
+                    na_filled.append('Capacity')
+
+            # Trial Capacity
+            raw_trial_cap = r.get('trial_capacity')
+            if raw_trial_cap in (None, '', 'NA', 'na', 'N/A', '-'):
+                trial_cap = matched_tpl.default_trial_capacity or 2
+                na_filled.append('Trial Capacity')
+            else:
+                try:
+                    trial_cap = int(raw_trial_cap)
+                except (ValueError, TypeError):
+                    trial_cap = matched_tpl.default_trial_capacity or 2
+
+            # Waitlist Capacity
+            raw_wait_cap = r.get('waitlist_capacity')
+            if raw_wait_cap in (None, '', 'NA', 'na', 'N/A', '-'):
+                waitlist_cap = matched_tpl.default_waitlist_capacity or 3
+                na_filled.append('Waitlist Capacity')
+            else:
+                try:
+                    waitlist_cap = int(raw_wait_cap)
+                except (ValueError, TypeError):
+                    waitlist_cap = matched_tpl.default_waitlist_capacity or 3
+
+            # Duration & Delivery Mode & Category
+            duration_mins = matched_tpl.default_duration_minutes or 60
+            delivery_mode = matched_tpl.default_delivery_mode or 'OFFLINE'
+            category_name = matched_tpl.category.name if matched_tpl.category else 'Group Fitness'
+
+            # Room resolution
+            raw_room = str(r.get('room') or '').strip()
+            if raw_room in ('', 'NA', 'na', 'N/A', '-', 'None'):
+                if 'pilates' in matched_tpl.name.lower() or 'pilates' in str(r.get('sheet', '')).lower():
+                    room_name = 'Pilates Studio'
+                else:
+                    room_name = 'Bootcamp Room'
+                na_filled.append('Room')
+            else:
+                room_name = raw_room
+
+            total_na_fields_filled += len(na_filled)
+
+            # Date expansion
+            dates_to_generate = []
+            if r.get('date'):
+                p_date = SmartDateParser.parse_date(r.get('date'))
+                if p_date:
+                    dates_to_generate.append(p_date)
+
+            if not dates_to_generate:
+                dp = str(r.get('day_pattern') or '')
+                if dp == 'MWF': days = [1, 3, 5]
+                elif dp == 'TT': days = [2, 4]
+                elif dp == 'SS': days = [6, 7]
+                else: days = [1, 2, 3, 4, 5, 6, 7]
+
+                for d in range(1, num_days + 1):
+                    cur_date = datetime.date(year, month, d)
+                    if cur_date.isoweekday() in days:
+                        dates_to_generate.append(cur_date)
+
+            for cur_date in dates_to_generate:
+                occ_dedup_key = (cur_date, st, et, str(matched_branch.id), room_name.lower())
+                if occ_dedup_key in seen_occurrence_keys:
+                    continue
+                seen_occurrence_keys.add(occ_dedup_key)
+
+                # Check if this exact session already exists in the database
+                already_in_db = (cur_date, st, str(matched_branch.id)) in existing_db_keys
+
+                occ_id = f"sim_{uuid.uuid4().hex[:10]}"
+                occurrences.append({
+                    'id': occ_id,
+                    'date': cur_date.strftime('%Y-%m-%d'),
+                    'date_formatted': cur_date.strftime('%a, %d %b %Y'),
+                    'day_name': cur_date.strftime('%A'),
+                    'start_time': st.strftime('%H:%M'),
+                    'end_time': et.strftime('%H:%M'),
+                    'time_slot': f"{st.strftime('%I:%M %p')} - {et.strftime('%I:%M %p')}",
+                    'class_name': matched_tpl.name,
+                    'template_id': str(matched_tpl.id),
+                    'template_name': matched_tpl.name,
+                    'template_code': matched_tpl.code,
+                    'category_name': category_name,
+                    'branch_id': str(matched_branch.id),
+                    'branch_name': matched_branch.name,
+                    'branch_code': matched_branch.code,
+                    'room': room_name,
+                    'capacity': cap,
+                    'trial_capacity': trial_cap,
+                    'waitlist_capacity': waitlist_cap,
+                    'delivery_mode': delivery_mode,
+                    'duration_minutes': duration_mins,
+                    'status': 'EXISTS_IN_CRM' if already_in_db else 'OPEN',
+                    'already_exists': already_in_db,
+                    'na_fields_filled': na_filled,
+                    'rule_source': f"{r.get('sheet', 'Schedule')} (Row {r.get('row_number', '-')})",
+                })
+
+        # Sort occurrences by date and start_time
+        occurrences.sort(key=lambda x: (x['date'], x['start_time'], x['branch_name']))
+
+        unique_branches = sorted(list({o['branch_name'] for o in occurrences}))
+        unique_templates = sorted(list({o['template_name'] for o in occurrences}))
+
+        available_branches = [
+            {'id': str(b.id), 'name': b.name, 'code': b.code}
+            for b in branches_list
+        ]
+        available_templates = [
+            {
+                'id': str(t.id),
+                'name': t.name,
+                'code': t.code,
+                'category_name': t.category.name if t.category else 'General',
+                'default_capacity': t.default_capacity,
+                'default_trial_capacity': t.default_trial_capacity,
+            }
+            for t in templates_list
+        ]
+
+        return {
+            'summary': {
+                'total_classes': len(occurrences),
+                'month_label': month_label,
+                'year': year,
+                'month': month,
+                'unique_branches_count': len(unique_branches),
+                'unique_templates_count': len(unique_templates),
+                'unique_branches': unique_branches,
+                'unique_templates': unique_templates,
+                'na_fields_filled_count': total_na_fields_filled,
+                'date_range': f"{occurrences[0]['date_formatted']} to {occurrences[-1]['date_formatted']}" if occurrences else "",
+            },
+            'occurrences': occurrences,
+            'unique_branches': unique_branches,
+            'unique_templates': unique_templates,
+            'available_branches': available_branches,
+            'available_templates': available_templates,
+        }
+
+    @classmethod
+    def commit_curated_occurrences(
+        cls,
+        occurrences: List[Dict[str, Any]],
+        org: Organization,
+        db_alias: str,
+        user: Optional[TenantUser] = None,
+    ) -> Dict[str, Any]:
+        """
+        Commits verified and user-curated/edited class occurrences directly to the CRM database.
+        Ensures atomic persistence with parent ClassScheduleRule linking and branch timezone accuracy.
+        """
+        created_count = 0
+        updated_count = 0
+        errors = []
+
+        branches_list = list(Branch.objects.using(db_alias).all())
+        templates_list = list(ClassTemplate.objects.using(db_alias).all())
+
+        branches_by_id = {str(b.id): b for b in branches_list}
+        templates_by_id = {str(t.id): t for t in templates_list}
+
+        import zoneinfo
+
+        with transaction.atomic(using=db_alias):
+            for occ in occurrences:
+                if occ.get('status') == 'DELETED':
+                    continue
+
+                # 1. Resolve Branch
+                branch = branches_by_id.get(str(occ.get('branch_id')))
+                if not branch:
+                    b_name = str(occ.get('branch_name') or occ.get('branch') or '').lower()
+                    for b in branches_list:
+                        if b_name in b.name.lower() or b_name in b.code.lower():
+                            branch = b
+                            break
+                if not branch:
+                    branch = branches_list[0] if branches_list else None
+
+                # 2. Resolve Template
+                template = templates_by_id.get(str(occ.get('template_id')))
+                if not template:
+                    t_name = str(occ.get('template_name') or occ.get('class_name') or '').lower()
+                    for t in templates_list:
+                        if t_name in t.name.lower() or t_name in t.code.lower():
+                            template = t
+                            break
+                if not template:
+                    template = templates_list[0] if templates_list else None
+
+                if not branch or not template:
+                    errors.append(f"Could not resolve branch/template for class on {occ.get('date')}")
+                    continue
+
+                # 3. Parse Date & Times
+                try:
+                    occ_date = SmartDateParser.parse_date(occ.get('date'))
+                    if not occ_date:
+                        continue
+
+                    st_str = occ.get('start_time') or '06:30'
+                    et_str = occ.get('end_time') or '07:30'
+
+                    sh, sm = [int(x) for x in st_str.split(':')]
+                    eh, em = [int(x) for x in et_str.split(':')]
+                    st = time(sh, sm)
+                    et = time(eh, em)
+
+                    branch_tz = zoneinfo.ZoneInfo(getattr(branch, 'timezone', None) or 'Asia/Kolkata')
+                    start_aware = timezone.make_aware(datetime.datetime.combine(occ_date, st), timezone=branch_tz)
+                    end_aware = timezone.make_aware(datetime.datetime.combine(occ_date, et), timezone=branch_tz)
+                except Exception as ex:
+                    errors.append(f"Invalid date/time for class on {occ.get('date')}: {str(ex)}")
+                    continue
+
+                cap = int(occ.get('capacity') or template.default_capacity or 12)
+                trial_cap = int(occ.get('trial_capacity') or template.default_trial_capacity or 2)
+                wait_cap = int(occ.get('waitlist_capacity') or template.default_waitlist_capacity or 5)
+                delivery_mode = occ.get('delivery_mode') or template.default_delivery_mode or 'OFFLINE'
+
+                # 4. Link or Create ClassScheduleRule (safely avoid MultipleObjectsReturned)
+                weekday = occ_date.isoweekday()
+                rule = ClassScheduleRule.objects.using(db_alias).filter(
+                    branch=branch,
+                    class_template=template,
+                    start_time=st,
+                    end_time=et,
+                    days_of_week__contains=[weekday]
+                ).first()
+                if not rule:
+                    rule = ClassScheduleRule.objects.using(db_alias).filter(
+                        branch=branch,
+                        class_template=template,
+                        start_time=st,
+                        end_time=et
+                    ).first()
+                if not rule:
+                    rule = ClassScheduleRule.objects.using(db_alias).create(
+                        branch=branch,
+                        class_template=template,
+                        start_time=st,
+                        end_time=et,
+                        days_of_week=[weekday],
+                        delivery_mode=delivery_mode,
+                        valid_from=occ_date,
+                        status='ACTIVE',
+                    )
+
+                # 5. Create or Update ClassOccurrence
+                occ_item = ClassOccurrence.objects.using(db_alias).filter(
+                    branch=branch,
+                    class_template=template,
+                    occurrence_date=occ_date,
+                    start_at=start_aware
+                ).first()
+
+                if not occ_item:
+                    ClassOccurrence.objects.using(db_alias).create(
+                        branch=branch,
+                        class_template=template,
+                        occurrence_date=occ_date,
+                        start_at=start_aware,
+                        schedule_rule=rule,
+                        end_at=end_aware,
+                        capacity=cap,
+                        trial_capacity=trial_cap,
+                        waitlist_capacity=wait_cap,
+                        delivery_mode=delivery_mode,
+                        status='OPEN',
+                    )
+                    created_count += 1
+                else:
+                    occ_item.schedule_rule = rule
+                    occ_item.end_at = end_aware
+                    occ_item.capacity = cap
+                    occ_item.trial_capacity = trial_cap
+                    occ_item.waitlist_capacity = wait_cap
+                    occ_item.delivery_mode = delivery_mode
+                    occ_item.status = 'OPEN'
+                    occ_item.save(using=db_alias)
+                    updated_count += 1
+
+        return {
+            'success': len(errors) == 0,
+            'created_count': created_count,
+            'updated_count': updated_count,
+            'errors': errors,
+        }
+
+    @classmethod
+    def simulate_trainer_shifts(
+        cls,
+        rows: List[Dict[str, Any]],
+        target_month: Optional[str] = None,
+        org: Optional[Organization] = None,
+        db_alias: str = 'default'
+    ) -> Dict[str, Any]:
+        """
+        Intermediate Phase for Trainer Shift Rosters:
+        Simulates concrete trainer shift assignments before publishing.
+        Intelligently resolves TrainerProfile and Branch entities,
+        and automatically populates missing/"NA" attributes (shift hours, role, buffer, trainer codes)
+        from CRM staff directories and branch profiles.
+        Prevents duplicate shift assignments within the batch and checks against existing CRM records.
+        """
+        from .models_org import Branch
+        from .models import TrainerProfile, ClassOccurrenceTrainer
+
+        branches_list = list(Branch.objects.using(db_alias).all())
+        trainers_list = list(TrainerProfile.objects.using(db_alias).all().select_related('employee_profile'))
+
+        stop_words = {'sweat', 'fitness', 'west', 'east', 'north', 'south', 'studio', 'branch', 'club', 'center', 'gym', 'hq'}
+
+        def resolve_branch(br_str):
+            raw = str(br_str or '').lower().strip()
+            for b in branches_list:
+                if raw == b.name.lower() or raw == b.code.lower():
+                    return b
+            for b in branches_list:
+                tokens = [t.lower() for t in re.split(r'[\s\-_\/]+', b.name) if len(t) >= 3 and t.lower() not in stop_words]
+                if getattr(b, 'code', None):
+                    tokens.extend([t.lower() for t in re.split(r'[\s\-_\/]+', b.code) if len(t) >= 3 and t.lower() not in stop_words])
+                if tokens and any(tok in raw for tok in tokens):
+                    return b
+            return branches_list[0] if branches_list else None
+
+        # Build comprehensive trainer name mapping
+        name_map = {}
+        for tp in trainers_list:
+            name_map[tp.trainer_code.lower()] = tp
+            ep = getattr(tp, 'employee_profile', None)
+            up = getattr(ep, 'user_profile', None) if ep else None
+            if up:
+                fn = (getattr(up, 'first_name_snapshot', '') or '').strip().lower()
+                ln = (getattr(up, 'last_name_snapshot', '') or '').strip().lower()
+                if fn: name_map[fn] = tp
+                if ln: name_map[ln] = tp
+                if fn and ln: name_map[f"{fn} {ln}"] = tp
+                try:
+                    u = getattr(up, 'user', None)
+                    if u and u.full_name:
+                        name_map[u.full_name.strip().lower()] = tp
+                        for part in u.full_name.strip().lower().split():
+                            if len(part) > 2:
+                                name_map[part] = tp
+                except Exception:
+                    pass
+
+        # Aliases / typos
+        for alias, canon in [('saaed', 'saeed'), ('vincet', 'vincent'), ('muzaifa', 'muzalfa'), ('sheena', 'sheana')]:
+            if canon in name_map:
+                name_map[alias] = name_map[canon]
+
+        def resolve_trainer(t_name):
+            clean = t_name.strip().lower()
+            if clean in name_map:
+                return name_map[clean]
+            for k, tp in name_map.items():
+                if clean in k or k in clean:
+                    return tp
+            return None
+
+        target_tuple = SmartMonthParser.parse_month_string(target_month) or (2026, 11)
+        year, month = target_tuple
+        month_label = f"{calendar.month_name[month]} {year}"
+
+        shifts = []
+        total_na_fields_filled = 0
+        seen_shift_keys = set()
+
+        # Query existing ClassOccurrenceTrainer in DB for target month to mark duplicates
+        existing_trainer_occ_keys = set()
+        try:
+            existing_records = ClassOccurrenceTrainer.objects.using(db_alias).filter(
+                occurrence__occurrence_date__year=year,
+                occurrence__occurrence_date__month=month
+            ).values_list('trainer_profile_id', 'occurrence__occurrence_date', 'occurrence__branch_id')
+            for tid, odate, obid in existing_records:
+                existing_trainer_occ_keys.add((str(tid), odate.strftime('%Y-%m-%d'), str(obid)))
+        except Exception:
+            pass
+
+        for r in rows:
+            if r.get('status') == 'ERROR':
+                continue
+
+            raw_outlet = r.get('outlet') or ''
+            raw_shift = r.get('shift') or ''
+            week_col = r.get('week_column') or ''
+            trainer_raw = r.get('trainer_name') or ''
+
+            matched_branch = resolve_branch(raw_outlet)
+            if not matched_branch:
+                continue
+
+            # Parse shift times & hours
+            na_filled = []
+            shift_lower = raw_shift.lower()
+            if 'morning' in shift_lower:
+                shift_name = 'Morning Shift'
+                start_time_str = '06:30'
+                end_time_str = '13:30'
+                time_slot = '06:30 AM - 01:30 PM'
+                duration_hours = 7.0
+            elif 'evening' in shift_lower:
+                shift_name = 'Evening Shift'
+                start_time_str = '13:30'
+                end_time_str = '22:30'
+                time_slot = '01:30 PM - 10:30 PM'
+                duration_hours = 9.0
+            elif 'sunday' in shift_lower:
+                shift_name = 'Weekend Sunday Roster'
+                start_time_str = '08:00'
+                end_time_str = '18:00'
+                time_slot = '08:00 AM - 06:00 PM'
+                duration_hours = 10.0
+            else:
+                shift_name = 'Weekend Saturday Roster'
+                start_time_str = '08:00'
+                end_time_str = '18:00'
+                time_slot = '08:00 AM - 06:00 PM'
+                duration_hours = 10.0
+
+            na_filled.append('Shift Hours')
+            na_filled.append('Branch')
+            na_filled.append('Lead Role')
+
+            # Parse week date range
+            date_label = week_col
+            m_week = re.search(r'(\d{1,2})\s*to\s*(\d{1,2})', week_col)
+            start_day = 1
+            end_day = 7
+            if m_week:
+                start_day = int(m_week.group(1))
+                end_day = int(m_week.group(2))
+                date_label = f"{start_day:02d} {calendar.month_abbr[month]} - {end_day:02d} {calendar.month_abbr[month]} {year}"
+
+            # Split individual trainers
+            individual_trainers = [n.strip() for n in re.split(r'[,|&/]', trainer_raw) if n.strip() and n.strip().lower() not in ('-', 'off')]
+
+            for t_raw_name in individual_trainers:
+                matched_tp = resolve_trainer(t_raw_name)
+                if matched_tp:
+                    trainer_id = str(matched_tp.id)
+                    trainer_code = matched_tp.trainer_code
+                    trainer_display = t_raw_name.title()
+                    try:
+                        ep = getattr(matched_tp, 'employee_profile', None)
+                        up = getattr(ep, 'user_profile', None) if ep else None
+                        if up:
+                            fn = (getattr(up, 'first_name_snapshot', '') or '').strip()
+                            ln = (getattr(up, 'last_name_snapshot', '') or '').strip()
+                            if fn or ln:
+                                trainer_display = f"{fn} {ln}".strip()
+                            try:
+                                u = getattr(up, 'user', None)
+                                if u and u.full_name:
+                                    trainer_display = u.full_name.strip()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                else:
+                    trainer_id = f"custom_{slugify(t_raw_name)}"
+                    trainer_code = f"TRN-{t_raw_name.upper()[:4]}"
+                    trainer_display = t_raw_name.title()
+
+                na_filled.append('Trainer Code')
+                total_na_fields_filled += len(na_filled)
+
+                # Deduplication key within batch
+                dedup_key = (trainer_id, str(matched_branch.id), shift_name, week_col)
+                if dedup_key in seen_shift_keys:
+                    continue
+                seen_shift_keys.add(dedup_key)
+
+                # Check if trainer is already in DB for this branch and week/date
+                check_key = (trainer_id, f"{year}-{month:02d}-{start_day:02d}", str(matched_branch.id))
+                already_in_db = check_key in existing_trainer_occ_keys
+
+                shift_id = f"shift_{uuid.uuid4().hex[:10]}"
+                shifts.append({
+                    'id': shift_id,
+                    'trainer_id': trainer_id,
+                    'trainer_name': trainer_display,
+                    'trainer_code': trainer_code,
+                    'role': 'Lead Trainer',
+                    'role_code': 'LEAD',
+                    'branch_id': str(matched_branch.id),
+                    'branch_name': matched_branch.name,
+                    'branch_code': matched_branch.code,
+                    'shift_name': shift_name,
+                    'start_time': start_time_str,
+                    'end_time': end_time_str,
+                    'time_slot': time_slot,
+                    'duration_hours': duration_hours,
+                    'week_column': week_col,
+                    'date_label': date_label,
+                    'start_day': start_day,
+                    'end_day': end_day,
+                    'month_label': month_label,
+                    'status': 'EXISTS_IN_CRM' if already_in_db else 'SCHEDULED',
+                    'already_exists': already_in_db,
+                    'na_fields_filled': list(set(na_filled)),
+                    'rule_source': f"{r.get('sheet', '02. Trainer allocation')} (Row {r.get('row_number', '-')})",
+                })
+
+        shifts.sort(key=lambda s: (s['start_day'], s['branch_name'], s['shift_name'], s['trainer_name']))
+
+        unique_branches = sorted(list({s['branch_name'] for s in shifts}))
+        unique_trainers = sorted(list({s['trainer_name'] for s in shifts}))
+        unique_shifts = sorted(list({s['shift_name'] for s in shifts}))
+
+        available_branches = [
+            {'id': str(b.id), 'name': b.name, 'code': b.code}
+            for b in branches_list
+        ]
+        available_trainers = []
+        for tp in trainers_list:
+            t_name = tp.trainer_code
+            try:
+                ep = getattr(tp, 'employee_profile', None)
+                up = getattr(ep, 'user_profile', None) if ep else None
+                if up:
+                    fn = (getattr(up, 'first_name_snapshot', '') or '').strip()
+                    ln = (getattr(up, 'last_name_snapshot', '') or '').strip()
+                    if fn or ln:
+                        t_name = f"{fn} {ln}".strip()
+                    try:
+                        u = getattr(up, 'user', None)
+                        if u and u.full_name:
+                            t_name = u.full_name.strip()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            available_trainers.append({
+                'id': str(tp.id),
+                'name': t_name,
+                'trainer_code': tp.trainer_code,
+            })
+
+        return {
+            'summary': {
+                'total_shifts': len(shifts),
+                'month_label': month_label,
+                'year': year,
+                'month': month,
+                'unique_branches_count': len(unique_branches),
+                'unique_trainers_count': len(unique_trainers),
+                'unique_branches': unique_branches,
+                'unique_trainers': unique_trainers,
+                'unique_shifts': unique_shifts,
+                'na_fields_filled_count': total_na_fields_filled,
+                'date_range': f"{shifts[0]['date_label']} to {shifts[-1]['date_label']}" if shifts else "",
+            },
+            'shifts': shifts,
+            'unique_branches': unique_branches,
+            'unique_trainers': unique_trainers,
+            'unique_shifts': unique_shifts,
+            'available_branches': available_branches,
+            'available_trainers': available_trainers,
+        }
+
+    @classmethod
+    def commit_curated_trainer_shifts(
+        cls,
+        shifts: List[Dict[str, Any]],
+        org: Organization,
+        db_alias: str,
+        user: Optional[TenantUser] = None,
+        target_month: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Commits verified and user-curated trainer shift assignments directly to the CRM database.
+        Atomically allocates trainers to matching class occurrences in ClassOccurrenceTrainer.
+        Guarantees no duplicate assignments with ultra-fast in-memory indexing.
+        """
+        created_count = 0
+        updated_count = 0
+        errors = []
+
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo('Asia/Kolkata')
+        from .models import TrainerProfile, ClassOccurrence, ClassOccurrenceTrainer
+        from django.core.exceptions import ValidationError
+        from datetime import timedelta
+
+        target_tuple = SmartMonthParser.parse_month_string(target_month) or (2026, 11)
+        year, month = target_tuple
+
+        # 1. High-Performance Bulk Prefetching & Indexed Lookup
+        all_trainers = list(TrainerProfile.objects.using(db_alias).select_related('employee_profile__user_profile'))
+        trainers_by_id = {str(t.id): t for t in all_trainers}
+        trainers_by_code = {t.trainer_code.lower(): t for t in all_trainers if t.trainer_code}
+        trainers_by_first_name = {}
+        for t in all_trainers:
+            name = (
+                getattr(t, 'first_name_snapshot', '') or
+                (t.employee_profile.user_profile.first_name_snapshot if getattr(t, 'employee_profile', None) and getattr(t.employee_profile, 'user_profile', None) else '') or ''
+            )
+            if name:
+                trainers_by_first_name[name.lower()] = t
+
+        all_occurrences = list(
+            ClassOccurrence.objects.using(db_alias).filter(
+                occurrence_date__year=year,
+                occurrence_date__month=month,
+            )
+        )
+
+        # Precompute timezone times & bucket by (branch_id, day) for instant O(1) lookups
+        occ_by_branch_day = {}
+        for occ in all_occurrences:
+            if not occ.start_at or not occ.end_at:
+                continue
+            occ._calc_time = occ.start_at.astimezone(tz).time()
+            occ._calc_weekday = occ.occurrence_date.isoweekday()
+            key = (str(occ.branch_id), occ.occurrence_date.day)
+            occ_by_branch_day.setdefault(key, []).append(occ)
+
+        existing_cots = list(
+            ClassOccurrenceTrainer.objects.using(db_alias).filter(
+                occurrence__occurrence_date__year=year,
+                occurrence__occurrence_date__month=month,
+            ).select_related('occurrence')
+        )
+        existing_cot_map = {
+            (cot.occurrence_id, cot.trainer_profile_id): cot for cot in existing_cots
+        }
+        # In-memory collision tracker: trainer_id -> list of (start_at, end_at, occ_id)
+        trainer_intervals = {}
+        for cot in existing_cots:
+            if cot.status in ['ASSIGNED', 'CONFIRMED'] and cot.occurrence and cot.occurrence.start_at and cot.occurrence.end_at:
+                trainer_intervals.setdefault(cot.trainer_profile_id, []).append(
+                    (cot.occurrence.start_at, cot.occurrence.end_at, cot.occurrence_id)
+                )
+
+        cots_to_create = []
+        cots_to_update = []
+        seen_creates = set()
+
+        with transaction.atomic(using=db_alias):
+            for s in shifts:
+                if s.get('status') == 'DELETED':
+                    continue
+
+                branch_id = str(s.get('branch_id') or '')
+                trainer_id = str(s.get('trainer_id') or '')
+                trainer_code = str(s.get('trainer_code', '')).lower()
+                trainer_display = str(s.get('trainer_name', ''))
+                shift_name = s.get('shift_name', '')
+                shift_lower = shift_name.lower()
+                start_day = s.get('start_day', 1)
+                end_day = s.get('end_day', 31)
+
+                tp = trainers_by_id.get(trainer_id)
+                if not tp and trainer_code:
+                    tp = trainers_by_code.get(trainer_code)
+                if not tp and trainer_display:
+                    first_part = trainer_display.split()[0].strip().lower()
+                    tp = trainers_by_first_name.get(first_part)
+
+                if not tp:
+                    continue
+
+                buffer_min = getattr(tp, 'minimum_schedule_buffer_minutes', 0) or 0
+                buffer_delta = timedelta(minutes=buffer_min)
+                assigned_list = trainer_intervals.setdefault(tp.id, [])
+
+                # Scan ONLY occurrences belonging to this exact branch and this week's days
+                for d in range(start_day, end_day + 1):
+                    day_classes = occ_by_branch_day.get((branch_id, d), [])
+                    for occ in day_classes:
+                        occ_time = occ._calc_time
+                        weekday = occ._calc_weekday
+
+                        if 'morning' in shift_lower:
+                            if not (occ_time < datetime.time(13, 30) and weekday < 6):
+                                continue
+                        elif 'evening' in shift_lower:
+                            if not (occ_time >= datetime.time(13, 30) and weekday < 6):
+                                continue
+                        elif 'sunday' in shift_lower:
+                            if weekday != 7:
+                                continue
+                        elif 'saturday' in shift_lower:
+                            if weekday != 6:
+                                continue
+
+                        # In-memory overlap check
+                        target_start = occ.start_at - buffer_delta
+                        target_end = occ.end_at + buffer_delta
+                        has_overlap = any(
+                            (iv_start < target_end and iv_end > target_start and iv_occ_id != occ.id)
+                            for iv_start, iv_end, iv_occ_id in assigned_list
+                        )
+                        if has_overlap:
+                            continue
+
+                        key = (occ.id, tp.id)
+                        existing_cot = existing_cot_map.get(key)
+                        if not existing_cot:
+                            if key not in seen_creates:
+                                seen_creates.add(key)
+                                new_cot = ClassOccurrenceTrainer(
+                                    occurrence=occ,
+                                    trainer_profile=tp,
+                                    trainer_role='LEAD',
+                                    status='CONFIRMED',
+                                    assigned_by_user=user,
+                                )
+                                cots_to_create.append(new_cot)
+                                assigned_list.append((occ.start_at, occ.end_at, occ.id))
+                                created_count += 1
+                        else:
+                            if existing_cot.trainer_role != 'LEAD' or existing_cot.status != 'CONFIRMED':
+                                existing_cot.trainer_role = 'LEAD'
+                                existing_cot.status = 'CONFIRMED'
+                                cots_to_update.append(existing_cot)
+                            updated_count += 1
+
+            if cots_to_create:
+                ClassOccurrenceTrainer.objects.using(db_alias).bulk_create(cots_to_create, batch_size=500, ignore_conflicts=True)
+            if cots_to_update:
+                ClassOccurrenceTrainer.objects.using(db_alias).bulk_update(cots_to_update, ['trainer_role', 'status'], batch_size=500)
 
         return {
             'success': len(errors) == 0,

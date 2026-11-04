@@ -1193,17 +1193,27 @@ class RoleViewSet(TenantDBMixin, viewsets.ModelViewSet):
 
     def perform_update(self, serializer):
         instance = serializer.instance
+        old_scope = instance.scope
         if instance.is_system:
             data = self.request.data
             if 'code' in data and data['code'] != instance.code:
                 raise PermissionDenied('System role code is immutable.')
-            if 'scope' in data and data['scope'] != instance.scope:
-                raise PermissionDenied('System role scope is immutable.')
+            # Safeguard root Organization Administrator from being downgraded to branch scope
+            if instance.code == 'ORG_ADMIN' and data.get('scope') and data.get('scope') not in ('ORG', 'ORGANIZATION'):
+                raise PermissionDenied('Organization Administrator role must retain organization-wide scope.')
             if 'is_system' in data and not data['is_system']:
                 raise PermissionDenied('System role flag is immutable.')
             if 'is_active' in data and not data['is_active']:
                 raise PermissionDenied('System roles cannot be deactivated.')
         super().perform_update(serializer)
+
+        # Sync active RoleAssignments if scope changed
+        new_scope = serializer.instance.scope
+        if old_scope != new_scope:
+            db = self.get_db()
+            from .models_rbac import RoleAssignment
+            new_scope_type = 'ORGANIZATION' if new_scope in ('ORG', 'ORGANIZATION') else 'BRANCH'
+            RoleAssignment.objects.using(db).filter(role=serializer.instance, is_active=True).update(scope_type=new_scope_type)
 
     def perform_destroy(self, instance):
         if instance.is_system:
