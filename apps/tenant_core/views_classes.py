@@ -896,6 +896,139 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             }
         }, status=status.HTTP_200_OK)
 
+    @action(detail=True, methods=['post'], url_path='assign-video')
+    def assign_video(self, request, pk=None):
+        """
+        Manually assign or unassign a workout video to/from a ClassOccurrence.
+        Accepts: { 'video_id': '<uuid>' } or { 'video_id': None } to clear.
+        """
+        alias = _get_db(request)
+        org = _get_org(request)
+        try:
+            occurrence = ClassOccurrence.objects.using(alias).get(id=pk)
+        except ClassOccurrence.DoesNotExist:
+            return Response({'error': 'Class occurrence not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        video_id = request.data.get('video_id')
+        from .models_wod import WorkoutContentItem
+        from .models_classes import ClassContentItem, ClassContentAssignment
+
+        if not video_id:
+            # Unassign video
+            ClassContentAssignment.objects.using(alias).filter(occurrence=occurrence).delete()
+            return Response({
+                'success': True,
+                'message': 'Workout video unassigned from class session.',
+                'occurrence_id': str(occurrence.id),
+                'video_id': None,
+            })
+
+        workout_item = WorkoutContentItem.objects.using(alias).filter(id=video_id).first()
+        if not workout_item:
+            return Response({'error': 'Workout video not found in library'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Create or fetch ClassContentItem bridge for this video
+        content_item, _ = ClassContentItem.objects.using(alias).get_or_create(
+            organization=org,
+            external_url=workout_item.video_url,
+            defaults={
+                'title': workout_item.movement_name,
+                'description': workout_item.description,
+                'content_type': 'VIDEO',
+                'status': 'ACTIVE',
+            }
+        )
+
+        assignment, created = ClassContentAssignment.objects.using(alias).update_or_create(
+            occurrence=occurrence,
+            defaults={
+                'content_item': content_item,
+                'assignment_method': 'MANUAL',
+                'assigned_by_user': request.user if hasattr(request, 'user') and request.user.is_authenticated else None,
+                'status': 'ACTIVE',
+            }
+        )
+
+        return Response({
+            'success': True,
+            'message': f'Assigned "{workout_item.movement_name}" to class.',
+            'occurrence_id': str(occurrence.id),
+            'video_id': str(workout_item.id),
+            'video_title': workout_item.movement_name,
+            'video_url': workout_item.video_url,
+            'assignment_id': str(assignment.id),
+        })
+
+    @action(detail=False, methods=['get'], url_path='available-videos')
+    def available_workout_videos(self, request):
+        """
+        Returns active workout videos from the WOD Content Library
+        for selection in class creation and video assignment modals.
+        Supports search, category filtering, and pagination.
+        """
+        import re
+        alias = _get_db(request)
+        org = _get_org(request)
+        from .models_wod import WorkoutContentItem
+
+        qs = WorkoutContentItem.objects.using(alias).filter(
+            status='ACTIVE'
+        ).exclude(video_url='').exclude(video_url__isnull=True).order_by('-shot_date', '-created_at')
+
+        if org:
+            qs = qs.filter(organization=org)
+
+        category = request.query_params.get('category')
+        if category and category != 'ALL':
+            qs = qs.filter(
+                Q(raw_import_data__category_code__icontains=category) |
+                Q(raw_import_data__program__icontains=category) |
+                Q(raw_import_data__sheet__icontains=category) |
+                Q(movement_name__icontains=category)
+            )
+
+        search = request.query_params.get('search')
+        if search:
+            qs = qs.filter(
+                Q(movement_name__icontains=search) |
+                Q(description__icontains=search) |
+                Q(raw_import_data__muscles__icontains=search) |
+                Q(raw_import_data__equipment__icontains=search)
+            )
+
+        limit = int(request.query_params.get('limit', 200))
+        items = list(qs[:limit])
+
+        data = []
+        for itm in items:
+            raw_data = itm.raw_import_data or {}
+            embed_url = ''
+            url = itm.video_url or ''
+            if 'youtu' in url:
+                m_yt = re.search(r'(?:v=|\/embed\/|\/shorts\/|youtu\.be\/|\/v\/)([a-zA-Z0-9_-]{11})', url)
+                if m_yt:
+                    embed_url = f"https://www.youtube-nocookie.com/embed/{m_yt.group(1)}?rel=0&modestbranding=1"
+
+            data.append({
+                'id': str(itm.id),
+                'title': itm.movement_name,
+                'description': itm.description or '',
+                'video_url': itm.video_url,
+                'embed_url': embed_url,
+                'date': str(itm.shot_date or raw_data.get('date') or ''),
+                'category_code': raw_data.get('category_code', ''),
+                'program': raw_data.get('program', ''),
+                'sheet': raw_data.get('sheet', ''),
+                'targeted_muscles': raw_data.get('muscles', ''),
+                'equipment_required': raw_data.get('equipment', ''),
+                'classification_status': itm.classification_status,
+            })
+
+        return Response({
+            'count': len(data),
+            'results': data,
+        })
+
 
 class ClassOccurrenceTrainerViewSet(viewsets.ModelViewSet):
     serializer_class = ClassOccurrenceTrainerSerializer

@@ -2174,6 +2174,299 @@ class UniversalImportEngine:
         }
 
     @classmethod
+    def simulate_workout_videos(
+        cls,
+        rows: List[Dict[str, Any]],
+        target_month: Optional[str] = None,
+        org: Optional[Organization] = None,
+        db_alias: str = 'default'
+    ) -> Dict[str, Any]:
+        """
+        Intermediate Phase for Class Workout Videos:
+        Simulates concrete daily workout videos before publishing.
+        Resolves YouTube embeds, category templates, muscle tags, and detects
+        matching calendar class occurrences for automatic linking.
+        """
+        import uuid
+        import re
+        from .models_wod import WorkoutContentItem
+        from .models_classes import ClassOccurrence, ClassCategory, ClassTemplate
+
+        target_tuple = SmartMonthParser.parse_month_string(target_month) or (2026, 11)
+        year, month = target_tuple
+        month_label = f"{calendar.month_name[month]} {year}"
+
+        videos = []
+        total_auto_links = 0
+        seen_urls = set()
+
+        # Query existing WorkoutContentItem in DB
+        existing_urls = set(
+            WorkoutContentItem.objects.using(db_alias).values_list('video_url', flat=True)
+        )
+
+        for r in rows:
+            if r.get('status') == 'ERROR':
+                continue
+
+            raw_url = str(r.get('video_url') or r.get('url') or '').strip()
+            if not raw_url or raw_url in seen_urls:
+                continue
+            seen_urls.add(raw_url)
+
+            # YouTube embed resolution
+            embed_url = ''
+            m_yt = re.search(r'(?:v=|\/embed\/|\/shorts\/|youtu\.be\/|\/v\/)([a-zA-Z0-9_-]{11})', raw_url)
+            if m_yt:
+                embed_url = f"https://www.youtube-nocookie.com/embed/{m_yt.group(1)}?rel=0&modestbranding=1"
+            else:
+                embed_url = raw_url
+
+            # Date resolution
+            raw_date = r.get('date')
+            p_date = SmartDateParser.parse_date(raw_date)
+            date_str = p_date.strftime('%Y-%m-%d') if p_date else (str(raw_date) if raw_date else '')
+            date_label = p_date.strftime('%a, %d %b %Y') if p_date else (str(raw_date) if raw_date else 'General')
+
+            vol_str = str(r.get('volume') or '').strip()
+            muscle_str = str(r.get('muscle_group') or r.get('targeted_muscles') or '').strip()
+            equip_str = str(r.get('equipment') or r.get('equipment_required') or '').strip()
+            s_title = str(r.get('sheet') or '').strip()
+
+            cat_code, prog_name = cls._resolve_category_and_program(s_title, r.get('category_name') or r.get('program'), db_alias)
+
+            title = r.get('title') or (
+                f"{prog_name} - {vol_str} ({muscle_str})" if vol_str and muscle_str else (
+                    f"{prog_name} - {vol_str}" if vol_str else (
+                        f"{prog_name} - {muscle_str}" if muscle_str else f"{prog_name} Workout Flow"
+                    )
+                )
+            )
+
+            already_exists = raw_url in existing_urls
+
+            # Detect matching ClassOccurrences on this date
+            matching_class_count = 0
+            if p_date:
+                try:
+                    matching_class_count = ClassOccurrence.objects.using(db_alias).filter(
+                        occurrence_date=p_date
+                    ).count()
+                except Exception:
+                    matching_class_count = 0
+
+            total_auto_links += matching_class_count
+
+            video_id = f"wod_{uuid.uuid4().hex[:10]}"
+            videos.append({
+                'id': video_id,
+                'title': title,
+                'video_url': raw_url,
+                'embed_url': embed_url,
+                'date': date_str,
+                'date_label': date_label,
+                'sheet': s_title,
+                'category_code': cat_code,
+                'program_name': prog_name,
+                'volume': vol_str,
+                'targeted_muscles': muscle_str,
+                'equipment_required': equip_str,
+                'auto_link_classes_count': matching_class_count,
+                'already_exists': already_exists,
+                'status': 'Ready',
+                'na_fields_filled': ['Category', 'Targeted Muscles', 'Embed Player URL'],
+            })
+
+        summary = {
+            'target_month': month_label,
+            'total_videos': len(videos),
+            'new_videos': sum(1 for v in videos if not v.get('already_exists')),
+            'existing_videos': sum(1 for v in videos if v.get('already_exists')),
+            'auto_linkable_classes': total_auto_links,
+        }
+
+        return {
+            'videos': videos,
+            'summary': summary,
+        }
+
+    @classmethod
+    def commit_curated_workout_videos(
+        cls,
+        videos: List[Dict[str, Any]],
+        target_month: Optional[str] = None,
+        org: Optional[Organization] = None,
+        db_alias: str = 'default',
+        user=None
+    ) -> Dict[str, Any]:
+        """
+        Commits curated workout videos into WorkoutContentItem, tags,
+        and automatically links them to calendar ClassOccurrences on matching dates.
+        """
+        import re
+        from django.utils.text import slugify
+        from .models_wod import WorkoutContentItem, WorkoutTag, WorkoutContentTag
+        from .models_classes import ClassOccurrence, ClassContentItem, ClassContentAssignment
+
+        created_count = 0
+        updated_count = 0
+        auto_linked_count = 0
+        errors = []
+
+        for v in videos:
+            if v.get('status') == 'DELETED':
+                continue
+
+            url_str = (v.get('video_url') or '').strip()
+            if not url_str:
+                continue
+
+            title = (v.get('title') or '').strip()
+            date_str = v.get('date') or ''
+            p_date = None
+            if date_str:
+                try:
+                    p_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                except Exception:
+                    p_date = None
+
+            prog_name = v.get('program_name') or 'Workout'
+            cat_code = v.get('category_code') or 'GENERAL'
+            vol_str = v.get('volume') or ''
+            muscle_str = v.get('targeted_muscles') or ''
+            equip_str = v.get('equipment_required') or ''
+            s_title = v.get('sheet') or ''
+
+            try:
+                # 1. Create or update WorkoutContentItem
+                item, is_created = WorkoutContentItem.objects.using(db_alias).get_or_create(
+                    organization=org,
+                    video_url=url_str,
+                    defaults={
+                        'movement_name': title or f"{prog_name} Workout",
+                        'description': f"{prog_name} flow targeting {muscle_str}. Equipment: {equip_str or 'None'}.",
+                        'video_provider': 'YOUTUBE',
+                        'content_kind': 'MOVEMENT',
+                        'is_wod_eligible': True,
+                        'classification_status': 'COMPLETE',
+                        'status': 'ACTIVE',
+                        'shot_date': p_date,
+                        'raw_import_data': {
+                            'date': date_str,
+                            'volume': vol_str,
+                            'muscles': muscle_str,
+                            'equipment': equip_str,
+                            'category_code': cat_code,
+                            'sheet': s_title,
+                            'program': prog_name,
+                        }
+                    }
+                )
+
+                if not is_created:
+                    item.movement_name = title or item.movement_name
+                    item.description = f"{prog_name} flow targeting {muscle_str}. Equipment: {equip_str or 'None'}."
+                    item.shot_date = p_date
+                    item.status = 'ACTIVE'
+                    item.raw_import_data = {
+                        'date': date_str,
+                        'volume': vol_str,
+                        'muscles': muscle_str,
+                        'equipment': equip_str,
+                        'category_code': cat_code,
+                        'sheet': s_title,
+                        'program': prog_name,
+                    }
+                    item.save(using=db_alias)
+                    updated_count += 1
+                else:
+                    created_count += 1
+
+                # 2. Attach muscle and equipment tags
+                if equip_str:
+                    for eq_name in [e.strip() for e in re.split(r'[,+/&|]', equip_str) if e.strip()]:
+                        eq_code = slugify(eq_name).upper().replace('-', '_')[:50] or 'EQUIPMENT'
+                        eq_tag, _ = WorkoutTag.objects.using(db_alias).get_or_create(
+                            organization=org,
+                            tag_group='EQUIPMENT',
+                            code=eq_code,
+                            defaults={'name': eq_name.title(), 'status': 'ACTIVE'}
+                        )
+                        WorkoutContentTag.objects.using(db_alias).get_or_create(
+                            organization=org,
+                            content_item=item,
+                            tag=eq_tag,
+                        )
+
+                if muscle_str:
+                    for m_name in [m.strip() for m in re.split(r'[,+/&|]', muscle_str) if m.strip()]:
+                        m_code = slugify(m_name).upper().replace('-', '_')[:50] or 'MUSCLE'
+                        m_tag, _ = WorkoutTag.objects.using(db_alias).get_or_create(
+                            organization=org,
+                            tag_group='MUSCLE_GROUP',
+                            code=m_code,
+                            defaults={'name': m_name.title(), 'status': 'ACTIVE'}
+                        )
+                        WorkoutContentTag.objects.using(db_alias).get_or_create(
+                            organization=org,
+                            content_item=item,
+                            tag=m_tag,
+                        )
+
+                # 3. Automatic Calendar Association:
+                # Find matching ClassOccurrences on this date for this category / template
+                if p_date:
+                    content_bridge, _ = ClassContentItem.objects.using(db_alias).get_or_create(
+                        organization=org,
+                        external_url=url_str,
+                        defaults={
+                            'title': item.movement_name,
+                            'description': item.description,
+                            'content_type': 'VIDEO',
+                            'status': 'ACTIVE',
+                        }
+                    )
+
+                    matching_occs = ClassOccurrence.objects.using(db_alias).filter(
+                        occurrence_date=p_date
+                    )
+                    if org:
+                        matching_occs = matching_occs.filter(class_template__organization=org)
+
+                    matched_list = []
+                    for occ in matching_occs.select_related('class_template', 'class_template__category'):
+                        t_cat = (occ.class_template.category.code or '').upper() if (occ.class_template and occ.class_template.category) else ''
+                        t_name = (occ.class_template.name or '').lower() if occ.class_template else ''
+                        p_lower = prog_name.lower()
+                        s_lower = s_title.lower()
+
+                        if (cat_code and cat_code in t_cat) or (p_lower in t_name) or (s_lower in t_name):
+                            matched_list.append(occ)
+
+                    for matched_occ in matched_list:
+                        ClassContentAssignment.objects.using(db_alias).update_or_create(
+                            occurrence=matched_occ,
+                            defaults={
+                                'content_item': content_bridge,
+                                'assignment_method': 'AUTO_SYNC',
+                                'assigned_by_user': user if (user and hasattr(user, 'is_authenticated') and user.is_authenticated) else None,
+                                'status': 'ACTIVE',
+                            }
+                        )
+                        auto_linked_count += 1
+
+            except Exception as e:
+                errors.append(f"Error on video '{title}': {str(e)}")
+
+        return {
+            'success': len(errors) == 0,
+            'created_count': created_count,
+            'updated_count': updated_count,
+            'auto_linked_count': auto_linked_count,
+            'errors': errors,
+        }
+
+    @classmethod
     def execute_confirmed_import(
         cls,
         file_obj,

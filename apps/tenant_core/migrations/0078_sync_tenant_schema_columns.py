@@ -50,3 +50,4 @@ class Migration(migrations.Migration):
             reverse_sql="-- Irreversible without data drop, no-op"
         ),
     ]
+

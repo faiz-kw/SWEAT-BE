@@ -2,7 +2,11 @@
 Tenant core serializers.
 """
 
+import logging
 from rest_framework import serializers
+
+logger = logging.getLogger(__name__)
+
 from .models_org import Organization, CompanyEntity, Location, Branch
 from .models_users import TenantUser, Department, UserBranch, UserDepartment
 from .models_rbac import Role, RoleAssignment, ModuleCatalog

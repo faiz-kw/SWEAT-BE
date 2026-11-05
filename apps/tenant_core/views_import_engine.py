@@ -207,6 +207,56 @@ class UniversalImportViewSet(viewsets.ViewSet):
 
         return Response(sim_result, status=status.HTTP_200_OK)
 
+    @action(detail=False, methods=['post'], url_path='simulate-workout-videos')
+    def simulate_workout_videos(self, request):
+        """
+        Intermediate CRM Preview Step for Class Workout Videos:
+        Simulates and normalizes daily workout video items before publishing.
+        Resolves YouTube embeds, category templates, muscle tags, and detects
+        matching calendar class occurrences for automatic linking.
+        """
+        alias = _get_db(request)
+        org = _get_org(request)
+        target_month = request.data.get('target_month') or request.data.get('month')
+
+        curated_rows = request.data.get('curated_rows') or request.data.get('rows')
+        if isinstance(curated_rows, str):
+            import json
+            try:
+                curated_rows = json.loads(curated_rows)
+            except Exception:
+                curated_rows = None
+
+        if not curated_rows:
+            uploaded_file = request.FILES.get('file') or request.FILES.get('excel_file')
+            if uploaded_file:
+                preview_result = UniversalImportEngine.process_file_preview(
+                    uploaded_file,
+                    target_entity='WOD_VIDEO',
+                    target_month=target_month,
+                    org=org,
+                    db_alias=alias,
+                )
+                curated_rows = preview_result.get('rows', [])
+
+        if not curated_rows:
+            return Response(
+                {'error': 'No workout video rows provided to simulate.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            result = UniversalImportEngine.simulate_workout_videos(
+                rows=curated_rows,
+                target_month=target_month,
+                org=org,
+                db_alias=alias,
+            )
+            return Response(result, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.error("Failed to simulate workout videos: %s", e, exc_info=True)
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
     @action(detail=False, methods=['post'], url_path='confirm')
     def confirm(self, request):
         uploaded_file = request.FILES.get('file') or request.FILES.get('excel_file')
@@ -226,6 +276,14 @@ class UniversalImportViewSet(viewsets.ViewSet):
             except Exception:
                 curated_trainer_shifts = None
 
+        curated_workout_videos = request.data.get('curated_workout_videos') or request.data.get('videos')
+        if isinstance(curated_workout_videos, str):
+            import json
+            try:
+                curated_workout_videos = json.loads(curated_workout_videos)
+            except Exception:
+                curated_workout_videos = None
+
         curated_rows = request.data.get('curated_rows') or request.data.get('rows')
         if isinstance(curated_rows, str):
             import json
@@ -234,7 +292,7 @@ class UniversalImportViewSet(viewsets.ViewSet):
             except Exception:
                 curated_rows = None
 
-        if not uploaded_file and not curated_occurrences and not curated_rows and not curated_trainer_shifts:
+        if not uploaded_file and not curated_occurrences and not curated_rows and not curated_trainer_shifts and not curated_workout_videos:
             return Response(
                 {'error': 'No file or curated data provided for import confirmation.'},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -242,7 +300,9 @@ class UniversalImportViewSet(viewsets.ViewSet):
 
         entity_type = request.data.get('entity_type') or (
             'CLASS_SCHEDULE' if curated_occurrences else (
-                'TRAINER_ROSTER' if curated_trainer_shifts else None
+                'TRAINER_ROSTER' if curated_trainer_shifts else (
+                    'WOD_VIDEO' if curated_workout_videos else None
+                )
             )
         )
         if not entity_type:
@@ -266,7 +326,15 @@ class UniversalImportViewSet(viewsets.ViewSet):
         user = getattr(request, 'user', None)
 
         try:
-            if curated_trainer_shifts and isinstance(curated_trainer_shifts, list) and len(curated_trainer_shifts) > 0:
+            if curated_workout_videos and isinstance(curated_workout_videos, list) and len(curated_workout_videos) > 0:
+                result = UniversalImportEngine.commit_curated_workout_videos(
+                    videos=curated_workout_videos,
+                    org=org,
+                    db_alias=alias,
+                    user=user,
+                    target_month=target_month,
+                )
+            elif curated_trainer_shifts and isinstance(curated_trainer_shifts, list) and len(curated_trainer_shifts) > 0:
                 result = UniversalImportEngine.commit_curated_trainer_shifts(
                     shifts=curated_trainer_shifts,
                     org=org,
