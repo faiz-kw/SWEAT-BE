@@ -176,6 +176,9 @@ class BookingListSerializer(serializers.ModelSerializer):
     package_name = serializers.CharField(source='membership.package.name', read_only=True, allow_null=True)
     parq_status = serializers.SerializerMethodField()
     attendance_record = serializers.SerializerMethodField()
+    total_sessions = serializers.SerializerMethodField()
+    consumed_sessions = serializers.SerializerMethodField()
+    remaining_sessions = serializers.SerializerMethodField()
 
     class Meta:
         model = Booking
