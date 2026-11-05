@@ -119,7 +119,7 @@ class ClassTemplateSerializer(serializers.ModelSerializer):
             'code', 'name', 'description', 'default_duration_minutes', 'default_capacity',
             'default_trial_capacity', 'default_waitlist_capacity', 'default_delivery_mode',
             'allow_booking', 'allow_trial', 'allow_waitlist', 'allow_reschedule',
-            'min_age', 'max_age', 'status', 'specialty_requirements', 'branch_availabilities', 'created_at', 'updated_at'
+            'min_age', 'max_age', 'image_url', 'status', 'specialty_requirements', 'branch_availabilities', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
         extra_kwargs = {
@@ -127,6 +127,7 @@ class ClassTemplateSerializer(serializers.ModelSerializer):
             'name': {'required': False, 'allow_blank': True},
             'min_age': {'required': False, 'allow_null': True},
             'max_age': {'required': False, 'allow_null': True},
+            'image_url': {'required': False, 'allow_null': True, 'allow_blank': True},
         }
         validators = []
 
@@ -586,7 +587,7 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         start_time = attrs.pop('start_time', None)
         end_time = attrs.pop('end_time', None)
-        occ_date = attrs.get('occurrence_date')
+        occ_date = attrs.get('occurrence_date') or (self.instance.occurrence_date if self.instance else None)
         tpl = attrs.get('class_template') or (self.instance.class_template if self.instance else None)
         branch = attrs.get('branch') or (self.instance.branch if self.instance else None)
 

@@ -794,6 +794,9 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             instructions = getattr(ci, 'description', '') or ''
             movement_title = getattr(ci, 'title', template_name)
 
+        if not video_url and occurrence.online_join_url:
+            video_url = occurrence.online_join_url
+
         # 2. Date-Aware Lookup in WorkoutContentItem (WOD Library)
         workout_item = None
         if not video_url and occ_date_str:
@@ -1037,6 +1040,27 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
         })
 
 
+
+    @action(detail=True, methods=['post', 'patch'], url_path='update-video')
+    def update_video(self, request, pk=None):
+        """
+        Updates or sets the workout video URL attached to this class occurrence.
+        """
+        alias = _get_db(request)
+        try:
+            occurrence = ClassOccurrence.objects.using(alias).get(id=pk)
+        except ClassOccurrence.DoesNotExist:
+            return Response({'error': 'Class occurrence not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        video_url = (request.data.get('video_url') or '').strip()
+        occurrence.online_join_url = video_url
+        occurrence.save(using=alias, update_fields=['online_join_url'])
+
+        return Response({
+            'message': 'Workout video URL updated successfully.',
+            'video_url': video_url,
+            'occurrence_id': str(occurrence.id),
+        }, status=status.HTTP_200_OK)
 
     def destroy(self, request, *args, **kwargs):
         """
