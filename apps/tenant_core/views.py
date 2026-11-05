@@ -854,6 +854,13 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
                     db_alias=db,
                 )
 
+                try:
+                    from apps.master.services_auth_directory import sync_tenant_user_identity
+                    tenant_id = self.get_tenant_id()
+                    sync_tenant_user_identity(instance, tenant_id=tenant_id, db=db)
+                except Exception as sync_e:
+                    logger.warning("Failed to sync updated username for %s: %s", instance.email, sync_e)
+
             if br_obj:
                 instance.home_branch = br_obj
                 instance.save(using=db, update_fields=['home_branch'])

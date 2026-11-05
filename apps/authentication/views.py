@@ -281,29 +281,93 @@ class UniversalLoginView(APIView):
             )
 
         if not tenant_slug:
-            # Blank organization code is exclusively a master-database superadmin login.
+            # 1. Superadmin check in Master DB
             from apps.master.models_iam import PlatformUser
             from django.db.models import Q
             from types import SimpleNamespace
-            user = PlatformUser.objects.using('default').filter(
+            superadmin = PlatformUser.objects.using('default').filter(
                 Q(email__iexact=identifier) | Q(username__iexact=identifier),
                 is_superuser=True,
             ).first()
-            if user:
+            if superadmin:
                 response = self._platform_login(
-                    request, SimpleNamespace(subject_id=user.id), identifier, password,
+                    request, SimpleNamespace(subject_id=superadmin.id), identifier, password,
                 )
                 if response.status_code not in (401, 403):
                     return response
-            else:
-                locked, remaining = check_login_lockout(request, identifier, tenant_id=None)
-                if locked:
-                    return Response({'error': f'Too many failed login attempts. Try again in {remaining} seconds.'}, status=429)
-                record_login_failure(request, identifier, tenant_id=None)
-            return Response({
-                'code': 'organization_required',
-                'error': "Please enter your organization code to sign in. If you don't have a code or your account hasn't been activated, contact your organization administrator.",
-            }, status=status.HTTP_400_BAD_REQUEST)
+
+            # 2. Universal Auth Directory resolution
+            identity = resolve_identity(identifier)
+            if identity:
+                if identity.account_type == 'PLATFORM':
+                    return self._platform_login(request, identity, identifier, password)
+                elif identity.account_type == 'TENANT' and identity.tenant_id:
+                    tenant = Tenant.objects.using('default').filter(id=identity.tenant_id, status='ACTIVE').first()
+                    if tenant:
+                        if identity.status == 'INVITED':
+                            return Response(
+                                {'error': 'Account invitation is pending. Please complete your invitation setup.'},
+                                status=status.HTTP_403_FORBIDDEN,
+                            )
+                        if identity.status in ('INACTIVE', 'SUSPENDED'):
+                            return Response(
+                                {'error': 'Account is inactive. Contact your administrator.'},
+                                status=status.HTTP_403_FORBIDDEN,
+                            )
+                        return self._tenant_login(request, identity, identifier, password, tenant_slug=tenant.slug)
+
+            # 3. Disambiguation check: if multiple tenants share this username, require organization code
+            from apps.master.models_iam import AuthenticationIdentity
+            from apps.master.services_auth_directory import compute_lookup_hash
+            lookup_hash = compute_lookup_hash(identifier)
+            if AuthenticationIdentity.objects.using('default').filter(lookup_hash=lookup_hash).count() > 1:
+                return Response({
+                    'code': 'organization_required',
+                    'error': "Multiple organizations found with this username. Please enter your organization code to sign in.",
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # 4. Default active studio fallback (matches frontend 'Defaults to active studio if left blank')
+            default_tenant = Tenant.objects.using('default').filter(status='ACTIVE').order_by('created_at').first()
+            if default_tenant:
+                tenant = default_tenant
+                tenant_slug = tenant.slug
+                identity = resolve_identity(identifier, account_type='TENANT', tenant_id=tenant.id)
+                if not identity:
+                    try:
+                        db_alias = _register_and_resolve_tenant(tenant)
+                        from apps.tenant_core.models_users import TenantUser
+                        t_user = TenantUser.objects.using(db_alias).filter(
+                            Q(email__iexact=identifier) | Q(username__iexact=identifier)
+                        ).first()
+                        if t_user:
+                            from apps.master.services_auth_directory import sync_tenant_user_identity
+                            sync_tenant_user_identity(t_user, tenant_id=tenant.id, db=db_alias)
+                            identity = resolve_identity(identifier, account_type='TENANT', tenant_id=tenant.id)
+                    except Exception as e:
+                        logger.debug("Default tenant fallback lookup failed: %s", e)
+
+                if identity and identity.account_type == 'TENANT':
+                    if identity.status == 'INVITED':
+                        return Response(
+                            {'error': 'Account invitation is pending. Please complete your invitation setup.'},
+                            status=status.HTTP_403_FORBIDDEN,
+                        )
+                    if identity.status in ('INACTIVE', 'SUSPENDED'):
+                        return Response(
+                            {'error': 'Account is inactive. Contact your administrator.'},
+                            status=status.HTTP_403_FORBIDDEN,
+                        )
+                    return self._tenant_login(request, identity, identifier, password, tenant_slug=tenant_slug)
+
+            # 5. Fail-closed: authentication failure (lockout guarded)
+            locked, remaining = check_login_lockout(request, identifier, tenant_id=None)
+            if locked:
+                return Response({'error': f'Too many failed login attempts. Try again in {remaining} seconds.'}, status=429)
+            record_login_failure(request, identifier, tenant_id=None)
+            return Response(
+                {'error': 'Invalid username/email or password.'},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
 
         from django.db.models import Q as _TenantQ
         tenant = Tenant.objects.using('default').filter(

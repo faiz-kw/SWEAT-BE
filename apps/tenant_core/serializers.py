@@ -516,7 +516,7 @@ class TenantUserSerializer(serializers.ModelSerializer):
 
 
 class TenantUserCreateSerializer(TenantUserSerializer):
-    password = serializers.CharField(write_only=True, required=False, allow_blank=True, default='')
+    password = serializers.CharField(write_only=True, required=False, allow_blank=True, default='', trim_whitespace=False)
     role = serializers.CharField(write_only=True, required=False, allow_blank=True)
     role_id = serializers.CharField(write_only=True, required=False, allow_blank=True)
     department_id = serializers.CharField(write_only=True, required=False, allow_blank=True)
@@ -660,6 +660,27 @@ class TenantUserCreateSerializer(TenantUserSerializer):
                     })
 
             # 5. Create user only after quota check passes
+            # 5. Ensure valid, unique username is present (used as User ID for login)
+            username_val = validated_data.get('username')
+            if not username_val:
+                base_username = (validated_data.get('email') or '').split('@')[0].strip().lower()
+                import re
+                clean_base = re.sub(r'[^a-z0-9_.-]', '', base_username)
+                if len(clean_base) < 3:
+                    fn = re.sub(r'[^a-z0-9]', '', (validated_data.get('first_name') or '').lower())
+                    ln = re.sub(r'[^a-z0-9]', '', (validated_data.get('last_name') or '').lower())
+                    clean_base = f"{fn}.{ln}".strip('.')
+                    if len(clean_base) < 3:
+                        clean_base = f"user.{uuid.uuid4().hex[:6]}"
+                candidate = clean_base
+                counter = 1
+                while TenantUser.objects.using(db_alias).filter(username__iexact=candidate).exists():
+                    candidate = f"{clean_base}{counter}"
+                    counter += 1
+                validated_data['username'] = candidate
+            else:
+                validated_data['username'] = str(username_val).strip().lower()
+
             user = TenantUser(**validated_data)
             if raw_password:
                 user.set_password(raw_password)
@@ -785,6 +806,13 @@ class TenantUserCreateSerializer(TenantUserSerializer):
             if emp_profile.reporting_manager != mgr_emp:
                 emp_profile.reporting_manager = mgr_emp
                 emp_profile.save(using=db_alias, update_fields=['reporting_manager'])
+
+            # Explicitly sync user identity to Universal Authentication Directory in Master DB
+            try:
+                from apps.master.services_auth_directory import sync_tenant_user_identity
+                sync_tenant_user_identity(user, tenant_id=tenant_id, db=db_alias)
+            except Exception as sync_err:
+                logger.warning("Auth directory sync for new user %s: %s", user.email, sync_err)
 
             return user
 
