@@ -1030,6 +1030,43 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
         })
 
 
+
+    def destroy(self, request, *args, **kwargs):
+        """
+        Admin-controlled deletion of a class occurrence slot.
+        Safety checks:
+        1. If active member bookings exist (CONFIRMED, ATTENDED, WAITLISTED), prevents accidental deletion
+           and instructs the admin to cancel/reassign bookings first.
+        2. Cleans up any CANCELLED bookings before deleting occurrence to satisfy PROTECT foreign key.
+        3. Deletes occurrence and returns 204 No Content.
+        """
+        alias = _get_db(request)
+        instance = self.get_object()
+        from .models_bookings import Booking
+        active_bookings_count = Booking.objects.using(alias).filter(
+            occurrence=instance,
+            status__in=['CONFIRMED', 'WAITLISTED', 'ATTENDED']
+        ).count()
+        if active_bookings_count > 0:
+            return Response(
+                {
+                    'detail': f'Cannot delete class slot because it has {active_bookings_count} active booking(s). Please cancel or reassign the bookings first.'
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        try:
+            Booking.objects.using(alias).filter(occurrence=instance).delete()
+            from .models_classes import ClassOccurrenceTrainer
+            ClassOccurrenceTrainer.objects.using(alias).filter(occurrence=instance).delete()
+            instance.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        except Exception as e:
+            return Response(
+                {'detail': f'Failed to delete class slot: {str(e)}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+
 class ClassOccurrenceTrainerViewSet(viewsets.ModelViewSet):
     serializer_class = ClassOccurrenceTrainerSerializer
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
