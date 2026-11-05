@@ -238,7 +238,7 @@ class ClassTemplateViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         alias = _get_db(self.request)
         org = _get_org(self.request)
-        qs = ClassTemplate.objects.using(alias).filter(organization=org)
+        qs = ClassTemplate.objects.using(alias).filter(organization=org).prefetch_related('branch_availabilities', 'branch_availabilities__branch')
         category_id = self.request.query_params.get('category_id')
         if category_id:
             qs = qs.filter(category_id=category_id)
@@ -247,10 +247,47 @@ class ClassTemplateViewSet(viewsets.ModelViewSet):
             qs = qs.filter(status=status_filter)
         return qs.order_by('name')
 
+    def _save_branch_capacities(self, instance, branch_capacities, alias):
+        if not isinstance(branch_capacities, list):
+            return
+        from .models_classes import ClassBranchAvailability
+        from .models_org import Branch
+        for item in branch_capacities:
+            branch_id = item.get('branch_id') or item.get('branch')
+            if not branch_id:
+                continue
+            branch = Branch.objects.using(alias).filter(id=branch_id).first()
+            if not branch:
+                continue
+
+            is_enabled = item.get('is_enabled')
+            status_val = 'DISABLED' if is_enabled is False else item.get('status', 'ENABLED')
+            cap = item.get('capacity_override')
+            trial_cap = item.get('trial_capacity_override')
+            wait_cap = item.get('waitlist_capacity_override')
+
+            cap_val = int(cap) if cap not in (None, '') else None
+            trial_val = int(trial_cap) if trial_cap not in (None, '') else None
+            wait_val = int(wait_cap) if wait_cap not in (None, '') else None
+
+            ClassBranchAvailability.objects.using(alias).update_or_create(
+                class_template=instance,
+                branch=branch,
+                defaults={
+                    'status': status_val,
+                    'capacity_override': cap_val,
+                    'trial_capacity_override': trial_val,
+                    'waitlist_capacity_override': wait_val,
+                }
+            )
+
     def perform_create(self, serializer):
         org = _get_org(self.request)
         instance = serializer.save(organization=org)
         alias = _get_db(self.request)
+        branch_capacities = self.request.data.get('branch_capacities')
+        if branch_capacities:
+            self._save_branch_capacities(instance, branch_capacities, alias)
         record_business_audit(
             organization=org,
             module='classes',
@@ -267,6 +304,9 @@ class ClassTemplateViewSet(viewsets.ModelViewSet):
         instance = serializer.save()
         alias = _get_db(self.request)
         org = _get_org(self.request)
+        branch_capacities = self.request.data.get('branch_capacities')
+        if branch_capacities is not None:
+            self._save_branch_capacities(instance, branch_capacities, alias)
         record_business_audit(
             organization=org,
             module='classes',
