@@ -1880,6 +1880,7 @@ class MemberViewSet(viewsets.ViewSet):
         'available_actions': 'core.users.view',
         'renew': 'core.users.edit',
         'upgrade': 'core.users.edit',
+        'upgrade_options': 'core.users.view',
         'extend': 'core.users.edit',
         'freeze': 'core.users.edit',
         'unfreeze': 'core.users.edit',
@@ -2992,6 +2993,140 @@ class MemberViewSet(viewsets.ViewSet):
                 'member': serialize_member(profile, alias),
             }, status=status.HTTP_201_CREATED)
 
+    @action(detail=True, methods=['get'], url_path='upgrade-options')
+    def upgrade_options(self, request, pk=None):
+        """
+        Returns eligible upgrade packages for a member strictly enforcing the
+        Administration upgrade allowed window policy (e.g. 15 days from 1st purchase).
+        If the member is outside the window, returns empty package list ([]).
+        """
+        alias = _get_db(request)
+        org = _get_org(request)
+        profile = self.get_member_profile(alias, org, pk)
+        active_m = None
+        if not profile:
+            mb = Membership.objects.using(alias).filter(id=pk).select_related('user_profile').first()
+            if mb and mb.user_profile:
+                profile = mb.user_profile
+                active_m = mb
+
+        if not profile:
+            return Response({'detail': 'Member not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if not active_m:
+            membership_id = request.query_params.get('membership_id')
+            if membership_id:
+                active_m = Membership.objects.using(alias).filter(id=membership_id, user_profile=profile).first()
+        if not active_m:
+            active_m = Membership.objects.using(alias).filter(user_profile=profile, status='ACTIVE').order_by('-created_at').first()
+
+        if not active_m:
+            return Response({
+                'is_within_window': False,
+                'reason': 'No active membership found to upgrade.',
+                'packages': [],
+            }, status=status.HTTP_200_OK)
+
+        # 1. Resolve Administration Upgrade Window Policy
+        policy_cfg = MembershipLifecycleService.get_policy_config(org, db_alias=alias)
+        window_days = getattr(policy_cfg, 'upgrade_allowed_window_days', 15) or 15
+
+        # 2. Determine initial purchase / enrollment date (first active package contract)
+        first_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('created_at').first()
+        initial_date = None
+        if first_m:
+            initial_date = first_m.start_date or (first_m.created_at.date() if first_m.created_at else None)
+        if not initial_date:
+            initial_date = active_m.start_date or (active_m.created_at.date() if active_m.created_at else timezone.now().date())
+
+        today = timezone.now().date()
+        days_elapsed = max(0, (today - initial_date).days)
+        is_within_window = (days_elapsed <= window_days)
+
+        # 3. IF OUTSIDE WINDOW -> DO NOT RETURN ANY PACKAGES
+        if not is_within_window:
+            return Response({
+                'is_within_window': False,
+                'window_days': window_days,
+                'days_elapsed': days_elapsed,
+                'initial_purchase_date': initial_date.isoformat(),
+                'message': f"Upgrade window expired. Upgrades by paying only difference are strictly allowed within {window_days} days of 1st package purchase ({days_elapsed} days elapsed since purchase on {initial_date}).",
+                'packages': [],
+            }, status=status.HTTP_200_OK)
+
+        # 4. IF INSIDE WINDOW -> Calculate current sessions and price, return only higher packages
+        cur_sessions = 0
+        if active_m.package_version:
+            cur_sessions = getattr(active_m.package_version, 'max_sessions', None) or getattr(active_m.package_version, 'session_count', None) or 0
+        if not cur_sessions:
+            cur_sessions = active_m.home_sessions_remaining or 36
+
+        cur_price = 0.0
+        if active_m.order_item and active_m.order_item.order:
+            cur_price = float(active_m.order_item.order.total_amount or 0.0)
+        elif active_m.package_version:
+            p_obj = active_m.package_version.prices.using(alias).filter(status='ACTIVE').first()
+            if p_obj:
+                cur_price = float(p_obj.base_price)
+
+        current_prog_id = active_m.package.program_id if (active_m.package and active_m.package.program_id) else None
+        current_prog_name = active_m.package.program.name if (active_m.package and active_m.package.program) else ''
+
+        # Filter candidate packages for higher sessions and price
+        all_pkgs = Package.objects.using(alias).filter(status='ACTIVE').select_related('program')
+        if current_prog_id:
+            all_pkgs = all_pkgs.filter(program_id=current_prog_id)
+
+        candidate_packages = []
+        import re
+        for pkg in all_pkgs:
+            if active_m.package and pkg.id == active_m.package.id:
+                continue
+            ver = pkg.versions.using(alias).filter(status='ACTIVE').order_by('-version_number').first()
+            if not ver:
+                continue
+            p_obj = ver.prices.using(alias).filter(status='ACTIVE').first()
+            if not p_obj:
+                continue
+
+            pkg_price = float(p_obj.base_price)
+            pkg_sessions = getattr(ver, 'max_sessions', None) or getattr(ver, 'session_count', None) or 0
+            if not pkg_sessions:
+                s_match = re.search(r'(\d+)\s*(?:sessions?|sess)?', pkg.name, re.I)
+                if s_match:
+                    pkg_sessions = int(s_match.group(1))
+
+            validity_days = ver.validity_days or ver.total_days or (ver.duration_value if ver.duration_unit == 'DAYS' else 30)
+
+            # Strictly higher session tier & higher price
+            if pkg_sessions > cur_sessions and pkg_price > cur_price:
+                diff = max(0.0, round(pkg_price - cur_price, 2))
+                candidate_packages.append({
+                    'id': str(pkg.id),
+                    'package_id': str(pkg.id),
+                    'package_version_id': str(ver.id),
+                    'name': pkg.name,
+                    'program_name': pkg.program.name if pkg.program else current_prog_name,
+                    'sessions': pkg_sessions,
+                    'price': pkg_price,
+                    'validity_days': validity_days,
+                    'difference_amount': diff,
+                    'extra_sessions': max(0, pkg_sessions - cur_sessions),
+                })
+
+        candidate_packages.sort(key=lambda x: (x['sessions'], x['price']))
+
+        return Response({
+            'is_within_window': True,
+            'window_days': window_days,
+            'days_elapsed': days_elapsed,
+            'days_remaining': max(0, window_days - days_elapsed),
+            'initial_purchase_date': initial_date.isoformat(),
+            'current_sessions': cur_sessions,
+            'current_price': cur_price,
+            'packages': candidate_packages,
+        }, status=status.HTTP_200_OK)
+
     @action(detail=True, methods=['post'], url_path='upgrade')
     def upgrade(self, request, pk=None):
         """
@@ -3018,6 +3153,26 @@ class MemberViewSet(viewsets.ViewSet):
             active_m = Membership.objects.using(alias).filter(user_profile=profile, status='ACTIVE').order_by('-created_at').first()
         if not active_m:
             return Response({'error': 'No active membership to upgrade.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # 1. Enforce Administration Upgrade Window Policy
+        policy_cfg = MembershipLifecycleService.get_policy_config(org, db_alias=alias)
+        window_days = getattr(policy_cfg, 'upgrade_allowed_window_days', 15) or 15
+
+        first_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('created_at').first()
+        initial_date = None
+        if first_m:
+            initial_date = first_m.start_date or (first_m.created_at.date() if first_m.created_at else None)
+        if not initial_date:
+            initial_date = active_m.start_date or (active_m.created_at.date() if active_m.created_at else timezone.now().date())
+
+        days_elapsed = max(0, (timezone.now().date() - initial_date).days)
+        if days_elapsed > window_days:
+            return Response({
+                'error': f'Upgrade window expired. Upgrades by paying the difference are strictly allowed within {window_days} days of 1st package purchase ({days_elapsed} days elapsed).',
+                'code': 'UPGRADE_WINDOW_EXPIRED',
+                'window_days': window_days,
+                'days_elapsed': days_elapsed,
+            }, status=status.HTTP_400_BAD_REQUEST)
 
         target_pkg_id = request.data.get('package_id')
         target_pkg_ver_id = request.data.get('package_version_id')
