@@ -1111,9 +1111,24 @@ class UniversalImportEngine:
                     if target_tuple:
                         year, month = target_tuple
                         num_days = calendar.monthrange(year, month)[1]
-                        cap = matched_tpl.default_capacity or (8 if 'malad' in matched_branch.code.lower() else 12)
-                        trial_cap = matched_tpl.default_trial_capacity or 2
-                        waitlist_cap = matched_tpl.default_waitlist_capacity or 5
+                        branch_avail = ClassBranchAvailability.objects.using(db_alias).filter(
+                            class_template=matched_tpl, branch=matched_branch, status='ENABLED'
+                        ).first()
+                        cap = (
+                            (branch_avail.capacity_override if branch_avail and branch_avail.capacity_override is not None else None)
+                            or matched_tpl.default_capacity
+                            or 12
+                        )
+                        trial_cap = (
+                            (branch_avail.trial_capacity_override if branch_avail and branch_avail.trial_capacity_override is not None else None)
+                            or matched_tpl.default_trial_capacity
+                            or 2
+                        )
+                        waitlist_cap = (
+                            (branch_avail.waitlist_capacity_override if branch_avail and branch_avail.waitlist_capacity_override is not None else None)
+                            or matched_tpl.default_waitlist_capacity
+                            or 5
+                        )
 
                         for d in range(1, num_days + 1):
                             cur_date = datetime.date(year, month, d)
@@ -1404,39 +1419,68 @@ class UniversalImportEngine:
             # Automatic Template Data Fetching for "NA" / unspecified values
             na_filled = []
 
-            # Capacity
+            # Branch-wise availability lookup
+            branch_avail = ClassBranchAvailability.objects.using(db_alias).filter(
+                class_template=matched_tpl, branch=matched_branch, status='ENABLED'
+            ).first()
+
+            # Capacity (branch-override -> template default -> baseline)
             raw_cap = r.get('capacity')
             if raw_cap in (None, '', 'NA', 'na', 'N/A', '-', 0, '0'):
-                cap = matched_tpl.default_capacity or (8 if 'malad' in matched_branch.code.lower() else 12)
+                cap = (
+                    (branch_avail.capacity_override if branch_avail and branch_avail.capacity_override is not None else None)
+                    or matched_tpl.default_capacity
+                    or 12
+                )
                 na_filled.append('Capacity')
             else:
                 try:
                     cap = int(raw_cap)
                 except (ValueError, TypeError):
-                    cap = matched_tpl.default_capacity or 12
+                    cap = (
+                        (branch_avail.capacity_override if branch_avail and branch_avail.capacity_override is not None else None)
+                        or matched_tpl.default_capacity
+                        or 12
+                    )
                     na_filled.append('Capacity')
 
             # Trial Capacity
             raw_trial_cap = r.get('trial_capacity')
             if raw_trial_cap in (None, '', 'NA', 'na', 'N/A', '-'):
-                trial_cap = matched_tpl.default_trial_capacity or 2
+                trial_cap = (
+                    (branch_avail.trial_capacity_override if branch_avail and branch_avail.trial_capacity_override is not None else None)
+                    or matched_tpl.default_trial_capacity
+                    or 2
+                )
                 na_filled.append('Trial Capacity')
             else:
                 try:
                     trial_cap = int(raw_trial_cap)
                 except (ValueError, TypeError):
-                    trial_cap = matched_tpl.default_trial_capacity or 2
+                    trial_cap = (
+                        (branch_avail.trial_capacity_override if branch_avail and branch_avail.trial_capacity_override is not None else None)
+                        or matched_tpl.default_trial_capacity
+                        or 2
+                    )
 
             # Waitlist Capacity
             raw_wait_cap = r.get('waitlist_capacity')
             if raw_wait_cap in (None, '', 'NA', 'na', 'N/A', '-'):
-                waitlist_cap = matched_tpl.default_waitlist_capacity or 3
+                waitlist_cap = (
+                    (branch_avail.waitlist_capacity_override if branch_avail and branch_avail.waitlist_capacity_override is not None else None)
+                    or matched_tpl.default_waitlist_capacity
+                    or 3
+                )
                 na_filled.append('Waitlist Capacity')
             else:
                 try:
                     waitlist_cap = int(raw_wait_cap)
                 except (ValueError, TypeError):
-                    waitlist_cap = matched_tpl.default_waitlist_capacity or 3
+                    waitlist_cap = (
+                        (branch_avail.waitlist_capacity_override if branch_avail and branch_avail.waitlist_capacity_override is not None else None)
+                        or matched_tpl.default_waitlist_capacity
+                        or 3
+                    )
 
             # Duration & Delivery Mode & Category
             duration_mins = matched_tpl.default_duration_minutes or 60

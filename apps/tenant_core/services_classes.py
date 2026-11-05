@@ -209,9 +209,27 @@ class ClassSchedulingService:
         curr = max(from_date, rule.valid_from)
         end = min(to_date, rule.valid_until) if rule.valid_until else to_date
 
-        capacity = rule.capacity_override or rule.class_template.default_capacity
-        trial_cap = rule.trial_capacity_override or rule.class_template.default_trial_capacity
-        wait_cap = rule.waitlist_capacity_override or rule.class_template.default_waitlist_capacity
+        branch_avail = ClassBranchAvailability.objects.using(alias).filter(
+            class_template=rule.class_template,
+            branch=rule.branch,
+            status='ENABLED',
+        ).first()
+
+        capacity = (
+            rule.capacity_override
+            or (branch_avail.capacity_override if branch_avail and branch_avail.capacity_override is not None else None)
+            or rule.class_template.default_capacity
+        )
+        trial_cap = (
+            rule.trial_capacity_override
+            or (branch_avail.trial_capacity_override if branch_avail and branch_avail.trial_capacity_override is not None else None)
+            or rule.class_template.default_trial_capacity
+        )
+        wait_cap = (
+            rule.waitlist_capacity_override
+            or (branch_avail.waitlist_capacity_override if branch_avail and branch_avail.waitlist_capacity_override is not None else None)
+            or rule.class_template.default_waitlist_capacity
+        )
 
         while curr <= end:
             # Python weekday: Mon=0 .. Sun=6, our spec uses 1..7 (Mon=1 .. Sun=7)

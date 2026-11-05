@@ -110,6 +110,7 @@ class ClassTemplateSerializer(serializers.ModelSerializer):
     category_code = serializers.CharField(source='category.code', read_only=True)
     program_name = serializers.CharField(source='program.name', read_only=True)
     specialty_requirements = ClassSpecialtyRequirementSerializer(many=True, read_only=True)
+    branch_availabilities = ClassBranchAvailabilitySerializer(many=True, read_only=True)
 
     class Meta:
         model = ClassTemplate
@@ -118,7 +119,7 @@ class ClassTemplateSerializer(serializers.ModelSerializer):
             'code', 'name', 'description', 'default_duration_minutes', 'default_capacity',
             'default_trial_capacity', 'default_waitlist_capacity', 'default_delivery_mode',
             'allow_booking', 'allow_trial', 'allow_waitlist', 'allow_reschedule',
-            'min_age', 'max_age', 'status', 'specialty_requirements', 'created_at', 'updated_at'
+            'min_age', 'max_age', 'status', 'specialty_requirements', 'branch_availabilities', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
         extra_kwargs = {
@@ -142,6 +143,33 @@ class ClassTemplateSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({'category': 'Please select a Class Name.'})
         return attrs
 
+    def _save_branch_capacities(self, instance):
+        branch_capacities = self.initial_data.get('branch_capacities') or self.initial_data.get('branch_availabilities')
+        if not branch_capacities or not isinstance(branch_capacities, list):
+            return
+        req = self.context.get('request')
+        alias = getattr(getattr(req, 'user', None), '_db_alias', None) or self.context.get('db_alias') or 'default'
+        for b_item in branch_capacities:
+            branch_id = b_item.get('branch_id') or b_item.get('branch')
+            if not branch_id:
+                continue
+            is_enabled = b_item.get('is_enabled', True)
+            status_val = 'ENABLED' if is_enabled and b_item.get('status') != 'DISABLED' else 'DISABLED'
+            cap = b_item.get('capacity_override')
+            trial_cap = b_item.get('trial_capacity_override')
+            wait_cap = b_item.get('waitlist_capacity_override')
+
+            ClassBranchAvailability.objects.using(alias).update_or_create(
+                class_template=instance,
+                branch_id=branch_id,
+                defaults={
+                    'status': status_val,
+                    'capacity_override': int(cap) if cap is not None and str(cap).strip() != '' else None,
+                    'trial_capacity_override': int(trial_cap) if trial_cap is not None and str(trial_cap).strip() != '' else None,
+                    'waitlist_capacity_override': int(wait_cap) if wait_cap is not None and str(wait_cap).strip() != '' else None,
+                }
+            )
+
     def create(self, validated_data):
         if not validated_data.get('name'):
             cat = validated_data.get('category')
@@ -152,14 +180,18 @@ class ClassTemplateSerializer(serializers.ModelSerializer):
             alias = getattr(getattr(req, 'user', None), '_db_alias', None) or self.context.get('db_alias')
             org = validated_data.get('organization') or getattr(req, 'organization', None) or self.context.get('organization')
             validated_data['code'] = _generate_unique_code(ClassTemplate, org, validated_data.get('name', 'CLASS'), db_alias=alias)
-        return super().create(validated_data)
+        instance = super().create(validated_data)
+        self._save_branch_capacities(instance)
+        return instance
 
     def update(self, instance, validated_data):
         if 'code' in validated_data and not validated_data['code']:
             validated_data.pop('code')
         if not validated_data.get('name') and validated_data.get('category'):
             validated_data['name'] = validated_data['category'].name
-        return super().update(instance, validated_data)
+        instance = super().update(instance, validated_data)
+        self._save_branch_capacities(instance)
+        return instance
 
 
 class ClassScheduleRuleSerializer(serializers.ModelSerializer):
@@ -579,12 +611,35 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
             occ_date = start_at.date()
 
         if tpl:
+            branch_avail = None
+            if branch:
+                from .models_classes import ClassBranchAvailability
+                from .context import get_tenant_db_alias
+                alias = get_tenant_db_alias() or getattr(getattr(self.context.get('request'), 'user', None), '_db_alias', None) or self.context.get('db_alias') or 'default'
+                branch_avail = ClassBranchAvailability.objects.using(alias).filter(
+                    class_template=tpl,
+                    branch=branch,
+                    status='ENABLED'
+                ).first()
+
             if attrs.get('capacity') is None:
-                attrs['capacity'] = tpl.default_capacity
+                attrs['capacity'] = (
+                    branch_avail.capacity_override
+                    if branch_avail and branch_avail.capacity_override is not None
+                    else tpl.default_capacity
+                )
             if attrs.get('trial_capacity') is None:
-                attrs['trial_capacity'] = tpl.default_trial_capacity
+                attrs['trial_capacity'] = (
+                    branch_avail.trial_capacity_override
+                    if branch_avail and branch_avail.trial_capacity_override is not None
+                    else tpl.default_trial_capacity
+                )
             if attrs.get('waitlist_capacity') is None:
-                attrs['waitlist_capacity'] = tpl.default_waitlist_capacity
+                attrs['waitlist_capacity'] = (
+                    branch_avail.waitlist_capacity_override
+                    if branch_avail and branch_avail.waitlist_capacity_override is not None
+                    else tpl.default_waitlist_capacity
+                )
             if 'delivery_mode' not in attrs or not attrs.get('delivery_mode'):
                 attrs['delivery_mode'] = tpl.default_delivery_mode
         else:

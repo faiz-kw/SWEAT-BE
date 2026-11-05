@@ -310,7 +310,14 @@ class ClassBranchAvailabilityViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         alias = _get_db(self.request)
-        return ClassBranchAvailability.objects.using(alias).all()
+        qs = ClassBranchAvailability.objects.using(alias).select_related('class_template', 'branch').all()
+        tpl = self.request.query_params.get('class_template') or self.request.query_params.get('template_id')
+        if tpl:
+            qs = qs.filter(class_template_id=tpl)
+        br = self.request.query_params.get('branch') or self.request.query_params.get('branch_id')
+        if br:
+            qs = qs.filter(branch_id=br)
+        return qs
 
 
 class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
