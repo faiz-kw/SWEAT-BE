@@ -1248,7 +1248,7 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
         user = self.get_object()
         db = self.get_db()
 
-        default_frontend = (getattr(settings, 'FRONTEND_URL', None) or os.getenv('FRONTEND_URL', '') or 'http://localhost:5173').rstrip('/')
+        default_frontend = (getattr(settings, 'FRONTEND_URL', None) or os.getenv('FRONTEND_URL', '') or ('http://localhost:5173' if settings.DEBUG else 'https://crm.sweatfitwellness.com')).rstrip('/')
         origin = (request.META.get('HTTP_ORIGIN') or request.META.get('HTTP_REFERER') or default_frontend).rstrip('/')
         parsed_origin = urlparse(origin)
         clean_origin = f"{parsed_origin.scheme}://{parsed_origin.netloc}" if parsed_origin.netloc else default_frontend

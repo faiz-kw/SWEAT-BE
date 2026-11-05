@@ -216,8 +216,8 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LOGIN_REDIRECT_URL = '/admin/'
 LOGOUT_REDIRECT_URL = '/admin/login/'
-FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173')
-BACKEND_PUBLIC_URL = os.getenv('BACKEND_PUBLIC_URL', '').rstrip('/')
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'https://crm.sweatfitwellness.com' if not DEBUG else 'http://localhost:5173')
+BACKEND_PUBLIC_URL = os.getenv('BACKEND_PUBLIC_URL', 'https://api.sweatfitwellness.com' if not DEBUG else 'http://localhost:8000').rstrip('/')
 META_REDIRECT_URI = os.getenv('META_REDIRECT_URI', '').strip()
 PRIVACY_CONTACT_EMAIL = os.getenv('PRIVACY_CONTACT_EMAIL', '').strip()
 

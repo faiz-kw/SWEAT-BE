@@ -90,7 +90,7 @@ def export_leads_to_excel_buffer(leads_qs, db_alias: str, request=None) -> bytes
     backend_public_url = (
         getattr(settings, 'BACKEND_PUBLIC_URL', '')
         or os.getenv('BACKEND_PUBLIC_URL', '')
-        or (request.build_absolute_uri('/') if request else 'http://localhost:8000')
+        or (request.build_absolute_uri('/') if request else ('http://localhost:8000' if settings.DEBUG else 'https://api.sweatfitwellness.com'))
     ).rstrip('/')
 
     rec_cache_dir = os.path.join(settings.BASE_DIR, 'media', 'recordings')
