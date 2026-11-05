@@ -83,7 +83,7 @@ class VobizVoiceAdapter(BaseCommunicationAdapter):
     ) -> ProviderSendResult:
         """
         Dispatches an Agent-First Click-to-Call request via Vobiz Call API.
-        1. Rings Agent's Zoiper SIP endpoint first.
+        1. Rings Agent's Vobiz SIP endpoint first.
         2. When agent answers, Vobiz requests answer_url, which returns XML instructing
            Vobiz to bridge to the customer's phone number with company DID callerId.
         """
@@ -276,7 +276,7 @@ class VobizVoiceAdapter(BaseCommunicationAdapter):
     ) -> str:
         """
         Builds VobizXML for Outbound Click-to-Call.
-        Played when the agent picks up Zoiper: whispers caller info, then dials customer on PSTN.
+        Played when the agent answers Vobiz WebPhone: whispers caller info, then dials customer on PSTN.
         Injects <Record startOnDialAnswer="true"> so the conversation is recorded as soon as customer answers.
         """
         rec_str = "true" if record else "false"

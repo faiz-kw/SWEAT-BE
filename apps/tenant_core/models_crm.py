@@ -1351,7 +1351,7 @@ class CallSession(models.Model):
     # --- HUMAN CALLING & VOBIZ TELEPHONY EXTENSIONS ---
     CALL_MODES = [
         ('AI_AUTOMATED', 'AI Automated (Sarvam)'),
-        ('HUMAN_MANUAL', 'Human Manual (Vobiz/Zoiper)'),
+        ('HUMAN_MANUAL', 'Human Manual (Vobiz WebPhone)'),
     ]
     DISPOSITION_CHOICES = [
         ('TRIAL_BOOKED', 'Trial Booked / Scheduled'),

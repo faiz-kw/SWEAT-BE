@@ -469,7 +469,7 @@ class VobizInboundWebhookView(APIView):
 class VobizInboundFallbackWebhookView(APIView):
     """
     POST /api/v1/telephony/dial-fallback/
-    Triggered if the primary rep's Zoiper returns busy or times out after 15s.
+    Triggered if the primary rep's softphone returns busy or times out after 15s.
     Executes the overflow ladder to secondary reps so calls never drop.
     """
     permission_classes = [permissions.AllowAny]
@@ -801,7 +801,7 @@ class ClickToCallView(APIView):
     POST /api/v1/tenant/crm/telephony/click-to-call/
     Triggered when an agent clicks "Call Lead" inside the CRM.
     Executes Agent-First Bridging:
-    1. Rings Agent's Zoiper SIP endpoint first.
+    1. Rings Agent's Vobiz WebRTC endpoint first.
     2. Once agent picks up, Vobiz fetches agent-answer-bridge XML and dials customer.
     """
     permission_classes = [permissions.IsAuthenticated]
@@ -881,7 +881,7 @@ class ClickToCallView(APIView):
         return Response({
             'call_session_id': str(session.id),
             'status': session.status,
-            'message': 'Ringing your Zoiper softphone. Customer will be bridged on pickup.',
+            'message': 'Dialing customer via Vobiz WebPhone.',
             'agent_sip': agent_sip_uri,
             'masked_phone': masked_phone,
         }, status=status.HTTP_200_OK)
@@ -891,7 +891,7 @@ class ClickToCallView(APIView):
 class AgentAnswerBridgeXmlView(APIView):
     """
     POST /api/v1/telephony/agent-answer-bridge/
-    Fetched by Vobiz the moment the agent answers their Zoiper headset.
+    Fetched by Vobiz the moment the agent answers their Vobiz WebPhone.
     Returns VobizXML: whispers caller context to the agent, then dials the customer.
     """
     permission_classes = [permissions.AllowAny]
