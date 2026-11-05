@@ -4114,13 +4114,33 @@ class MemberViewSet(viewsets.ViewSet):
                 if pr:
                     price_val = float(pr.base_price)
                     currency = pr.currency
-                duration_months = pv.duration_value if pv.duration_value else 1
+                if getattr(pv, 'duration_unit', '') == 'MONTH':
+                    duration_months = pv.duration_value or 1
+                elif getattr(pv, 'duration_unit', '') == 'YEAR':
+                    duration_months = (pv.duration_value or 1) * 12
+                elif getattr(pv, 'duration_unit', '') == 'WEEK':
+                    duration_months = max(1, round((pv.duration_value or 1) / 4))
+                else:  # DAY or fallback
+                    duration_months = max(1, round((pv.duration_value or 30) / 30))
                 validity_days = pv.validity_days or pv.total_days or (duration_months * 30)
 
-            # Extract session count from package name if present
-            s_match = re.search(r'(\d+)\s*session', pkg.name, re.I)
-            if s_match:
-                total_sessions = int(s_match.group(1))
+                # Check entitlement definitions for explicit allocated session units
+                try:
+                    from django.db.models import Sum
+                    ent_sessions = pv.entitlement_definitions.using(alias).filter(
+                        entitlement_type__in=['HOME_BRANCH_SESSION', 'CLASS_SESSION']
+                    ).aggregate(tot=Sum('allocated_units'))['tot']
+                    if ent_sessions and ent_sessions > 0:
+                        total_sessions = int(ent_sessions)
+                except Exception:
+                    pass
+
+            # Extract session count from package name if not found in entitlements:
+            # Matches "Bootcamp - 384 sessions", "Performance 36", "Transform 72", "Transform + 144"
+            if not total_sessions:
+                s_match = re.search(r'(\d+)\s*(?:sessions?|sess)?', pkg.name, re.I)
+                if s_match:
+                    total_sessions = int(s_match.group(1))
 
             prog = pkg.program
             cat_name = prog.category.name if (prog and getattr(prog, 'category', None)) else 'General'
