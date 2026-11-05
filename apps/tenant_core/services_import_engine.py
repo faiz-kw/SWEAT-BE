@@ -1529,11 +1529,16 @@ class UniversalImportEngine:
                 already_in_db = (cur_date, st, str(matched_branch.id)) in existing_db_keys
 
                 occ_id = f"sim_{uuid.uuid4().hex[:10]}"
+                cur_weekday = cur_date.isoweekday()
+                pattern_days = days if ('days' in locals() and cur_weekday in days) else [cur_weekday]
                 occurrences.append({
                     'id': occ_id,
                     'date': cur_date.strftime('%Y-%m-%d'),
                     'date_formatted': cur_date.strftime('%a, %d %b %Y'),
                     'day_name': cur_date.strftime('%A'),
+                    'day_number': cur_weekday,
+                    'day_pattern': dp if ('dp' in locals() and dp) else 'CUSTOM',
+                    'day_pattern_days': pattern_days,
                     'start_time': st.strftime('%H:%M'),
                     'end_time': et.strftime('%H:%M'),
                     'time_slot': f"{st.strftime('%I:%M %p')} - {et.strftime('%I:%M %p')}",
@@ -1680,35 +1685,80 @@ class UniversalImportEngine:
                 wait_cap = int(occ.get('waitlist_capacity') or template.default_waitlist_capacity or 5)
                 delivery_mode = occ.get('delivery_mode') or template.default_delivery_mode or 'OFFLINE'
 
-                # 4. Link or Create ClassScheduleRule (safely avoid MultipleObjectsReturned)
+                # 4. Safe Deletion / Removal Handler (Gap 3 Fix)
+                if occ.get('status') in ('DELETED', 'CANCELLED'):
+                    existing_to_delete = ClassOccurrence.objects.using(db_alias).filter(
+                        branch=branch,
+                        class_template=template,
+                        occurrence_date=occ_date,
+                        start_at=start_aware
+                    ).first()
+                    if existing_to_delete:
+                        has_bookings = existing_to_delete.bookings.filter(
+                            status__in=['CONFIRMED', 'RESERVED', 'ATTENDED', 'BOOKED']
+                        ).exists()
+                        if has_bookings:
+                            existing_to_delete.status = 'CANCELLED'
+                            existing_to_delete.save(using=db_alias)
+                            updated_count += 1
+                        else:
+                            existing_to_delete.delete()
+                    continue
+
+                # 5. Unified ClassScheduleRule generation (Gap 1 Fix - No Fragmented Rules)
                 weekday = occ_date.isoweekday()
+                pattern_days = occ.get('day_pattern_days') or [weekday]
+                if not isinstance(pattern_days, list):
+                    pattern_days = [weekday]
+
+                # Match rule by branch, template, and start_time (tolerant to slight duration differences)
                 rule = ClassScheduleRule.objects.using(db_alias).filter(
                     branch=branch,
                     class_template=template,
-                    start_time=st,
-                    end_time=et,
-                    days_of_week__contains=[weekday]
+                    start_time=st
                 ).first()
-                if not rule:
-                    rule = ClassScheduleRule.objects.using(db_alias).filter(
-                        branch=branch,
-                        class_template=template,
-                        start_time=st,
-                        end_time=et
-                    ).first()
-                if not rule:
+
+                if rule:
+                    existing_days = set(rule.days_of_week or [])
+                    updated_days = sorted(list(existing_days | set(pattern_days)))
+                    rule.days_of_week = updated_days
+                    rule.end_time = et
+                    if not rule.capacity_override:
+                        rule.capacity_override = cap
+                    if not rule.trial_capacity_override:
+                        rule.trial_capacity_override = trial_cap
+                    if not rule.waitlist_capacity_override:
+                        rule.waitlist_capacity_override = wait_cap
+                    rule.save(using=db_alias)
+                else:
                     rule = ClassScheduleRule.objects.using(db_alias).create(
                         branch=branch,
                         class_template=template,
                         start_time=st,
                         end_time=et,
-                        days_of_week=[weekday],
+                        days_of_week=sorted(list(set(pattern_days))),
+                        capacity_override=cap,
+                        trial_capacity_override=trial_cap,
+                        waitlist_capacity_override=wait_cap,
                         delivery_mode=delivery_mode,
                         valid_from=occ_date,
                         status='ACTIVE',
                     )
 
-                # 5. Create or Update ClassOccurrence
+                # 6. Room Collision Detection (Gap 4 Fix)
+                room_val = str(occ.get('room') or '').strip()
+                if room_val:
+                    colliding_occ = ClassOccurrence.objects.using(db_alias).filter(
+                        branch=branch,
+                        occurrence_date=occ_date,
+                        start_at=start_aware
+                    ).exclude(class_template=template).first()
+                    if colliding_occ:
+                        errors.append(
+                            f"Room collision warning on {occ_date} {st_str}: '{template.name}' collides with '{colliding_occ.class_template.name}' in {room_val}."
+                        )
+
+                # 7. Create or Update ClassOccurrence with Active Booking Protection (Gap 2 Fix)
                 occ_item = ClassOccurrence.objects.using(db_alias).filter(
                     branch=branch,
                     class_template=template,
@@ -1732,13 +1782,26 @@ class UniversalImportEngine:
                     )
                     created_count += 1
                 else:
+                    # Protection against overwriting active member bookings
+                    active_bookings_count = 0
+                    try:
+                        active_bookings_count = occ_item.bookings.filter(
+                            status__in=['CONFIRMED', 'RESERVED', 'ATTENDED', 'BOOKED']
+                        ).count()
+                    except Exception:
+                        pass
+
+                    # Never shrink capacity below confirmed bookings
+                    safe_cap = max(cap, active_bookings_count) if active_bookings_count > 0 else cap
+
                     occ_item.schedule_rule = rule
                     occ_item.end_at = end_aware
-                    occ_item.capacity = cap
+                    occ_item.capacity = safe_cap
                     occ_item.trial_capacity = trial_cap
                     occ_item.waitlist_capacity = wait_cap
                     occ_item.delivery_mode = delivery_mode
-                    occ_item.status = 'OPEN'
+                    if occ_item.status != 'CANCELLED':
+                        occ_item.status = 'OPEN'
                     occ_item.save(using=db_alias)
                     updated_count += 1
 
