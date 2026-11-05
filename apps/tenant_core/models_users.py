@@ -234,12 +234,15 @@ class UserDepartmentQuerySet(models.QuerySet):
     def create(self, **kwargs):
         return super().create(**self._translate_kwargs(kwargs))
 
-    def get_or_create(self, **kwargs):
+    def get_or_create(self, *args, **kwargs):
         defaults = kwargs.pop('defaults', None)
+        if args:
+            defaults = args[0]
+            args = args[1:]
         tr_kwargs = self._translate_kwargs(kwargs)
         if defaults:
             tr_kwargs['defaults'] = self._translate_kwargs(defaults)
-        return super().get_or_create(**tr_kwargs)
+        return super().get_or_create(*args, **tr_kwargs)
 
 
 class UserDepartment(models.Model):

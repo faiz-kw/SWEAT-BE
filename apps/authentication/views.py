@@ -1138,6 +1138,25 @@ class MeView(APIView):
                         }
                         for b in all_branches
                     ]
+                else:
+                    from apps.tenant_core.models_users import UserBranch
+                    for ub in UserBranch.objects.using(db_alias).filter(user=tenant_user, is_active=True, status='ACTIVE').select_related('branch', 'branch__location'):
+                        if ub.branch and ub.branch.status == 'ACTIVE':
+                            loc = ub.branch.location
+                            allowed_branches.append({
+                                'id': str(ub.branch.id),
+                                'name': ub.branch.name,
+                                'code': ub.branch.code,
+                                'city': loc.city if loc else '',
+                                'address': ub.branch.address or (loc.area if loc else ''),
+                            })
+                    seen_bids = set()
+                    deduped_branches = []
+                    for ab in allowed_branches:
+                        if ab['id'] not in seen_bids:
+                            seen_bids.add(ab['id'])
+                            deduped_branches.append(ab)
+                    allowed_branches = deduped_branches
 
                 # Fetch permissions granted to user's active roles
                 if role_ids:

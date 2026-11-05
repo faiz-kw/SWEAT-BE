@@ -205,6 +205,7 @@ class TenantUserSerializer(serializers.ModelSerializer):
     is_active = serializers.BooleanField(source='is_accessible', read_only=True)
     reports_to_id = serializers.SerializerMethodField()
     reports_to_name = serializers.SerializerMethodField()
+    assigned_branches = serializers.SerializerMethodField()
 
     class Meta:
         model = TenantUser
@@ -215,7 +216,7 @@ class TenantUserSerializer(serializers.ModelSerializer):
             'last_login_at', 'created_at',
             'full_name', 'role', 'role_name', 'roles', 'branch_access', 'department', 'departments',
             'home_branch_name', 'active_location_name', 'active_location_address', 'active_location_id', 'tenant_id', 'tenant_name', 'is_active',
-            'reports_to_id', 'reports_to_name',
+            'reports_to_id', 'reports_to_name', 'assigned_branches',
         ]
         read_only_fields = ['id', 'last_login_at', 'created_at', 'deactivated_at', 'deactivated_by']
         extra_kwargs = {
@@ -379,6 +380,39 @@ class TenantUserSerializer(serializers.ModelSerializer):
         except Exception:
             return []
 
+    def get_assigned_branches(self, obj):
+        try:
+            db = getattr(getattr(obj, '_state', None), 'db', None) or 'default'
+            from .models_users import UserBranch
+            from .models_rbac import RoleAssignment
+            branches_map = {}
+            for ub in UserBranch.objects.using(db).filter(user=obj, is_active=True, status='ACTIVE').select_related('branch'):
+                if ub.branch:
+                    branches_map[str(ub.branch.id)] = {
+                        'id': str(ub.branch.id),
+                        'name': ub.branch.name,
+                        'code': ub.branch.code,
+                        'is_primary': ub.is_primary or (obj.home_branch_id == ub.branch_id),
+                    }
+            for ra in RoleAssignment.objects.using(db).filter(user=obj, is_active=True).select_related('branch'):
+                if ra.branch and str(ra.branch.id) not in branches_map:
+                    branches_map[str(ra.branch.id)] = {
+                        'id': str(ra.branch.id),
+                        'name': ra.branch.name,
+                        'code': ra.branch.code,
+                        'is_primary': (obj.home_branch_id == ra.branch_id),
+                    }
+            if obj.home_branch and str(obj.home_branch.id) not in branches_map:
+                branches_map[str(obj.home_branch.id)] = {
+                    'id': str(obj.home_branch.id),
+                    'name': obj.home_branch.name,
+                    'code': obj.home_branch.code,
+                    'is_primary': True,
+                }
+            return list(branches_map.values())
+        except Exception:
+            return []
+
     def validate(self, attrs):
         from apps.master.services_auth_directory import check_identifier_available
         subject_id = self.instance.id if self.instance else None
@@ -528,9 +562,12 @@ class TenantUserCreateSerializer(TenantUserSerializer):
     branch_id = serializers.CharField(write_only=True, required=False, allow_blank=True)
     home_branch = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     reports_to_id = serializers.CharField(write_only=True, required=False, allow_blank=True, allow_null=True)
+    branch_ids = serializers.ListField(child=serializers.CharField(), write_only=True, required=False, default=list)
+    primary_branch_id = serializers.CharField(write_only=True, required=False, allow_blank=True, allow_null=True)
+    branch_access = serializers.ListField(child=serializers.DictField(), write_only=True, required=False, default=list)
 
     class Meta(TenantUserSerializer.Meta):
-        fields = TenantUserSerializer.Meta.fields + ['password', 'role', 'role_id', 'department_id', 'branch', 'branch_id', 'reports_to_id']
+        fields = TenantUserSerializer.Meta.fields + ['password', 'role', 'role_id', 'department_id', 'branch', 'branch_id', 'home_branch', 'reports_to_id', 'branch_ids', 'primary_branch_id', 'branch_access']
 
     def validate_password(self, value):
         if not value:
@@ -581,25 +618,59 @@ class TenantUserCreateSerializer(TenantUserSerializer):
         role_id_param = validated_data.pop('role_id', None)
         dept_id_param = validated_data.pop('department_id', None)
         reports_to_id_param = validated_data.pop('reports_to_id', None)
-        # Consume every alias: the frontend sends all three. Short-circuiting
-        # pop() leaves branch_id in the model kwargs and causes a TypeError.
+        
+        branch_ids_param = validated_data.pop('branch_ids', [])
+        primary_branch_param = validated_data.pop('primary_branch_id', None)
+        branch_access_param = validated_data.pop('branch_access', None)
+
         branch_value = validated_data.pop('branch', None)
         branch_id_value = validated_data.pop('branch_id', None)
         home_branch_value = validated_data.pop('home_branch', None)
-        branch_param = branch_value or branch_id_value or home_branch_value
 
-        # Resolve home_branch from branch_param if provided
-        if branch_param:
-            if isinstance(branch_param, Branch):
-                validated_data['home_branch'] = branch_param
+        candidate_branch_ids = []
+        if isinstance(branch_ids_param, list):
+            candidate_branch_ids.extend([str(b) for b in branch_ids_param if b])
+        if isinstance(branch_access_param, list):
+            for entry in branch_access_param:
+                if isinstance(entry, dict) and entry.get('enabled') and entry.get('branch_id'):
+                    candidate_branch_ids.append(str(entry['branch_id']))
+        for b_cand in (branch_value, branch_id_value, home_branch_value):
+            if b_cand and str(b_cand) not in candidate_branch_ids:
+                candidate_branch_ids.append(str(b_cand))
+
+        resolved_branches = []
+        seen_branch_ids = set()
+        for b_ident in candidate_branch_ids:
+            if not b_ident or str(b_ident).lower() in ('none', 'null', 'all', ''):
+                continue
+            b_obj = None
+            if isinstance(b_ident, Branch):
+                b_obj = b_ident
             else:
-                branch_obj = None
                 try:
-                    branch_obj = Branch.objects.using(db_alias).filter(id=uuid.UUID(str(branch_param))).first()
+                    b_obj = Branch.objects.using(db_alias).filter(id=uuid.UUID(str(b_ident))).first()
                 except Exception:
-                    branch_obj = Branch.objects.using(db_alias).filter(name__iexact=str(branch_param)).first()
-                if branch_obj:
-                    validated_data['home_branch'] = branch_obj
+                    b_obj = Branch.objects.using(db_alias).filter(name__iexact=str(b_ident)).first()
+            if b_obj and b_obj.id not in seen_branch_ids:
+                seen_branch_ids.add(b_obj.id)
+                resolved_branches.append(b_obj)
+
+        primary_branch_obj = None
+        if primary_branch_param:
+            try:
+                primary_branch_obj = Branch.objects.using(db_alias).filter(id=uuid.UUID(str(primary_branch_param))).first()
+            except Exception:
+                primary_branch_obj = Branch.objects.using(db_alias).filter(name__iexact=str(primary_branch_param)).first()
+        if not primary_branch_obj and branch_value:
+            for b in resolved_branches:
+                if str(b.id) == str(branch_value) or b.name.lower() == str(branch_value).lower():
+                    primary_branch_obj = b
+                    break
+        if not primary_branch_obj and resolved_branches:
+            primary_branch_obj = resolved_branches[0]
+
+        if primary_branch_obj:
+            validated_data['home_branch'] = primary_branch_obj
 
         # Resolve tenant_id from auth context
         request = self.context.get('request')
@@ -733,16 +804,42 @@ class TenantUserCreateSerializer(TenantUserSerializer):
                     actor = None
 
             if target_role:
-                RoleAssignment.objects.using(db_alias).create(
-                    organization=org,
-                    user=user,
-                    role=target_role,
-                    branch=user.home_branch,
-                    scope_type='BRANCH' if user.home_branch else 'ORGANIZATION',
-                    status='ACTIVE',
-                    is_active=True,
-                    assigned_by=actor,
-                )
+                if target_role.scope == 'ORG':
+                    RoleAssignment.objects.using(db_alias).create(
+                        organization=org,
+                        user=user,
+                        role=target_role,
+                        branch=None,
+                        scope_type='ORGANIZATION',
+                        status='ACTIVE',
+                        is_active=True,
+                        assigned_by=actor,
+                    )
+                else:
+                    branches_to_assign = resolved_branches if resolved_branches else ([user.home_branch] if user.home_branch else [])
+                    if branches_to_assign:
+                        for b in branches_to_assign:
+                            RoleAssignment.objects.using(db_alias).create(
+                                organization=org,
+                                user=user,
+                                role=target_role,
+                                branch=b,
+                                scope_type='BRANCH',
+                                status='ACTIVE',
+                                is_active=True,
+                                assigned_by=actor,
+                            )
+                    else:
+                        RoleAssignment.objects.using(db_alias).create(
+                            organization=org,
+                            user=user,
+                            role=target_role,
+                            branch=None,
+                            scope_type='BRANCH',
+                            status='ACTIVE',
+                            is_active=True,
+                            assigned_by=actor,
+                        )
 
             # 7. Create UserDepartment if specified
             if dept_id_param:
@@ -755,20 +852,30 @@ class TenantUserCreateSerializer(TenantUserSerializer):
                         Department.objects.using(db_alias).filter(name__iexact=str(dept_id_param)).first()
                     )
                 if dept:
-                    UserDepartment.objects.using(db_alias).create(
+                    UserDepartment.objects.using(db_alias).filter(user=user).exclude(department=dept).update(status='INACTIVE', is_primary=False)
+                    UserDepartment.objects.using(db_alias).update_or_create(
                         user=user,
                         department=dept,
-                        is_primary=True,
-                        status='ACTIVE',
+                        defaults={
+                            'is_primary': True,
+                            'status': 'ACTIVE',
+                        }
                     )
 
-            # 8. Create UserBranch if home_branch is set
-            if user.home_branch:
-                UserBranch.objects.using(db_alias).get_or_create(
+            # 8. Create UserBranch records for all assigned branches
+            branches_to_allot = resolved_branches if resolved_branches else ([user.home_branch] if user.home_branch else [])
+            for b in branches_to_allot:
+                is_pri = (b == user.home_branch)
+                UserBranch.objects.using(db_alias).update_or_create(
                     user=user,
-                    branch=user.home_branch,
-                    scope_type='HOME',
-                    defaults={'is_active': True, 'status': 'ACTIVE', 'is_primary': True, 'relationship_type': 'PRIMARY'},
+                    branch=b,
+                    defaults={
+                        'scope_type': 'HOME' if is_pri else 'ADDITIONAL',
+                        'is_primary': is_pri,
+                        'relationship_type': 'PRIMARY' if is_pri else 'SECONDARY',
+                        'status': 'ACTIVE',
+                        'is_active': True,
+                    }
                 )
 
             # 9. Handle Reporting Manager & EmployeeProfile (Optional for non-Org Admin roles)
