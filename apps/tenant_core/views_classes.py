@@ -3,13 +3,14 @@ DRF ViewSets for Layer 2: Module E (Group Classes, Scheduling, Content Studio & 
 """
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.core.exceptions import ValidationError
+from django.db import transaction
 
 
 class ClassesPagination(PageNumberPagination):
@@ -403,6 +404,120 @@ class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
             )
 
         return qs.order_by('start_time', 'id')
+
+    def create(self, request, *args, **kwargs):
+        alias = _get_db(request)
+        branches = request.data.get('branches')
+        auto_generate = request.data.get('generate_slots', True)
+        gen_from = request.data.get('generate_from_date') or request.data.get('valid_from')
+        gen_to = request.data.get('generate_to_date') or request.data.get('valid_until')
+
+        # Multi-branch batch creation
+        if isinstance(branches, list) and len(branches) > 0:
+            if not gen_to and gen_from:
+                try:
+                    from_d = date.fromisoformat(str(gen_from))
+                    gen_to = (from_d + timedelta(days=30)).isoformat()
+                except Exception:
+                    pass
+
+            created_rules = []
+            total_occurrences_count = 0
+
+            with transaction.atomic(using=alias):
+                for branch_id in branches:
+                    data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
+                    data['branch'] = branch_id
+                    data.pop('branches', None)
+                    data.pop('generate_slots', None)
+                    data.pop('generate_from_date', None)
+                    data.pop('generate_to_date', None)
+
+                    serializer = self.get_serializer(data=data)
+                    serializer.is_valid(raise_exception=True)
+                    rule = serializer.save()
+
+                    record_business_audit(
+                        organization=rule.branch.organization,
+                        branch=rule.branch,
+                        module='classes',
+                        action_code='SCHEDULE_RULE_CREATED',
+                        entity_type='ClassScheduleRule',
+                        entity_id=rule.id,
+                        actor_user=request.user,
+                        event_description=f"Created recurring schedule rule for {rule.class_template.name} at {rule.branch.name}",
+                        after_data={
+                            'template_name': rule.class_template.name,
+                            'branch_name': rule.branch.name,
+                            'days': rule.days_of_week,
+                            'time_window': f"{rule.start_time.strftime('%H:%M')} – {rule.end_time.strftime('%H:%M')}",
+                            'status': rule.status,
+                        },
+                        db_alias=alias,
+                    )
+                    created_rules.append(rule)
+
+                    if auto_generate and gen_from and gen_to:
+                        try:
+                            from_d = date.fromisoformat(str(gen_from))
+                            to_d = date.fromisoformat(str(gen_to))
+                            occs = ClassSchedulingService.generate_occurrences_from_rule(
+                                rule=rule,
+                                from_date=from_d,
+                                to_date=to_d,
+                                actor=request.user,
+                                db_alias=alias,
+                            )
+                            total_occurrences_count += len(occs)
+                        except Exception as exc:
+                            logger.warning(f"Failed to generate occurrences for rule {rule.id}: {exc}")
+
+            serialized = self.get_serializer(created_rules, many=True).data
+            return Response({
+                'rules': serialized,
+                'count': len(created_rules),
+                'occurrences_generated': total_occurrences_count,
+            }, status=status.HTTP_201_CREATED)
+
+        # Single branch creation
+        data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
+        data.pop('branches', None)
+        data.pop('generate_slots', None)
+        data.pop('generate_from_date', None)
+        data.pop('generate_to_date', None)
+
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        rule = serializer.instance
+
+        total_occurrences_count = 0
+        if auto_generate and gen_from:
+            if not gen_to:
+                try:
+                    from_d = date.fromisoformat(str(gen_from))
+                    gen_to = (from_d + timedelta(days=30)).isoformat()
+                except Exception:
+                    pass
+            if gen_to:
+                try:
+                    from_d = date.fromisoformat(str(gen_from))
+                    to_d = date.fromisoformat(str(gen_to))
+                    occs = ClassSchedulingService.generate_occurrences_from_rule(
+                        rule=rule,
+                        from_date=from_d,
+                        to_date=to_d,
+                        actor=request.user,
+                        db_alias=alias,
+                    )
+                    total_occurrences_count = len(occs)
+                except Exception as exc:
+                    logger.warning(f"Failed to generate occurrences for rule {rule.id}: {exc}")
+
+        resp_data = serializer.data
+        resp_data['occurrences_generated'] = total_occurrences_count
+        headers = self.get_success_headers(serializer.data)
+        return Response(resp_data, status=status.HTTP_201_CREATED, headers=headers)
 
     def perform_create(self, serializer):
         rule = serializer.save()
