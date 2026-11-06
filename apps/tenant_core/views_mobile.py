@@ -2751,9 +2751,16 @@ class MobileMyCreditsView(APIView):
             'is_enabled': reward_cfg['is_enabled'],
         }
 
+        # Show the member's current plan first: active, then frozen, then the rest.
+        # Within each group, the plan ending latest comes first.
+        status_rank = {'ACTIVE': 0, 'FROZEN': 1}
+        packs.sort(key=lambda p: p['end_date'] or '', reverse=True)
+        packs.sort(key=lambda p: status_rank.get(p['status'], 2))
+        active_packs_count = sum(1 for p in packs if p['status'] == 'ACTIVE')
+
         return Response({
             'total_credits_available': total_remaining_credits,
-            'active_packs_count': len(packs),
+            'active_packs_count': active_packs_count,
             'packs': packs,
             'rewards_wallet': rewards_wallet,
             'reward_points': rewards_wallet,
