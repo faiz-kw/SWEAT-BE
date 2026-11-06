@@ -149,7 +149,7 @@ class Command(BaseCommand):
     def _sync_tenant(self, db_alias, tenant, dry_run, member_number, order_number, start_date_mode):
         from apps.tenant_core.models_commerce import Order, OrderItem
         from apps.tenant_core.models_memberships import Membership, MembershipExtension, Package, PackageVersion
-        from apps.tenant_core.models_users import UserProfile
+        from apps.tenant_core.models_workforce import UserProfile
         from apps.tenant_core.services_memberships import MembershipLifecycleService
 
         activated_count = 0
