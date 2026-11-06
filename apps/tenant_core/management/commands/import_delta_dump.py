@@ -135,8 +135,10 @@ class Command(BaseCommand):
         candidates.extend([
             'sweat_oct15_to_nov05_complete_delta.sql',
             '../sweat_oct15_to_nov05_complete_delta.sql',
+            'Downloads/sweat_oct15_to_nov05_complete_delta.sql',
             '/var/www/sweat_oct15_to_nov05_complete_delta.sql',
             '/var/www/SWEAT-BE/sweat_oct15_to_nov05_complete_delta.sql',
+            '/root/Downloads/sweat_oct15_to_nov05_complete_delta.sql',
             os.path.expanduser('~/Downloads/sweat_oct15_to_nov05_complete_delta.sql'),
             r'C:\Users\Masheera\Downloads\sweat_oct15_to_nov05_complete_delta.sql',
         ])
