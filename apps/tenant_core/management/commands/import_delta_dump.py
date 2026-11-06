@@ -281,24 +281,29 @@ class Command(BaseCommand):
                     existing.start_date = start_d
                     existing.end_date = end_d
                     existing.status = status_val
+                    up_fields = ['user_profile', 'legacy_reference', 'start_date', 'end_date', 'status', 'updated_at']
+
                     if matched_order:
                         existing.source_order = matched_order
                         existing.source_order_item = matched_item
-                    if home_br:
+                        up_fields.extend(['source_order', 'source_order_item'])
+                    if not existing.home_branch_id and home_br:
                         existing.home_branch = home_br
-                    if purch_br:
+                        up_fields.append('home_branch')
+                    if not existing.purchase_branch_id and purch_br:
                         existing.purchase_branch = purch_br
-                    if package_id:
+                        up_fields.append('purchase_branch')
+                    if not existing.package_id and package_id:
                         existing.package_id = package_id
-                    if package_version_id:
+                        up_fields.append('package_id')
+                    if not existing.package_version_id and package_version_id:
                         existing.package_version_id = package_version_id
-                    if program_id:
+                        up_fields.append('package_version_id')
+                    if not existing.program_id and program_id:
                         existing.program_id = program_id
-                    existing.save(using=db_alias, update_fields=[
-                        'user_profile', 'legacy_reference', 'start_date', 'end_date', 'status',
-                        'source_order', 'source_order_item', 'home_branch', 'purchase_branch',
-                        'package_id', 'package_version_id', 'program_id', 'updated_at'
-                    ])
+                        up_fields.append('program_id')
+
+                    existing.save(using=db_alias, update_fields=up_fields)
                     legacy_to_membership[legacy_ref] = existing
                     legacy_to_membership[mem_num] = existing
                     target_m = existing
