@@ -1021,7 +1021,7 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
 
         # Check if membership is currently active or frozen
         is_active_or_frozen = m.status in ('ACTIVE', 'FROZEN') and (not m.end_date or m.end_date >= timezone.now().date())
-        if is_active_or_frozen or m.id == getattr(active_m, 'id', None):
+        if is_active_or_frozen or (m.id == getattr(active_m, 'id', None) and m.status in ('ACTIVE', 'FROZEN')):
             if not active_membership_data:
                 active_membership_data = m_obj
             active_memberships_list.append(m_obj)
@@ -1037,7 +1037,7 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
                 'cross_branch_sessions_remaining': m_cross_s,
                 'home_branch': m.home_branch.name if m.home_branch else 'Branch',
             })
-        elif m.start_date and m.start_date > timezone.now().date():
+        elif m.status in ('ACTIVE', 'PENDING_PAYMENT') and m.start_date and m.start_date > timezone.now().date():
             upcoming_membership_data.append(m_obj)
         else:
             history_membership_data.append(m_obj)
@@ -1984,6 +1984,13 @@ class MemberViewSet(viewsets.ViewSet):
                 profile = None
         if not profile:
             profile = qs.filter(member_number=pk).first()
+        if not profile:
+            try:
+                mem = Membership.objects.using(alias).filter(id=pk).select_related('user_profile').first()
+                if mem and mem.user_profile:
+                    profile = mem.user_profile
+            except Exception:
+                pass
         return profile
 
     def list(self, request):
@@ -2495,7 +2502,14 @@ class MemberViewSet(viewsets.ViewSet):
         if not profile:
             return Response({'detail': 'Member not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        active_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
+        active_m = None
+        target_membership_id = request.data.get('membership_id')
+        if target_membership_id:
+            active_m = Membership.objects.using(alias).filter(id=target_membership_id, user_profile=profile).first()
+        if not active_m and pk:
+            active_m = Membership.objects.using(alias).filter(id=pk, user_profile=profile).first()
+        if not active_m:
+            active_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
         if not active_m:
             return Response({'error': 'No existing membership found to renew.'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -2526,9 +2540,18 @@ class MemberViewSet(viewsets.ViewSet):
         price_obj = package_version.prices.using(alias).filter(status='ACTIVE').first()
         branch = active_m.home_branch or profile.preferred_branch
 
-        # Determine start date: day after active_m.end_date if in future, else today
+        # Determine start date: respect start_schedule / custom_start_date or day after active_m.end_date
         today = timezone.now().date()
-        if active_m.end_date and active_m.end_date >= today:
+        start_schedule = request.data.get('start_schedule', 'CONTINUOUS')
+        custom_start_date = request.data.get('custom_start_date')
+        if start_schedule == 'CUSTOM' and custom_start_date:
+            try:
+                renewal_start = datetime.strptime(str(custom_start_date)[:10], '%Y-%m-%d').date()
+            except Exception:
+                renewal_start = today
+        elif start_schedule == 'FIRST_VISIT':
+            renewal_start = today
+        elif active_m.end_date and active_m.end_date >= today:
             renewal_start = active_m.end_date + timedelta(days=1)
         else:
             renewal_start = today
@@ -3493,7 +3516,14 @@ class MemberViewSet(viewsets.ViewSet):
         if not profile:
             return Response({'detail': 'Member not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        active_m = Membership.objects.using(alias).filter(user_profile=profile, status='ACTIVE').order_by('-created_at').first()
+        active_m = None
+        target_membership_id = request.data.get('membership_id')
+        if target_membership_id:
+            active_m = Membership.objects.using(alias).filter(id=target_membership_id, user_profile=profile).first()
+        if not active_m and pk:
+            active_m = Membership.objects.using(alias).filter(id=pk, user_profile=profile).first()
+        if not active_m:
+            active_m = Membership.objects.using(alias).filter(user_profile=profile, status='ACTIVE').order_by('-created_at').first()
         if not active_m:
             return Response({'error': 'No active membership to cancel.'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -3504,8 +3534,10 @@ class MemberViewSet(viewsets.ViewSet):
             actor_user=request.user,
             db_alias=alias,
         )
-        profile.member_status = 'INACTIVE'
-        profile.save(using=alias, update_fields=['member_status'])
+        other_active = Membership.objects.using(alias).filter(user_profile=profile, status='ACTIVE').exclude(id=active_m.id).exists()
+        if not other_active:
+            profile.member_status = 'INACTIVE'
+            profile.save(using=alias, update_fields=['member_status', 'updated_at'])
 
         return Response({
             'success': True,
