@@ -266,19 +266,42 @@ class Command(BaseCommand):
                     f"Plan #{mem_num} | Dates: {start_d} to {end_d} | Status: {status_val}"
                 ))
                 created_memberships += 1
-                legacy_to_membership[legacy_ref] = m_id
+                legacy_to_membership[legacy_ref] = profile
+                legacy_to_membership[mem_num] = profile
             else:
                 home_br = branches_cache.get(home_branch_id) or profile.preferred_branch
                 purch_br = branches_cache.get(purchase_branch_id) or home_br
 
                 # Insert or update
                 existing = Membership.objects.using(db_alias).filter(Q(id=m_id) | Q(membership_number=mem_num)).first()
+                target_m = None
                 if existing:
+                    existing.user_profile = profile
+                    existing.legacy_reference = legacy_ref
                     existing.start_date = start_d
                     existing.end_date = end_d
                     existing.status = status_val
-                    existing.save(using=db_alias, update_fields=['start_date', 'end_date', 'status', 'updated_at'])
+                    if matched_order:
+                        existing.source_order = matched_order
+                        existing.source_order_item = matched_item
+                    if home_br:
+                        existing.home_branch = home_br
+                    if purch_br:
+                        existing.purchase_branch = purch_br
+                    if package_id:
+                        existing.package_id = package_id
+                    if package_version_id:
+                        existing.package_version_id = package_version_id
+                    if program_id:
+                        existing.program_id = program_id
+                    existing.save(using=db_alias, update_fields=[
+                        'user_profile', 'legacy_reference', 'start_date', 'end_date', 'status',
+                        'source_order', 'source_order_item', 'home_branch', 'purchase_branch',
+                        'package_id', 'package_version_id', 'program_id', 'updated_at'
+                    ])
                     legacy_to_membership[legacy_ref] = existing
+                    legacy_to_membership[mem_num] = existing
+                    target_m = existing
                     updated_memberships += 1
                 else:
                     m_obj = Membership(
@@ -301,7 +324,30 @@ class Command(BaseCommand):
                     )
                     m_obj.save(using=db_alias)
                     legacy_to_membership[legacy_ref] = m_obj
+                    legacy_to_membership[mem_num] = m_obj
+                    target_m = m_obj
                     created_memberships += 1
+
+                if target_m:
+                    order_amt = matched_order.paid_amount if (matched_order and matched_order.paid_amount) else (matched_order.total_amount if matched_order else Decimal('11000'))
+                    disc_amt = matched_order.discount_amount if (matched_order and matched_order.discount_amount) else Decimal('0')
+                    cat_amt = matched_order.subtotal if (matched_order and matched_order.subtotal) else order_amt
+                    try:
+                        MembershipContractSnapshot.objects.using(db_alias).update_or_create(
+                            membership=target_m,
+                            defaults={
+                                'package_name_snapshot': target_m.package.name if target_m.package else 'Sweat Pilates',
+                                'purchase_price': order_amt,
+                                'catalog_price': cat_amt,
+                                'final_amount': order_amt,
+                                'discount_amount': disc_amt,
+                                'start_date': start_d,
+                                'end_date': end_d,
+                                'source_order': matched_order,
+                            }
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to create contract snapshot: {e}")
 
                 self.stdout.write(self.style.SUCCESS(
                     f"  [OK IMPORTED] Member: {profile.member_number} | {mem_num} | {start_d} to {end_d} | Status: {status_val}"
@@ -349,13 +395,28 @@ class Command(BaseCommand):
 
             # Find target membership
             target_membership = None
-            if not dry_run and m_ref:
-                target_membership = Membership.objects.using(db_alias).filter(legacy_reference=m_ref).first()
-                if not target_membership:
-                    target_membership = legacy_to_membership.get(m_ref)
+            if m_ref:
+                target_membership = legacy_to_membership.get(m_ref)
+                if not target_membership or isinstance(target_membership, str):
+                    target_membership = Membership.objects.using(db_alias).filter(legacy_reference=m_ref).first()
+                if not target_membership and 'userplan:' in m_ref:
+                    num_str = m_ref.split(':')[-1]
+                    try:
+                        mem_num_cand = f"MEMSHIP-{int(num_str):06d}"
+                        target_membership = Membership.objects.using(db_alias).filter(membership_number=mem_num_cand).first()
+                    except ValueError:
+                        pass
 
-            if target_member_number and target_membership:
-                if target_membership.user_profile.member_number != target_member_number:
+            if target_member_number:
+                if not target_membership:
+                    continue
+                # Check member number
+                mem_num_val = None
+                if hasattr(target_membership, 'member_number'):
+                    mem_num_val = target_membership.member_number
+                elif hasattr(target_membership, 'user_profile') and target_membership.user_profile:
+                    mem_num_val = target_membership.user_profile.member_number
+                if mem_num_val != target_member_number:
                     continue
 
             alloc_num = Decimal(str(alloc_units))
@@ -363,11 +424,12 @@ class Command(BaseCommand):
             rem_num = max(Decimal('0'), alloc_num - consumed_num)
 
             if dry_run:
+                plan_name_disp = getattr(target_membership, 'membership_number', m_ref or 'Plan')
                 self.stdout.write(self.style.SUCCESS(
-                    f"  [DRY-RUN WOULD PROVISION SESSIONS] Plan: {m_ref} | Allocated: {alloc_num} | Consumed: {consumed_num} | Remaining: {rem_num}"
+                    f"  [DRY-RUN WOULD PROVISION SESSIONS] Plan: {plan_name_disp} | Allocated: {alloc_num} | Consumed: {consumed_num} | Remaining: {rem_num}"
                 ))
                 created_entitlements += 1
-            elif target_membership:
+            elif target_membership and hasattr(target_membership, 'id'):
                 # Upsert entitlement
                 ent_obj = MembershipEntitlement.objects.using(db_alias).filter(id=ent_id).first()
                 if not ent_obj:
@@ -383,6 +445,7 @@ class Command(BaseCommand):
                         status=ent_status,
                     )
                 else:
+                    ent_obj.membership = target_membership
                     ent_obj.allocated_units = alloc_num
                     ent_obj.consumed_units = consumed_num
                     ent_obj.status = ent_status
