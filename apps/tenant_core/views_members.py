@@ -2558,6 +2558,7 @@ class MemberViewSet(viewsets.ViewSet):
             )
 
             payment_provider = request.data.get('payment_provider', 'CARD')
+            payment_method = request.data.get('payment_method', payment_provider or 'CARD')
             is_cash = str(payment_provider).upper() == 'CASH' or str(payment_method).upper() == 'CASH'
             is_link = str(payment_provider).upper() in ('PAYMENT_LINK', 'LINK') or str(payment_method).upper() in ('PAYMENT_LINK', 'LINK')
             payment_amount = request.data.get('payment_amount')
@@ -3119,8 +3120,6 @@ class MemberViewSet(viewsets.ViewSet):
             cur_price = float(active_m.source_order_item.order.total_amount or 0.0)
         elif getattr(active_m, 'package_price', None):
             cur_price = float(active_m.package_price.base_price)
-        elif active_m.order_item and active_m.order_item.order:
-            cur_price = float(active_m.order_item.order.total_amount or 0.0)
         elif active_m.package_version:
             p_obj = active_m.package_version.prices.using(alias).filter(status='ACTIVE').first()
             if p_obj:
