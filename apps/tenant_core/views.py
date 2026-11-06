@@ -878,18 +878,33 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
 
         role_param = self.request.query_params.get('role')
         if role_param and role_param != 'all':
-            has_matching_role = RoleAssignment.objects.using(db).filter(
-                Q(role__name__iexact=str(role_param)) | Q(role__code__iexact=str(role_param)),
-                user=OuterRef('pk'),
-                is_active=True,
-            )
-            qs = qs.filter(Exists(has_matching_role))
+            role_str = str(role_param).strip()
+            if role_str.upper() in ('STAFF', 'STAFF MEMBER', 'GENERAL STAFF', 'UNASSIGNED'):
+                from .models_rbac import RoleAssignment
+                has_specialized_role = RoleAssignment.objects.using(db).filter(
+                    user=OuterRef('pk'),
+                    is_active=True,
+                ).exclude(role__code__iexact='STAFF').exclude(role__name__iexact='STAFF')
+                has_staff_role = RoleAssignment.objects.using(db).filter(
+                    Q(role__name__iexact='STAFF') | Q(role__code__iexact='STAFF'),
+                    user=OuterRef('pk'),
+                    is_active=True,
+                )
+                qs = qs.filter(Exists(has_staff_role) | ~Exists(has_specialized_role))
+            else:
+                has_matching_role = RoleAssignment.objects.using(db).filter(
+                    Q(role__name__iexact=role_str) | Q(role__code__iexact=role_str) | Q(role__id__iexact=role_str),
+                    user=OuterRef('pk'),
+                    is_active=True,
+                )
+                qs = qs.filter(Exists(has_matching_role))
 
         dept_param = self.request.query_params.get('department')
         if dept_param and dept_param != 'all':
             from .models_users import UserDepartment
+            dept_str = str(dept_param).strip()
             has_matching_dept = UserDepartment.objects.using(db).filter(
-                Q(department__name__iexact=str(dept_param)) | Q(department__code__iexact=str(dept_param)),
+                Q(department__name__iexact=dept_str) | Q(department__code__iexact=dept_str) | Q(department__id__iexact=dept_str),
                 user=OuterRef('pk'),
                 status='ACTIVE',
             )
@@ -900,19 +915,67 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
             st_upper = status_param.strip().upper()
             if st_upper == 'INACTIVE':
                 qs = qs.exclude(status__iexact='ACTIVE').exclude(status__iexact='INVITED')
+            elif st_upper == 'DEACTIVATED':
+                qs = qs.filter(Q(status__iexact='DEACTIVATED') | Q(is_accessible=False))
             else:
                 qs = qs.filter(status__iexact=st_upper)
 
         search_param = (self.request.query_params.get('search') or '').strip()
         if search_param:
-            for token in search_param.split():
+            import re
+            from django.db.models.functions import Concat
+            from .models_rbac import RoleAssignment
+
+            qs = qs.annotate(
+                full_name_lookup=Concat('first_name', Value(' '), 'last_name')
+            )
+
+            has_role_match = RoleAssignment.objects.using(db).filter(
+                Q(role__name__icontains=search_param) | Q(role__code__icontains=search_param),
+                user=OuterRef('pk'),
+                is_active=True,
+            )
+
+            is_staff_search = 'staff' in search_param.lower()
+            if is_staff_search:
+                has_specialized_role = RoleAssignment.objects.using(db).filter(
+                    user=OuterRef('pk'),
+                    is_active=True,
+                ).exclude(role__code__iexact='STAFF').exclude(role__name__iexact='STAFF')
+                staff_fallback_q = ~Exists(has_specialized_role)
+            else:
+                staff_fallback_q = Q()
+
+            cleaned_digits = re.sub(r'\D', '', search_param)
+            if len(cleaned_digits) >= 4:
+                phone_raw_q = Q(phone__icontains=cleaned_digits)
+                if cleaned_digits.startswith('91') and len(cleaned_digits) >= 5:
+                    phone_raw_q |= Q(phone__icontains=cleaned_digits[2:])
                 qs = qs.filter(
-                    Q(first_name__icontains=token) |
-                    Q(last_name__icontains=token) |
-                    Q(email__icontains=token) |
-                    Q(username__icontains=token) |
-                    Q(phone__icontains=token)
+                    phone_raw_q |
+                    Q(first_name__icontains=search_param) |
+                    Q(last_name__icontains=search_param) |
+                    Q(full_name_lookup__icontains=search_param) |
+                    Q(email__icontains=search_param) |
+                    Q(username__icontains=search_param) |
+                    Exists(has_role_match) |
+                    staff_fallback_q
                 )
+            else:
+                for token in search_param.split():
+                    token_clean = token.strip()
+                    if not token_clean:
+                        continue
+                    qs = qs.filter(
+                        Q(first_name__icontains=token_clean) |
+                        Q(last_name__icontains=token_clean) |
+                        Q(full_name_lookup__icontains=token_clean) |
+                        Q(email__icontains=token_clean) |
+                        Q(username__icontains=token_clean) |
+                        Q(phone__icontains=token_clean) |
+                        Exists(has_role_match) |
+                        staff_fallback_q
+                    )
 
         qs = qs.annotate(
             status_priority=Case(
@@ -950,10 +1013,14 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
                 if role_obj is None:
                     raise ValidationError({'role_id': 'Select a valid role.'})
 
+            if role_obj and instance.organization_id != role_obj.organization_id:
+                instance.organization = role_obj.organization
+                instance.save(using=db, update_fields=['organization'])
+
             branch_access = data.get('branch_access')
             resolved_access = []
             if branch_access is not None:
-                if not role_obj or role_obj.scope != 'BRANCH' or not role_obj.is_active or role_obj.organization_id != instance.organization_id:
+                if not role_obj or role_obj.scope != 'BRANCH' or not role_obj.is_active:
                     raise ValidationError({'branch_access': 'Select an active branch-scoped role.'})
                 if not isinstance(branch_access, list):
                     raise ValidationError({'branch_access': 'Expected a list of branch access entries.'})
@@ -965,7 +1032,7 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
                         branch_pk = uuid.UUID(str(entry.get('branch_id')))
                     except (ValueError, TypeError, AttributeError):
                         raise ValidationError({'branch_access': 'Invalid branch ID.'})
-                    branch_obj = Branch.objects.using(db).filter(pk=branch_pk, organization_id=instance.organization_id).first()
+                    branch_obj = Branch.objects.using(db).filter(pk=branch_pk).first()
                     if not branch_obj or branch_pk in seen:
                         raise ValidationError({'branch_access': 'Branch is missing or repeated.'})
                     if entry['enabled'] and branch_obj.status != 'ACTIVE':
@@ -973,10 +1040,8 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
                     self.validate_branch_scope(branch_pk)
                     seen.add(branch_pk)
                     resolved_access.append((branch_obj, entry['enabled']))
-                if data.get('branch_id') or data.get('branch') or data.get('home_branch'):
-                    raise ValidationError({'branch_access': 'Update home branch separately from branch access.'})
 
-            branch_id = data.get('home_branch') or data.get('branch_id') or data.get('branch')
+            branch_id = data.get('home_branch') or data.get('primary_branch_id') or data.get('branch_id') or data.get('branch')
             br_obj = None
             if branch_id:
                 try:

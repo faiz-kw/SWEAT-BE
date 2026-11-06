@@ -806,11 +806,11 @@ class MembershipLifecycleService:
             )
 
             # Provision and adjust entitlements for upgraded target package version
-            for ped in target_package_version.entitlement_definitions.using(alias).all():
+            for ped in target_package_version.entitlement_definitions.using(alias).filter(status='ACTIVE'):
                 existing_ent = membership.entitlements.using(alias).filter(entitlement_type=ped.entitlement_type).first()
                 if existing_ent:
                     if policy_rule.unused_session_handling == 'CARRY_FORWARD':
-                        add_units = ped.allocated_units or Decimal('0.00')
+                        add_units = max(Decimal('0.00'), (ped.allocated_units or Decimal('0.00')) - (existing_ent.allocated_units or Decimal('0.00')))
                         if add_units > Decimal('0.00'):
                             cls.adjust_entitlement(
                                 membership=membership,
@@ -974,10 +974,10 @@ class MembershipLifecycleService:
 
         valid_until_dt = timezone.make_aware(datetime.combine(membership.end_date, datetime.max.time())) if membership.end_date else timezone.now() + timedelta(days=90)
 
-        for ped in target_package_version.entitlement_definitions.using(alias).all():
+        for ped in target_package_version.entitlement_definitions.using(alias).filter(status='ACTIVE'):
             existing_ent = membership.entitlements.using(alias).filter(entitlement_type=ped.entitlement_type, status='ACTIVE').first()
             if existing_ent:
-                add_units = ped.allocated_units or Decimal('0.00')
+                add_units = max(Decimal('0.00'), (ped.allocated_units or Decimal('0.00')) - (existing_ent.allocated_units or Decimal('0.00')))
                 if add_units > Decimal('0.00'):
                     cls.adjust_entitlement(
                         membership=membership,
