@@ -227,6 +227,9 @@ class Command(BaseCommand):
                     )
 
                 if existing_m and existing_m.status == 'ACTIVE':
+                    self.stdout.write(
+                        f"  [ALREADY ACTIVE] Member: {mem_num_display} | Order {order.order_number} already active as {existing_m.membership_number}."
+                    )
                     skipped_count += 1
                     continue
 
@@ -258,8 +261,14 @@ class Command(BaseCommand):
                 calc_end_date = calculate_expected_end_date(calc_start_date, duration_val, duration_unit)
 
                 # STRICT VALIDITY GUARD:
-                # If package validity expired in the past (e.g. 2025 or earlier in 2026), DO NOT activate as an active plan!
+                # If package validity expired in the past (e.g. 2025 or earlier in 2026), skip unless --start-date=today is specified
                 if calc_end_date < today and start_date_mode != 'today':
+                    days_ago = (today - calc_end_date).days
+                    self.stdout.write(self.style.NOTICE(
+                        f"  [PAST EXPIRED] Member: {mem_num_display} | Order: {order.order_number} (₹{order.total_amount}) | "
+                        f"Plan: {pkg_name_display} | Validity was {calc_start_date} to {calc_end_date} (Expired {days_ago} days ago). "
+                        f"To activate with validity starting today, use --start-date=today"
+                    ))
                     skipped_count += 1
                     continue
 

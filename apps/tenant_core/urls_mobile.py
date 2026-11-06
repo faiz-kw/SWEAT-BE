@@ -1,3 +1,4 @@
+from apps.tenant_core import views_cms
 from django.urls import path
 from apps.authentication.views_otp import SendOTPView, VerifyOTPView
 from . import views_wellness
@@ -156,4 +157,6 @@ urlpatterns = [
     path('assessment/eligibility/', AssessmentEligibilityMobileView.as_view(), name='mobile-assessment-eligibility'),
     path('assessment/start/', AssessmentSessionViewSet.as_view({'post': 'create'}), name='mobile-assessment-start'),
     path('assessment/<uuid:pk>/', AssessmentSessionViewSet.as_view({'get': 'retrieve'}), name='mobile-assessment-detail'),
+    # 9. CMS App Content Delivery
+    path('cms/home-feed/', views_cms.MobileCMSHomeFeedView.as_view(), name='mobile-cms-home-feed'),
 ]
