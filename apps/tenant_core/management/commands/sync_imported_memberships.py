@@ -147,6 +147,7 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS("=" * 60 + "\n"))
 
     def _sync_tenant(self, db_alias, tenant, dry_run, member_number, order_number, start_date_mode):
+        from django.db.models import Q
         from apps.tenant_core.models_commerce import Order, OrderItem
         from apps.tenant_core.models_memberships import Membership, MembershipExtension, Package, PackageVersion
         from apps.tenant_core.models_workforce import UserProfile
@@ -156,11 +157,17 @@ class Command(BaseCommand):
         extended_count = 0
         skipped_count = 0
 
-        # Query orders with status='PAID'
+        # Query membership/extension relevant orders with status='PAID'
         orders_qs = (
             Order.objects.using(db_alias)
             .filter(status='PAID')
-            .select_related('user_profile', 'branch')
+            .filter(
+                Q(order_type__in=['NEW_MEMBERSHIP', 'RENEWAL', 'EXTENSION'])
+                | Q(items__item_type='PACKAGE')
+                | Q(items__package__isnull=False)
+            )
+            .distinct()
+            .select_related('user_profile', 'user_profile__user', 'branch')
             .prefetch_related('items', 'items__package', 'items__package_version', 'items__package_price')
             .order_by('created_at')
         )
@@ -172,7 +179,7 @@ class Command(BaseCommand):
             orders_qs = orders_qs.filter(user_profile__member_number=member_number)
 
         orders = list(orders_qs)
-        self.stdout.write(f"Found {len(orders)} PAID order(s) to evaluate in {tenant.slug}.")
+        self.stdout.write(f"Found {len(orders)} relevant PAID membership/extension order(s) in {tenant.slug}.")
 
         for order in orders:
             profile = order.user_profile
@@ -180,7 +187,12 @@ class Command(BaseCommand):
                 continue
 
             mem_num_display = profile.member_number or str(profile.id)[:8]
-            user_name_display = profile.full_name or profile.user.email if profile.user else 'Unknown'
+            fn = getattr(profile, 'first_name_snapshot', '') or ''
+            ln = getattr(profile, 'last_name_snapshot', '') or ''
+            full_n = f"{fn} {ln}".strip()
+            if not full_n and getattr(profile, 'user', None):
+                full_n = getattr(profile.user, 'display_name', '') or getattr(profile.user, 'email', '')
+            user_name_display = full_n or 'Member'
 
             # -------------------------------------------------------------
             # Case 1: Package Orders (NEW_MEMBERSHIP, RENEWAL, or line item with package)
