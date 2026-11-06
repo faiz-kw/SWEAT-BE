@@ -396,3 +396,15 @@ __all__ += [
     'POSTerminal',
     'POSTransaction',
 ]
+
+from .models_cms import (
+    CMSBanner,
+    ProgramCategoryMedia,
+    CMSMediaAsset,
+)
+
+__all__ += [
+    'CMSBanner',
+    'ProgramCategoryMedia',
+    'CMSMediaAsset',
+]

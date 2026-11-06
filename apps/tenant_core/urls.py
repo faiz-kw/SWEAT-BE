@@ -1,3 +1,4 @@
+from apps.tenant_core import views_cms
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
@@ -363,6 +364,12 @@ router.register(r'tickets', SupportTicketViewSet, basename='ticket')
 from .views_import_engine import UniversalImportViewSet
 router.register(r'excel-imports', UniversalImportViewSet, basename='excel-imports')
 
+
+# CMS (Content Management System)
+router.register(r'cms/banners', views_cms.CMSBannerViewSet, basename='cms-banner')
+router.register(r'cms/categories', views_cms.ProgramCategoryMediaViewSet, basename='cms-category')
+router.register(r'cms/media', views_cms.CMSMediaAssetViewSet, basename='cms-media')
+
 app_name = 'tenant_core'
 
 urlpatterns = [
@@ -434,6 +441,8 @@ urlpatterns = [
     path('pos/initiate/', views_pos.InitiatePOSPaymentView.as_view(), name='pos-initiate-payment'),
     path('pos/status/<str:external_ref_id>/', views_pos.POSPaymentStatusView.as_view(), name='pos-payment-status'),
     path('pos/cancel/<str:external_ref_id>/', views_pos.CancelPOSPaymentView.as_view(), name='pos-cancel-payment'),
+
+    
 
     path('', include(router.urls)),
 ]

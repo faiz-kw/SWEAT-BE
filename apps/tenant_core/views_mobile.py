@@ -2751,9 +2751,16 @@ class MobileMyCreditsView(APIView):
             'is_enabled': reward_cfg['is_enabled'],
         }
 
+        # Show the member's current plan first: active, then frozen, then the rest.
+        # Within each group, the plan ending latest comes first.
+        status_rank = {'ACTIVE': 0, 'FROZEN': 1}
+        packs.sort(key=lambda p: p['end_date'] or '', reverse=True)
+        packs.sort(key=lambda p: status_rank.get(p['status'], 2))
+        active_packs_count = sum(1 for p in packs if p['status'] == 'ACTIVE')
+
         return Response({
             'total_credits_available': total_remaining_credits,
-            'active_packs_count': len(packs),
+            'active_packs_count': active_packs_count,
             'packs': packs,
             'rewards_wallet': rewards_wallet,
             'reward_points': rewards_wallet,
@@ -3013,7 +3020,43 @@ class MobileCheckoutOrderView(APIView):
 
         base_price = price_obj.base_price
         tax_pct = price_obj.tax_percent or Decimal('18.0')
-        subtotal = base_price * (1 + (tax_pct / Decimal('100.0')))
+        package_tax_amount = (base_price * (tax_pct / Decimal('100.0'))).quantize(Decimal('0.01'))
+        package_subtotal = base_price + package_tax_amount
+
+        branch = user.home_branch or Branch.objects.using(alias).filter(status='ACTIVE').first()
+        org = branch.organization if branch else Organization.objects.using(alias).filter(status='ACTIVE').first()
+
+        # Check if member has an active, unexpired membership; if expired or new member, include activation fee
+        today_date = timezone.now().date()
+        has_active_membership = Membership.objects.using(alias).filter(
+            user_profile=profile,
+            status='ACTIVE',
+            end_date__gte=today_date,
+        ).exists()
+
+        is_reactivation = not has_active_membership
+        activation_base = Decimal('0.00')
+        activation_tax = Decimal('0.00')
+        activation_total = Decimal('0.00')
+
+        if is_reactivation:
+            from .models_memberships import MembershipPolicyConfig
+            policy_cfg = (
+                MembershipPolicyConfig.objects.using(alias)
+                .filter(organization=org)
+                .first()
+            )
+            if policy_cfg and getattr(policy_cfg, 'extension_activation_fee', None) and policy_cfg.extension_activation_fee > Decimal('0.00'):
+                activation_total = policy_cfg.extension_activation_fee
+                activation_base = (activation_total / Decimal('1.05')).quantize(Decimal('0.01'))
+                activation_tax = activation_total - activation_base
+            else:
+                activation_base = Decimal('475.24')
+                activation_tax = Decimal('23.76')
+                activation_total = Decimal('499.00')
+
+        subtotal = package_subtotal + activation_total
+        gross_subtotal = subtotal
         discount_amount = Decimal('0.00')
 
         if coupon_code:
@@ -3073,10 +3116,10 @@ class MobileCheckoutOrderView(APIView):
                 order_type='NEW_MEMBERSHIP',
                 source='MOBILE_APP',
                 status='PENDING_PAYMENT',
-                subtotal=subtotal,
+                subtotal=gross_subtotal,
                 discount_amount=discount_amount,
                 reward_amount=reward_discount,
-                tax_amount=subtotal * (tax_pct / Decimal('100.0')),
+                tax_amount=package_tax_amount + activation_tax,
                 total_amount=final_amount,
                 currency='INR',
             )
@@ -3092,9 +3135,22 @@ class MobileCheckoutOrderView(APIView):
                 unit_price_snapshot=base_price,
                 tax_percent_snapshot=tax_pct,
                 discount_amount=discount_amount,
-                tax_amount=subtotal * (tax_pct / Decimal('100.0')),
-                total_amount=final_amount,
+                tax_amount=package_tax_amount,
+                total_amount=package_subtotal,
             )
+
+            if is_reactivation and activation_total > Decimal('0.00'):
+                OrderItem.objects.using(alias).create(
+                    order=order,
+                    item_type='ACTIVATION_FEE',
+                    item_name_snapshot='Membership Activation / Registration Fee',
+                    quantity=1,
+                    unit_price_snapshot=activation_base,
+                    tax_percent_snapshot=Decimal('5.0'),
+                    discount_amount=Decimal('0.00'),
+                    tax_amount=activation_tax,
+                    total_amount=activation_total,
+                )
 
             # If coins were redeemed, execute ledger debit
             if points_redeemed > Decimal('0.00'):
@@ -3148,7 +3204,32 @@ class MobileCheckoutOrderView(APIView):
             'razorpay_order_id': rzp_order_id,
             'amount_in_paise': amount_paise,
             'amount': float(final_amount),
-            'subtotal': float(subtotal),
+            'subtotal': float(gross_subtotal),
+            'package_price': float(base_price),
+            'package_tax': float(package_tax_amount),
+            'package_total': float(package_subtotal),
+            'activation_charge': float(activation_total),
+            'activation_base': float(activation_base),
+            'activation_tax': float(activation_tax),
+            'is_reactivation': is_reactivation,
+            'items': [
+                {
+                    'item_type': 'PACKAGE',
+                    'name': package.name,
+                    'price': float(base_price),
+                    'tax': float(package_tax_amount),
+                    'total': float(package_subtotal),
+                },
+                *(
+                    [{
+                        'item_type': 'ACTIVATION_FEE',
+                        'name': 'Membership Activation / Registration Fee',
+                        'price': float(activation_base),
+                        'tax': float(activation_tax),
+                        'total': float(activation_total),
+                    }] if is_reactivation and activation_total > Decimal('0.00') else []
+                ),
+            ],
             'coupon_discount': float(discount_amount),
             'coins_discount': float(reward_discount),
             'coins_redeemed': float(points_redeemed),

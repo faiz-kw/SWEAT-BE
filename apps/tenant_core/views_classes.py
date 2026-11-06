@@ -3,13 +3,14 @@ DRF ViewSets for Layer 2: Module E (Group Classes, Scheduling, Content Studio & 
 """
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.core.exceptions import ValidationError
+from django.db import transaction
 
 
 class ClassesPagination(PageNumberPagination):
@@ -237,7 +238,7 @@ class ClassTemplateViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         alias = _get_db(self.request)
         org = _get_org(self.request)
-        qs = ClassTemplate.objects.using(alias).filter(organization=org)
+        qs = ClassTemplate.objects.using(alias).filter(organization=org).prefetch_related('branch_availabilities', 'branch_availabilities__branch')
         category_id = self.request.query_params.get('category_id')
         if category_id:
             qs = qs.filter(category_id=category_id)
@@ -246,10 +247,47 @@ class ClassTemplateViewSet(viewsets.ModelViewSet):
             qs = qs.filter(status=status_filter)
         return qs.order_by('name')
 
+    def _save_branch_capacities(self, instance, branch_capacities, alias):
+        if not isinstance(branch_capacities, list):
+            return
+        from .models_classes import ClassBranchAvailability
+        from .models_org import Branch
+        for item in branch_capacities:
+            branch_id = item.get('branch_id') or item.get('branch')
+            if not branch_id:
+                continue
+            branch = Branch.objects.using(alias).filter(id=branch_id).first()
+            if not branch:
+                continue
+
+            is_enabled = item.get('is_enabled')
+            status_val = 'DISABLED' if is_enabled is False else item.get('status', 'ENABLED')
+            cap = item.get('capacity_override')
+            trial_cap = item.get('trial_capacity_override')
+            wait_cap = item.get('waitlist_capacity_override')
+
+            cap_val = int(cap) if cap not in (None, '') else None
+            trial_val = int(trial_cap) if trial_cap not in (None, '') else None
+            wait_val = int(wait_cap) if wait_cap not in (None, '') else None
+
+            ClassBranchAvailability.objects.using(alias).update_or_create(
+                class_template=instance,
+                branch=branch,
+                defaults={
+                    'status': status_val,
+                    'capacity_override': cap_val,
+                    'trial_capacity_override': trial_val,
+                    'waitlist_capacity_override': wait_val,
+                }
+            )
+
     def perform_create(self, serializer):
         org = _get_org(self.request)
         instance = serializer.save(organization=org)
         alias = _get_db(self.request)
+        branch_capacities = self.request.data.get('branch_capacities')
+        if branch_capacities:
+            self._save_branch_capacities(instance, branch_capacities, alias)
         record_business_audit(
             organization=org,
             module='classes',
@@ -266,6 +304,9 @@ class ClassTemplateViewSet(viewsets.ModelViewSet):
         instance = serializer.save()
         alias = _get_db(self.request)
         org = _get_org(self.request)
+        branch_capacities = self.request.data.get('branch_capacities')
+        if branch_capacities is not None:
+            self._save_branch_capacities(instance, branch_capacities, alias)
         record_business_audit(
             organization=org,
             module='classes',
@@ -403,6 +444,120 @@ class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
             )
 
         return qs.order_by('start_time', 'id')
+
+    def create(self, request, *args, **kwargs):
+        alias = _get_db(request)
+        branches = request.data.get('branches')
+        auto_generate = request.data.get('generate_slots', True)
+        gen_from = request.data.get('generate_from_date') or request.data.get('valid_from')
+        gen_to = request.data.get('generate_to_date') or request.data.get('valid_until')
+
+        # Multi-branch batch creation
+        if isinstance(branches, list) and len(branches) > 0:
+            if not gen_to and gen_from:
+                try:
+                    from_d = date.fromisoformat(str(gen_from))
+                    gen_to = (from_d + timedelta(days=30)).isoformat()
+                except Exception:
+                    pass
+
+            created_rules = []
+            total_occurrences_count = 0
+
+            with transaction.atomic(using=alias):
+                for branch_id in branches:
+                    data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
+                    data['branch'] = branch_id
+                    data.pop('branches', None)
+                    data.pop('generate_slots', None)
+                    data.pop('generate_from_date', None)
+                    data.pop('generate_to_date', None)
+
+                    serializer = self.get_serializer(data=data)
+                    serializer.is_valid(raise_exception=True)
+                    rule = serializer.save()
+
+                    record_business_audit(
+                        organization=rule.branch.organization,
+                        branch=rule.branch,
+                        module='classes',
+                        action_code='SCHEDULE_RULE_CREATED',
+                        entity_type='ClassScheduleRule',
+                        entity_id=rule.id,
+                        actor_user=request.user,
+                        event_description=f"Created recurring schedule rule for {rule.class_template.name} at {rule.branch.name}",
+                        after_data={
+                            'template_name': rule.class_template.name,
+                            'branch_name': rule.branch.name,
+                            'days': rule.days_of_week,
+                            'time_window': f"{rule.start_time.strftime('%H:%M')} – {rule.end_time.strftime('%H:%M')}",
+                            'status': rule.status,
+                        },
+                        db_alias=alias,
+                    )
+                    created_rules.append(rule)
+
+                    if auto_generate and gen_from and gen_to:
+                        try:
+                            from_d = date.fromisoformat(str(gen_from))
+                            to_d = date.fromisoformat(str(gen_to))
+                            occs = ClassSchedulingService.generate_occurrences_from_rule(
+                                rule=rule,
+                                from_date=from_d,
+                                to_date=to_d,
+                                actor=request.user,
+                                db_alias=alias,
+                            )
+                            total_occurrences_count += len(occs)
+                        except Exception as exc:
+                            logger.warning(f"Failed to generate occurrences for rule {rule.id}: {exc}")
+
+            serialized = self.get_serializer(created_rules, many=True).data
+            return Response({
+                'rules': serialized,
+                'count': len(created_rules),
+                'occurrences_generated': total_occurrences_count,
+            }, status=status.HTTP_201_CREATED)
+
+        # Single branch creation
+        data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
+        data.pop('branches', None)
+        data.pop('generate_slots', None)
+        data.pop('generate_from_date', None)
+        data.pop('generate_to_date', None)
+
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        rule = serializer.instance
+
+        total_occurrences_count = 0
+        if auto_generate and gen_from:
+            if not gen_to:
+                try:
+                    from_d = date.fromisoformat(str(gen_from))
+                    gen_to = (from_d + timedelta(days=30)).isoformat()
+                except Exception:
+                    pass
+            if gen_to:
+                try:
+                    from_d = date.fromisoformat(str(gen_from))
+                    to_d = date.fromisoformat(str(gen_to))
+                    occs = ClassSchedulingService.generate_occurrences_from_rule(
+                        rule=rule,
+                        from_date=from_d,
+                        to_date=to_d,
+                        actor=request.user,
+                        db_alias=alias,
+                    )
+                    total_occurrences_count = len(occs)
+                except Exception as exc:
+                    logger.warning(f"Failed to generate occurrences for rule {rule.id}: {exc}")
+
+        resp_data = serializer.data
+        resp_data['occurrences_generated'] = total_occurrences_count
+        headers = self.get_success_headers(serializer.data)
+        return Response(resp_data, status=status.HTTP_201_CREATED, headers=headers)
 
     def perform_create(self, serializer):
         rule = serializer.save()
@@ -794,6 +949,9 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             instructions = getattr(ci, 'description', '') or ''
             movement_title = getattr(ci, 'title', template_name)
 
+        if not video_url and occurrence.online_join_url:
+            video_url = occurrence.online_join_url
+
         # 2. Date-Aware Lookup in WorkoutContentItem (WOD Library)
         workout_item = None
         if not video_url and occ_date_str:
@@ -1037,6 +1195,27 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
         })
 
 
+
+    @action(detail=True, methods=['post', 'patch'], url_path='update-video')
+    def update_video(self, request, pk=None):
+        """
+        Updates or sets the workout video URL attached to this class occurrence.
+        """
+        alias = _get_db(request)
+        try:
+            occurrence = ClassOccurrence.objects.using(alias).get(id=pk)
+        except ClassOccurrence.DoesNotExist:
+            return Response({'error': 'Class occurrence not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        video_url = (request.data.get('video_url') or '').strip()
+        occurrence.online_join_url = video_url
+        occurrence.save(using=alias, update_fields=['online_join_url'])
+
+        return Response({
+            'message': 'Workout video URL updated successfully.',
+            'video_url': video_url,
+            'occurrence_id': str(occurrence.id),
+        }, status=status.HTTP_200_OK)
 
     def destroy(self, request, *args, **kwargs):
         """

@@ -425,18 +425,28 @@ class ClassSchedulingService:
                         f"Trainer {trainer.trainer_code} does not have required specialty credentials for {occ.class_template.name}."
                     )
 
-            # 3. Schedule shift and leave check via TrainerAvailabilityService
-            duration = int((occ.end_at - occ.start_at).total_seconds() // 60)
-            is_avail, reason, _ = TrainerAvailabilityService.is_trainer_available(
-                trainer=trainer,
-                branch=occ.branch,
-                start_datetime=occ.start_at,
-                duration_minutes=duration,
-                delivery_mode='GROUP',
-                db_alias=alias,
-            )
-            if not is_avail:
-                raise ValidationError(f"Trainer availability check failed: {reason}")
+            # 3. Schedule shift and leave check (Admins/Managers can schedule/assign outside strict shifts)
+            is_admin_override = True
+            if actor:
+                actor_role = str(getattr(actor, 'role', '')).upper()
+                is_admin_override = (
+                    getattr(actor, 'is_staff', False)
+                    or getattr(actor, 'is_superuser', False)
+                    or actor_role in ['ADMIN', 'SUPER_ADMIN', 'ORG_ADMIN', 'BRANCH_MANAGER', 'MANAGER', 'STAFF']
+                )
+
+            if not is_admin_override:
+                duration = int((occ.end_at - occ.start_at).total_seconds() // 60)
+                is_avail, reason, _ = TrainerAvailabilityService.is_trainer_available(
+                    trainer=trainer,
+                    branch=occ.branch,
+                    start_datetime=occ.start_at,
+                    duration_minutes=duration,
+                    delivery_mode='GROUP',
+                    db_alias=alias,
+                )
+                if not is_avail:
+                    raise ValidationError(f"Trainer availability check failed: {reason}")
 
             # 4. Conflict check with other class occurrences including buffer
             buffer_min = getattr(trainer, 'minimum_schedule_buffer_minutes', 0) or 0

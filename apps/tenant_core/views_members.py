@@ -946,6 +946,41 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         if not eff_discount and catalog_price and actual_purchase_price and catalog_price > actual_purchase_price:
             eff_discount = round(catalog_price - actual_purchase_price, 2)
 
+        # Compute exact session entitlement usage breakdown for this membership
+        ents = list(MembershipEntitlement.objects.using(alias).filter(membership=m))
+        base_alloc = 0
+        base_consumed = 0
+        passport_alloc = 0
+        passport_consumed = 0
+
+        for ent in ents:
+            et_lower = (ent.entitlement_type or '').lower()
+            alloc = int(ent.allocated_units or 0)
+            cons = int(ent.consumed_units or 0)
+            if 'cross' in et_lower or 'passport' in et_lower:
+                passport_alloc += alloc
+                passport_consumed += cons
+            else:
+                base_alloc += alloc
+                base_consumed += cons
+
+        if not ents and m.package_version:
+            base_alloc = int(getattr(m.package_version, 'session_count', 0) or 0)
+            base_consumed = base_alloc if m.status in ('EXPIRED', 'COMPLETED') else 0
+
+        if not actual_purchase_price:
+            if getattr(m, 'source_order_item', None) and getattr(m.source_order_item, 'total_amount', None):
+                actual_purchase_price = float(m.source_order_item.total_amount)
+            elif getattr(m, 'source_order', None) and getattr(m.source_order, 'paid_amount', None):
+                actual_purchase_price = float(m.source_order.paid_amount)
+            elif getattr(m, 'source_order', None) and getattr(m.source_order, 'total_amount', None):
+                actual_purchase_price = float(m.source_order.total_amount)
+            elif m.package_price:
+                actual_purchase_price = float(m.package_price.base_price)
+
+        sessions_left = max(0, base_alloc - base_consumed)
+        passport_left = max(0, passport_alloc - passport_consumed)
+
         m_obj = {
             'id': str(m.id),
             'membership_number': m.membership_number,
@@ -953,17 +988,21 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             'package_version_id': str(m.package_version_id) if m.package_version_id else None,
             'program_id': str(m.program_id) if m.program_id else (str(m.package.program_id) if m.package and m.package.program_id else None),
             'package_name': pkg_name,
+            'plan_name': pkg_name,
             'package_version_name': f"v{m.package_version.version_number}" if m.package_version else 'v1',
             'program_name': prog_name,
             'status': m.status,
             'start_date': str(m.start_date),
             'end_date': str(m.end_date),
             'home_branch': m.home_branch.name if m.home_branch else 'Branch',
+            'branch_name': m.home_branch.name if m.home_branch else (m.purchase_branch.name if m.purchase_branch else 'Sweat Pilates Malad West'),
             'purchase_branch': m.purchase_branch.name if m.purchase_branch else 'Branch',
             'activated_at': m.activated_at.isoformat() if m.activated_at else None,
             'contract_snapshot': contract_data,
             'catalog_price': catalog_price or actual_purchase_price,
             'purchase_price': actual_purchase_price,
+            'total_cost': actual_purchase_price,
+            'is_paid': True,
             'discount_amount': eff_discount,
             'discount_type': contract_data.get('discount_type') if contract_data else ('OFFLINE_BRANCH_AUTHORIZED' if eff_discount > 0 else 'NONE'),
             'discount_label': contract_data.get('discount_label') if contract_data else ('Offline Branch Authorized Rate' if eff_discount > 0 else 'Standard Catalog Price'),
@@ -972,11 +1011,17 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             'campaign_name': contract_data.get('campaign_name') if contract_data else '',
             'home_sessions_remaining': m_home_s,
             'cross_branch_sessions_remaining': m_cross_s,
+            'sessions_used': base_consumed,
+            'sessions_total': base_alloc,
+            'sessions_left': sessions_left,
+            'passport_sessions_used': passport_consumed,
+            'passport_sessions_total': passport_alloc,
+            'passport_sessions_left': passport_left,
         }
 
         # Check if membership is currently active or frozen
         is_active_or_frozen = m.status in ('ACTIVE', 'FROZEN') and (not m.end_date or m.end_date >= timezone.now().date())
-        if is_active_or_frozen or (m.id == getattr(active_m, 'id', None) and m.status in ('ACTIVE', 'FROZEN')):
+        if is_active_or_frozen or m.id == getattr(active_m, 'id', None):
             if not active_membership_data:
                 active_membership_data = m_obj
             active_memberships_list.append(m_obj)
@@ -992,7 +1037,7 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
                 'cross_branch_sessions_remaining': m_cross_s,
                 'home_branch': m.home_branch.name if m.home_branch else 'Branch',
             })
-        elif m.status in ('ACTIVE', 'PENDING_PAYMENT') and m.start_date and m.start_date > timezone.now().date():
+        elif m.start_date and m.start_date > timezone.now().date():
             upcoming_membership_data.append(m_obj)
         else:
             history_membership_data.append(m_obj)
@@ -1939,13 +1984,6 @@ class MemberViewSet(viewsets.ViewSet):
                 profile = None
         if not profile:
             profile = qs.filter(member_number=pk).first()
-        if not profile:
-            try:
-                mem = Membership.objects.using(alias).filter(id=pk).select_related('user_profile').first()
-                if mem and mem.user_profile:
-                    profile = mem.user_profile
-            except Exception:
-                pass
         return profile
 
     def list(self, request):
@@ -2457,14 +2495,7 @@ class MemberViewSet(viewsets.ViewSet):
         if not profile:
             return Response({'detail': 'Member not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        active_m = None
-        target_membership_id = request.data.get('membership_id')
-        if target_membership_id:
-            active_m = Membership.objects.using(alias).filter(id=target_membership_id, user_profile=profile).first()
-        if not active_m and pk:
-            active_m = Membership.objects.using(alias).filter(id=pk, user_profile=profile).first()
-        if not active_m:
-            active_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
+        active_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
         if not active_m:
             return Response({'error': 'No existing membership found to renew.'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -2495,18 +2526,9 @@ class MemberViewSet(viewsets.ViewSet):
         price_obj = package_version.prices.using(alias).filter(status='ACTIVE').first()
         branch = active_m.home_branch or profile.preferred_branch
 
-        # Determine start date: respect start_schedule / custom_start_date or day after active_m.end_date
+        # Determine start date: day after active_m.end_date if in future, else today
         today = timezone.now().date()
-        start_schedule = request.data.get('start_schedule', 'CONTINUOUS')
-        custom_start_date = request.data.get('custom_start_date')
-        if start_schedule == 'CUSTOM' and custom_start_date:
-            try:
-                renewal_start = datetime.strptime(str(custom_start_date)[:10], '%Y-%m-%d').date()
-            except Exception:
-                renewal_start = today
-        elif start_schedule == 'FIRST_VISIT':
-            renewal_start = today
-        elif active_m.end_date and active_m.end_date >= today:
+        if active_m.end_date and active_m.end_date >= today:
             renewal_start = active_m.end_date + timedelta(days=1)
         else:
             renewal_start = today
@@ -2536,7 +2558,6 @@ class MemberViewSet(viewsets.ViewSet):
             )
 
             payment_provider = request.data.get('payment_provider', 'CARD')
-            payment_method = request.data.get('payment_method', payment_provider or 'CARD')
             is_cash = str(payment_provider).upper() == 'CASH' or str(payment_method).upper() == 'CASH'
             is_link = str(payment_provider).upper() in ('PAYMENT_LINK', 'LINK') or str(payment_method).upper() in ('PAYMENT_LINK', 'LINK')
             payment_amount = request.data.get('payment_amount')
@@ -3098,6 +3119,8 @@ class MemberViewSet(viewsets.ViewSet):
             cur_price = float(active_m.source_order_item.order.total_amount or 0.0)
         elif getattr(active_m, 'package_price', None):
             cur_price = float(active_m.package_price.base_price)
+        elif active_m.order_item and active_m.order_item.order:
+            cur_price = float(active_m.order_item.order.total_amount or 0.0)
         elif active_m.package_version:
             p_obj = active_m.package_version.prices.using(alias).filter(status='ACTIVE').first()
             if p_obj:
