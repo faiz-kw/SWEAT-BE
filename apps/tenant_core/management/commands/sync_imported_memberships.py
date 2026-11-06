@@ -39,6 +39,20 @@ from config.routers import build_tenant_db_alias, set_tenant_db_alias, get_tenan
 logger = logging.getLogger(__name__)
 
 
+def calculate_expected_end_date(start_date: date, duration_value: int, duration_unit: str) -> date:
+    dur_unit_norm = str(duration_unit or 'MONTH').upper().rstrip('S')
+    val = int(duration_value or 1)
+    if dur_unit_norm == 'DAY':
+        return start_date + timedelta(days=val)
+    elif dur_unit_norm == 'WEEK':
+        return start_date + timedelta(weeks=val)
+    elif dur_unit_norm == 'MONTH':
+        return start_date + timedelta(days=val * 30)
+    elif dur_unit_norm == 'YEAR':
+        return start_date + timedelta(days=val * 365)
+    return start_date + timedelta(days=30)
+
+
 class Command(BaseCommand):
     help = 'Syncs imported paid orders from data dumps into active Memberships and Entitlements.'
 
@@ -231,7 +245,7 @@ class Command(BaseCommand):
                     skipped_count += 1
                     continue
 
-                # Compute start date
+                # Compute start and expected end date
                 today = timezone.now().date()
                 if start_date_mode == 'today':
                     calc_start_date = today
@@ -241,12 +255,22 @@ class Command(BaseCommand):
                 pkg_name_display = package.name
                 duration_val = package_ver.duration_value or 1
                 duration_unit = package_ver.duration_unit or 'MONTH'
+                calc_end_date = calculate_expected_end_date(calc_start_date, duration_val, duration_unit)
+
+                # STRICT VALIDITY GUARD:
+                # If package validity expired in the past (e.g. 2025 or earlier in 2026), DO NOT activate as an active plan!
+                if calc_end_date < today and start_date_mode != 'today':
+                    skipped_count += 1
+                    continue
+
+                days_remaining = (calc_end_date - today).days
 
                 if dry_run:
                     self.stdout.write(self.style.SUCCESS(
                         f"  [DRY-RUN WOULD ACTIVATE] Member: {mem_num_display} ({user_name_display}) | "
                         f"Order: {order.order_number} (₹{order.total_amount}) | "
-                        f"Plan: {pkg_name_display} ({duration_val} {duration_unit}) | Start: {calc_start_date}"
+                        f"Plan: {pkg_name_display} ({duration_val} {duration_unit}) | "
+                        f"Validity: {calc_start_date} to {calc_end_date} ({days_remaining} days remaining)"
                     ))
                     activated_count += 1
                 else:
@@ -266,7 +290,7 @@ class Command(BaseCommand):
                         self.stdout.write(self.style.SUCCESS(
                             f"  [OK ACTIVATED] Member: {mem_num_display} ({user_name_display}) | "
                             f"Order: {order.order_number} -> Membership: {membership.membership_number} | "
-                            f"Valid: {membership.start_date} to {membership.end_date}"
+                            f"Valid: {membership.start_date} to {membership.end_date} ({days_remaining} days remaining)"
                         ))
                         activated_count += 1
                     except Exception as e:
@@ -314,10 +338,18 @@ class Command(BaseCommand):
                     except Exception:
                         pass
 
+                # Check if extension would actually be valid today
+                today = timezone.now().date()
+                current_end = target_m.end_date or (order.created_at.date() if order.created_at else today)
+                calc_new_end = current_end + timedelta(days=ext_days)
+                if calc_new_end < today and start_date_mode != 'today':
+                    skipped_count += 1
+                    continue
+
                 if dry_run:
                     self.stdout.write(self.style.SUCCESS(
                         f"  [DRY-RUN WOULD EXTEND] Member: {mem_num_display} ({user_name_display}) | "
-                        f"Order: {order.order_number} | Membership: {target_m.membership_number} | +{ext_days} days"
+                        f"Order: {order.order_number} | Membership: {target_m.membership_number} | +{ext_days} days (New Expiry: {calc_new_end})"
                     ))
                     extended_count += 1
                 else:
