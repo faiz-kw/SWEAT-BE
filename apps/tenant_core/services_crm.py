@@ -491,6 +491,13 @@ class CRMLeadService:
                 assignment_source = 'MANUAL'
                 assignment_reason = 'Created unassigned (Manual assignment required)'
 
+            if not extra.get('campaign_reference'):
+                attr_payload = attribution_data or attribution_from_extra
+                if attr_payload and isinstance(attr_payload, dict):
+                    camp_ref = attr_payload.get('campaign_name') or attr_payload.get('campaign_id')
+                    if camp_ref:
+                        extra['campaign_reference'] = str(camp_ref)[:200]
+
             lead = Lead.objects.using(alias).create(
                 organization=organization,
                 branch=branch,
