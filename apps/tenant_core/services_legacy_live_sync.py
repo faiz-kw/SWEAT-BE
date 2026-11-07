@@ -385,8 +385,12 @@ def sync_live_legacy_member_to_tenant(primary_uid: int, tenant_alias: str, org_i
                 }
             )
 
-            # Entitlement (Base Sessions)
-            ent_base_uuid = uuid.UUID(gen_uuid('entitlement_base', p_uid))
+            # Entitlement (Base Sessions) - update existing pool or deterministic UUID
+            existing_base = MembershipEntitlement.objects.using(tenant_alias).filter(
+                membership=mem,
+                entitlement_type='CLASS_SESSION'
+            ).order_by('-consumed_units', '-updated_at').first()
+            ent_base_uuid = existing_base.id if existing_base else uuid.UUID(gen_uuid('entitlement_base', p_uid))
             MembershipEntitlement.objects.using(tenant_alias).update_or_create(
                 id=ent_base_uuid,
                 defaults={
@@ -403,7 +407,11 @@ def sync_live_legacy_member_to_tenant(primary_uid: int, tenant_alias: str, org_i
 
             # Entitlement (Passport Sessions)
             if pass_max > 0:
-                ent_pass_uuid = uuid.UUID(gen_uuid('entitlement_pass', p_uid))
+                existing_pass = MembershipEntitlement.objects.using(tenant_alias).filter(
+                    membership=mem,
+                    entitlement_type__in=['CROSS_BRANCH', 'CROSS_BRANCH_SESSION']
+                ).order_by('-consumed_units', '-updated_at').first()
+                ent_pass_uuid = existing_pass.id if existing_pass else uuid.UUID(gen_uuid('entitlement_pass', p_uid))
                 MembershipEntitlement.objects.using(tenant_alias).update_or_create(
                     id=ent_pass_uuid,
                     defaults={

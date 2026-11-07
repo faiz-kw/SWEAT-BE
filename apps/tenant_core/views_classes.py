@@ -1250,18 +1250,61 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
 
 
 
+    @action(detail=False, methods=['get'], url_path='available-tags')
+    def available_tags(self, request):
+        """
+        Returns active tags grouped by MUSCLE_GROUP and EQUIPMENT from WOD library
+        for class video assignment autocompletion.
+        """
+        from django.db.models import Q
+        alias = _get_db(request)
+        org = _get_org(request)
+        from .models_wod import WorkoutTag
+
+        qs = WorkoutTag.objects.using(alias).filter(status='ACTIVE')
+        if org:
+            qs = qs.filter(Q(organization=org) | Q(organization__isnull=True))
+
+        tags = list(qs.values('id', 'name', 'tag_group', 'code').order_by('name'))
+        muscle_tags = [t['name'] for t in tags if t['tag_group'] in ('MUSCLE_GROUP', 'BODY_TARGET')]
+        equipment_tags = [t['name'] for t in tags if t['tag_group'] == 'EQUIPMENT']
+
+        return Response({
+            'muscles': muscle_tags,
+            'equipment': equipment_tags,
+            'all_tags': tags,
+        }, status=status.HTTP_200_OK)
+
     @action(detail=True, methods=['post', 'patch'], url_path='update-video')
     def update_video(self, request, pk=None):
         """
         Updates or sets the workout video URL attached to this class occurrence.
+        If the YouTube video is already present in Content Studio (WorkoutContentItem),
+        it automatically maps all rich metadata (targeted muscles, equipment needed, cues)
+        and creates/updates a ClassContentAssignment link.
+        If it does not exist yet, it can auto-register the video in Content Studio with the
+        provided targeted muscles and equipment requirements.
         """
+        import re
         alias = _get_db(request)
+        org = _get_org(request)
         try:
-            occurrence = ClassOccurrence.objects.using(alias).get(id=pk)
+            occurrence = ClassOccurrence.objects.using(alias).select_related('class_template', 'branch').get(id=pk)
         except ClassOccurrence.DoesNotExist:
             return Response({'error': 'Class occurrence not found'}, status=status.HTTP_404_NOT_FOUND)
 
+        from .models_wod import WorkoutContentItem, WorkoutTag, WorkoutContentTag
+        from .models_classes import ClassContentItem, ClassContentAssignment
+
         video_url = (request.data.get('video_url') or '').strip()
+        manual_muscles = request.data.get('targeted_muscles') or request.data.get('muscles') or []
+        manual_equip = request.data.get('equipment_required') or request.data.get('equipment') or []
+
+        if isinstance(manual_muscles, str):
+            manual_muscles = [m.strip() for m in re.split(r'[,|&/]', manual_muscles) if m.strip()]
+        if isinstance(manual_equip, str):
+            manual_equip = [e.strip() for e in re.split(r'[,+/&|]', manual_equip) if e.strip()]
+
         occurrence.online_join_url = video_url
         occurrence.save(using=alias, update_fields=['online_join_url'])
 
@@ -1290,12 +1333,224 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             if yt_id else (video_url or '')
         )
 
+        mapped_info = {
+            'in_content_studio': False,
+            'workout_item_id': None,
+            'movement_title': occurrence.class_template.name if occurrence.class_template else 'Class Workout',
+            'targeted_muscles': [],
+            'equipment_required': [],
+            'instructions': '',
+        }
+
+        if not video_url:
+            # If video cleared, remove any existing content assignment for this occurrence
+            ClassContentAssignment.objects.using(alias).filter(occurrence=occurrence).delete()
+            return Response({
+                'message': 'Workout video URL cleared successfully.',
+                'video_url': '',
+                'occurrence_id': str(occurrence.id),
+                'mapped_info': mapped_info,
+            }, status=status.HTTP_200_OK)
+
+        # 1. Normalize video identifiers for YouTube matching
+        patterns = [
+            r'(?:youtu\.be/|youtube\.com/(?:embed/|v/|watch\?v=|watch\?.+&v=))([\w-]{11})',
+            r'youtu\.be/([\w-]{11})',
+        ]
+        yt_id = None
+        for p in patterns:
+            m = re.search(p, video_url)
+            if m:
+                yt_id = m.group(1)
+                break
+
+        # 2. Check if already present in Content Studio (WorkoutContentItem)
+        workout_item = None
+        if yt_id:
+            workout_item = WorkoutContentItem.objects.using(alias).filter(
+                Q(video_url__icontains=yt_id) | Q(video_url__icontains=video_url)
+            ).order_by('-created_at').first()
+        else:
+            workout_item = WorkoutContentItem.objects.using(alias).filter(
+                video_url__iexact=video_url
+            ).order_by('-created_at').first()
+
+        # 3. If found in Content Studio, extract and map metadata
+        if workout_item:
+            mapped_info['in_content_studio'] = True
+            mapped_info['workout_item_id'] = str(workout_item.id)
+            mapped_info['movement_title'] = workout_item.movement_name or (occurrence.class_template.name if occurrence.class_template else 'Class Workout')
+            mapped_info['instructions'] = workout_item.description or ''
+
+            # Muscles from raw_import_data or tags
+            raw_muscles = workout_item.raw_import_data.get('muscles') if (workout_item.raw_import_data and isinstance(workout_item.raw_import_data, dict)) else None
+            if raw_muscles:
+                if isinstance(raw_muscles, list):
+                    mapped_info['targeted_muscles'] = [str(m).strip() for m in raw_muscles if str(m).strip()]
+                elif isinstance(raw_muscles, str):
+                    mapped_info['targeted_muscles'] = [m.strip() for m in re.split(r'[,|&/]', raw_muscles) if m.strip()]
+
+            if not mapped_info['targeted_muscles']:
+                try:
+                    mapped_info['targeted_muscles'] = [
+                        ct.tag.name for ct in workout_item.content_tags.using(alias).select_related('tag').filter(tag__tag_group='MUSCLE_GROUP') if ct.tag
+                    ]
+                except Exception:
+                    mapped_info['targeted_muscles'] = []
+
+            # If user supplied manual muscle tags, use them (or merge)
+            if manual_muscles:
+                mapped_info['targeted_muscles'] = list(manual_muscles)
+            elif not mapped_info['targeted_muscles'] and raw_muscles:
+                pass
+
+            # Equipment from raw_import_data or tags
+            raw_equip = workout_item.raw_import_data.get('equipment') if (workout_item.raw_import_data and isinstance(workout_item.raw_import_data, dict)) else None
+            if raw_equip:
+                if isinstance(raw_equip, list):
+                    mapped_info['equipment_required'] = [str(e).strip() for e in raw_equip if str(e).strip()]
+                elif isinstance(raw_equip, str):
+                    mapped_info['equipment_required'] = [e.strip() for e in re.split(r'[,+/&|]', raw_equip) if e.strip()]
+
+            if not mapped_info['equipment_required']:
+                try:
+                    mapped_info['equipment_required'] = [
+                        ct.tag.name for ct in workout_item.content_tags.using(alias).select_related('tag').filter(tag__tag_group='EQUIPMENT') if ct.tag
+                    ]
+                except Exception:
+                    mapped_info['equipment_required'] = []
+
+            # If user supplied manual equipment tags, use them
+            if manual_equip:
+                mapped_info['equipment_required'] = list(manual_equip)
+
+        else:
+            # 4. If NOT present in Content Studio, auto-register as new Content Studio entry if organization exists
+            tpl_name = occurrence.class_template.name if occurrence.class_template else 'Class Workout'
+            auto_org = org or (occurrence.class_template.organization if occurrence.class_template else None)
+            if auto_org:
+                new_title = f"{tpl_name} - Video Flow"
+                workout_item = WorkoutContentItem.objects.using(alias).create(
+                    organization=auto_org,
+                    movement_name=new_title,
+                    description=f"Auto-registered from class occurrence ({occurrence.occurrence_date}).",
+                    video_url=video_url,
+                    video_provider='YOUTUBE' if yt_id else 'EXTERNAL',
+                    content_kind='MOVEMENT',
+                    is_wod_eligible=True,
+                    status='ACTIVE',
+                    created_by_user=request.user if hasattr(request, 'user') and request.user.is_authenticated else None,
+                    raw_import_data={
+                        'class_occurrence_id': str(occurrence.id),
+                        'class_template_name': tpl_name,
+                        'date': occurrence.occurrence_date.strftime('%Y-%m-%d') if occurrence.occurrence_date else '',
+                        'muscles': list(manual_muscles),
+                        'equipment': list(manual_equip),
+                        'source': 'CLASS_OCCURRENCE_EDIT',
+                    }
+                )
+                mapped_info['in_content_studio'] = True
+                mapped_info['workout_item_id'] = str(workout_item.id)
+                mapped_info['movement_title'] = new_title
+                mapped_info['targeted_muscles'] = list(manual_muscles)
+                mapped_info['equipment_required'] = list(manual_equip)
+
+        # 5. Persist assigned tags to WorkoutTag / WorkoutContentTag for the workout item (multiple tags support)
+        if workout_item:
+            auto_org = org or workout_item.organization
+            if auto_org:
+                for m_name in mapped_info.get('targeted_muscles', []):
+                    m_clean = str(m_name).strip()
+                    if not m_clean:
+                        continue
+                    try:
+                        m_tag = WorkoutTag.objects.using(alias).filter(
+                            organization=auto_org,
+                            tag_group__in=['MUSCLE_GROUP', 'BODY_TARGET'],
+                            name__iexact=m_clean
+                        ).first()
+                        if not m_tag:
+                            m_tag = WorkoutTag.objects.using(alias).filter(
+                                tag_group__in=['MUSCLE_GROUP', 'BODY_TARGET'],
+                                name__iexact=m_clean
+                            ).first()
+                        if not m_tag:
+                            m_tag, _ = WorkoutTag.objects.using(alias).get_or_create(
+                                organization=auto_org,
+                                tag_group='MUSCLE_GROUP',
+                                name=m_clean,
+                                defaults={'code': slugify(m_clean).upper().replace('-', '_')[:50] or 'CORE', 'status': 'ACTIVE'}
+                            )
+                        WorkoutContentTag.objects.using(alias).get_or_create(content_item=workout_item, tag=m_tag)
+                    except Exception:
+                        pass
+
+                for eq_name in mapped_info.get('equipment_required', []):
+                    eq_clean = str(eq_name).strip()
+                    if not eq_clean:
+                        continue
+                    try:
+                        eq_tag = WorkoutTag.objects.using(alias).filter(
+                            organization=auto_org,
+                            tag_group='EQUIPMENT',
+                            name__iexact=eq_clean
+                        ).first()
+                        if not eq_tag:
+                            eq_tag = WorkoutTag.objects.using(alias).filter(
+                                tag_group='EQUIPMENT',
+                                name__iexact=eq_clean
+                            ).first()
+                        if not eq_tag:
+                            eq_tag, _ = WorkoutTag.objects.using(alias).get_or_create(
+                                organization=auto_org,
+                                tag_group='EQUIPMENT',
+                                name=eq_clean,
+                                defaults={'code': slugify(eq_clean).upper().replace('-', '_')[:50] or 'EQUIPMENT', 'status': 'ACTIVE'}
+                            )
+                        WorkoutContentTag.objects.using(alias).get_or_create(content_item=workout_item, tag=eq_tag)
+                    except Exception:
+                        pass
+
+                # Update raw_import_data so cached reads reflect all multiple tags
+                try:
+                    curr_raw = dict(workout_item.raw_import_data or {})
+                    curr_raw['muscles'] = mapped_info.get('targeted_muscles', [])
+                    curr_raw['equipment'] = mapped_info.get('equipment_required', [])
+                    workout_item.raw_import_data = curr_raw
+                    workout_item.save(using=alias, update_fields=['raw_import_data'])
+                except Exception:
+                    pass
+
+        # 5. Connect / bridge ClassContentAssignment so trainer screen & app immediately render it
+        if workout_item:
+            auto_org = org or workout_item.organization
+            content_item, _ = ClassContentItem.objects.using(alias).get_or_create(
+                organization=auto_org,
+                external_url=workout_item.video_url,
+                defaults={
+                    'title': workout_item.movement_name,
+                    'description': workout_item.description,
+                    'content_type': 'VIDEO',
+                    'status': 'ACTIVE',
+                }
+            )
+            ClassContentAssignment.objects.using(alias).update_or_create(
+                occurrence=occurrence,
+                defaults={
+                    'content_item': content_item,
+                    'assignment_method': 'MANUAL',
+                    'assigned_by_user': request.user if hasattr(request, 'user') and request.user.is_authenticated else None,
+                    'status': 'ACTIVE',
+                }
+            )
+
         return Response({
-            'message': 'Workout video URL updated successfully.',
+            'message': 'Workout video updated and mapped to Content Studio successfully.',
             'video_url': video_url,
             'external_url': video_url,
             'embed_player_url': embed_player_url,
             'occurrence_id': str(occurrence.id),
+            'mapped_info': mapped_info,
         }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['get'], url_path='cancellation-preview')
