@@ -115,32 +115,22 @@ def calculate_member_outstanding(profile: UserProfile, alias: str = 'default') -
     Excludes cancelled, refunded, draft, and abandoned unpaid checkout attempts.
     """
     orders = Order.objects.using(alias).filter(
-        user_profile=profile
+        user_profile=profile,
+        status__in=['PARTIALLY_PAID', 'PENDING_PAYMENT']
     ).exclude(status__in=['CANCELLED', 'REFUNDED', 'DRAFT'])
 
     total_outstanding = Decimal('0.00')
     for order in orders:
-        if order.status == 'PARTIALLY_PAID':
-            paid_sum = PaymentTransaction.objects.using(alias).filter(
-                order=order, status__in=['SUCCESS', 'success']
-            ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
-            refund_sum = Refund.objects.using(alias).filter(
-                order=order, status__in=['SUCCESS', 'success']
-            ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
-            net_paid = max(Decimal('0.00'), paid_sum - refund_sum)
-            diff = order.total_amount - net_paid
-            if diff > Decimal('0.00'):
-                total_outstanding += diff
-        elif order.status == 'PENDING_PAYMENT':
-            # Check if any partial payment was committed on this order
-            paid_sum = PaymentTransaction.objects.using(alias).filter(
-                order=order, status__in=['SUCCESS', 'success']
-            ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
-            if paid_sum > Decimal('0.00'):
-                diff = order.total_amount - paid_sum
-                if diff > Decimal('0.00'):
-                    total_outstanding += diff
-            # Abandoned/cancelled payment attempts with zero payments are NOT debt
+        paid_sum = PaymentTransaction.objects.using(alias).filter(
+            order=order, status__in=['SUCCESS', 'success']
+        ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        refund_sum = Refund.objects.using(alias).filter(
+            order=order, status__in=['SUCCESS', 'success']
+        ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        net_paid = max(Decimal('0.00'), paid_sum - refund_sum)
+        diff = max(Decimal('0.00'), order.total_amount - net_paid)
+        if diff > Decimal('0.00'):
+            total_outstanding += diff
 
     return total_outstanding
 
@@ -223,7 +213,7 @@ def get_member_sessions_summary(profile: UserProfile, active_m: Membership = Non
     return home_sessions, cross_sessions, detailed_balances
 
 
-def serialize_member(profile: UserProfile, alias: str = 'default') -> dict:
+def serialize_member(profile: UserProfile, alias: str = 'default', compact: bool = False) -> dict:
     user = profile.user
     first_name = profile.first_name_snapshot or getattr(user, 'first_name', '')
     last_name = profile.last_name_snapshot or getattr(user, 'last_name', '')
@@ -262,8 +252,19 @@ def serialize_member(profile: UserProfile, alias: str = 'default') -> dict:
         if active_m.package_version:
             package_version_name = f"v{active_m.package_version.version_number}"
 
-        # Real membership status: check expiration against today
-        if active_m.status == 'ACTIVE' and active_m.end_date and active_m.end_date < today:
+        # Real membership status: check freeze and expiration against today
+        is_frozen = (
+            active_m.status == 'FROZEN'
+            or MembershipFreeze.objects.using(alias).filter(
+                membership=active_m,
+                status='ACTIVE',
+                freeze_from__lte=today,
+                freeze_until__gte=today
+            ).exists()
+        )
+        if is_frozen:
+            membership_status = 'FROZEN'
+        elif active_m.status == 'ACTIVE' and active_m.end_date and active_m.end_date < today:
             membership_status = 'EXPIRED'
         else:
             membership_status = active_m.status
@@ -295,50 +296,62 @@ def serialize_member(profile: UserProfile, alias: str = 'default') -> dict:
         else:
             emergency_contact = str(profile.emergency_contact_json)
 
-    # Entitlement calculation
-    home_sessions, cross_sessions, _ = get_member_sessions_summary(profile, active_m, alias)
+    if compact:
+        home_sessions, cross_sessions = 0, 0
+        outstanding_balance = Decimal('0.00')
+        att_count_30d = 0
+        last_visit = str(profile.joining_date or timezone.now().date())
+        assigned_trainer = getattr(profile, 'primary_coach_name', None) or 'Unassigned'
+        parq_status = getattr(active_m, 'parq_status', 'PENDING') if active_m else 'PENDING'
+        parq_completed_at = active_m.parq_completed_at.isoformat() if (active_m and active_m.parq_completed_at) else None
+        parq_sub_count = 1 if parq_status == 'COMPLETED' else 0
+        parq_has_edits = False
+        parq_version = 1
+    else:
+        # Entitlement calculation
+        home_sessions, cross_sessions, _ = get_member_sessions_summary(profile, active_m, alias)
 
-    # Outstanding balance
-    outstanding_balance = calculate_member_outstanding(profile, alias)
+        # Outstanding balance
+        outstanding_balance = calculate_member_outstanding(profile, alias)
 
-    # Attendance stats
-    thirty_days_ago = timezone.now() - timedelta(days=30)
-    att_qs = AttendanceRecord.objects.using(alias).filter(user_profile=profile)
-    att_count_30d = att_qs.filter(created_at__gte=thirty_days_ago).count()
-    last_record = att_qs.order_by('-created_at').first()
-    last_visit = str(last_record.check_in_at.date()) if (last_record and last_record.check_in_at) else (
-        str(last_record.created_at.date()) if last_record else str(profile.joining_date or timezone.now().date())
-    )
+        # Attendance stats
+        thirty_days_ago = timezone.now() - timedelta(days=30)
+        att_qs = AttendanceRecord.objects.using(alias).filter(user_profile=profile)
+        att_count_30d = att_qs.filter(created_at__gte=thirty_days_ago).count()
+        last_record = att_qs.order_by('-created_at').first()
+        last_visit = str(last_record.check_in_at.date()) if (last_record and last_record.check_in_at) else (
+            str(last_record.created_at.date()) if last_record else str(profile.joining_date or timezone.now().date())
+        )
 
-    # Assigned trainer
-    assigned_trainer = getattr(profile, 'primary_coach_name', None) or 'Unassigned'
+        # Assigned trainer
+        assigned_trainer = getattr(profile, 'primary_coach_name', None) or 'Unassigned'
 
-    # PAR-Q Compliance Status & Revision Tracking
-    from .models_crm import IntakeSubmission
-    parq_subs = IntakeSubmission.objects.using(alias).filter(user_profile=profile).order_by('-submitted_at')
-    parq_sub_count = parq_subs.count()
-    latest_parq = parq_subs.first()
+        # PAR-Q Compliance Status & Revision Tracking
+        from .models_crm import IntakeSubmission
+        parq_subs = IntakeSubmission.objects.using(alias).filter(user_profile=profile).order_by('-submitted_at')
+        parq_sub_count = parq_subs.count()
+        latest_parq = parq_subs.first()
 
-    parq_status = 'PENDING'
-    parq_completed_at = None
-    parq_version = 1
-    parq_has_edits = parq_sub_count > 1
+        parq_status = 'PENDING'
+        parq_completed_at = None
+        parq_version = 1
+        parq_has_edits = parq_sub_count > 1
 
-    if active_m and getattr(active_m, 'parq_status', None):
-        parq_status = active_m.parq_status
-        parq_completed_at = active_m.parq_completed_at.isoformat() if active_m.parq_completed_at else None
-    elif latest_parq and latest_parq.status == 'COMPLETED':
-        parq_status = 'COMPLETED'
-        parq_completed_at = latest_parq.submitted_at.isoformat() if latest_parq.submitted_at else None
-    elif profile.address_json and profile.address_json.get('onboarding', {}).get('is_cleared'):
-        parq_status = 'COMPLETED'
-        parq_completed_at = profile.address_json.get('onboarding', {}).get('completed_at')
+        if active_m and getattr(active_m, 'parq_status', None):
+            parq_status = active_m.parq_status
+            parq_completed_at = active_m.parq_completed_at.isoformat() if active_m.parq_completed_at else None
+        elif latest_parq and latest_parq.status == 'COMPLETED':
+            parq_status = 'COMPLETED'
+            parq_completed_at = latest_parq.submitted_at.isoformat() if latest_parq.submitted_at else None
+        elif profile.address_json and profile.address_json.get('onboarding', {}).get('is_cleared'):
+            parq_status = 'COMPLETED'
+            parq_completed_at = profile.address_json.get('onboarding', {}).get('completed_at')
 
-    if latest_parq:
-        if isinstance(getattr(latest_parq, 'form_snapshot', None), dict) and latest_parq.form_snapshot.get('version'):
-            parq_version = latest_parq.form_snapshot.get('version')
-        elif latest_parq.intake_form:
-            parq_version = latest_parq.intake_form.version_number
+        if latest_parq:
+            if isinstance(getattr(latest_parq, 'form_snapshot', None), dict) and latest_parq.form_snapshot.get('version'):
+                parq_version = latest_parq.form_snapshot.get('version')
+            elif latest_parq.intake_form:
+                parq_version = latest_parq.intake_form.version_number
 
     return {
         'parq_status': parq_status,
@@ -2041,32 +2054,54 @@ class MemberViewSet(viewsets.ViewSet):
                 Q(joining_date__lte=date_to) | (Q(joining_date__isnull=True) & Q(created_at__date__lte=date_to))
             )
 
+        # Active freeze membership IDs
+        active_freeze_mem_ids = set(MembershipFreeze.objects.using(alias).filter(
+            status='ACTIVE',
+            freeze_from__lte=today,
+            freeze_until__gte=today
+        ).values_list('membership_id', flat=True))
+
+        active_profile_ids_cache = None
+        def _get_active_profile_ids():
+            nonlocal active_profile_ids_cache
+            if active_profile_ids_cache is None:
+                active_profile_ids_cache = set(Membership.objects.using(alias).filter(
+                    status='ACTIVE'
+                ).filter(
+                    Q(end_date__gte=today) | Q(end_date__isnull=True)
+                ).exclude(
+                    status='FROZEN'
+                ).exclude(
+                    id__in=active_freeze_mem_ids
+                ).values_list('user_profile_id', flat=True))
+            return active_profile_ids_cache
+
         # Status filter
         status_param = request.query_params.get('status')
         if status_param and status_param not in ['all', 'ALL']:
             st = status_param.upper()
             if st == 'ACTIVE':
-                qs = qs.filter(
-                    memberships__status='ACTIVE',
-                    memberships__end_date__gte=today
-                ).exclude(
-                    memberships__status='FROZEN'
-                )
+                qs = qs.filter(id__in=_get_active_profile_ids())
             elif st == 'FROZEN':
-                qs = qs.filter(
-                    Q(memberships__status='FROZEN') |
-                    (Q(memberships__freezes__status='ACTIVE') & Q(memberships__freezes__freeze_from__lte=today) & Q(memberships__freezes__freeze_until__gte=today))
-                )
+                frozen_ids = set(Membership.objects.using(alias).filter(
+                    Q(status='FROZEN') | Q(id__in=active_freeze_mem_ids)
+                ).values_list('user_profile_id', flat=True))
+                qs = qs.filter(id__in=frozen_ids)
             elif st == 'EXPIRED':
+                act_ids = _get_active_profile_ids()
+                frozen_ids = set(Membership.objects.using(alias).filter(
+                    Q(status='FROZEN') | Q(id__in=active_freeze_mem_ids)
+                ).values_list('user_profile_id', flat=True))
+                excluded_ids = act_ids | frozen_ids
+
+                exp_profile_ids = set(Membership.objects.using(alias).filter(
+                    Q(status='EXPIRED') | (Q(status='ACTIVE') & Q(end_date__lt=today))
+                ).exclude(
+                    user_profile_id__in=excluded_ids
+                ).values_list('user_profile_id', flat=True))
+
                 qs = qs.filter(
-                    Q(memberships__status='EXPIRED')
-                    | (Q(memberships__status='ACTIVE') & Q(memberships__end_date__lt=today))
-                    | Q(member_status='EXPIRED')
-                ).exclude(
-                    memberships__status='ACTIVE',
-                    memberships__end_date__gte=today
-                ).exclude(
-                    memberships__status='FROZEN'
+                    Q(id__in=exp_profile_ids) | (Q(member_status='EXPIRED') & ~Q(id__in=excluded_ids))
                 )
             elif st == 'CANCELLED':
                 qs = qs.filter(memberships__status='CANCELLED')
@@ -2080,11 +2115,25 @@ class MemberViewSet(viewsets.ViewSet):
         if search:
             s = search.strip()
             if s:
+                import re
+                clean_digits = re.sub(r'\D', '', s)
+                phone_q = Q(user__phone__icontains=s)
+                if len(clean_digits) >= 5:
+                    phone_q = (
+                        phone_q
+                        | Q(user__phone__icontains=clean_digits)
+                        | Q(user__phone__icontains=f"+{clean_digits}")
+                        | Q(user__phone__icontains=f"+91{clean_digits}")
+                    )
+                    if clean_digits.startswith('91') and len(clean_digits) > 7:
+                        phone_q = phone_q | Q(user__phone__icontains=clean_digits[2:])
+
                 parts = s.split()
                 if len(parts) >= 2:
                     name_q = (
                         (Q(user__first_name__icontains=parts[0]) & Q(user__last_name__icontains=parts[1]))
                         | (Q(first_name_snapshot__icontains=parts[0]) & Q(last_name_snapshot__icontains=parts[1]))
+                        | (Q(user__first_name__icontains=s) | Q(user__last_name__icontains=s))
                     )
                 else:
                     name_q = (
@@ -2094,65 +2143,69 @@ class MemberViewSet(viewsets.ViewSet):
                         | Q(user__last_name__icontains=s)
                     )
 
+                id_q = Q()
+                if len(s) >= 4:
+                    try:
+                        id_q = Q(id__istartswith=s)
+                    except Exception:
+                        pass
+
                 qs = qs.filter(
                     name_q
                     | Q(user__email__icontains=s)
-                    | Q(user__phone__icontains=s)
+                    | phone_q
                     | Q(member_number__icontains=s)
+                    | Q(legacy_reference__icontains=s)
                     | Q(memberships__membership_number__icontains=s)
+                    | id_q
                 )
 
         # Quick Views filter
         quick_view = request.query_params.get('quick_view')
-        if quick_view == 'active':
-            # Canonical active membership: currently ACTIVE, not past end_date, not FROZEN
-            qs = qs.filter(
-                memberships__status='ACTIVE',
-                memberships__end_date__gte=today
-            ).exclude(
-                memberships__status='FROZEN'
-            )
-        elif quick_view == 'frozen':
-            # Canonical frozen: currently effective freeze lifecycle
-            qs = qs.filter(
-                Q(memberships__status='FROZEN') |
-                (Q(memberships__freezes__status='ACTIVE') & Q(memberships__freezes__freeze_from__lte=today) & Q(memberships__freezes__freeze_until__gte=today))
-            )
-        elif quick_view == 'expiring_soon':
-            # Active membership expiring between today and today + 30 days, not frozen
-            soon = today + timedelta(days=30)
-            qs = qs.filter(
-                memberships__status='ACTIVE',
-                memberships__end_date__gte=today,
-                memberships__end_date__lte=soon
-            ).exclude(
-                memberships__status='FROZEN'
-            )
-        elif quick_view == 'expired':
-            # Expired membership, but active current membership wins over old expired historical membership
-            qs = qs.filter(
-                Q(memberships__status='EXPIRED')
-                | (Q(memberships__status='ACTIVE') & Q(memberships__end_date__lt=today))
-                | Q(member_status='EXPIRED')
-            ).exclude(
-                memberships__status='ACTIVE',
-                memberships__end_date__gte=today
-            ).exclude(
-                memberships__status='FROZEN'
-            )
-        elif quick_view == 'outstanding':
-            # Server-calculated outstanding > 0, excluding cancelled/refunded/fully paid
-            candidate_ids = list(qs.filter(
-                orders__status__in=['PENDING_PAYMENT', 'PARTIALLY_PAID']
-            ).values_list('id', flat=True).distinct())
+        if quick_view and quick_view not in ['all', 'ALL']:
+            if quick_view == 'active':
+                qs = qs.filter(id__in=_get_active_profile_ids())
+            elif quick_view == 'frozen':
+                frozen_ids = set(Membership.objects.using(alias).filter(
+                    Q(status='FROZEN') | Q(id__in=active_freeze_mem_ids)
+                ).values_list('user_profile_id', flat=True))
+                qs = qs.filter(id__in=frozen_ids)
+            elif quick_view == 'expiring_soon':
+                soon = today + timedelta(days=30)
+                exp_ids = set(Membership.objects.using(alias).filter(
+                    status='ACTIVE',
+                    end_date__gte=today,
+                    end_date__lte=soon
+                ).exclude(
+                    status='FROZEN'
+                ).exclude(
+                    id__in=active_freeze_mem_ids
+                ).values_list('user_profile_id', flat=True))
+                qs = qs.filter(id__in=exp_ids)
+            elif quick_view == 'expired':
+                act_ids = _get_active_profile_ids()
+                frozen_ids = set(Membership.objects.using(alias).filter(
+                    Q(status='FROZEN') | Q(id__in=active_freeze_mem_ids)
+                ).values_list('user_profile_id', flat=True))
+                excluded_ids = act_ids | frozen_ids
 
-            outstanding_ids = []
-            for p_id in candidate_ids:
-                p = qs.filter(id=p_id).first()
-                if p and calculate_member_outstanding(p, alias) > Decimal('0.00'):
-                    outstanding_ids.append(p_id)
+                exp_profile_ids = set(Membership.objects.using(alias).filter(
+                    Q(status='EXPIRED') | (Q(status='ACTIVE') & Q(end_date__lt=today))
+                ).exclude(
+                    user_profile_id__in=excluded_ids
+                ).values_list('user_profile_id', flat=True))
 
-            qs = qs.filter(id__in=outstanding_ids)
+                qs = qs.filter(
+                    Q(id__in=exp_profile_ids) | (Q(member_status='EXPIRED') & ~Q(id__in=excluded_ids))
+                )
+            elif quick_view == 'outstanding':
+                debt_profile_ids = set(Order.objects.using(alias).filter(
+                    status__in=['PENDING_PAYMENT', 'PARTIALLY_PAID'],
+                    total_amount__gt=Decimal('0.00')
+                ).exclude(
+                    status__in=['CANCELLED', 'REFUNDED', 'DRAFT']
+                ).values_list('user_profile_id', flat=True))
+                qs = qs.filter(id__in=debt_profile_ids)
 
         qs = qs.distinct().order_by('-created_at')
 
@@ -2178,7 +2231,8 @@ class MemberViewSet(viewsets.ViewSet):
         end_idx = start_idx + page_size
         page_qs = qs[start_idx:end_idx]
 
-        results = [serialize_member(p, alias) for p in page_qs]
+        is_compact = request.query_params.get('compact') == 'true'
+        results = [serialize_member(p, alias, compact=is_compact) for p in page_qs]
 
         # If client explicitly specifies flat format
         if request.query_params.get('format') == 'flat':

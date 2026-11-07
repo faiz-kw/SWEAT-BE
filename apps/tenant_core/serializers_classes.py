@@ -442,6 +442,7 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
             membership = self.context.get('membership')
             user_profile = self.context.get('user_profile')
             db_alias = self.context.get('db_alias')
+            is_staff = self.context.get('is_staff', False)
             if membership or user_profile:
                 from .services_bookings import BookingWaitlistAttendanceService
                 obj._cached_eligibility = BookingWaitlistAttendanceService.evaluate_occurrence_eligibility(
@@ -449,6 +450,7 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
                     membership=membership,
                     user_profile=user_profile,
                     db_alias=db_alias,
+                    is_staff=is_staff,
                 )
             else:
                 obj._cached_eligibility = {'eligible': True, 'reason_code': None, 'reason_message': None}
@@ -478,6 +480,34 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
         if instance.end_at:
             dt = instance.end_at.astimezone(branch_tz) if branch_tz else instance.end_at
             ret['end_time'] = dt.strftime('%H:%M:%S')
+
+        # Real-time lifecycle status evaluation
+        now = timezone.now()
+        if instance.status in ('CANCELLED', 'DEACTIVATED'):
+            ret['status'] = instance.status
+        elif instance.end_at and now >= instance.end_at:
+            ret['status'] = 'COMPLETED'
+        elif instance.start_at and instance.end_at and instance.start_at <= now < instance.end_at:
+            ret['status'] = 'IN_PROGRESS'
+        else:
+            ret['status'] = instance.status or 'SCHEDULED'
+
+        # Ensure consistent class name and trainer name aliases across frontend callers
+        tmpl_name = (
+            getattr(instance.class_template, 'name', None)
+            or ret.get('class_name')
+            or 'Class Session'
+        )
+        ret['class_name'] = tmpl_name
+        ret['template_name'] = tmpl_name
+        ret['class_template_name'] = tmpl_name
+
+        trainers_list = ret.get('trainers') or []
+        lead_t = next((t.get('trainer_name') for t in trainers_list if t.get('trainer_name') and t.get('trainer_name') != 'Trainer'), None)
+        if not lead_t and trainers_list:
+            lead_t = trainers_list[0].get('trainer_name')
+        ret['trainer_name'] = lead_t or getattr(instance, 'lead_trainer_snapshot', None) or 'Unassigned'
+
         return ret
 
     def get_trainer_checked_in(self, obj):

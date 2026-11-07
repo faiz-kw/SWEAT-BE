@@ -634,7 +634,18 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
     required_module = 'ops'
     required_submodule = 'classes'
     required_permission = 'ops.classes.view'
-    permission_action_map = {'create': 'ops.classes.create', 'update': 'ops.classes.edit', 'partial_update': 'ops.classes.edit', 'destroy': 'ops.classes.delete', 'assign_trainer': 'ops.classes.edit', 'assign_content': 'ops.classes.edit'}
+    permission_action_map = {
+        'create': 'ops.classes.create',
+        'update': 'ops.classes.edit',
+        'partial_update': 'ops.classes.edit',
+        'destroy': 'ops.classes.delete',
+        'assign_trainer': 'ops.classes.edit',
+        'assign_content': 'ops.classes.edit',
+        'cancel': 'ops.classes.cancel',
+        'restore': 'ops.classes.cancel',
+        'deactivate': 'ops.classes.cancel',
+        'cancellation_preview': 'ops.classes.view',
+    }
 
     def get_queryset(self):
         from django.db.models import Q, Exists, OuterRef, Prefetch
@@ -667,7 +678,13 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
         if occ_date:
             qs = qs.filter(occurrence_date=occ_date)
         if status_param and status_param.upper() != 'ALL':
-            qs = qs.filter(status=status_param)
+            if ',' in status_param:
+                st_list = [s.strip() for s in status_param.split(',') if s.strip()]
+                qs = qs.filter(status__in=st_list)
+            else:
+                qs = qs.filter(status=status_param)
+        elif from_date:
+            qs = qs.exclude(status__in=['CANCELLED', 'DEACTIVATED'])
         if trainer_id:
             qs = qs.filter(trainer_assignments__trainer_profile_id=trainer_id)
         if from_date:
@@ -702,13 +719,16 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
                 Exists(matching_trainer)
             )
 
+        ordering = (self.request.query_params.get('ordering') or '').strip()
+        order_fields = ('-start_at', '-id') if ordering in ['-start_at', '-occurrence_date'] else ('start_at', 'id')
+
         return qs.select_related(
             'class_template', 'class_template__category', 'class_template__program', 'branch'
         ).prefetch_related(
             'trainer_assignments__trainer_profile__employee_profile__user_profile__user',
             'content_assignments__content_item',
             Prefetch('bookings', queryset=Booking.objects.using(alias).only('id', 'occurrence_id', 'status')),
-        ).order_by('start_at', 'id').distinct()
+        ).order_by(*order_fields).distinct()
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
@@ -729,6 +749,11 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
                 context['user_profile'] = UserProfile.objects.using(alias).get(id=user_profile_id)
             except Exception:
                 pass
+        is_staff = bool(
+            self.request.user
+            and (getattr(self.request.user, 'is_staff', False) or getattr(self.request.user, 'is_superuser', False) or getattr(self.request.user, 'role', '') in ['ADMIN', 'STAFF', 'MANAGER'])
+        )
+        context['is_staff'] = is_staff
         context['db_alias'] = alias
         return context
 
@@ -1215,6 +1240,268 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             'message': 'Workout video URL updated successfully.',
             'video_url': video_url,
             'occurrence_id': str(occurrence.id),
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['get'], url_path='cancellation-preview')
+    def cancellation_preview(self, request, pk=None):
+        """
+        Preview affected member bookings before cancelling or deactivating a class occurrence.
+        Returns total counts, confirmed vs waitlist breakdown, and detailed affected member list.
+        """
+        alias = _get_db(request)
+        instance = self.get_object()
+        from .models_bookings import Booking
+
+        active_bookings = Booking.objects.using(alias).filter(
+            occurrence=instance,
+            status__in=['CONFIRMED', 'WAITLISTED', 'RESERVED']
+        ).select_related(
+            'user_profile__user',
+            'membership__package_version__package',
+            'entitlement',
+        ).order_by('created_at')
+
+        affected_list = []
+        confirmed_count = 0
+        waitlist_count = 0
+
+        for b in active_bookings:
+            if b.status == 'WAITLISTED':
+                waitlist_count += 1
+            else:
+                confirmed_count += 1
+
+            u = getattr(b.user_profile, 'user', None)
+            first_name = getattr(b.user_profile, 'first_name_snapshot', '') or (u.first_name if u else '')
+            last_name = getattr(b.user_profile, 'last_name_snapshot', '') or (u.last_name if u else '')
+            full_name = f"{first_name} {last_name}".strip() or "Member"
+            phone = getattr(b.user_profile, 'phone_snapshot', '') or (u.phone if u else '')
+            email = getattr(b.user_profile, 'email_snapshot', '') or (u.email if u else '')
+
+            package_name = ""
+            if b.membership and getattr(b.membership, 'package_version', None) and getattr(b.membership.package_version, 'package', None):
+                package_name = b.membership.package_version.package.name
+            elif b.membership and getattr(b.membership, 'name', None):
+                package_name = b.membership.name
+
+            affected_list.append({
+                'id': str(b.id),
+                'booking_number': b.booking_number,
+                'status': b.status,
+                'member_id': str(b.user_profile.id) if b.user_profile else None,
+                'member_name': full_name,
+                'phone': phone,
+                'email': email,
+                'membership_id': str(b.membership.id) if b.membership else None,
+                'membership_name': package_name,
+                'booking_type': b.booking_type,
+                'has_entitlement': bool(b.entitlement),
+                'entitlement_type': getattr(b.entitlement, 'entitlement_type', None),
+                'waitlist_position': b.waitlist_position if b.status == 'WAITLISTED' else None,
+            })
+
+        start_time_str = instance.start_at.strftime('%H:%M') if instance.start_at else ''
+        end_time_str = instance.end_at.strftime('%H:%M') if instance.end_at else ''
+
+        return Response({
+            'occurrence_id': str(instance.id),
+            'class_name': instance.class_template.name if instance.class_template else 'Class Session',
+            'branch_name': instance.branch.name if instance.branch else '',
+            'occurrence_date': str(instance.occurrence_date),
+            'start_time': start_time_str,
+            'end_time': end_time_str,
+            'current_status': instance.status,
+            'total_booked': len(affected_list),
+            'confirmed_count': confirmed_count,
+            'waitlist_count': waitlist_count,
+            'is_recurring': bool(instance.schedule_rule_id),
+            'affected_bookings': affected_list,
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='cancel')
+    def cancel(self, request, pk=None):
+        """
+        Cancels or deactivates an individual class occurrence session.
+        - Does NOT delete the occurrence record.
+        - Updates occurrence status to 'CANCELLED' (or 'DEACTIVATED').
+        - Handles existing member bookings:
+            - Transitions active bookings to CANCELLED via BookingService.cancel_booking (reason_code='CLASS_CANCELLED_BY_ADMIN').
+            - Restores membership session credits / entitlements if restore_credits is True.
+            - Creates in-app notifications for affected members if notify_members is True.
+            - Maintains full cancellation and status history (no silent deletions).
+        - Single occurrence cancellation: Does not affect future recurring schedule rule sessions.
+        """
+        alias = _get_db(request)
+        instance = self.get_object()
+        from .models_bookings import Booking
+        from .services_bookings import BookingService, record_business_audit
+        from .models_govern import InAppNotification
+        from django.db import transaction
+
+        reason = (request.data.get('reason') or '').strip()
+        notify_members = request.data.get('notify_members', True)
+        restore_credits = request.data.get('restore_credits', True)
+        target_status = 'DEACTIVATED' if str(request.data.get('mode', '')).upper() == 'DEACTIVATED' else 'CANCELLED'
+
+        if instance.status == target_status:
+            return Response(
+                {'detail': f"Class session is already {target_status.lower()}."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        with transaction.atomic(using=alias):
+            # 1. Update occurrence status
+            old_status = instance.status
+            instance.status = target_status
+            instance.save(using=alias, update_fields=['status', 'updated_at'])
+
+            # 2. Query and process all active bookings
+            active_bookings = list(
+                Booking.objects.using(alias).filter(
+                    occurrence=instance,
+                    status__in=['CONFIRMED', 'WAITLISTED', 'RESERVED']
+                ).select_related(
+                    'user_profile__user',
+                    'occurrence__class_template',
+                    'occurrence__branch',
+                    'membership',
+                    'entitlement',
+                )
+            )
+
+            cancelled_bookings_count = 0
+            notifications_sent_count = 0
+            credits_restored_count = 0
+
+            org = (
+                instance.class_template.category.organization
+                if (instance.class_template and instance.class_template.category and instance.class_template.category.organization)
+                else (instance.class_template.organization if (instance.class_template and instance.class_template.organization) else (instance.branch.organization if instance.branch else None))
+            )
+
+            class_name = instance.class_template.name if instance.class_template else "Class"
+            date_str = str(instance.occurrence_date)
+            start_str = instance.start_at.strftime('%I:%M %p') if instance.start_at else ''
+
+            for b in active_bookings:
+                had_credits = bool(b.membership and b.entitlement)
+                # Cancel booking through authoritative service
+                BookingService.cancel_booking(
+                    booking=b,
+                    cancelled_by_user=request.user,
+                    reason_code='CLASS_CANCELLED_BY_ADMIN',
+                    reason_text=reason or "Class session cancelled by administrator.",
+                    db_alias=alias,
+                )
+                cancelled_bookings_count += 1
+                if had_credits and restore_credits:
+                    credits_restored_count += 1
+
+                # Send in-app notification to member
+                if notify_members and b.user_profile and b.user_profile.user and org:
+                    try:
+                        notif_msg = f"Your class session '{class_name}' on {date_str} at {start_str} has been cancelled by the studio."
+                        if reason:
+                            notif_msg += f" Reason: {reason}."
+                        if had_credits:
+                            notif_msg += " Your session credit has been restored to your membership."
+
+                        InAppNotification.objects.using(alias).create(
+                            organization=org,
+                            user=b.user_profile.user,
+                            notification_type='CLASS_CANCELLED',
+                            title=f"Class Cancelled: {class_name}",
+                            message=notif_msg,
+                            data={
+                                'occurrence_id': str(instance.id),
+                                'booking_id': str(b.id),
+                                'class_name': class_name,
+                                'date': date_str,
+                                'time': start_str,
+                                'reason': reason,
+                            },
+                        )
+                        notifications_sent_count += 1
+                    except Exception as notif_err:
+                        logger.warning(f"Failed to create notification for member {b.user_profile_id}: {notif_err}")
+
+            # Also record business audit log
+            if org:
+                record_business_audit(
+                    organization=org,
+                    module='CLASSES',
+                    action_code='CLASS_SESSION_CANCELLED',
+                    entity_type='ClassOccurrence',
+                    entity_id=instance.id,
+                    branch=instance.branch,
+                    actor_user=request.user,
+                    metadata={
+                        'target_status': target_status,
+                        'reason': reason,
+                        'cancelled_bookings_count': cancelled_bookings_count,
+                        'notifications_sent_count': notifications_sent_count,
+                    },
+                    db_alias=alias,
+                )
+
+        return Response({
+            'id': str(instance.id),
+            'status': instance.status,
+            'message': f"Class session {target_status.lower()} successfully.",
+            'cancelled_bookings_count': cancelled_bookings_count,
+            'notifications_sent_count': notifications_sent_count,
+            'credits_restored_count': credits_restored_count,
+        }, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='restore')
+    def restore(self, request, pk=None):
+        """
+        Restores / reactivates an accidentally cancelled or deactivated class occurrence.
+        - Validates that the class was previously CANCELLED or DEACTIVATED.
+        - If the occurrence end time has already passed, marks as COMPLETED.
+        - Otherwise, marks as OPEN / SCHEDULED and makes it visible again.
+        """
+        alias = _get_db(request)
+        instance = self.get_object()
+        from django.utils import timezone
+
+        if instance.status not in ('CANCELLED', 'DEACTIVATED'):
+            return Response(
+                {'detail': f"Only cancelled or deactivated classes can be restored. Current status is {instance.status}."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        now = timezone.now()
+        if instance.end_at and now >= instance.end_at:
+            instance.status = 'COMPLETED'
+        else:
+            instance.status = 'OPEN'
+
+        instance.save(using=alias, update_fields=['status', 'updated_at'])
+
+        org = (
+            instance.class_template.category.organization
+            if (instance.class_template and instance.class_template.category and instance.class_template.category.organization)
+            else (instance.class_template.organization if (instance.class_template and instance.class_template.organization) else (instance.branch.organization if instance.branch else None))
+        )
+        if org:
+            from .services_bookings import record_business_audit
+            record_business_audit(
+                organization=org,
+                module='CLASSES',
+                action_code='CLASS_SESSION_RESTORED',
+                entity_type='ClassOccurrence',
+                entity_id=instance.id,
+                branch=instance.branch,
+                actor_user=request.user,
+                metadata={'new_status': instance.status},
+                db_alias=alias,
+            )
+
+        return Response({
+            'id': str(instance.id),
+            'status': instance.status,
+            'message': f"Class session successfully reactivated to {instance.status}.",
         }, status=status.HTTP_200_OK)
 
     def destroy(self, request, *args, **kwargs):

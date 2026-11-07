@@ -322,6 +322,7 @@ class BookingWaitlistAttendanceService:
         user_profile: UserProfile = None,
         db_alias: str = None,
         booking_type: str = 'MEMBER',
+        is_staff: bool = False,
     ) -> dict:
         """
         Authoritatively evaluates whether an occurrence is bookable for a specific membership and user.
@@ -338,13 +339,19 @@ class BookingWaitlistAttendanceService:
                 'reason_code': 'OCCURRENCE_CANCELLED',
                 'reason_message': 'This class session is cancelled.',
             }
-        if occurrence.status == 'COMPLETED':
+        if occurrence.status == 'DEACTIVATED':
+            return {
+                'eligible': False,
+                'reason_code': 'OCCURRENCE_DEACTIVATED',
+                'reason_message': 'This class session is deactivated.',
+            }
+        if occurrence.status == 'COMPLETED' and not is_staff:
             return {
                 'eligible': False,
                 'reason_code': 'OCCURRENCE_COMPLETED',
                 'reason_message': 'This class session is already completed.',
             }
-        if occurrence.start_at and occurrence.start_at <= now:
+        if occurrence.start_at and occurrence.start_at <= now and not is_staff:
             return {
                 'eligible': False,
                 'reason_code': 'PAST_OCCURRENCE',
@@ -380,7 +387,8 @@ class BookingWaitlistAttendanceService:
 
         # 4. Membership Specific Validations (if membership provided)
         if membership:
-            if getattr(membership, 'parq_status', 'COMPLETED') != 'COMPLETED':
+            bp = cls.resolve_booking_policy(occurrence, db_alias=alias)
+            if bp and bp.require_parq and getattr(membership, 'parq_status', 'PENDING') != 'COMPLETED':
                 return {
                     'eligible': False,
                     'reason_code': 'PARQ_REQUIRED',
@@ -712,7 +720,7 @@ class BookingWaitlistAttendanceService:
             occurrence = ClassOccurrence.objects.using(alias).select_for_update().get(id=occurrence.id)
 
             # Validate occurrence lifecycle and class start/end boundaries
-            if occurrence.status in ('CANCELLED', 'COMPLETED'):
+            if occurrence.status in ('CANCELLED', 'DEACTIVATED'):
                 raise ValidationError(f"Cannot book a class occurrence that is {occurrence.status.lower()}.")
 
             now = timezone.now()
@@ -721,10 +729,18 @@ class BookingWaitlistAttendanceService:
                 duration = occurrence.class_template.default_duration_minutes if occurrence.class_template else 50
                 effective_end_at = occurrence.start_at + timedelta(minutes=duration)
 
-            if effective_end_at and effective_end_at <= now:
-                raise ValidationError("Cannot book a class occurrence that has already ended.")
-            if occurrence.start_at and occurrence.start_at <= now:
-                raise ValidationError("Cannot book a class occurrence that has already started.")
+            is_staff_override = bool(
+                (created_by_user and (getattr(created_by_user, 'is_staff', False) or getattr(created_by_user, 'is_superuser', False)))
+                or booking_source in ('ADMIN', 'FRONT_DESK')
+            )
+
+            if not is_staff_override:
+                if occurrence.status == 'COMPLETED':
+                    raise ValidationError("Cannot book a class occurrence that is completed.")
+                if effective_end_at and effective_end_at <= now:
+                    raise ValidationError("Cannot book a class occurrence that has already ended.")
+                if occurrence.start_at and occurrence.start_at <= now:
+                    raise ValidationError("Cannot book a class occurrence that has already started.")
 
             # 2. Prevent duplicate active booking
             existing = Booking.objects.using(alias).filter(
@@ -841,10 +857,7 @@ class BookingWaitlistAttendanceService:
                     raise ValidationError("Cannot book class occurring during an active or scheduled membership freeze window.")
 
                 # Gate: Verify PAR-Q completed and digitally signed for this specific membership
-                parq_enforced = bool(
-                    (booking_policy and booking_policy.require_parq)
-                    or getattr(membership, 'parq_status', 'PENDING') != 'COMPLETED'
-                )
+                parq_enforced = bool(booking_policy and booking_policy.require_parq)
                 if parq_enforced and getattr(membership, 'parq_status', 'PENDING') != 'COMPLETED':
                     if not membership.parq_form:
                         from .models_crm import IntakeForm
@@ -1245,6 +1258,12 @@ class BookingWaitlistAttendanceService:
                 session_action = applied_rule.session_action
                 if applied_rule.cancellation_type == 'TREATED_AS_NO_SHOW':
                     treated_as_no_show = True
+
+            # If cancelled by admin/system due to class cancellation, always restore member credits without penalty
+            if reason_code in ['CLASS_CANCELLED_BY_ADMIN', 'CLASS_DEACTIVATED', 'ADMIN_CLASS_CANCELLED']:
+                within_cutoff = True
+                treated_as_no_show = False
+                session_action = 'RESTORE'
 
             # If auto-cancelled due to non-payment, never consume membership credits
             if reason_code == 'AUTO_CANCELLED_UNPAID' or getattr(booking, 'payment_status', 'PAID') in ['UNPAID', 'PENDING']:
@@ -2381,4 +2400,5 @@ class BookingWaitlistAttendanceService:
 
 
 BookingAttendanceService = BookingWaitlistAttendanceService
+BookingService = BookingWaitlistAttendanceService
 
