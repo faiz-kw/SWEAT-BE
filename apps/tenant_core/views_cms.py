@@ -33,6 +33,7 @@ class CMSBannerViewSet(viewsets.ModelViewSet):
         'partial_update': 'cms.banners.manage',
         'destroy': 'cms.banners.manage',
         'reorder': 'cms.banners.manage',
+        'upload_media': 'cms.banners.manage',
     }
 
     def get_queryset(self):
@@ -66,6 +67,77 @@ class CMSBannerViewSet(viewsets.ModelViewSet):
             if b_id:
                 CMSBanner.objects.using(alias).filter(id=b_id).update(display_order=order)
         return Response({'status': 'reordered', 'count': len(items)})
+
+    @action(detail=False, methods=['post'], url_path='upload-media')
+    def upload_media(self, request):
+        """
+        Accepts a direct file upload (video or image) for CMS banners.
+        Saves the file to media storage and returns the stream/CDN URL.
+        """
+        uploaded = request.FILES.get('file') or request.FILES.get('media_file')
+        if not uploaded:
+            return Response({'error': 'No file provided. Expected field "file".'}, status=status.HTTP_400_BAD_REQUEST)
+
+        import os, re, uuid, mimetypes
+        from pathlib import Path
+        from django.conf import settings
+        from apps.tenant_core.models_infra import File
+
+        alias = get_current_tenant_db_alias() or 'default'
+        org = getattr(request, 'organization', None) or Organization.objects.using(alias).filter(status='ACTIVE').first()
+        org_id = str(org.id) if org else 'global'
+
+        orig_name = getattr(uploaded, 'name', 'media_file')
+        safe_name = re.sub(r'[^a-zA-Z0-9._-]', '_', os.path.basename(orig_name))
+        unique_prefix = uuid.uuid4().hex[:8]
+        filename = f"{unique_prefix}_{safe_name}"
+
+        media_root = getattr(settings, 'MEDIA_ROOT', None) or (Path(settings.BASE_DIR) / 'media')
+        target_dir = Path(media_root) / 'cms_banners' / org_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        file_path = target_dir / filename
+
+        total_bytes = 0
+        with open(file_path, 'wb') as out_f:
+            if hasattr(uploaded, 'chunks'):
+                for chunk in uploaded.chunks():
+                    out_f.write(chunk)
+                    total_bytes += len(chunk)
+            else:
+                data = uploaded.read()
+                out_f.write(data)
+                total_bytes += len(data)
+
+        # Detect media type
+        content_type = getattr(uploaded, 'content_type', '') or mimetypes.guess_type(orig_name)[0] or ''
+        is_video = 'video' in content_type.lower() or any(orig_name.lower().endswith(ext) for ext in ('.mp4', '.mov', '.webm', '.m4v', '.mkv', '.avi'))
+        media_type = 'VIDEO' if is_video else 'IMAGE'
+
+        media_url = f"/media/cms_banners/{org_id}/{filename}"
+
+        file_rec = None
+        try:
+            user = getattr(request, 'user', None)
+            tenant_user = getattr(user, 'tenant_user', None) if user else None
+            file_rec = File.objects.using(alias).create(
+                organization=org,
+                file_name=orig_name,
+                file_size=total_bytes,
+                mime_type=content_type or ('video/mp4' if is_video else 'image/jpeg'),
+                storage_provider='LOCAL',
+                object_key=f"cms_banners/{org_id}/{filename}",
+                uploaded_by=tenant_user,
+            )
+        except Exception:
+            pass
+
+        return Response({
+            'url': media_url,
+            'file_name': orig_name,
+            'file_size': total_bytes,
+            'media_type': media_type,
+            'file_id': str(file_rec.id) if file_rec else None,
+        }, status=status.HTTP_201_CREATED)
 
 
 class ProgramCategoryMediaViewSet(viewsets.ModelViewSet):
