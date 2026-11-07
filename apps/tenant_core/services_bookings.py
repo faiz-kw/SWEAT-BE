@@ -731,7 +731,7 @@ class BookingWaitlistAttendanceService:
 
             is_staff_override = bool(
                 (created_by_user and (getattr(created_by_user, 'is_staff', False) or getattr(created_by_user, 'is_superuser', False)))
-                or booking_source in ('ADMIN', 'FRONT_DESK')
+                or booking_source in ('ADMIN', 'FRONT_DESK', 'SALES_REP', 'TRAINER')
             )
 
             if not is_staff_override:

@@ -275,6 +275,8 @@ class Booking(models.Model):
             ('MOBILE_APP', 'MOBILE_APP'),
             ('FRONT_DESK', 'FRONT_DESK'),
             ('ADMIN', 'ADMIN'),
+            ('SALES_REP', 'SALES_REP'),
+            ('TRAINER', 'TRAINER'),
             ('KIOSK', 'KIOSK'),
             ('QR', 'QR'),
             ('API', 'API'),

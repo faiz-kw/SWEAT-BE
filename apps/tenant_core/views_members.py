@@ -2077,11 +2077,15 @@ class MemberViewSet(viewsets.ViewSet):
             return active_profile_ids_cache
 
         # Status filter
+        search = request.query_params.get('search')
         status_param = request.query_params.get('status')
         if status_param and status_param not in ['all', 'ALL']:
             st = status_param.upper()
             if st == 'ACTIVE':
-                qs = qs.filter(id__in=_get_active_profile_ids())
+                if search and search.strip():
+                    qs = qs.filter(Q(id__in=_get_active_profile_ids()) | Q(member_status='ACTIVE') | Q(user__status='ACTIVE'))
+                else:
+                    qs = qs.filter(id__in=_get_active_profile_ids())
             elif st == 'FROZEN':
                 frozen_ids = set(Membership.objects.using(alias).filter(
                     Q(status='FROZEN') | Q(id__in=active_freeze_mem_ids)

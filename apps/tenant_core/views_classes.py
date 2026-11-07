@@ -174,6 +174,15 @@ class ClassesMetadataView(APIView):
                 {'value': 'ENABLED', 'label': 'Enabled'},
                 {'value': 'DISABLED', 'label': 'Disabled'},
             ],
+            'occurrence_statuses': [
+                {'value': 'SCHEDULED', 'label': 'Scheduled'},
+                {'value': 'OPEN', 'label': 'Open'},
+                {'value': 'FULL', 'label': 'Full'},
+                {'value': 'IN_PROGRESS', 'label': 'In Progress'},
+                {'value': 'COMPLETED', 'label': 'Completed'},
+                {'value': 'CANCELLED', 'label': 'Cancelled'},
+                {'value': 'DEACTIVATED', 'label': 'Deactivated'},
+            ],
         })
 
 
@@ -683,12 +692,23 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
                 qs = qs.filter(status__in=st_list)
             else:
                 qs = qs.filter(status=status_param)
-        elif from_date:
-            qs = qs.exclude(status__in=['CANCELLED', 'DEACTIVATED'])
+        now = timezone.now()
+        upcoming_only = (self.request.query_params.get('upcoming_only') or '').strip().lower() == 'true'
+
         if trainer_id:
             qs = qs.filter(trainer_assignments__trainer_profile_id=trainer_id)
+
         if from_date:
             qs = qs.filter(occurrence_date__gte=from_date)
+            if (from_date == str(now.date()) and not to_date) or upcoming_only:
+                qs = qs.filter(end_at__gte=now - timedelta(minutes=15)).exclude(status__in=['CANCELLED', 'DEACTIVATED'])
+            elif not status_param:
+                qs = qs.exclude(status__in=['CANCELLED', 'DEACTIVATED'])
+        elif upcoming_only:
+            qs = qs.filter(end_at__gte=now - timedelta(minutes=15)).exclude(status__in=['CANCELLED', 'DEACTIVATED'])
+        elif not status_param:
+            pass
+
         if to_date:
             qs = qs.filter(occurrence_date__lte=to_date)
 
