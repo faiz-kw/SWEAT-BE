@@ -1346,7 +1346,6 @@ class MembershipLifecycleService:
         return membership
 
     @classmethod
-    @transaction.atomic
     def adjust_entitlement(
         cls,
         membership: Membership,
@@ -1356,56 +1355,92 @@ class MembershipLifecycleService:
         reason_text: Optional[str] = None,
         actor_user: Optional[TenantUser] = None,
         db_alias: Optional[str] = None,
+        entitlement_id: Optional[str] = None,
     ) -> MembershipEntitlementLedger:
         """
         Staff controlled adjustment of entitlement units with immutable ledger entry and balance_after.
         """
+        from django.db.models import Q
         alias = db_alias or get_current_tenant_db_alias() or 'default'
-        ent = MembershipEntitlement.objects.using(alias).select_for_update().filter(
-            membership=membership,
-            entitlement_type=entitlement_type,
-        ).first()
 
-        if not ent:
-            now_dt = timezone.now()
-            end_dt = timezone.make_aware(datetime.combine(membership.end_date, datetime.max.time()))
-            ent = MembershipEntitlement.objects.using(alias).create(
-                membership=membership,
-                entitlement_type=entitlement_type,
-                allocated_units=Decimal('0.00'),
-                consumed_units=Decimal('0.00'),
-                is_unlimited=False,
-                valid_from=now_dt,
-                valid_until=end_dt,
-                status='ACTIVE',
-            )
+        with transaction.atomic(using=alias):
+            ent = None
+            if entitlement_id:
+                ent = MembershipEntitlement.objects.using(alias).select_for_update().filter(
+                    id=entitlement_id,
+                    membership=membership,
+                ).first()
 
-        if units_delta >= Decimal('0.00'):
-            ent.allocated_units = (ent.allocated_units or Decimal('0.00')) + units_delta
-            if ent.status == 'EXHAUSTED':
-                ent.status = 'ACTIVE'
-        else:
-            reduction = abs(units_delta)
-            min_allowed = ent.consumed_units or Decimal('0.00')
-            if ent.allocated_units is not None and (ent.allocated_units - reduction) < min_allowed:
-                raise ValidationError(
-                    f"Cannot reduce allocation by {reduction} units. {ent.consumed_units} unit(s) have already been consumed. "
-                    f"Maximum possible reduction is {ent.allocated_units - min_allowed} unit(s)."
+            if not ent and entitlement_type:
+                ent = MembershipEntitlement.objects.using(alias).select_for_update().filter(
+                    membership=membership,
+                    entitlement_type=entitlement_type,
+                ).first()
+
+            if not ent and entitlement_type:
+                # Fallback for UI aliases: e.g. 'HOME_BRANCH_SESSION' -> 'CLASS_SESSION' or any active home pool
+                et_lower = (entitlement_type or '').lower()
+                candidate_qs = MembershipEntitlement.objects.using(alias).select_for_update().filter(membership=membership)
+                if 'home' in et_lower or 'session' in et_lower or 'class' in et_lower:
+                    ent = candidate_qs.filter(
+                        Q(entitlement_type__icontains='class') |
+                        Q(entitlement_type__icontains='home') |
+                        Q(entitlement_type__icontains='session') |
+                        Q(entitlement_type__iexact='CLASS_SESSION')
+                    ).first()
+                elif 'cross' in et_lower or 'passport' in et_lower:
+                    ent = candidate_qs.filter(
+                        Q(entitlement_type__icontains='cross') |
+                        Q(entitlement_type__icontains='passport')
+                    ).first()
+                elif 'personal' in et_lower or 'pt' in et_lower:
+                    ent = candidate_qs.filter(
+                        Q(entitlement_type__icontains='personal') |
+                        Q(entitlement_type__icontains='pt')
+                    ).first()
+                elif 'assess' in et_lower:
+                    ent = candidate_qs.filter(entitlement_type__icontains='assess').first()
+
+            if not ent:
+                now_dt = timezone.now()
+                end_dt = timezone.make_aware(datetime.combine(membership.end_date, datetime.max.time()))
+                ent = MembershipEntitlement.objects.using(alias).create(
+                    membership=membership,
+                    entitlement_type=entitlement_type or 'CLASS_SESSION',
+                    allocated_units=Decimal('0.00'),
+                    consumed_units=Decimal('0.00'),
+                    is_unlimited=False,
+                    valid_from=now_dt,
+                    valid_until=end_dt,
+                    status='ACTIVE',
                 )
-            ent.allocated_units = (ent.allocated_units or Decimal('0.00')) - reduction
-            if ent.allocated_units <= min_allowed:
-                ent.status = 'EXHAUSTED'
 
-        ent.save(using=alias, update_fields=['allocated_units', 'consumed_units', 'status', 'updated_at'])
-        balance_after = ent.remaining_units
+            if units_delta >= Decimal('0.00'):
+                ent.allocated_units = (ent.allocated_units or Decimal('0.00')) + units_delta
+                if ent.status == 'EXHAUSTED':
+                    ent.status = 'ACTIVE'
+            else:
+                reduction = abs(units_delta)
+                min_allowed = ent.consumed_units or Decimal('0.00')
+                if ent.allocated_units is not None and (ent.allocated_units - reduction) < min_allowed:
+                    raise ValidationError(
+                        f"Cannot reduce allocation by {reduction} units. {ent.consumed_units} unit(s) have already been consumed. "
+                        f"Maximum possible reduction is {ent.allocated_units - min_allowed} unit(s)."
+                    )
+                ent.allocated_units = (ent.allocated_units or Decimal('0.00')) - reduction
+                if ent.allocated_units <= min_allowed:
+                    ent.status = 'EXHAUSTED'
 
-        ledger = MembershipEntitlementLedger.objects.using(alias).create(
-            membership_entitlement=ent,
-            transaction_type='ADJUSTMENT',
-            units=units_delta,
-            reason_code=reason_code,
-            reason_text=reason_text or f"Manual adjustment of {units_delta} units",
-            balance_after=balance_after,
-            created_by_user=actor_user,
-        )
-        return ledger
+            ent.save(using=alias, update_fields=['allocated_units', 'consumed_units', 'status', 'updated_at'])
+            balance_after = ent.remaining_units
+
+            ledger = MembershipEntitlementLedger.objects.using(alias).create(
+                membership_entitlement=ent,
+                transaction_type='ADJUSTMENT',
+                units=units_delta,
+                reason_code=reason_code,
+                reason_text=reason_text or f"Manual adjustment of {units_delta} units",
+                balance_after=balance_after,
+                created_by_user=actor_user,
+            )
+            return ledger

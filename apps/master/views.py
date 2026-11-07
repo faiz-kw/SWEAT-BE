@@ -37,6 +37,34 @@ from .permissions import PlatformRBACPermission
 
 logger = logging.getLogger(__name__)
 
+# Canonical mappings for non-standard route prefixes to their parent product module
+PATH_TO_PARENT_MODULE = {
+    '/admin/cms': 'cms',
+    'cms': 'cms',
+    '/community': 'community',
+    'community': 'community',
+}
+
+MODULE_ADDITIONAL_SUBMODULES = {
+    'cms': ['/admin/cms'],
+    'community': ['/community'],
+}
+
+KNOWN_PRODUCT_MODULE_SPECS = {
+    'cms': {
+        'name': 'Content Management (CMS)',
+        'description': 'Mobile app home banners, program category visuals, and audio/video media library.',
+        'icon': 'Image',
+        'display_order': 16,
+    },
+    'community': {
+        'name': 'Community & Social',
+        'description': 'Community feed moderation, member transformations, and social engagements.',
+        'icon': 'Users',
+        'display_order': 17,
+    },
+}
+
 
 class TenantViewSet(viewsets.ModelViewSet):
     """
@@ -63,6 +91,20 @@ class TenantViewSet(viewsets.ModelViewSet):
             return TenantDetailSerializer
         return TenantSerializer
 
+    def update(self, request, *args, **kwargs):
+        response = super().update(request, *args, **kwargs)
+        # Invalidate prefetch cache and ensure representation returns freshly persisted modules
+        instance = self.get_object()
+        if hasattr(instance, '_prefetched_objects_cache'):
+            instance._prefetched_objects_cache = {}
+        try:
+            instance.refresh_from_db()
+        except Exception:
+            pass
+        serializer = self.get_serializer(instance)
+        response.data = serializer.data
+        return response
+
     def perform_update(self, serializer):
         from decimal import Decimal
         from django.utils import timezone
@@ -75,10 +117,32 @@ class TenantViewSet(viewsets.ModelViewSet):
             raw_modules = self.request.data.get('enabled_modules') or []
             enabled_codes = set()
             for item in raw_modules:
-                if not item:
+                if not item or not isinstance(item, str):
                     continue
-                code = item.strip('/').split('/')[0].lower()
-                enabled_codes.add(code)
+                clean_item = item.strip().lower()
+                if clean_item in PATH_TO_PARENT_MODULE:
+                    enabled_codes.add(PATH_TO_PARENT_MODULE[clean_item])
+                else:
+                    code = clean_item.strip('/').split('/')[0]
+                    if code:
+                        enabled_codes.add(code)
+
+            # Ensure known platform modules exist in master DB before updating
+            for code in enabled_codes:
+                if code in KNOWN_PRODUCT_MODULE_SPECS:
+                    spec = KNOWN_PRODUCT_MODULE_SPECS[code]
+                    ProductModule.objects.using('default').get_or_create(
+                        code=code,
+                        defaults={
+                            'name': spec['name'],
+                            'description': spec['description'],
+                            'icon': spec['icon'],
+                            'display_order': spec['display_order'],
+                            'sort_order': spec['display_order'],
+                            'is_active': True,
+                            'status': 'ACTIVE',
+                        }
+                    )
 
             all_modules = ProductModule.objects.using('default').all()
             for mod in all_modules:
@@ -87,7 +151,10 @@ class TenantViewSet(viewsets.ModelViewSet):
                 mod_submodules = [
                     item for item in raw_modules
                     if isinstance(item, str) and (
-                        item.lower().startswith(f"/{mod_code_lower}/") or item.lower() == f"/{mod_code_lower}"
+                        item.lower().startswith(f"/{mod_code_lower}/") or
+                        item.lower() == f"/{mod_code_lower}" or
+                        PATH_TO_PARENT_MODULE.get(item.lower()) == mod_code_lower or
+                        item.lower() in MODULE_ADDITIONAL_SUBMODULES.get(mod_code_lower, [])
                     )
                 ]
                 TenantModule.objects.using('default').update_or_create(
@@ -169,6 +236,14 @@ class TenantViewSet(viewsets.ModelViewSet):
                             'is_plan_default': False,
                         }
                     )
+
+        # Invalidate DRF prefetch cache and refresh instance
+        if hasattr(tenant, '_prefetched_objects_cache'):
+            tenant._prefetched_objects_cache = {}
+        try:
+            tenant.refresh_from_db()
+        except Exception:
+            pass
 
     @action(detail=True, methods=['post'])
     def activate(self, request, pk=None):
