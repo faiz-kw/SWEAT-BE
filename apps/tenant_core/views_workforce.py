@@ -207,7 +207,7 @@ class TrainerProfileViewSet(viewsets.ModelViewSet):
             Q(role__code__iregex=r'(^|[^a-z])(?:trainer|coach|instructor)([^a-z]|$)') |
             Q(role__name__iregex=r'(^|[^a-z])(?:trainer|coach|instructor)([^a-z]|$)')
         )
-        users = TenantUser.objects.using(alias).all()
+        users = TenantUser.objects.using(alias).filter(status='ACTIVE')
         if org:
             users = users.filter(organization=org)
             assignments = assignments.filter(organization=org)
@@ -297,10 +297,14 @@ class TrainerProfileViewSet(viewsets.ModelViewSet):
         qs = qs.filter(
             employee_profile__user_profile__user_id__in=
             self._trainer_users(alias, org).values('id')
+        ).filter(
+            employee_profile__user_profile__user__status='ACTIVE'
         )
         status_filter = self.request.query_params.get('trainer_status')
         if status_filter:
             qs = qs.filter(trainer_status=status_filter)
+        else:
+            qs = qs.filter(trainer_status='ACTIVE')
 
         branch_id = self.request.query_params.get('branch_id')
         if branch_id and branch_id not in ('all', 'ALL', '00000000-0000-0000-0000-000000000000', ''):

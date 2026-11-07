@@ -30,7 +30,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 import re
 from typing import Optional, Set
-from django.db.models import Q
+from django.db.models import Q, Count
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from django.shortcuts import get_object_or_404
@@ -157,7 +157,9 @@ def get_user_effective_branch_ids(user, db_alias: str = 'default') -> Optional[S
             .values_list('branch_id', flat=True)
             if b
         )
-        return ub_ids
+        if ub_ids:
+            return ub_ids
+        return None
 
     # If any active assignment has ORG scope, user has org-wide scope
     for ra in assignments:
@@ -712,6 +714,7 @@ class LeadViewSet(viewsets.ModelViewSet):
         if assignment_mode:
             extra_fields['assignment_mode'] = assignment_mode
 
+        is_staff_manual = hasattr(self.request, 'user') and getattr(self.request.user, 'is_authenticated', False) and hasattr(self.request.user, 'organization_id')
         lead = CRMLeadService.create_lead(
             organization=org,
             first_name=serializer.validated_data.get('first_name'),
@@ -721,9 +724,10 @@ class LeadViewSet(viewsets.ModelViewSet):
             branch=branch,
             lead_source=lead_source or serializer.validated_data.get('lead_source'),
             assigned_sales_user=assigned_sales_user if assignment_mode != 'AUTO' else None,
-            actor_user=self.request.user if (hasattr(self.request, 'user') and getattr(self.request.user, 'is_authenticated', False) and hasattr(self.request.user, 'organization_id')) else None,
+            actor_user=self.request.user if is_staff_manual else None,
             extra_fields=extra_fields,
             attribution_data=serializer.validated_data.get('attribution'),
+            block_if_duplicate=is_staff_manual,
             db_alias=alias,
         )
         serializer.instance = lead
@@ -1139,19 +1143,21 @@ class LeadViewSet(viewsets.ModelViewSet):
             if len(clean_digits) == 10:
                 q |= Q(phone_normalized=f"+91{clean_digits}") | Q(phone_normalized=clean_digits)
         if email:
-            q |= Q(email_normalized__iexact=email)
+            q |= Q(email_normalized=email)
 
-        qs = Lead.objects.using(alias).filter(organization=org).filter(q)
+        qs = Lead.objects.using(alias).filter(organization=org).filter(q).select_related('branch', 'assigned_sales_user')
         if exclude_id:
             qs = qs.exclude(id=exclude_id)
 
         matches = [
             {
                 'id': str(lead.id),
-                'full_name': f"{lead.first_name} {lead.last_name}".strip(),
+                'full_name': f"{lead.first_name} {lead.last_name}".strip() or "Unnamed Lead",
                 'phone': lead.phone_normalized,
                 'email': lead.email_normalized,
                 'current_status': lead.current_status,
+                'branch_name': lead.branch.name if lead.branch else None,
+                'assigned_sales_name': (f"{lead.assigned_sales_user.first_name} {lead.assigned_sales_user.last_name}".strip() or lead.assigned_sales_user.email) if lead.assigned_sales_user else None,
                 'created_at': lead.created_at.isoformat() if lead.created_at else None,
             }
             for lead in qs[:5]
@@ -2748,9 +2754,22 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
         'cancel': 'crm.leads.edit',
         'mark_attended': 'crm.leads.edit',
         'mark_no_show': 'crm.leads.edit',
+        'filter_options': 'crm.leads.view',
+        'filter_options_hyphen': 'crm.leads.view',
+        'summary_counts': 'crm.leads.view',
+        'summary_counts_hyphen': 'crm.leads.view',
+        'available_slots': 'crm.leads.view',
     }
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
-    search_fields = ['lead__first_name', 'lead__last_name', 'trial_type']
+    search_fields = [
+        'lead__first_name',
+        'lead__last_name',
+        'lead__phone_normalized',
+        'lead__email_normalized',
+        'trial_type',
+        'notes',
+        'branch__name',
+    ]
     ordering_fields = ['scheduled_start', 'created_at', 'status', 'confirmation_status']
     ordering = ['-scheduled_start', '-created_at']
 
@@ -2772,35 +2791,76 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
         if permitted_branches is not None:
             qs = qs.filter(branch_id__in=permitted_branches)
 
+        # 1. Lifecycle Status Filter
         status_val = self.request.query_params.get('status')
-        if status_val:
-            qs = qs.filter(status=status_val)
+        if status_val and status_val.strip().upper() != 'ALL':
+            qs = qs.filter(status__iexact=status_val.strip())
 
+        # 2. Confirmation Status Filter
         conf_status = self.request.query_params.get('confirmation_status')
-        if conf_status:
-            qs = qs.filter(confirmation_status=conf_status)
+        if conf_status and conf_status.strip().upper() != 'ALL':
+            qs = qs.filter(confirmation_status__iexact=conf_status.strip())
 
-        branch_id = self.request.query_params.get('branch_id')
-        if branch_id:
-            if permitted_branches is not None and str(branch_id) not in permitted_branches:
-                return qs.none()
-            qs = qs.filter(branch_id=branch_id)
+        # 3. Branch Filter
+        branch_id = self.request.query_params.get('branch_id') or self.request.query_params.get('branch')
+        if branch_id and branch_id.strip() and branch_id.strip().upper() != 'ALL':
+            branch_id_clean = branch_id.strip()
+            target_branch = Branch.objects.using(alias).filter(id=branch_id_clean).first()
+            if target_branch and target_branch.code:
+                branch_ids = list(Branch.objects.using(alias).filter(
+                    organization=target_branch.organization,
+                    code=target_branch.code
+                ).values_list('id', flat=True))
+                if permitted_branches is not None:
+                    branch_ids = [bid for bid in branch_ids if str(bid) in permitted_branches]
+                qs = qs.filter(branch_id__in=branch_ids)
+            else:
+                if permitted_branches is not None and str(branch_id_clean) not in permitted_branches:
+                    return qs.none()
+                qs = qs.filter(branch_id=branch_id_clean)
 
+        # 4. Lead Scoping
         lead_id = self.request.query_params.get('lead') or self.request.query_params.get('lead_id')
         if lead_id:
             qs = qs.filter(lead_id=lead_id)
 
+        # 5. Date Filter (Supports 'date', 'start_date'/'end_date', 'date_from'/'date_to')
         date_val = self.request.query_params.get('date')
+        date_from = self.request.query_params.get('date_from') or self.request.query_params.get('start_date')
+        date_to = self.request.query_params.get('date_to') or self.request.query_params.get('end_date')
+
         if date_val:
             qs = qs.filter(scheduled_start__date=date_val)
+        elif date_from and date_to and date_from == date_to:
+            qs = qs.filter(scheduled_start__date=date_from)
+        else:
+            if date_from:
+                qs = qs.filter(scheduled_start__date__gte=date_from)
+            if date_to:
+                qs = qs.filter(scheduled_start__date__lte=date_to)
 
-        date_from = self.request.query_params.get('date_from')
-        if date_from:
-            qs = qs.filter(scheduled_start__date__gte=date_from)
-
-        date_to = self.request.query_params.get('date_to')
-        if date_to:
-            qs = qs.filter(scheduled_start__date__lte=date_to)
+        # 6. Search Filter (First name, last name, full name, phone, email, notes, class/type, branch)
+        search_query = self.request.query_params.get('search', '').strip()
+        if search_query:
+            digits_only = re.sub(r'[^\d]', '', search_query)
+            search_q = (
+                Q(lead__first_name__icontains=search_query) |
+                Q(lead__last_name__icontains=search_query) |
+                Q(lead__email_normalized__icontains=search_query) |
+                Q(trial_type__icontains=search_query) |
+                Q(branch__name__icontains=search_query) |
+                Q(notes__icontains=search_query)
+            )
+            if ' ' in search_query:
+                parts = search_query.split()
+                if len(parts) >= 2:
+                    search_q |= (
+                        Q(lead__first_name__icontains=parts[0], lead__last_name__icontains=parts[-1]) |
+                        Q(lead__first_name__icontains=parts[-1], lead__last_name__icontains=parts[0])
+                    )
+            if digits_only:
+                search_q |= Q(lead__phone_normalized__icontains=digits_only)
+            qs = qs.filter(search_q)
 
         return qs
 
@@ -2891,9 +2951,23 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
         permitted_branches = get_user_effective_branch_ids(request.user, alias)
         if permitted_branches is not None:
             qs = qs.filter(branch_id__in=permitted_branches)
-        branch_id = request.query_params.get('branch_id')
-        if branch_id:
-            qs = qs.filter(branch_id=branch_id)
+
+        branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
+        if branch_id and branch_id.strip() and branch_id.strip().upper() != 'ALL':
+            branch_id_clean = branch_id.strip()
+            target_branch = Branch.objects.using(alias).filter(id=branch_id_clean).first()
+            if target_branch and target_branch.code:
+                branch_ids = list(Branch.objects.using(alias).filter(
+                    organization=target_branch.organization,
+                    code=target_branch.code
+                ).values_list('id', flat=True))
+                if permitted_branches is not None:
+                    branch_ids = [bid for bid in branch_ids if str(bid) in permitted_branches]
+                qs = qs.filter(branch_id__in=branch_ids)
+            else:
+                if permitted_branches is not None and str(branch_id_clean) not in permitted_branches:
+                    return Response({'counts': {}, 'total': 0})
+                qs = qs.filter(branch_id=branch_id_clean)
 
         now = timezone.now()
         today = now.date()
@@ -2916,6 +2990,91 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path='summary-counts')
     def summary_counts_hyphen(self, request):
         return self.summary_counts(request)
+
+    @action(detail=False, methods=['get'], url_path='filter_options')
+    def filter_options(self, request):
+        alias = _get_db(request)
+        org = _get_org(request)
+        permitted_branches = get_user_effective_branch_ids(request.user, alias)
+
+        # 1. Branches from database
+        branch_qs = Branch.objects.using(alias).filter(status='ACTIVE')
+        if org:
+            branch_qs = branch_qs.filter(organization=org)
+        if permitted_branches is not None:
+            branch_qs = branch_qs.filter(id__in=permitted_branches)
+
+        branches_data = []
+        for b in branch_qs.order_by('name'):
+            trial_count = TrialBooking.objects.using(alias).filter(branch_id=b.id).count()
+            branches_data.append({
+                'id': str(b.id),
+                'name': b.name,
+                'code': b.code,
+                'city': getattr(b, 'city', '') or getattr(b, 'location_name', '') or '',
+                'location_name': getattr(b, 'location_name', '') or getattr(b, 'address_line_1', '') or '',
+                'address': b.address or b.address_line_1 or '',
+                'trial_count': trial_count,
+            })
+
+        # 2. Lifecycle Statuses with actual database counts
+        base_trial_qs = TrialBooking.objects.using(alias)
+        if org:
+            base_trial_qs = base_trial_qs.filter(Q(lead__organization=org) | Q(branch__organization=org))
+        if permitted_branches is not None:
+            base_trial_qs = base_trial_qs.filter(branch_id__in=permitted_branches)
+
+        status_counts_map = dict(
+            base_trial_qs.values_list('status').annotate(c=Count('id')).values_list('status', 'c')
+        )
+        lifecycle_statuses = []
+        for val, label in TrialBooking.STATUSES:
+            lifecycle_statuses.append({
+                'value': val,
+                'label': label,
+                'count': status_counts_map.get(val, 0),
+            })
+
+        # 3. Confirmation Statuses with actual database counts
+        conf_counts_map = dict(
+            base_trial_qs.values_list('confirmation_status').annotate(c=Count('id')).values_list('confirmation_status', 'c')
+        )
+        confirmation_statuses = []
+        for val, label in TrialBooking.CONFIRMATION_STATUSES:
+            confirmation_statuses.append({
+                'value': val,
+                'label': label,
+                'count': conf_counts_map.get(val, 0),
+            })
+
+        # 4. Confirmation Channels
+        confirmation_channels = [
+            {'value': val, 'label': label}
+            for val, label in TrialBooking.CONFIRMATION_CHANNELS
+        ]
+
+        # 5. Cancellation Reasons
+        cancellation_reasons = [
+            {'value': 'CUSTOMER_CANCELLED', 'label': 'Customer cancelled directly'},
+            {'value': 'SCHEDULE_CONFLICT', 'label': 'Schedule conflict'},
+            {'value': 'NOT_INTERESTED', 'label': 'No longer interested in trial'},
+            {'value': 'UNABLE_TO_REACH', 'label': 'Unable to reach / contact'},
+            {'value': 'HEALTH_ISSUE', 'label': 'Health or injury concern'},
+            {'value': 'OTHER', 'label': 'Other / Custom'},
+        ]
+
+        return Response({
+            'branches': branches_data,
+            'lifecycle_statuses': lifecycle_statuses,
+            'confirmation_statuses': confirmation_statuses,
+            'confirmation_channels': confirmation_channels,
+            'cancellation_reasons': cancellation_reasons,
+            'total_trials': base_trial_qs.count(),
+        })
+
+    @action(detail=False, methods=['get'], url_path='filter-options')
+    def filter_options_hyphen(self, request):
+        return self.filter_options(request)
 
     @action(detail=True, methods=['post'], url_path='confirm')
     def confirm(self, request, pk=None):

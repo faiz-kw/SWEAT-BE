@@ -174,7 +174,7 @@ class TenantRBACPermission(permissions.BasePermission):
                     return True
             # C. Member & Lead trial bookings self-service
             if 'trial' in view_name:
-                if act in ['create', 'list', 'retrieve', 'available_slots', 'request_reschedule', 'cancel']:
+                if act in ['create', 'list', 'retrieve', 'available_slots', 'request_reschedule', 'cancel', 'filter_options', 'filter_options_hyphen', 'summary_counts', 'summary_counts_hyphen']:
                     return True
             # D. Lead & Member self-service on leads (e.g. converting themselves or booking trial).
             # NOTE: partial_update / update / retrieve are intentionally excluded here;
@@ -318,6 +318,11 @@ class RequireActiveTenantAndOrg(permissions.BasePermission):
             raise AuthenticationFailed('A valid tenant JWT authentication is required.')
 
         if is_platform_admin:
+            return True
+
+        user_type = getattr(user, 'user_type', None) or getattr(user, 'role', '').upper()
+        user_role = str(getattr(user, 'role', '')).lower()
+        if user_type in ('MEMBER', 'LEAD') or user_role in ('member', 'lead'):
             return True
 
         allowed, reason, check_code = RBACAuthorizationEngine.evaluate(

@@ -236,8 +236,10 @@ class ClassOccurrence(models.Model):
         ('SCHEDULED', 'Scheduled'),
         ('OPEN', 'Open for Booking'),
         ('FULL', 'Capacity Reached / Full'),
+        ('IN_PROGRESS', 'In Progress'),
         ('COMPLETED', 'Completed'),
         ('CANCELLED', 'Cancelled'),
+        ('DEACTIVATED', 'Deactivated'),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

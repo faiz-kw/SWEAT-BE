@@ -477,15 +477,26 @@ class BranchViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
         qs = Branch.objects.using(db).select_related('location', 'company_entity').all()
         if org:
             qs = qs.filter(organization=org)
+
+        # For detail actions (retrieve, update, reactivate, deactivate), do not filter by status
+        if self.action in ('retrieve', 'update', 'partial_update', 'destroy', 'deactivate', 'reactivate'):
+            return self.filter_queryset_by_scope(qs)
+
         status_param = self.request.query_params.get('status')
         if status_param:
-            qs = qs.filter(status=status_param.upper())
-        is_active_param = self.request.query_params.get('is_active')
-        if is_active_param is not None:
-            if str(is_active_param).lower() in ('true', '1'):
+            if status_param.upper() != 'ALL':
+                qs = qs.filter(status=status_param.upper())
+        else:
+            is_active_param = self.request.query_params.get('is_active')
+            if is_active_param is not None:
+                if str(is_active_param).lower() in ('true', '1'):
+                    qs = qs.filter(status='ACTIVE')
+                elif str(is_active_param).lower() in ('false', '0'):
+                    qs = qs.exclude(status='ACTIVE')
+            else:
+                # By default, general list endpoints return only operational/active branches
                 qs = qs.filter(status='ACTIVE')
-            elif str(is_active_param).lower() in ('false', '0'):
-                qs = qs.exclude(status='ACTIVE')
+
         return self.filter_queryset_by_scope(qs)
 
     def perform_create(self, serializer):
@@ -817,54 +828,32 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
         from .models_workforce import EmployeeProfile
         from .models_memberships import Membership
 
-        has_staff_role = RoleAssignment.objects.using(db).filter(
-            user=OuterRef('pk'),
-            is_active=True
-        ).exclude(role__code__iexact='MEMBER').exclude(role__name__iexact='MEMBER')
-
-        has_member_role = RoleAssignment.objects.using(db).filter(
-            user=OuterRef('pk'),
-            is_active=True,
-            role__code__iexact='MEMBER'
-        )
-
-        has_employee_profile = EmployeeProfile.objects.using(db).filter(
-            user_profile__user=OuterRef('pk')
-        )
-
-        has_membership = Membership.objects.using(db).filter(
-            user_profile__user=OuterRef('pk')
-        )
-
-        qs = qs.exclude(
-            user_type__in=['MEMBER', 'LEAD', 'member', 'lead']
-        ).exclude(
-            Exists(has_member_role),
-            ~Exists(has_staff_role)
-        ).exclude(
-            (
-                (Q(profile__member_number__isnull=False) & ~Q(profile__member_number=''))
-                | (Q(profile__acquisition_source__isnull=False) & ~Q(profile__acquisition_source=''))
-                | Exists(has_membership)
-            ),
-            ~Exists(has_staff_role),
-            ~Exists(has_employee_profile)
+        # Fast direct staff filter using indexed user_type and relationships
+        qs = qs.filter(user_type='STAFF').select_related(
+            'organization', 'home_branch', 'home_branch__location', 'profile'
         )
 
         branch_param = self.request.query_params.get('branch') or self.request.query_params.get('location')
         if branch_param and branch_param != 'all':
+            from .models_users import UserBranch
             try:
                 import uuid
                 branch_uuid = uuid.UUID(str(branch_param))
                 has_branch_role = RoleAssignment.objects.using(db).filter(
                     user=OuterRef('pk'), branch_id=branch_uuid, is_active=True
                 )
-                qs = qs.filter(Q(home_branch_id=branch_uuid) | Exists(has_branch_role))
+                has_user_branch = UserBranch.objects.using(db).filter(
+                    user=OuterRef('pk'), branch_id=branch_uuid, is_active=True
+                )
+                qs = qs.filter(Q(home_branch_id=branch_uuid) | Exists(has_branch_role) | Exists(has_user_branch))
             except (ValueError, TypeError, AttributeError):
                 has_branch_role = RoleAssignment.objects.using(db).filter(
                     user=OuterRef('pk'), branch__name__iexact=str(branch_param), is_active=True
                 )
-                qs = qs.filter(Q(home_branch__name__iexact=str(branch_param)) | Exists(has_branch_role))
+                has_user_branch = UserBranch.objects.using(db).filter(
+                    user=OuterRef('pk'), branch__name__iexact=str(branch_param), is_active=True
+                )
+                qs = qs.filter(Q(home_branch__name__iexact=str(branch_param)) | Exists(has_branch_role) | Exists(has_user_branch))
 
         # Compute KPI summary on the branch-scoped staff queryset before search/role/status filters
         if self.action == 'list' and getattr(self, 'paginator', None) is not None:
@@ -1165,6 +1154,21 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
                 'status', 'is_login_allowed', 'deactivated_at', 'deactivated_by', 'deactivation_reason', 'updated_at'
             ])
 
+            # Deactivate workforce trainer profiles and future work schedules
+            try:
+                from .models_workforce import TrainerProfile, EmployeeProfile, EmployeeWorkSchedule
+                TrainerProfile.objects.using(db).filter(
+                    employee_profile__user_profile__user=instance
+                ).update(trainer_status='INACTIVE')
+                EmployeeProfile.objects.using(db).filter(
+                    user_profile__user=instance
+                ).update(employment_status='TERMINATED')
+                EmployeeWorkSchedule.objects.using(db).filter(
+                    employee_profile__user_profile__user=instance
+                ).update(status='INACTIVE')
+            except Exception as w_err:
+                logger.warning("Failed to deactivate trainer profile for user %s: %s", instance.id, w_err)
+
             # Revoke all active sessions and blacklist tokens
             try:
                 revoke_all_user_sessions(
@@ -1197,6 +1201,128 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
         self.perform_destroy(user)
         serializer = self.get_serializer(user)
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['post'], url_path='bulk-deactivate')
+    def bulk_deactivate(self, request):
+        """
+        Bulk lifecycle deactivation for multiple staff accounts.
+        Preserves user rows, marks status='DEACTIVATED', sets is_login_allowed=False,
+        and revokes active sessions and tokens immediately.
+        """
+        db = self.get_db()
+        from django.utils import timezone
+        from apps.authentication.security import revoke_all_user_sessions
+        from .audit import emit_audit_event, snapshot_model_state
+
+        select_all = bool(request.data.get('select_all'))
+        user_ids = request.data.get('user_ids') or request.data.get('ids') or []
+        if not select_all and (not user_ids or not isinstance(user_ids, list)):
+            return Response(
+                {'error': 'A list of user_ids or select_all=true is required.', 'detail': 'A list of user_ids or select_all=true is required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        reason = request.data.get('reason') or 'Bulk deactivated via staff management'
+        actor = request.user if hasattr(request, 'user') else None
+        actor_obj = None
+        if actor and hasattr(actor, 'id') and getattr(actor, '_auth_type', None) == 'tenant':
+            try:
+                actor_obj = TenantUser.objects.using(db).filter(id=actor.id).first()
+            except Exception:
+                pass
+
+        now = timezone.now()
+        client_ip = request.META.get('REMOTE_ADDR')
+        actor_email = actor.email if (actor and hasattr(actor, 'email')) else None
+
+        deactivated_count = 0
+        skipped_root = 0
+        processed_ids = []
+
+        # Filter users within organization and scope
+        exclude_ids = {'USR-ADMIN'}
+        if actor_obj and hasattr(actor_obj, 'id'):
+            exclude_ids.add(str(actor_obj.id))
+
+        if select_all:
+            users_to_deactivate = list(
+                TenantUser.objects.using(db).filter(user_type='STAFF').exclude(
+                    id__in=exclude_ids
+                ).exclude(status='DEACTIVATED')
+            )
+        else:
+            users_to_deactivate = list(
+                TenantUser.objects.using(db).filter(id__in=user_ids)
+            )
+
+        with transaction.atomic(using=db):
+            for u in users_to_deactivate:
+                # Protect root system account and the active authenticated administrator from self-deactivation
+                if str(u.id) in exclude_ids:
+                    skipped_root += 1
+                    continue
+
+                before_state = snapshot_model_state(u)
+                u.status = 'DEACTIVATED'
+                u.is_login_allowed = False
+                u.deactivated_at = now
+                if actor_obj:
+                    u.deactivated_by = actor_obj
+                u.deactivation_reason = reason
+                u.save(using=db, update_fields=[
+                    'status', 'is_login_allowed', 'deactivated_at', 'deactivated_by', 'deactivation_reason', 'updated_at'
+                ])
+
+                # Deactivate workforce trainer profiles and future work schedules
+                try:
+                    from .models_workforce import TrainerProfile, EmployeeProfile, EmployeeWorkSchedule
+                    TrainerProfile.objects.using(db).filter(
+                        employee_profile__user_profile__user=u
+                    ).update(trainer_status='INACTIVE')
+                    EmployeeProfile.objects.using(db).filter(
+                        user_profile__user=u
+                    ).update(employment_status='TERMINATED')
+                    EmployeeWorkSchedule.objects.using(db).filter(
+                        employee_profile__user_profile__user=u
+                    ).update(status='INACTIVE')
+                except Exception as w_err:
+                    logger.warning("Failed to deactivate trainer profile for user %s: %s", u.id, w_err)
+
+                # Revoke active sessions immediately
+                try:
+                    revoke_all_user_sessions(
+                        user_id=str(u.id),
+                        user_type='tenant',
+                        actor_email=actor_email,
+                        client_ip=client_ip,
+                        db_alias=db,
+                    )
+                except Exception as rev_err:
+                    logger.warning("Failed to revoke session for user %s during bulk deactivation: %s", u.id, rev_err)
+
+                after_state = snapshot_model_state(u)
+                emit_audit_event(
+                    action='DEACTIVATE',
+                    resource_type='TenantUser',
+                    resource_id=str(u.pk),
+                    request=request,
+                    instance=u,
+                    before_state=before_state,
+                    after_state=after_state,
+                    db_alias=db,
+                    description=f"User {u.email} bulk deactivated (lifecycle preserved)."
+                )
+
+                deactivated_count += 1
+                processed_ids.append(str(u.id))
+
+        return Response({
+            'success': True,
+            'deactivated_count': deactivated_count,
+            'skipped_count': skipped_root,
+            'processed_ids': processed_ids,
+            'message': f"Successfully deactivated {deactivated_count} staff account(s)."
+        }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'], url_path='reactivate')
     def reactivate(self, request, pk=None):
@@ -1236,6 +1362,17 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
             user.save(using=db, update_fields=[
                 'status', 'is_login_allowed', 'activated_at', 'deactivated_at', 'deactivated_by', 'deactivation_reason', 'updated_at'
             ])
+
+            try:
+                from .models_workforce import TrainerProfile, EmployeeProfile
+                TrainerProfile.objects.using(db).filter(
+                    employee_profile__user_profile__user=user
+                ).update(trainer_status='ACTIVE')
+                EmployeeProfile.objects.using(db).filter(
+                    user_profile__user=user
+                ).update(employment_status='ACTIVE')
+            except Exception:
+                pass
 
             after_state = snapshot_model_state(user)
             emit_audit_event(

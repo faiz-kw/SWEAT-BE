@@ -1279,6 +1279,7 @@ class MobileScheduleView(APIView):
                 | (models.Q(start_at__isnull=True) & models.Q(occurrence_date=target_date)),
                 status__in=['OPEN', 'SCHEDULED', 'IN_PROGRESS', 'CONFIRMED', 'PUBLISHED', 'ACTIVE']
             )
+            .exclude(status__in=['CANCELLED', 'DEACTIVATED'])
             .select_related('class_template__category', 'branch')
             .prefetch_related(
                 'trainer_assignments__trainer_profile__employee_profile__user_profile__user',
@@ -1424,6 +1425,9 @@ class MobileScheduleView(APIView):
             trial_available_seats = max(0, min(available_seats, effective_trial_cap - total_trial_booked)) if allow_trial else 0
             is_trial_available = allow_trial and (not is_full) and (trial_available_seats > 0)
 
+            if occ.status in ('CANCELLED', 'DEACTIVATED'):
+                continue
+
             # Time boundary checks against authoritative current timestamp
             effective_end_at = occ.end_at
             if not effective_end_at and occ.start_at:
@@ -1431,6 +1435,13 @@ class MobileScheduleView(APIView):
                 effective_end_at = occ.start_at + timedelta(minutes=dur)
 
             has_ended = bool(effective_end_at and effective_end_at <= now) or (occ.status == 'COMPLETED')
+            # Automatically hide completed or ended classes from member booking / upcoming schedule
+            if has_ended and not (
+                request.query_params.get('include_completed', '').lower() in ('true', '1')
+                or request.query_params.get('include_ended', '').lower() in ('true', '1')
+            ):
+                continue
+
             has_started = bool(occ.start_at and occ.start_at <= now) or has_ended
             is_in_progress = bool(has_started and not has_ended)
 
@@ -1765,7 +1776,7 @@ class MobileClaimFreeTrialView(APIView):
             duration = occurrence.class_template.default_duration_minutes if occurrence.class_template else 50
             effective_end_at = occurrence.start_at + timedelta(minutes=duration)
 
-        if occurrence.status in ('CANCELLED', 'COMPLETED'):
+        if occurrence.status in ('CANCELLED', 'COMPLETED', 'DEACTIVATED'):
             return Response({
                 'detail': f'This class session is {occurrence.status.lower()}.',
                 'code': f'CLASS_{occurrence.status}',
@@ -1961,7 +1972,7 @@ class MobileBookClassView(APIView):
             duration = occurrence.class_template.default_duration_minutes if occurrence.class_template else 50
             effective_end_at = occurrence.start_at + timedelta(minutes=duration)
 
-        if occurrence.status in ('CANCELLED', 'COMPLETED'):
+        if occurrence.status in ('CANCELLED', 'COMPLETED', 'DEACTIVATED'):
             return Response({
                 'detail': f'This class session is {occurrence.status.lower()}.',
                 'code': f'CLASS_{occurrence.status}',

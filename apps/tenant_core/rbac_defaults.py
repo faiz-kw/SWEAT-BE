@@ -34,7 +34,7 @@ DEFAULT_ROLES_CONFIG: Dict[str, dict] = {
             'core.settings.view',
             'core.files.view', 'core.files.create', 'core.users.view', 'core.users.create', 'core.users.edit',
             # Ops (Classes, Bookings, Schedules, Rosters)
-            'ops.classes.view', 'ops.classes.create', 'ops.classes.edit', 'ops.classes.delete',
+            'ops.classes.view', 'ops.classes.create', 'ops.classes.edit', 'ops.classes.delete', 'ops.classes.cancel',
             'ops.bookings.view', 'ops.bookings.create', 'ops.bookings.edit', 'ops.bookings.delete',
             'ops.calendar.view', 'ops.calendar.create', 'ops.calendar.edit',
             'ops.trainers.view', 'ops.trainers.create', 'ops.trainers.edit',

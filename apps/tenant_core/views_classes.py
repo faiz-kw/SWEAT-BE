@@ -980,17 +980,24 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
         occ_date = occurrence.occurrence_date
         occ_date_str = occ_date.strftime('%Y-%m-%d') if occ_date else ''
 
-        # 1. Check direct content assignment linked to this occurrence from Content Studio
-        direct_assignment = occurrence.content_assignments.using(alias).select_related('content_item').first()
+        # 1. Check if admin explicitly set an online_join_url for this occurrence (highest priority)
         video_url = ''
         instructions = ''
         description = occurrence.class_template.description if occurrence.class_template else ''
         movement_title = template_name
         tags = []
+        equipment_tags = []
+        raw_equip = ''
 
+        if occurrence.online_join_url and occurrence.online_join_url.strip():
+            video_url = occurrence.online_join_url.strip()
+
+        # Check direct content assignment linked to this occurrence from Content Studio
+        direct_assignment = occurrence.content_assignments.using(alias).select_related('content_item').first()
         if direct_assignment and direct_assignment.content_item:
             ci = direct_assignment.content_item
-            video_url = getattr(ci, 'external_url', '') or getattr(ci, 'video_url', '')
+            if not video_url:
+                video_url = getattr(ci, 'external_url', '') or getattr(ci, 'video_url', '')
             instructions = getattr(ci, 'description', '') or ''
             movement_title = getattr(ci, 'title', template_name)
 
@@ -1093,6 +1100,8 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             'has_video': bool(video_url),
             'youtube_video_id': yt_id,
             'embed_player_url': embed_player_url,
+            'video_url': video_url,
+            'external_url': video_url,
             'targeted_muscles': tags,
             'equipment_required': equipment_tags,
             'raw_equipment': str(raw_equip or ''),
@@ -1256,9 +1265,36 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
         occurrence.online_join_url = video_url
         occurrence.save(using=alias, update_fields=['online_join_url'])
 
+        # If a direct content assignment exists on this occurrence, keep its external_url in sync as well
+        direct_assignment = occurrence.content_assignments.using(alias).select_related('content_item').first()
+        if direct_assignment and direct_assignment.content_item:
+            ci = direct_assignment.content_item
+            ci.external_url = video_url
+            ci.save(using=alias, update_fields=['external_url'])
+
+        import re
+        yt_id = None
+        if video_url:
+            patterns = [
+                r'(?:youtu\.be/|youtube\.com/(?:embed/|v/|watch\?v=|watch\?.+&v=))([\w-]{11})',
+                r'youtu\.be/([\w-]{11})',
+            ]
+            for p in patterns:
+                m = re.search(p, video_url)
+                if m:
+                    yt_id = m.group(1)
+                    break
+
+        embed_player_url = (
+            f"https://www.youtube-nocookie.com/embed/{yt_id}?rel=0&modestbranding=1&controls=1&showinfo=0&iv_load_policy=3&fs=0"
+            if yt_id else (video_url or '')
+        )
+
         return Response({
             'message': 'Workout video URL updated successfully.',
             'video_url': video_url,
+            'external_url': video_url,
+            'embed_player_url': embed_player_url,
             'occurrence_id': str(occurrence.id),
         }, status=status.HTTP_200_OK)
 

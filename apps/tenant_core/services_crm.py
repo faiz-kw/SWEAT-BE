@@ -225,6 +225,7 @@ class CRMLeadService:
         extra_fields: Optional[Dict[str, Any]] = None,
         attribution_data: Optional[Dict[str, Any]] = None,
         deduplicate: bool = True,
+        block_if_duplicate: bool = False,
         db_alias: Optional[str] = None,
     ) -> Lead:
         alias = db_alias or get_tenant_db_alias() or 'default'
@@ -256,7 +257,8 @@ class CRMLeadService:
                     if len(clean_digits) == 10:
                         contact_q |= Q(phone_normalized=f"+91{clean_digits}") | Q(phone_normalized=clean_digits)
                 if email:
-                    contact_q |= Q(email_normalized__iexact=email)
+                    clean_email = email.strip().lower()
+                    contact_q |= Q(email_normalized=clean_email)
 
                 existing_lead = (
                     Lead.objects.using(alias)
@@ -267,6 +269,12 @@ class CRMLeadService:
                 )
 
             if existing_lead:
+                if block_if_duplicate:
+                    lead_name = f"{existing_lead.first_name} {existing_lead.last_name}".strip() or existing_lead.phone_normalized or "Existing Lead"
+                    raise ValidationError(
+                        f"A lead with this phone number or email already exists ({lead_name}). Duplicate lead creation is blocked."
+                    )
+
                 existing_lead.is_duplicate_intake = True
                 update_fields = set()
 

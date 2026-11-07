@@ -102,6 +102,22 @@ class TrainerProfileSerializer(serializers.ModelSerializer):
         pref = obj.employee_profile.user_profile.preferred_branch_id
         if pref:
             b_ids.add(str(pref))
+
+        # Include direct user branch clearances
+        try:
+            from .models_users import UserBranch
+            for ub in UserBranch.objects.using(alias).filter(user=user, is_active=True):
+                b_ids.add(str(ub.branch_id))
+        except Exception:
+            pass
+
+        # Include any branches where the trainer has scheduled shifts
+        try:
+            for ws_bid in obj.employee_profile.work_schedules.using(alias).filter(status='ACTIVE').values_list('branch_id', flat=True):
+                b_ids.add(str(ws_bid))
+        except Exception:
+            pass
+
         return list(b_ids)
 
     def get_branch_names(self, obj):
@@ -118,6 +134,22 @@ class TrainerProfileSerializer(serializers.ModelSerializer):
         for a in assignments:
             if a.branch and a.branch.name not in names:
                 names.append(a.branch.name)
+
+        try:
+            from .models_users import UserBranch
+            for ub in UserBranch.objects.using(alias).filter(user=user, is_active=True).select_related('branch'):
+                if ub.branch and ub.branch.name not in names:
+                    names.append(ub.branch.name)
+        except Exception:
+            pass
+
+        try:
+            for ws in obj.employee_profile.work_schedules.using(alias).filter(status='ACTIVE').select_related('branch'):
+                if ws.branch and ws.branch.name not in names:
+                    names.append(ws.branch.name)
+        except Exception:
+            pass
+
         return names
 
     def get_specialties(self, obj):

@@ -86,18 +86,47 @@ class LeadAssignmentEligibilityService:
         consider_leave = config.consider_leave_availability if config is not None else True
         allow_all_staff_fallback = config.allow_all_staff_fallback if config is not None else True
 
-        # Base candidate query: all users in org
+        # Base candidate query: active staff and users with active role assignments
         qs = TenantUser.objects.using(alias).filter(
             organization=organization,
-        ).prefetch_related(
-            'role_assignments__role__permission_sets__items__permission',
+            status='ACTIVE',
+            is_login_allowed=True,
+        ).filter(
+            Q(role_assignments__status='ACTIVE', role_assignments__is_active=True) |
+            Q(user_type='STAFF')
+        ).distinct().prefetch_related(
+            'role_assignments__role',
             'branch_assignments',
             'home_branch',
-            'profile__employee_profile__schedule_exceptions',
+            'profile__employee_profile',
         ).select_related('home_branch')
 
         if excluded_users:
             qs = qs.exclude(id__in=list(excluded_users))
+
+        # Pre-resolve all roles granting canonical lead management permission in a single fast query
+        crm_lead_role_ids = set(
+            RolePermissionSetItem.objects.using(alias).filter(
+                permission_set__is_active=True,
+                granted=True,
+            ).filter(
+                Q(permission__permission_code__iexact=cls.CANONICAL_LEAD_PERMISSION) |
+                Q(permission__code__iexact=cls.CANONICAL_LEAD_PERMISSION)
+            ).values_list('permission_set__role_id', flat=True)
+        )
+
+        # Pre-fetch active leave exceptions for this date in a single fast query
+        active_exceptions_map = {}
+        if consider_leave:
+            exc_qs = EmployeeScheduleException.objects.using(alias).filter(
+                exception_date=eval_date,
+                status='ACTIVE',
+                is_available=False,
+            )
+            if branch:
+                exc_qs = exc_qs.filter(Q(branch__isnull=True) | Q(branch=branch))
+            for exc in exc_qs:
+                active_exceptions_map[exc.employee_profile_id] = exc
 
         results: List[Dict[str, Any]] = []
 
@@ -166,27 +195,11 @@ class LeadAssignmentEligibilityService:
                 has_lead_permission = True
             else:
                 candidate_roles = [ra.role for ra in branch_matching_ras]
-                # Direct check via RolePermissionSetItem for canonical permission
-                if candidate_roles:
-                    perm_items = RolePermissionSetItem.objects.using(alias).filter(
-                        permission_set__role__in=candidate_roles,
-                        permission_set__is_active=True,
-                        granted=True,
-                    ).filter(
-                        Q(permission__permission_code__iexact=cls.CANONICAL_LEAD_PERMISSION) |
-                        Q(permission__code__iexact=cls.CANONICAL_LEAD_PERMISSION)
-                    ).select_related('permission_set__role')
-
-                    first_perm = perm_items.first()
-                    if first_perm:
+                for r in candidate_roles:
+                    if r.id in crm_lead_role_ids or getattr(r, 'code', '') == 'ORG_ADMIN':
                         has_lead_permission = True
-                        perm_granting_role = first_perm.permission_set.role
-                    else:
-                        for r in candidate_roles:
-                            if getattr(r, 'code', '') == 'ORG_ADMIN':
-                                has_lead_permission = True
-                                perm_granting_role = r
-                                break
+                        perm_granting_role = r
+                        break
 
             # Optional secondary business restriction (CRMAgentAssignmentConfig.allowed_role_codes)
             matches_tenant_role_restriction = True
@@ -211,15 +224,7 @@ class LeadAssignmentEligibilityService:
             leave_reason = None
             if consider_leave and hasattr(user, 'profile') and hasattr(user.profile, 'employee_profile'):
                 emp = user.profile.employee_profile
-                exceptions = EmployeeScheduleException.objects.using(alias).filter(
-                    employee_profile=emp,
-                    exception_date=eval_date,
-                    status='ACTIVE',
-                    is_available=False,
-                )
-                if branch:
-                    exceptions = exceptions.filter(Q(branch__isnull=True) | Q(branch=branch))
-                exc = exceptions.first()
+                exc = active_exceptions_map.get(emp.id)
                 if exc:
                     is_on_leave = True
                     exc_type_display = exc.get_exception_type_display() if hasattr(exc, 'get_exception_type_display') else exc.exception_type
@@ -483,6 +488,11 @@ class LeadAssignmentExecutionService:
         alias = db_alias or get_tenant_db_alias() or 'default'
 
         with transaction.atomic(using=alias):
+            # Verify assigned user is active
+            if assigned_to_user:
+                if assigned_to_user.status != 'ACTIVE' or not assigned_to_user.is_login_allowed or not getattr(assigned_to_user, 'is_active', True):
+                    raise ValidationError(f"Cannot assign lead to user '{assigned_to_user.email}': Representative account is inactive or disabled.")
+
             # If no user assigned (Unassigned Lead)
             if not assigned_to_user:
                 lead.assigned_sales_user = None
