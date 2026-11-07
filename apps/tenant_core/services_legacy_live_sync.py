@@ -14,6 +14,10 @@ from .models_memberships import Membership, MembershipEntitlement
 from .models_org import Branch, Organization
 from .models_catalog import Package, PackageVersion, PackagePrice, Program
 from .models_crm import Lead
+from .models_commerce import Order, OrderItem, PaymentTransaction, MemberInvoice
+from .models_bookings import Booking
+from .models_attendance import AttendanceRecord
+from .models_classes import ClassTemplate, ClassOccurrence
 
 logger = logging.getLogger(__name__)
 
@@ -242,6 +246,40 @@ def sync_live_legacy_member_to_tenant(primary_uid: int, tenant_alias: str, org_i
             """, tuple(linked_uids))
             plans = cursor.fetchall()
 
+            # 4. Fetch all transactions & purchases
+            txns = []
+            try:
+                cursor.execute(f"""
+                    SELECT uid, userid, planid, sessionid, billitem, contact, sumcost, basecost,
+                           amountpaid, pendingamount, couponcost, taxcost, invoiceid, gstn,
+                           billto, billdate, transactionid, paymentmode, paymentmethod, status, createdon
+                    FROM transactions
+                    WHERE userid IN ({format_strings})
+                    ORDER BY createdon DESC
+                """, tuple(linked_uids))
+                txns = cursor.fetchall()
+            except Exception as e:
+                logger.warning(f"Could not fetch legacy transactions for {linked_uids}: {e}")
+
+            # 5. Fetch all bookings with slot and class details
+            bookings = []
+            try:
+                cursor.execute(f"""
+                    SELECT b.uid, b.book_id, b.user_id, b.userplan_id, b.slot_id, b.booking_status,
+                           b.booked_by, b.book_source, b.attended, b.attendance_tIme, b.cancellation_tIme,
+                           b.booking_time, b.createdon,
+                           s.class_id, s.class_name, s.day, s.start_time, s.end_time, s.date as slot_date,
+                           c.branch_id
+                    FROM bookings b
+                    LEFT JOIN slots s ON b.slot_id = s.uid
+                    LEFT JOIN class c ON s.class_id = c.uid
+                    WHERE b.user_id IN ({format_strings})
+                    ORDER BY b.createdon DESC
+                """, tuple(linked_uids))
+                bookings = cursor.fetchall()
+            except Exception as e:
+                logger.warning(f"Could not fetch legacy bookings for {linked_uids}: {e}")
+
     finally:
         conn.close()
 
@@ -377,6 +415,264 @@ def sync_live_legacy_member_to_tenant(primary_uid: int, tenant_alias: str, org_i
                         'valid_from': mem.start_date,
                         'valid_until': datetime.combine(mem.end_date, datetime.max.time()),
                         'status': status_val,
+                    }
+                )
+
+
+        # 4. Synchronize Transactions & Purchases
+        for t in txns:
+            t_uid = t[0]
+            billitem = str(t[4] or '').strip()
+
+            try:
+                t_sumcost = Decimal(str(t[6] or 0.00))
+            except Exception:
+                t_sumcost = Decimal('0.00')
+
+            try:
+                t_basecost = Decimal(str(t[7] or 0.00))
+            except Exception:
+                t_basecost = Decimal('0.00')
+
+            try:
+                amt_str = str(t[8] or '').strip().replace(',', '')
+                t_amountpaid = Decimal(amt_str) if amt_str and amt_str != ' ' else Decimal('0.00')
+            except Exception:
+                t_amountpaid = Decimal('0.00')
+
+            try:
+                t_couponcost = Decimal(str(t[10] or 0.00))
+            except Exception:
+                t_couponcost = Decimal('0.00')
+
+            try:
+                t_taxcost = Decimal(str(t[11] or 0.00))
+            except Exception:
+                t_taxcost = Decimal('0.00')
+
+            inv_id = str(t[12] or '').strip()
+            billdate_val = t[15]
+            txn_ref = str(t[16] or '').strip()
+            paymode = str(t[17] or 'offline').strip().lower()
+            paymethod = str(t[18] or 'Cash').strip()
+            txn_status = str(t[19] or '').strip().lower()
+            createdon_val = t[20]
+
+            tot = t_sumcost if t_sumcost > Decimal('0.00') else t_amountpaid
+            sub = t_basecost if t_basecost > Decimal('0.00') else tot
+
+            order_uuid = uuid.UUID(gen_uuid('order', t_uid))
+            order_num = inv_id if inv_id else f"ORD-{t_uid:06d}"
+            branch_uuid = uuid.UUID(DEFAULT_BRANCH_ID)
+
+            is_paid = (t_amountpaid >= tot and tot > Decimal('0.00')) or ('paid' in txn_status or 'success' in txn_status)
+            st_choice = 'PAID' if is_paid else ('PENDING_PAYMENT' if tot > Decimal('0.00') else 'PAID')
+            ful_choice = 'FULFILLED' if is_paid else 'UNFULFILLED'
+
+            if createdon_val and isinstance(createdon_val, datetime):
+                order_dt = createdon_val
+            elif billdate_val and isinstance(billdate_val, (date, datetime)):
+                order_dt = datetime.combine(billdate_val, datetime.min.time())
+            else:
+                order_dt = timezone.now()
+            if timezone.is_naive(order_dt):
+                order_dt = timezone.make_aware(order_dt)
+
+            order, _ = Order.objects.using(tenant_alias).update_or_create(
+                id=order_uuid,
+                defaults={
+                    'order_number': order_num,
+                    'user_profile': profile,
+                    'branch_id': branch_uuid,
+                    'order_type': 'NEW_MEMBERSHIP',
+                    'status': st_choice,
+                    'fulfillment_status': ful_choice,
+                    'subtotal': sub,
+                    'discount_amount': t_couponcost,
+                    'tax_amount': t_taxcost,
+                    'total_amount': tot,
+                    'currency': 'INR',
+                    'source': 'WEB' if 'online' in paymode else 'FRONT_DESK',
+                    'notes': f"Legacy Txn #{t_uid} | Mode: {paymode} | Method: {paymethod}",
+                    'created_at': order_dt,
+                }
+            )
+
+            # OrderItem
+            item_uuid = uuid.UUID(gen_uuid('orderitem', t_uid))
+            OrderItem.objects.using(tenant_alias).update_or_create(
+                id=item_uuid,
+                defaults={
+                    'order': order,
+                    'item_type': 'PACKAGE',
+                    'package_id': uuid.UUID(DEFAULT_PACKAGE_ID),
+                    'package_version_id': uuid.UUID(DEFAULT_VERSION_ID),
+                    'package_price_id': uuid.UUID(DEFAULT_PRICE_ID),
+                    'item_name_snapshot': billitem or 'Sweat Membership Package',
+                    'quantity': Decimal('1.00'),
+                    'unit_price_snapshot': sub,
+                    'discount_amount': t_couponcost,
+                    'tax_amount': t_taxcost,
+                    'total_amount': tot,
+                    'created_at': order_dt,
+                }
+            )
+
+            # PaymentTransaction
+            pay_uuid = uuid.UUID(gen_uuid('paytxn', t_uid))
+            is_online = 'online' in paymode or 'rzpay' in txn_ref.lower()
+            prov = 'RAZORPAY' if is_online else ('CASH' if 'cash' in paymethod.lower() else 'OTHER')
+
+            PaymentTransaction.objects.using(tenant_alias).update_or_create(
+                id=pay_uuid,
+                defaults={
+                    'order': order,
+                    'user_profile': profile,
+                    'provider': prov,
+                    'payment_method': paymethod[:50] if paymethod else 'Cash',
+                    'provider_transaction_id': (txn_ref or str(t_uid))[:255],
+                    'amount': tot if tot > Decimal('0.00') else t_amountpaid,
+                    'currency': 'INR',
+                    'status': 'SUCCESS' if is_paid else 'PENDING',
+                    'paid_at': order_dt if is_paid else None,
+                    'created_at': order_dt,
+                }
+            )
+
+            # MemberInvoice
+            if inv_id or is_paid:
+                inv_uuid = uuid.UUID(gen_uuid('invoice', t_uid))
+                MemberInvoice.objects.using(tenant_alias).update_or_create(
+                    id=inv_uuid,
+                    defaults={
+                        'invoice_number': inv_id if inv_id else f"INV-{t_uid:06d}",
+                        'order': order,
+                        'user_profile': profile,
+                        'branch_id': branch_uuid,
+                        'subtotal': sub,
+                        'discount_amount': t_couponcost,
+                        'tax_amount': t_taxcost,
+                        'total_amount': tot,
+                        'currency': 'INR',
+                        'status': 'PAID' if is_paid else 'ISSUED',
+                        'issued_at': order_dt,
+                        'created_at': order_dt,
+                    }
+                )
+
+        # 5. Synchronize All Class Bookings & Attendance
+        for b in bookings:
+            b_uid = b[0]
+            b_book_id = str(b[1] or '').strip()
+            slot_id = b[4]
+            b_status_raw = str(b[5] or '').lower()
+            b_source_raw = str(b[7] or '').lower()
+            attended = int(b[8] or 0)
+            att_time = b[9]
+            bkg_time = b[11]
+            createdon_bkg = b[12]
+            class_name = str(b[14] or 'Sweat Class').strip()
+            slot_start_time = b[16]
+            slot_date_val = b[18]
+            branch_id_num = int(b[19] or 1)
+            bkg_branch_uuid = uuid.UUID(BRANCH_MAP.get(branch_id_num, DEFAULT_BRANCH_ID))
+
+            tpl_code = re.sub(r'[^a-zA-Z0-9]+', '-', class_name).strip('-').lower() or 'sweat-class'
+            tpl_uuid = uuid.UUID(gen_uuid('classtpl', tpl_code))
+
+            org_uuid = uuid.UUID(org_id) if org_id else uuid.UUID('299b7ef9-00c1-4d62-937f-4554b3ba0810')
+            ct, _ = ClassTemplate.objects.using(tenant_alias).update_or_create(
+                id=tpl_uuid,
+                defaults={
+                    'organization_id': org_uuid,
+                    'code': tpl_code,
+                    'name': class_name,
+                    'default_duration_minutes': 50,
+                    'status': 'ACTIVE',
+                }
+            )
+
+            # ClassOccurrence
+            occ_uuid = uuid.UUID(gen_uuid('occurrence', slot_id)) if slot_id else uuid.UUID(gen_uuid('occurrence_bkg', b_uid))
+            if isinstance(slot_date_val, datetime):
+                occ_date = slot_date_val.date()
+                st_time = slot_date_val.time()
+            elif isinstance(slot_date_val, date):
+                occ_date = slot_date_val
+                st_time = slot_start_time if slot_start_time else time(9, 0, 0)
+            else:
+                occ_date = timezone.now().date()
+                st_time = time(9, 0, 0)
+
+            start_dt = datetime.combine(occ_date, st_time) if isinstance(st_time, time) else (slot_date_val if isinstance(slot_date_val, datetime) else timezone.now())
+            if timezone.is_naive(start_dt):
+                start_dt = timezone.make_aware(start_dt)
+            end_dt = start_dt + timezone.timedelta(minutes=50)
+
+            occ, _ = ClassOccurrence.objects.using(tenant_alias).update_or_create(
+                id=occ_uuid,
+                defaults={
+                    'class_template': ct,
+                    'branch_id': bkg_branch_uuid,
+                    'occurrence_date': occ_date,
+                    'start_at': start_dt,
+                    'end_at': end_dt,
+                    'capacity': 20,
+                    'status': 'COMPLETED' if start_dt < timezone.now() else 'SCHEDULED',
+                }
+            )
+
+            # Booking
+            bkg_uuid = uuid.UUID(gen_uuid('booking', b_uid))
+            book_num = b_book_id if b_book_id else f"BKG-{b_uid:06d}"
+
+            if 'cancel' in b_status_raw:
+                bkg_status = 'CANCELLED'
+            elif attended == 1 or start_dt < timezone.now():
+                bkg_status = 'COMPLETED'
+            else:
+                bkg_status = 'CONFIRMED'
+
+            bsrc = 'MOBILE_APP' if 'mobile' in b_source_raw else ('ADMIN' if 'admin' in b_source_raw else 'WEB')
+            booked_dt = bkg_time or createdon_bkg or start_dt
+            if booked_dt and timezone.is_naive(booked_dt):
+                booked_dt = timezone.make_aware(booked_dt)
+
+            bkg, _ = Booking.objects.using(tenant_alias).update_or_create(
+                id=bkg_uuid,
+                defaults={
+                    'booking_number': book_num,
+                    'user_profile': profile,
+                    'occurrence': occ,
+                    'branch_id': bkg_branch_uuid,
+                    'booking_type': 'MEMBER',
+                    'booking_source': bsrc,
+                    'status': bkg_status,
+                    'payment_status': 'PAID',
+                    'confirmation_status': 'CONFIRMED',
+                    'booked_at': booked_dt,
+                }
+            )
+
+            # AttendanceRecord
+            if attended == 1:
+                att_uuid = uuid.UUID(gen_uuid('attendance', b_uid))
+                checkin_dt = att_time or start_dt
+                if checkin_dt and timezone.is_naive(checkin_dt):
+                    checkin_dt = timezone.make_aware(checkin_dt)
+
+                AttendanceRecord.objects.using(tenant_alias).update_or_create(
+                    id=att_uuid,
+                    defaults={
+                        'booking': bkg,
+                        'user_profile': profile,
+                        'branch_id': bkg_branch_uuid,
+                        'occurrence': occ,
+                        'status': 'PRESENT',
+                        'check_in_status': 'SUCCESSFUL',
+                        'check_in_method': 'MOBILE' if bsrc == 'MOBILE_APP' else 'FRONT_DESK',
+                        'check_in_at': checkin_dt,
+                        'attendance_completed': True,
                     }
                 )
 
