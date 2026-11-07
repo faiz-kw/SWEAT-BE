@@ -4332,3 +4332,58 @@ class MemberViewSet(viewsets.ViewSet):
             })
         return Response(out, status=status.HTTP_200_OK)
 
+
+
+    @action(detail=False, methods=['get'], url_path='legacy-search')
+    def legacy_search(self, request):
+        """
+        Real-time search against the legacy MySQL database.
+        Searches by phone, email, or name.
+        """
+        query = request.query_params.get('query', '').strip()
+        if not query:
+            return Response({'results': [], 'count': 0}, status=status.HTTP_200_OK)
+
+        from .services_legacy_live_sync import search_legacy_members
+        try:
+            results = search_legacy_members(query)
+            return Response({'results': results, 'count': len(results)}, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.error(f"Legacy search failed: {e}", exc_info=True)
+            return Response({'error': str(e), 'results': [], 'count': 0}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['post'], url_path='legacy-sync')
+    def legacy_sync(self, request):
+        """
+        Pulls a member from the live legacy MySQL database and syncs their profile,
+        active & past memberships, session balances, transactions/purchases, and class bookings.
+        """
+        data = request.data or {}
+        primary_uid = data.get('primary_uid')
+        query = data.get('query')
+
+        alias = _get_db(request)
+        org = _get_org(request)
+        org_id = str(org.id) if org else None
+
+        from .services_legacy_live_sync import sync_live_legacy_member_to_tenant, search_legacy_members
+
+        try:
+            if not primary_uid and query:
+                candidates = search_legacy_members(str(query).strip())
+                if candidates:
+                    primary_uid = candidates[0].get('primary_uid')
+
+            if not primary_uid:
+                return Response({'error': 'primary_uid or valid query is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            profile = sync_live_legacy_member_to_tenant(int(primary_uid), alias, org_id)
+            serialized = serialize_member(profile, alias)
+
+            return Response({
+                'message': f"Successfully synced {profile.first_name_snapshot} {profile.last_name_snapshot} ({profile.member_number}) with all packages, sessions, transactions, and bookings.",
+                'member': serialized,
+            }, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.error(f"Legacy live sync failed for {primary_uid}: {e}", exc_info=True)
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

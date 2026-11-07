@@ -16,3 +16,4 @@ sentry-sdk>=2.0.0,<3.0.0
 concurrent-log-handler>=0.9.25
 Pillow>=10.0.0
 uvicorn>=0.30.0
+pymysql>=1.1.0
