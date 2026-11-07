@@ -438,6 +438,428 @@ def serialize_member(profile: UserProfile, alias: str = 'default', compact: bool
         'expiry_date': expiry_date,
         'home_sessions_remaining': home_sessions,
         'cross_branch_sessions_remaining': cross_sessions,
+        'credits_remaining': credits_rem_calc,
+        'credits_consumed': credits_cons_calc,
+        'credits_allocated': credits_alloc_calc,
+        'outstanding_balance': float(outstanding_balance),
+        'assigned_trainer': assigned_trainer,
+        'active_plan': active_plan,
+        'joined_at': str(profile.joining_date or profile.created_at.date() if profile.created_at else timezone.now().date()),
+        'emergency_contact': emergency_contact,
+        'source': profile.acquisition_source or 'DIRECT',
+        'fitness_goal': 'General Fitness',
+        'health_score': 80,
+        'performance_score': 75,
+        'risk_level': 'Low',
+        'attendance_count_30d': att_count_30d,
+        'last_visit': last_visit,
+    }
+
+
+def get_member_available_actions(profile: UserProfile, active_m: Membership, outstanding: Decimal) -> list:
+    """
+    Computes backend-authoritative eligible actions for a member.
+    Always includes PURCHASE_PACKAGE for existing members as well as trial members/leads.
+    """
+    actions = []
+    today = timezone.now().date()
+
+    # Always allow purchasing a new program / package
+    actions.append({'action': 'PURCHASE_PACKAGE', 'label': 'Purchase New Program / Package', 'eligible': True})
+
+    if active_m:
+        st = active_m.status
+        actions.append({'action': 'RENEW', 'label': 'Renew Membership', 'eligible': True})
+        if st == 'ACTIVE':
+            actions.append({'action': 'UPGRADE', 'label': 'Upgrade Package', 'eligible': True})
+            actions.append({'action': 'EXTEND', 'label': 'Extend Validity', 'eligible': True})
+            actions.append({'action': 'FREEZE', 'label': 'Freeze Membership', 'eligible': True})
+        if st == 'FROZEN':
+            actions.append({'action': 'UNFREEZE', 'label': 'Unfreeze Membership', 'eligible': True})
+        if st in ['ACTIVE', 'FROZEN']:
+            actions.append({'action': 'TRANSFER', 'label': 'Transfer Home Branch', 'eligible': True})
+            actions.append({'action': 'CANCEL', 'label': 'Cancel Membership', 'eligible': True})
+
+        actions.append({'action': 'ADJUST_ENTITLEMENT', 'label': 'Adjust Sessions', 'eligible': True})
+    else:
+        # Trial or new lead without active full membership
+        actions.append({'action': 'RENEW', 'label': 'Renew Membership', 'eligible': True})
+        actions.append({'action': 'REJOIN', 'label': 'Rejoin / New Plan', 'eligible': True})
+
+    if outstanding > Decimal('0.00'):
+        actions.append({'action': 'COLLECT_PAYMENT', 'label': f'Collect Outstanding (₹{outstanding})', 'eligible': True})
+
+    actions.append({'action': 'CHECK_IN', 'label': 'Record Check-in', 'eligible': True})
+    return actions
+
+
+def build_member_timeline(profile: UserProfile, alias: str = 'default', limit: int = 100) -> list:
+    """
+    Pure read-model aggregation assembling a unified chronological timeline across CRM, Commerce,
+    Memberships, Passbook, Bookings, Attendance, and Audit without duplicating source-of-truth records.
+    """
+    events = []
+    user = profile.user
+
+    # 1. CRM Lead Origin & History (if user has linked leads)
+    linked_leads = []
+    try:
+        filters = Q(converted_user_profile=profile)
+        if user and user.email:
+            filters = filters | Q(email_normalized=user.email.strip().lower())
+        if user and user.phone:
+            filters = filters | Q(phone_normalized=user.phone.strip())
+        linked_leads = list(Lead.objects.using(alias).filter(filters).distinct().order_by('-created_at')[:3])
+    except Exception:
+        linked_leads = []
+
+    for lead in linked_leads:
+        events.append({
+            'id': f"lead-create-{lead.id}",
+            'category': 'CRM',
+            'event_type': 'LEAD_CREATED',
+            'title': 'Lead Created',
+            'description': f"Prospect created via {lead.first_touch_source or 'Direct'} ({lead.first_name} {lead.last_name})",
+            'occurred_at': lead.created_at.isoformat() if lead.created_at else timezone.now().isoformat(),
+            'actor': 'System',
+            'badge_color': 'blue',
+            'metadata': {'lead_id': str(lead.id), 'source': lead.first_touch_source},
+        })
+
+        for act in LeadActivity.objects.using(alias).filter(lead=lead).order_by('-activity_at')[:10]:
+            events.append({
+                'id': f"lead-act-{act.id}",
+                'category': 'CRM',
+                'event_type': act.activity_type,
+                'title': f"Sales Activity: {act.activity_type.replace('_', ' ').title()}",
+                'description': f"{act.outcome + ': ' if act.outcome else ''}{act.notes or ''}".strip(),
+                'occurred_at': (act.activity_at or act.created_at).isoformat(),
+                'actor': act.performed_by_user.first_name if act.performed_by_user else 'Sales Rep',
+                'badge_color': 'indigo',
+                'metadata': {'lead_id': str(lead.id)},
+            })
+
+        for trial in TrialBooking.objects.using(alias).filter(lead=lead).order_by('-created_at')[:5]:
+            trial_status = getattr(trial, 'status', getattr(trial, 'current_status', 'BOOKED'))
+            events.append({
+                'id': f"trial-{trial.id}",
+                'category': 'CRM',
+                'event_type': f"TRIAL_{trial_status}",
+                'title': f"Trial {str(trial_status).replace('_', ' ').title()}",
+                'description': f"Trial booking scheduled for {trial.scheduled_start.date() if trial.scheduled_start else 'upcoming'}",
+                'occurred_at': trial.created_at.isoformat() if trial.created_at else timezone.now().isoformat(),
+                'actor': 'Staff',
+                'badge_color': 'teal',
+                'metadata': {'trial_id': str(trial.id), 'status': trial_status},
+            })
+
+    # Lead Conversions
+    for conv in LeadConversion.objects.using(alias).filter(user_profile=profile).order_by('-converted_at'):
+        events.append({
+            'id': f"conv-{conv.id}",
+            'category': 'CRM',
+            'event_type': 'LEAD_CONVERTED',
+            'title': 'Converted to Member',
+            'description': f"Prospect converted into active member profile. Package Version: {conv.package_version_id or 'Purchased'}",
+            'occurred_at': conv.converted_at.isoformat() if conv.converted_at else timezone.now().isoformat(),
+            'actor': 'System',
+            'badge_color': 'emerald',
+            'metadata': {'conversion_id': str(conv.id)},
+        })
+
+    # 2. Commerce Orders
+    for ord_obj in Order.objects.using(alias).filter(user_profile=profile).prefetch_related('items').order_by('-created_at'):
+        item_names = ", ".join(i.item_name_snapshot for i in ord_obj.items.all()) or "Order Items"
+        events.append({
+            'id': f"order-{ord_obj.id}",
+            'category': 'COMMERCE',
+            'event_type': 'ORDER_CREATED',
+            'title': f"Order {ord_obj.order_number}",
+            'description': f"{ord_obj.order_type.replace('_', ' ').title()} - {item_names} (Total: ₹{ord_obj.total_amount} {ord_obj.currency}) [{ord_obj.status}]",
+            'occurred_at': ord_obj.created_at.isoformat(),
+            'actor': 'Front Desk' if ord_obj.source == 'FRONT_DESK' else 'System',
+            'badge_color': 'amber',
+            'metadata': {'order_id': str(ord_obj.id), 'total_amount': str(ord_obj.total_amount), 'status': ord_obj.status},
+        })
+
+    # 3. Payments
+    for ptxn in PaymentTransaction.objects.using(alias).filter(user_profile=profile).order_by('-created_at'):
+        events.append({
+            'id': f"pay-{ptxn.id}",
+            'category': 'COMMERCE',
+            'event_type': 'PAYMENT_RECORDED',
+            'title': f"Payment Received: ₹{ptxn.amount}",
+            'description': f"Paid via {ptxn.provider} ({ptxn.payment_method or 'Cash'}) for Order {ptxn.order.order_number if ptxn.order else ''}",
+            'occurred_at': ptxn.paid_at.isoformat() if ptxn.paid_at else ptxn.created_at.isoformat(),
+            'actor': 'Finance / POS',
+            'badge_color': 'emerald',
+            'metadata': {'payment_id': str(ptxn.id), 'amount': str(ptxn.amount), 'provider': ptxn.provider},
+        })
+
+    # 4. Invoices
+    for inv in MemberInvoice.objects.using(alias).filter(user_profile=profile).order_by('-issued_at'):
+        events.append({
+            'id': f"inv-{inv.id}",
+            'category': 'COMMERCE',
+            'event_type': 'INVOICE_ISSUED',
+            'title': f"Invoice Issued: {inv.invoice_number}",
+            'description': f"Official tax invoice generated for ₹{inv.total_amount} [{inv.status}]",
+            'occurred_at': inv.issued_at.isoformat() if inv.issued_at else inv.created_at.isoformat(),
+            'actor': 'System',
+            'badge_color': 'cyan',
+            'metadata': {'invoice_id': str(inv.id), 'total_amount': str(inv.total_amount)},
+        })
+
+    # 5. Memberships & Lifecycle Transitions
+    for mem in Membership.objects.using(alias).filter(user_profile=profile).select_related('package', 'package_version'):
+        events.append({
+            'id': f"mem-act-{mem.id}",
+            'category': 'MEMBERSHIP',
+            'event_type': 'MEMBERSHIP_ACTIVATED',
+            'title': f"Membership Activated: {mem.package.name if mem.package else 'Plan'}",
+            'description': f"Active from {mem.start_date} to {mem.end_date} at {mem.home_branch.name if mem.home_branch else 'Branch'}",
+            'occurred_at': mem.activated_at.isoformat() if mem.activated_at else mem.created_at.isoformat(),
+            'actor': 'System',
+            'badge_color': 'green',
+            'metadata': {'membership_id': str(mem.id), 'number': mem.membership_number},
+        })
+
+        for sh in MembershipStatusHistory.objects.using(alias).filter(membership=mem).order_by('-created_at'):
+            events.append({
+                'id': f"mem-st-{sh.id}",
+                'category': 'MEMBERSHIP',
+                'event_type': f"STATUS_{sh.to_status}",
+                'title': f"Membership Status: {sh.to_status}",
+                'description': sh.reason_text or f"Status changed from {sh.from_status} to {sh.to_status}",
+                'occurred_at': sh.created_at.isoformat(),
+                'actor': 'Staff',
+                'badge_color': 'purple',
+                'metadata': {'from_status': sh.from_status, 'to_status': sh.to_status},
+            })
+
+        for bh in MembershipBranchHistory.objects.using(alias).filter(membership=mem).order_by('-created_at'):
+            if bh.change_type != 'INITIAL':
+                events.append({
+                    'id': f"mem-bh-{bh.id}",
+                    'category': 'MEMBERSHIP',
+                    'event_type': 'BRANCH_TRANSFER',
+                    'title': 'Branch Transfer',
+                    'description': bh.reason or f"Transferred to {bh.to_branch.name}",
+                    'occurred_at': bh.created_at.isoformat(),
+                    'actor': 'Staff',
+                    'badge_color': 'indigo',
+                    'metadata': {'to_branch': bh.to_branch.name},
+                })
+
+        for frz in MembershipFreeze.objects.using(alias).filter(membership=mem).order_by('-created_at'):
+            events.append({
+                'id': f"mem-frz-{frz.id}",
+                'category': 'MEMBERSHIP',
+                'event_type': 'MEMBERSHIP_FROZEN',
+                'title': f"Membership Freeze ({frz.status})",
+                'description': f"Frozen from {frz.freeze_from} to {frz.freeze_until}. Extended validity by {frz.extend_membership_days or 0} days.",
+                'occurred_at': frz.created_at.isoformat(),
+                'actor': 'Staff',
+                'badge_color': 'sky',
+                'metadata': {'freeze_from': str(frz.freeze_from), 'freeze_until': str(frz.freeze_until)},
+            })
+
+    # 6. Entitlement Passbook Movements
+    for led in MembershipEntitlementLedger.objects.using(alias).filter(
+        membership_entitlement__membership__user_profile=profile
+    ).select_related('membership_entitlement').order_by('-created_at')[:30]:
+        events.append({
+            'id': f"led-{led.id}",
+            'category': 'ENTITLEMENT',
+            'event_type': f"ENTITLEMENT_{led.transaction_type}",
+            'title': f"Session {led.transaction_type.capitalize()}: {led.units:+}",
+            'description': f"{led.membership_entitlement.entitlement_type} | {led.reason_text or led.reason_code or 'Balance update'} (New balance: {led.balance_after})",
+            'occurred_at': led.created_at.isoformat(),
+            'actor': 'System / Staff',
+            'badge_color': 'blue' if led.transaction_type == 'ALLOCATION' else ('emerald' if led.transaction_type == 'REVERSAL' else 'orange'),
+            'metadata': {'units': str(led.units), 'balance_after': str(led.balance_after), 'type': led.membership_entitlement.entitlement_type},
+        })
+
+    # 7. Bookings & Attendance
+    for bk in Booking.objects.using(alias).filter(user_profile=profile).select_related('occurrence', 'occurrence__class_template', 'branch').order_by('-booked_at')[:20]:
+        cls_name = bk.occurrence.class_template.name if (bk.occurrence and bk.occurrence.class_template) else "Class Session"
+        events.append({
+            'id': f"bk-{bk.id}",
+            'category': 'BOOKING',
+            'event_type': f"BOOKING_{bk.status}",
+            'title': f"Booking: {cls_name} [{bk.status}]",
+            'description': f"Booked for {bk.occurrence.start_at if bk.occurrence else 'upcoming'} at {bk.branch.name if bk.branch else 'Branch'}",
+            'occurred_at': bk.booked_at.isoformat() if bk.booked_at else bk.created_at.isoformat(),
+            'actor': 'Member / Front Desk',
+            'badge_color': 'violet',
+            'metadata': {'booking_id': str(bk.id), 'status': bk.status},
+        })
+
+    for att in AttendanceRecord.objects.using(alias).filter(user_profile=profile).select_related('branch').order_by('-check_in_at', '-created_at')[:20]:
+        events.append({
+            'id': f"att-{att.id}",
+            'category': 'ATTENDANCE',
+            'event_type': f"ATTENDANCE_{att.status}",
+            'title': f"Check-in: {att.status}",
+            'description': f"Checked in at {att.branch.name if att.branch else 'Branch'} via {att.check_in_method}",
+            'occurred_at': att.check_in_at.isoformat() if att.check_in_at else att.created_at.isoformat(),
+            'actor': 'Front Desk' if att.check_in_method == 'FRONT_DESK' else 'QR Scan',
+            'badge_color': 'teal' if att.status == 'PRESENT' else 'rose',
+            'metadata': {'attendance_id': str(att.id), 'method': att.check_in_method},
+        })
+
+    # 7. Health & PAR-Q Intake Assessments and Revisions
+    from .models_crm import IntakeSubmission
+    for sub in IntakeSubmission.objects.using(alias).filter(user_profile=profile).select_related('intake_form').order_by('-submitted_at'):
+        sub_meta = getattr(sub, 'metadata', {}) or {}
+        is_edit = sub_meta.get('is_edit', False)
+        rev_num = sub_meta.get('revision_number', 1)
+        form_name = (sub.form_snapshot.get('name') if isinstance(sub.form_snapshot, dict) else None) or (sub.intake_form.name if sub.intake_form else 'PAR-Q Questionnaire')
+        form_v = (sub.form_snapshot.get('version') if isinstance(sub.form_snapshot, dict) else None) or (sub.intake_form.version_number if sub.intake_form else 1)
+
+        events.append({
+            'id': f"parq-{sub.id}",
+            'category': 'HEALTH',
+            'event_type': 'PARQ_REVISION' if is_edit else 'PARQ_CLEARED',
+            'title': f"PAR-Q Assessment Updated (Rev #{rev_num})" if is_edit else f"PAR-Q Assessment Completed (v{form_v})",
+            'description': f"{form_name} {'edited and re-certified' if is_edit else 'completed and digitally signed'} by {sub.signer_identity or 'Member'}.",
+            'occurred_at': sub.submitted_at.isoformat() if sub.submitted_at else sub.created_at.isoformat(),
+            'actor': sub.signer_identity or 'Member',
+            'badge_color': 'blue' if is_edit else 'emerald',
+            'metadata': {
+                'submission_id': str(sub.id),
+                'is_edit': is_edit,
+                'revision_number': rev_num,
+                'status': sub.status,
+            },
+        })
+
+    # 8. Call History — inbound & outbound calls involving this member by phone number
+    try:
+        phone_digits = (user.phone or '').replace('+', '').replace(' ', '').lstrip('0')[-10:] if user and user.phone else ''
+        if phone_digits:
+            call_sessions = CallSession.objects.using(alias).filter(
+                user_phone_number__icontains=phone_digits
+            ).order_by('-started_at')[:20]
+            for cs in call_sessions:
+                direction = cs.direction or 'INBOUND'
+                mode = cs.call_mode or 'HUMAN_MANUAL'
+                dur = int(cs.duration_seconds or 0)
+                dur_label = f"{dur}s" if dur < 60 else f"{dur // 60}m {dur % 60}s"
+
+                # Determine status label & badge
+                if cs.status in ('COMPLETED', 'ANSWERED') and dur > 0:
+                    outcome_label = 'ANSWERED'
+                    badge = 'green'
+                elif mode == 'AI_INBOUND':
+                    outcome_label = 'AI HANDLED'
+                    badge = 'violet'
+                else:
+                    outcome_label = 'MISSED'
+                    badge = 'rose'
+
+                rep_name = ''
+                if cs.sales_rep:
+                    rep_name = f" · {cs.sales_rep.first_name or 'Rep'}"
+
+                events.append({
+                    'id': f"call-{cs.id}",
+                    'category': 'CRM',
+                    'event_type': f"CALL_{outcome_label.replace(' ', '_')}",
+                    'title': f"{'Inbound' if direction == 'INBOUND' else 'Outbound'} Call · {outcome_label}",
+                    'description': (
+                        f"{outcome_label}: {'AI handled inquiry' if mode == 'AI_INBOUND' else ('Connected ' + dur_label if dur > 0 else 'No answer')}{rep_name}."
+                        + (f" {cs.disposition_notes}" if cs.disposition_notes else "")
+                    ).strip(),
+                    'occurred_at': cs.started_at.isoformat() if cs.started_at else cs.created_at.isoformat(),
+                    'actor': cs.sales_rep.first_name if cs.sales_rep else ('AI Agent' if mode == 'AI_INBOUND' else 'Sales Rep'),
+                    'badge_color': badge,
+                    'metadata': {
+                        'call_session_id': str(cs.id),
+                        'direction': direction,
+                        'mode': mode,
+                        'duration_seconds': dur,
+                        'hangup_cause': cs.hangup_cause or '',
+                        'recording_url': cs.recording_url or '',
+                    },
+                })
+    except Exception as _call_err:
+        logger.warning("build_member_timeline: call session query failed: %s", _call_err)
+
+    # Sort all events chronologically descending
+    events.sort(key=lambda x: x['occurred_at'], reverse=True)
+    return events[:limit]
+
+
+def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', requesting_user=None, request=None) -> dict:
+    """
+    Builds the complete authoritative 6-section Member 360 payload with sensitive health data protection.
+    """
+    user = profile.user
+    base_member = serialize_member(profile, alias)
+
+    active_m = get_primary_membership(profile, alias)
+    outstanding = Decimal(str(base_member['outstanding_balance']))
+
+    # Alerts
+    alerts = []
+    if outstanding > Decimal('0.00'):
+        alerts.append({
+            'id': 'alert-outstanding',
+            'type': 'PAYMENT_DUE',
+            'severity': 'warning',
+            'title': 'Outstanding Payment Due',
+            'message': f"Member has an unpaid balance of ₹{outstanding:,.2f}.",
+            'action': 'COLLECT_PAYMENT',
+        })
+
+    if active_m:
+        today = timezone.now().date()
+        if active_m.status == 'FROZEN':
+            alerts.append({
+                'id': 'alert-frozen',
+                'type': 'MEMBERSHIP_FROZEN',
+                'severity': 'info',
+                'title': 'Membership Frozen',
+                'message': "Membership is currently paused.",
+                'action': 'UNFREEZE',
+            })
+        elif active_m.end_date:
+            days_left = (active_m.end_date - today).days
+            if days_left < 0:
+                alerts.append({
+                    'id': 'alert-expired',
+                    'type': 'MEMBERSHIP_EXPIRED',
+                    'severity': 'destructive',
+                    'title': 'Membership Expired',
+                    'message': f"Expired {abs(days_left)} days ago on {active_m.end_date}.",
+                    'action': 'RENEW',
+                })
+            elif days_left <= 15:
+                alerts.append({
+                    'id': 'alert-expiring-soon',
+                    'type': 'EXPIRING_SOON',
+                    'severity': 'warning',
+                    'title': 'Expiring Soon',
+                    'message': f"Expires in {days_left} day(s) on {active_m.end_date}.",
+                    'action': 'RENEW',
+                })
+
+    available_actions = get_member_available_actions(profile, active_m, outstanding)
+
+    # 1. Header
+    header = {
+        'name': base_member['name'],
+        'member_number': base_member['membership_number'],
+        'status': base_member['membership_status'],
+        'home_branch': base_member['home_branch'],
+        'home_branch_id': base_member['home_branch_id'],
+        'current_program': base_member['program_name'],
+        'current_package': base_member['package_name'],
+        'current_package_version': base_member['package_version_name'],
+        'expiry_date': base_member['expiry_date'],
+        'home_sessions_remaining': base_member['home_sessions_remaining'],
+        'cross_branch_sessions_remaining': base_member['cross_branch_sessions_remaining'],
         'credits_remaining': base_member.get('credits_remaining', 0),
         'credits_consumed': base_member.get('credits_consumed', 0),
         'credits_allocated': base_member.get('credits_allocated', 0),
@@ -1375,6 +1797,7 @@ def serialize_member(profile: UserProfile, alias: str = 'default', compact: bool
         'point_value_rupees': point_value,
         'is_enabled': reward_cfg['is_enabled'],
     }
+    header['available_reward_coins'] = pts_balance
 
     # Passport / Cross-Branch Sessions
     passport_allowed = 0
