@@ -223,31 +223,28 @@ class MobileRegisterView(APIView):
                 last_name=last_name,
                 display_name=f"{first_name} {last_name}".strip(),
                 home_branch=branch,
-                user_type='MEMBER',
+                # FIX [MOBILE-USER-TYPE]: Create mobile registrants as LEAD, not MEMBER.
+                # user_type='MEMBER' was set before any program purchase, which made every
+                # mobile sign-up immediately a full member. The CRM Lead created below
+                # (source=MOBILE_APP) is the correct representation. user_type is promoted
+                # to 'MEMBER' only by LeadConversionService.execute_conversion() after payment.
+                user_type='LEAD',
                 status='ACTIVE',
                 is_login_allowed=True,
             )
             user.set_password(password)
             user.save(using=alias)
 
-            # 4. Assign MEMBER Role
-            member_role = Role.objects.using(alias).filter(code='MEMBER').first()
-            if not member_role:
-                member_role = Role.objects.using(alias).create(
-                    organization=org,
-                    code='MEMBER',
-                    name='Studio Member',
-                    scope='BRANCH',
-                    is_system=True,
-                    is_active=True,
+            # 4. Assign LEAD Role (FIX [MOBILE-ROLE]: was incorrectly assigning MEMBER role
+            # before any program purchase. MEMBER role is granted by LeadConversionService
+            # after payment. Mobile sign-ups are leads until they buy a program.)
+            lead_role = Role.objects.using(alias).filter(code='LEAD').first()
+            if lead_role:
+                RoleAssignment.objects.using(alias).get_or_create(
+                    user=user,
+                    role=lead_role,
+                    defaults={'branch': branch, 'is_active': True},
                 )
-
-            RoleAssignment.objects.using(alias).create(
-                user=user,
-                role=member_role,
-                branch=branch,
-                is_active=True,
-            )
 
             # 5. Create UserProfile
             profile = _get_or_create_user_profile(user, alias, branch=branch)

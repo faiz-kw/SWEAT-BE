@@ -405,19 +405,25 @@ class LeadViewSet(viewsets.ModelViewSet):
                 user.save(using=alias)
                 user_created = True
 
-                member_role = Role.objects.using(alias).filter(code='MEMBER').first()
-                if member_role:
+                # FIX [LEAD-ROLE]: Assign LEAD role, not MEMBER, on lead intake.
+                # A person becomes a MEMBER only after a confirmed program purchase
+                # via LeadConversionService.execute_conversion(). Assigning MEMBER
+                # here granted premature member-level RBAC to every new enquiry.
+                lead_role = Role.objects.using(alias).filter(code='LEAD').first()
+                if lead_role:
                     RoleAssignment.objects.using(alias).get_or_create(
                         user=user,
-                        role=member_role,
+                        role=lead_role,
                         defaults={'branch': lead.branch, 'is_active': True}
                     )
 
-            if user and not user_created:
-                profile = UserProfile.objects.using(alias).filter(user=user).first()
-                if profile and not lead.converted_user_profile_id:
-                    lead.converted_user_profile = profile
-                    lead.save(using=alias, update_fields=['converted_user_profile'])
+            # FIX [LEAD-CONV-PROFILE]: Do NOT link converted_user_profile on lead intake.
+            # converted_user_profile is the definitive marker of a completed commercial
+            # conversion. Setting it here — just because an existing TenantUser/UserProfile
+            # was matched by phone or email — caused every returning enquiry to appear as a
+            # fully Converted Member in the UI (member badge, disabled Call button, hidden
+            # "Convert to Member" action). The correct place to set this FK is exclusively
+            # inside LeadConversionService.execute_conversion() after payment is confirmed.
 
             # START [SEC-LEAD-TOKEN]
             # WHY: LeadViewSet.create() is AllowAny; returning tokens for pre-existing TenantUsers allows unauthenticated token harvesting for staff/member accounts.
