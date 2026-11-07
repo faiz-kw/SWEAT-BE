@@ -649,6 +649,7 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
         'partial_update': 'ops.classes.edit',
         'destroy': 'ops.classes.delete',
         'assign_trainer': 'ops.classes.edit',
+        'unassign_trainer': 'ops.classes.edit',
         'assign_content': 'ops.classes.edit',
         'cancel': 'ops.classes.cancel',
         'restore': 'ops.classes.cancel',
@@ -816,6 +817,44 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
+    @action(detail=True, methods=['post'], url_path='unassign-trainer')
+    def unassign_trainer(self, request, pk=None):
+        alias = _get_db(request)
+        trainer_profile_id = request.data.get('trainer_profile_id')
+        assignment_id = request.data.get('assignment_id')
+        if not trainer_profile_id and not assignment_id:
+            return Response({'error': 'trainer_profile_id or assignment_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from .models_classes import ClassOccurrenceTrainer
+        qs = ClassOccurrenceTrainer.objects.using(alias).filter(occurrence_id=pk)
+        if assignment_id:
+            qs = qs.filter(id=assignment_id)
+        elif trainer_profile_id:
+            qs = qs.filter(trainer_profile_id=trainer_profile_id)
+
+        deleted_count, _ = qs.delete()
+        if deleted_count == 0:
+            return Response({'error': 'Trainer assignment not found for this occurrence.'}, status=status.HTTP_404_NOT_FOUND)
+
+        from .services_classes import record_business_audit
+        try:
+            occ = ClassOccurrence.objects.using(alias).select_related('branch', 'branch__organization').get(id=pk)
+            record_business_audit(
+                organization=occ.branch.organization,
+                branch=occ.branch,
+                module='classes',
+                action_code='TRAINER_UNASSIGNED',
+                entity_type='ClassOccurrence',
+                entity_id=occ.id,
+                actor_user=request.user,
+                event_description=f"Unassigned trainer from {occ}",
+                db_alias=alias,
+            )
+        except Exception:
+            pass
+
+        return Response({'message': 'Trainer unassigned successfully.', 'deleted_count': deleted_count}, status=status.HTTP_200_OK)
+
     @action(detail=True, methods=['post'], url_path='assign-content')
     def assign_content(self, request, pk=None):
         alias = _get_db(request)
@@ -980,6 +1019,20 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
         occ_date = occurrence.occurrence_date
         occ_date_str = occ_date.strftime('%Y-%m-%d') if occ_date else ''
 
+        # If admin explicitly removed video from this occurrence, honor that immediately
+        if occurrence.online_join_url == '__NONE__' or occurrence.online_provider == 'NO_VIDEO':
+            return Response({
+                'video_url': '',
+                'embed_player_url': '',
+                'title': template_name,
+                'category': (occurrence.class_template.category.name if occurrence.class_template and occurrence.class_template.category else ''),
+                'description': occurrence.class_template.description if occurrence.class_template else '',
+                'muscle_groups': [],
+                'equipment_needed': [],
+                'is_removed': True,
+                'message': 'No video attached to this class session.',
+            }, status=status.HTTP_200_OK)
+
         # 1. Check if admin explicitly set an online_join_url for this occurrence (highest priority)
         video_url = ''
         instructions = ''
@@ -1133,8 +1186,11 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
         from .models_classes import ClassContentItem, ClassContentAssignment
 
         if not video_id:
-            # Unassign video
+            # Unassign video and mark occurrence as explicitly having NO_VIDEO
             ClassContentAssignment.objects.using(alias).filter(occurrence=occurrence).delete()
+            occurrence.online_join_url = '__NONE__'
+            occurrence.online_provider = 'NO_VIDEO'
+            occurrence.save(using=alias, update_fields=['online_join_url', 'online_provider'])
             return Response({
                 'success': True,
                 'message': 'Workout video unassigned from class session.',
@@ -1145,6 +1201,11 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
         workout_item = WorkoutContentItem.objects.using(alias).filter(id=video_id).first()
         if not workout_item:
             return Response({'error': 'Workout video not found in library'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Clear NO_VIDEO marker and set active URL
+        occurrence.online_join_url = workout_item.video_url
+        occurrence.online_provider = 'WOD_LIBRARY'
+        occurrence.save(using=alias, update_fields=['online_join_url', 'online_provider'])
 
         # Create or fetch ClassContentItem bridge for this video
         content_item, _ = ClassContentItem.objects.using(alias).get_or_create(
@@ -1158,12 +1219,15 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             }
         )
 
+        from .models_users import TenantUser
+        assigned_user = request.user if hasattr(request, 'user') and request.user.is_authenticated and isinstance(request.user, TenantUser) else None
+
         assignment, created = ClassContentAssignment.objects.using(alias).update_or_create(
             occurrence=occurrence,
             defaults={
                 'content_item': content_item,
                 'assignment_method': 'MANUAL',
-                'assigned_by_user': request.user if hasattr(request, 'user') and request.user.is_authenticated else None,
+                'assigned_by_user': assigned_user,
                 'status': 'ACTIVE',
             }
         )
@@ -1262,8 +1326,22 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             return Response({'error': 'Class occurrence not found'}, status=status.HTTP_404_NOT_FOUND)
 
         video_url = (request.data.get('video_url') or '').strip()
+        if not video_url or video_url == '__NONE__':
+            from .models_classes import ClassContentAssignment
+            ClassContentAssignment.objects.using(alias).filter(occurrence=occurrence).delete()
+            occurrence.online_join_url = '__NONE__'
+            occurrence.online_provider = 'NO_VIDEO'
+            occurrence.save(using=alias, update_fields=['online_join_url', 'online_provider'])
+            return Response({
+                'success': True,
+                'message': 'Workout video removed from class occurrence',
+                'video_url': '',
+                'embed_player_url': '',
+            }, status=status.HTTP_200_OK)
+
         occurrence.online_join_url = video_url
-        occurrence.save(using=alias, update_fields=['online_join_url'])
+        occurrence.online_provider = 'CUSTOM_URL'
+        occurrence.save(using=alias, update_fields=['online_join_url', 'online_provider'])
 
         # If a direct content assignment exists on this occurrence, keep its external_url in sync as well
         direct_assignment = occurrence.content_assignments.using(alias).select_related('content_item').first()

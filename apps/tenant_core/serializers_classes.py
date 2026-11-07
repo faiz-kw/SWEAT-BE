@@ -508,6 +508,9 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
             lead_t = trainers_list[0].get('trainer_name')
         ret['trainer_name'] = lead_t or getattr(instance, 'lead_trainer_snapshot', None) or 'Unassigned'
 
+        if ret.get('online_join_url') == '__NONE__' or getattr(instance, 'online_provider', None) == 'NO_VIDEO':
+            ret['online_join_url'] = ''
+
         return ret
 
     def get_trainer_checked_in(self, obj):

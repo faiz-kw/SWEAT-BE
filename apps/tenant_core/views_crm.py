@@ -2759,6 +2759,9 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
         'summary_counts': 'crm.leads.view',
         'summary_counts_hyphen': 'crm.leads.view',
         'available_slots': 'crm.leads.view',
+        'available_slots_hyphen': 'crm.leads.view',
+        'eligible_programs': 'crm.leads.view',
+        'eligible_programs_hyphen': 'crm.leads.view',
     }
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = [
@@ -2940,6 +2943,32 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path='available-slots')
     def available_slots_hyphen(self, request):
         return self.available_slots(request)
+
+    @action(detail=False, methods=['get'], url_path='eligible_programs')
+    def eligible_programs(self, request):
+        alias = _get_db(request)
+        branch_id = request.query_params.get('branch_id')
+        if not branch_id:
+            return Response({'error': 'branch_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        permitted_branches = get_user_effective_branch_ids(request.user, alias)
+        if permitted_branches is not None and str(branch_id) not in permitted_branches:
+            raise PermissionDenied("You do not have permission to view programs for this branch.")
+
+        lead_id = request.query_params.get('lead_id')
+        date = request.query_params.get('date') or request.query_params.get('date_from')
+
+        programs = CRMLeadService.get_eligible_trial_programs(
+            branch_id=branch_id,
+            date=date,
+            lead_id=lead_id,
+            db_alias=alias,
+        )
+        return Response({'programs': programs, 'results': programs})
+
+    @action(detail=False, methods=['get'], url_path='eligible-programs')
+    def eligible_programs_hyphen(self, request):
+        return self.eligible_programs(request)
 
     @action(detail=False, methods=['get'], url_path='summary_counts')
     def summary_counts(self, request):

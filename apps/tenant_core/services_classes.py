@@ -429,10 +429,14 @@ class ClassSchedulingService:
             is_admin_override = True
             if actor:
                 actor_role = str(getattr(actor, 'role', '')).upper()
+                role_codes = {str(r).upper() for r in (getattr(actor, '_role_codes', set()) or set())}
+                role_list = [str(r).upper() for r in getattr(actor, '_roles', [])]
                 is_admin_override = (
                     getattr(actor, 'is_staff', False)
                     or getattr(actor, 'is_superuser', False)
-                    or actor_role in ['ADMIN', 'SUPER_ADMIN', 'ORG_ADMIN', 'BRANCH_MANAGER', 'MANAGER', 'STAFF']
+                    or actor_role in ['ADMIN', 'SUPER_ADMIN', 'ORG_ADMIN', 'BRANCH_MANAGER', 'MANAGER', 'STAFF', 'ORGANIZATION_ADMIN']
+                    or bool(role_codes.intersection({'ADMIN', 'SUPER_ADMIN', 'ORG_ADMIN', 'BRANCH_MANAGER', 'MANAGER', 'STAFF', 'ORGANIZATION_ADMIN'}))
+                    or any(r in ['ADMIN', 'SUPER_ADMIN', 'ORG_ADMIN', 'BRANCH_MANAGER', 'MANAGER', 'STAFF', 'ORGANIZATION_ADMIN'] for r in role_list)
                 )
 
             if not is_admin_override:
@@ -465,16 +469,29 @@ class ClassSchedulingService:
             if conflict:
                 raise ValidationError("Trainer has an overlapping class assignment.")
 
-            # Create assignment
-            assignment = ClassOccurrenceTrainer(
+            # Check if this trainer is already assigned to this occurrence (update role if exists)
+            existing_assignment = ClassOccurrenceTrainer.objects.using(alias).filter(
                 occurrence=occ,
                 trainer_profile=trainer,
-                trainer_role=trainer_role,
-                status='CONFIRMED',
-                assigned_by_user=actor,
-                assigned_at=timezone.now(),
-            )
-            assignment.save(using=alias)
+            ).first()
+            if existing_assignment:
+                existing_assignment.trainer_role = trainer_role
+                existing_assignment.status = 'CONFIRMED'
+                existing_assignment.assigned_by_user = actor
+                existing_assignment.assigned_at = timezone.now()
+                existing_assignment.save(using=alias)
+                assignment = existing_assignment
+            else:
+                # Create assignment
+                assignment = ClassOccurrenceTrainer(
+                    occurrence=occ,
+                    trainer_profile=trainer,
+                    trainer_role=trainer_role,
+                    status='CONFIRMED',
+                    assigned_by_user=actor,
+                    assigned_at=timezone.now(),
+                )
+                assignment.save(using=alias)
 
             record_business_audit(
                 organization=occ.branch.organization,
