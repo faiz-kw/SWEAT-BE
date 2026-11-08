@@ -1611,6 +1611,9 @@ class CRMLeadService:
         db_alias: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         alias = db_alias or get_tenant_db_alias() or 'default'
+        from config.routers import set_tenant_db_alias
+        if alias and alias != 'default':
+            set_tenant_db_alias(alias)
         from .models_classes import ClassOccurrence, ClassBranchAvailability
         from .models_bookings import Booking
 
@@ -1642,6 +1645,21 @@ class CRMLeadService:
 
         slots = []
         for occ in qs.order_by('start_at')[:100]:
+            # Authoritative Program Branch Availability check
+            if occ.class_template.program:
+                from .models_catalog import ProgramBranchAvailability
+                has_prog_branch_records = ProgramBranchAvailability.objects.using(alias).filter(
+                    program=occ.class_template.program
+                ).exists()
+                if has_prog_branch_records:
+                    is_prog_avail = ProgramBranchAvailability.objects.using(alias).filter(
+                        program=occ.class_template.program,
+                        branch=occ.branch,
+                        is_active=True,
+                    ).exists()
+                    if not is_prog_avail:
+                        continue
+
             # Branch availability check
             branch_avail = ClassBranchAvailability.objects.using(alias).filter(
                 class_template=occ.class_template,
@@ -1652,17 +1670,17 @@ class CRMLeadService:
 
             effective_capacity = (
                 occ.capacity
-                or (branch_avail.capacity_override if branch_avail and branch_avail.capacity_override else None)
-                or occ.class_template.default_capacity
+                if occ.capacity is not None
+                else (branch_avail.capacity_override if branch_avail and branch_avail.capacity_override is not None else occ.class_template.default_capacity)
             )
             effective_trial_cap = (
                 occ.trial_capacity
-                or (branch_avail.trial_capacity_override if branch_avail and branch_avail.trial_capacity_override else None)
-                or occ.class_template.default_trial_capacity
+                if occ.trial_capacity is not None
+                else (branch_avail.trial_capacity_override if branch_avail and branch_avail.trial_capacity_override is not None else occ.class_template.default_trial_capacity)
             )
 
-            # Semantics: If effective_trial_cap <= 0, trials are disabled for this session
-            if effective_trial_cap <= 0:
+            # Semantics: If effective_trial_cap <= 0 or template forbids trials, trials are disabled for this session
+            if not occ.class_template.allow_trial or effective_trial_cap <= 0:
                 continue
 
             policy_allowed, policy_message = cls.resolve_trial_booking_policy(
@@ -1766,6 +1784,47 @@ class CRMLeadService:
         return slots
 
     @classmethod
+    def get_eligible_trial_programs(
+        cls,
+        branch_id: str,
+        date: Optional[str] = None,
+        lead_id: Optional[str] = None,
+        db_alias: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Dynamically returns only programs that have at least one bookable trial-eligible
+        class occurrence with remaining trial capacity for the given branch and date.
+        Completely backend-driven: zero hardcoded program names.
+        """
+        alias = db_alias or get_tenant_db_alias() or 'default'
+        slots = cls.get_available_trial_slots(
+            branch_id=branch_id,
+            date_from=date,
+            date_to=date,
+            lead_id=lead_id,
+            db_alias=alias,
+        )
+        seen_programs = set()
+        programs = []
+        for slot in slots:
+            pid = slot.get('program_id')
+            pname = slot.get('program_name')
+            if (
+                pid
+                and pname
+                and pid not in seen_programs
+                and slot.get('is_available')
+                and slot.get('remaining_trial_capacity', 0) > 0
+                and slot.get('remaining_capacity', 0) > 0
+            ):
+                seen_programs.add(pid)
+                programs.append({
+                    'id': str(pid),
+                    'name': pname,
+                })
+        return programs
+
+    @classmethod
     def book_trial(
         cls,
         lead: Optional[Lead] = None,
@@ -1826,6 +1885,20 @@ class CRMLeadService:
             if not occ.class_template.allow_trial:
                 raise ValidationError("Trials are not permitted for this class.")
 
+            if occ.class_template.program:
+                from .models_catalog import ProgramBranchAvailability
+                has_prog_branch_records = ProgramBranchAvailability.objects.using(alias).filter(
+                    program=occ.class_template.program
+                ).exists()
+                if has_prog_branch_records:
+                    is_prog_avail = ProgramBranchAvailability.objects.using(alias).filter(
+                        program=occ.class_template.program,
+                        branch=occ.branch,
+                        is_active=True,
+                    ).exists()
+                    if not is_prog_avail:
+                        raise ValidationError(f"Program '{occ.class_template.program.name}' is not available at {branch.name}.")
+
             branch_avail = ClassBranchAvailability.objects.using(alias).filter(
                 class_template=occ.class_template,
                 branch=occ.branch,
@@ -1835,17 +1908,17 @@ class CRMLeadService:
 
             effective_capacity = (
                 occ.capacity
-                or (branch_avail.capacity_override if branch_avail and branch_avail.capacity_override else None)
-                or occ.class_template.default_capacity
+                if occ.capacity is not None
+                else (branch_avail.capacity_override if branch_avail and branch_avail.capacity_override is not None else occ.class_template.default_capacity)
             )
             effective_trial_cap = (
                 occ.trial_capacity
-                or (branch_avail.trial_capacity_override if branch_avail and branch_avail.trial_capacity_override else None)
-                or occ.class_template.default_trial_capacity
+                if occ.trial_capacity is not None
+                else (branch_avail.trial_capacity_override if branch_avail and branch_avail.trial_capacity_override is not None else occ.class_template.default_trial_capacity)
             )
 
-            if effective_trial_cap <= 0:
-                raise ValidationError("Trial bookings are not enabled for this session (trial capacity is 0).")
+            if not occ.class_template.allow_trial or effective_trial_cap <= 0:
+                raise ValidationError("Trial bookings are not enabled for this session (trials not permitted or trial capacity is 0).")
 
             # Duplicate booking check: lead already has active trial for this occurrence
             # Booking Policy Check
@@ -2079,6 +2152,9 @@ class CRMLeadService:
         db_alias: Optional[str] = None,
     ) -> TrialBooking:
         alias = db_alias or get_tenant_db_alias() or 'default'
+        from config.routers import set_tenant_db_alias
+        if alias and alias != 'default':
+            set_tenant_db_alias(alias)
         from .models_classes import ClassOccurrence, ClassBranchAvailability
         from .models_bookings import Booking, BookingPolicySet
 

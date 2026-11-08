@@ -405,19 +405,25 @@ class LeadViewSet(viewsets.ModelViewSet):
                 user.save(using=alias)
                 user_created = True
 
-                member_role = Role.objects.using(alias).filter(code='MEMBER').first()
-                if member_role:
+                # FIX [LEAD-ROLE]: Assign LEAD role, not MEMBER, on lead intake.
+                # A person becomes a MEMBER only after a confirmed program purchase
+                # via LeadConversionService.execute_conversion(). Assigning MEMBER
+                # here granted premature member-level RBAC to every new enquiry.
+                lead_role = Role.objects.using(alias).filter(code='LEAD').first()
+                if lead_role:
                     RoleAssignment.objects.using(alias).get_or_create(
                         user=user,
-                        role=member_role,
+                        role=lead_role,
                         defaults={'branch': lead.branch, 'is_active': True}
                     )
 
-            if user and not user_created:
-                profile = UserProfile.objects.using(alias).filter(user=user).first()
-                if profile and not lead.converted_user_profile_id:
-                    lead.converted_user_profile = profile
-                    lead.save(using=alias, update_fields=['converted_user_profile'])
+            # FIX [LEAD-CONV-PROFILE]: Do NOT link converted_user_profile on lead intake.
+            # converted_user_profile is the definitive marker of a completed commercial
+            # conversion. Setting it here — just because an existing TenantUser/UserProfile
+            # was matched by phone or email — caused every returning enquiry to appear as a
+            # fully Converted Member in the UI (member badge, disabled Call button, hidden
+            # "Convert to Member" action). The correct place to set this FK is exclusively
+            # inside LeadConversionService.execute_conversion() after payment is confirmed.
 
             # START [SEC-LEAD-TOKEN]
             # WHY: LeadViewSet.create() is AllowAny; returning tokens for pre-existing TenantUsers allows unauthenticated token harvesting for staff/member accounts.
@@ -2759,6 +2765,9 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
         'summary_counts': 'crm.leads.view',
         'summary_counts_hyphen': 'crm.leads.view',
         'available_slots': 'crm.leads.view',
+        'available_slots_hyphen': 'crm.leads.view',
+        'eligible_programs': 'crm.leads.view',
+        'eligible_programs_hyphen': 'crm.leads.view',
     }
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = [
@@ -2940,6 +2949,32 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path='available-slots')
     def available_slots_hyphen(self, request):
         return self.available_slots(request)
+
+    @action(detail=False, methods=['get'], url_path='eligible_programs')
+    def eligible_programs(self, request):
+        alias = _get_db(request)
+        branch_id = request.query_params.get('branch_id')
+        if not branch_id:
+            return Response({'error': 'branch_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        permitted_branches = get_user_effective_branch_ids(request.user, alias)
+        if permitted_branches is not None and str(branch_id) not in permitted_branches:
+            raise PermissionDenied("You do not have permission to view programs for this branch.")
+
+        lead_id = request.query_params.get('lead_id')
+        date = request.query_params.get('date') or request.query_params.get('date_from')
+
+        programs = CRMLeadService.get_eligible_trial_programs(
+            branch_id=branch_id,
+            date=date,
+            lead_id=lead_id,
+            db_alias=alias,
+        )
+        return Response({'programs': programs, 'results': programs})
+
+    @action(detail=False, methods=['get'], url_path='eligible-programs')
+    def eligible_programs_hyphen(self, request):
+        return self.eligible_programs(request)
 
     @action(detail=False, methods=['get'], url_path='summary_counts')
     def summary_counts(self, request):

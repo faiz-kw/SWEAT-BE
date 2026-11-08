@@ -168,10 +168,14 @@ class LeadSerializer(serializers.ModelSerializer):
 
         # Converted member linking and canonical action eligibility
         alias = getattr(getattr(instance, '_state', None), 'db', None) or 'default'
-        is_converted = (
-            instance.current_status in ('CONVERTED', 'DEAL_DONE', 'SUBSCRIBED')
-            or getattr(instance, 'converted_user_profile_id', None) is not None
-        )
+        # FIX [LEAD-IS-CONVERTED]: Determine conversion state only from authoritative signals.
+        # Previously, `converted_user_profile_id is not None` was included here, which caused
+        # any lead matched to a pre-existing UserProfile (via phone/email at intake) to be
+        # treated as a fully Converted Member — blocking the Call button, hiding "Convert to
+        # Member", and showing a member badge in the UI. The correct signals are:
+        #   1. current_status is an explicitly terminal conversion state, OR
+        #   2. A LeadConversion record exists (created only by LeadConversionService after payment).
+        is_converted = instance.current_status in ('CONVERTED', 'DEAL_DONE', 'SUBSCRIBED')
         if not is_converted and instance.current_status not in ('LOST', 'NOT_INTERESTED'):
             from .models_crm import LeadConversion
             is_converted = LeadConversion.objects.using(alias).filter(lead=instance).exists()

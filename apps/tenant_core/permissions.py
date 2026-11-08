@@ -174,7 +174,7 @@ class TenantRBACPermission(permissions.BasePermission):
                     return True
             # C. Member & Lead trial bookings self-service
             if 'trial' in view_name:
-                if act in ['create', 'list', 'retrieve', 'available_slots', 'request_reschedule', 'cancel', 'filter_options', 'filter_options_hyphen', 'summary_counts', 'summary_counts_hyphen']:
+                if act in ['create', 'list', 'retrieve', 'available_slots', 'available_slots_hyphen', 'eligible_programs', 'eligible_programs_hyphen', 'request_reschedule', 'cancel', 'filter_options', 'filter_options_hyphen', 'summary_counts', 'summary_counts_hyphen']:
                     return True
             # D. Lead & Member self-service on leads (e.g. converting themselves or booking trial).
             # NOTE: partial_update / update / retrieve are intentionally excluded here;

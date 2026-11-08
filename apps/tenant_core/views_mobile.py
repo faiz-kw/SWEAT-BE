@@ -223,31 +223,28 @@ class MobileRegisterView(APIView):
                 last_name=last_name,
                 display_name=f"{first_name} {last_name}".strip(),
                 home_branch=branch,
-                user_type='MEMBER',
+                # FIX [MOBILE-USER-TYPE]: Create mobile registrants as LEAD, not MEMBER.
+                # user_type='MEMBER' was set before any program purchase, which made every
+                # mobile sign-up immediately a full member. The CRM Lead created below
+                # (source=MOBILE_APP) is the correct representation. user_type is promoted
+                # to 'MEMBER' only by LeadConversionService.execute_conversion() after payment.
+                user_type='LEAD',
                 status='ACTIVE',
                 is_login_allowed=True,
             )
             user.set_password(password)
             user.save(using=alias)
 
-            # 4. Assign MEMBER Role
-            member_role = Role.objects.using(alias).filter(code='MEMBER').first()
-            if not member_role:
-                member_role = Role.objects.using(alias).create(
-                    organization=org,
-                    code='MEMBER',
-                    name='Studio Member',
-                    scope='BRANCH',
-                    is_system=True,
-                    is_active=True,
+            # 4. Assign LEAD Role (FIX [MOBILE-ROLE]: was incorrectly assigning MEMBER role
+            # before any program purchase. MEMBER role is granted by LeadConversionService
+            # after payment. Mobile sign-ups are leads until they buy a program.)
+            lead_role = Role.objects.using(alias).filter(code='LEAD').first()
+            if lead_role:
+                RoleAssignment.objects.using(alias).get_or_create(
+                    user=user,
+                    role=lead_role,
+                    defaults={'branch': branch, 'is_active': True},
                 )
-
-            RoleAssignment.objects.using(alias).create(
-                user=user,
-                role=member_role,
-                branch=branch,
-                is_active=True,
-            )
 
             # 5. Create UserProfile
             profile = _get_or_create_user_profile(user, alias, branch=branch)
@@ -1232,18 +1229,104 @@ class MobileScheduleView(APIView):
         if not alias:
             return Response([], status=status.HTTP_200_OK)
 
-        branch_id = request.query_params.get('branch_id')
+        user = request.user if (hasattr(request, 'user') and request.user.is_authenticated) else None
+        user_profile = None
+        user_home_branch = None
+        active_mems = []
+        purchased_programs = []
+        purchased_program_ids = set()
+        active_mem = None
+        is_credit_based_user = False
+        user_credit_ent = None
+        user_passport_ent = None
+        user_home_ent = None
+        user_booking_map = {}
+        included_class_ids = None
+
+        if user:
+            user_profile = _get_or_create_user_profile(user, alias)
+            if not user_profile and getattr(user, 'email', None):
+                user_profile = UserProfile.objects.using(alias).filter(user__email__iexact=user.email).first()
+            if user_profile:
+                # Retrieve all active memberships of the member to identify purchased program packages
+                active_mems = list(
+                    Membership.objects.using(alias)
+                    .filter(user_profile=user_profile, status='ACTIVE', end_date__gte=timezone.now().date())
+                    .select_related('program', 'package', 'package_version', 'home_branch')
+                    .order_by('-created_at')
+                )
+                user_home_branch = (
+                    getattr(user_profile, 'preferred_branch', None)
+                    or (active_mems[0].home_branch if active_mems and getattr(active_mems[0], 'home_branch', None) else None)
+                    or getattr(user, 'home_branch', None)
+                )
+
+                for m in active_mems:
+                    prog = m.program or (m.package.program if m.package else None)
+                    if prog and str(prog.id) not in purchased_program_ids:
+                        purchased_program_ids.add(str(prog.id))
+                        purchased_programs.append({
+                            'id': str(prog.id),
+                            'name': prog.name,
+                            'package_id': str(m.package.id) if m.package else '',
+                            'package_name': m.package.name if m.package else '',
+                            'membership_id': str(m.id),
+                        })
+
+                # Primary active membership for session entitlement calculation
+                active_mem = active_mems[0] if active_mems else None
+                if active_mem:
+                    mem_ents = list(active_mem.entitlements.using(alias).filter(status='ACTIVE'))
+                    for e in mem_ents:
+                        if e.entitlement_type == 'CREDIT_WALLET':
+                            user_credit_ent = e
+                        elif e.entitlement_type in ('CROSS_BRANCH_SESSION', 'CROSS_BRANCH'):
+                            user_passport_ent = e
+                        elif e.entitlement_type == 'HOME_BRANCH_SESSION':
+                            user_home_ent = e
+                    if not user_home_ent:
+                        user_home_ent = next((e for e in mem_ents if e.entitlement_type not in ('CROSS_BRANCH_SESSION', 'CROSS_BRANCH', 'CREDIT_WALLET')), None)
+
+                    is_credit_based_user = bool(user_credit_ent and (user_credit_ent.is_unlimited or (user_credit_ent.remaining_units and user_credit_ent.remaining_units > 0) or user_credit_ent.allocated_units))
+
+                    if not is_credit_based_user and active_mem.package_version_id:
+                        rules = PackageClassAccessRule.objects.using(alias).filter(
+                            package_version_id=active_mem.package_version_id, access_type='INCLUDED'
+                        )
+                        rule_ids = {str(r.class_template_id) for r in rules if r.class_template_id}
+                        if rule_ids:
+                            included_class_ids = rule_ids
+
+        branch_id_param = request.query_params.get('branch_id')
         category_id = request.query_params.get('category_id')
+        selected_program_id = request.query_params.get('program_id')
+
+        # Determine effective branch:
+        # 1. If explicitly requested as 'all', view all branches.
+        # 2. If explicitly requested with a branch UUID, view that specific branch.
+        # 3. Default: View member's registered home branch if available, else 'all'.
+        if branch_id_param is not None and str(branch_id_param).strip() != '':
+            if str(branch_id_param).strip().lower() == 'all':
+                effective_branch_id = 'all'
+            else:
+                effective_branch_id = str(branch_id_param).strip()
+        else:
+            if user_home_branch:
+                effective_branch_id = str(user_home_branch.id)
+            else:
+                effective_branch_id = 'all'
 
         # Resolve authoritative studio timezone (default 'Asia/Kolkata')
         tz_name = 'Asia/Kolkata'
-        if branch_id and str(branch_id).lower() != 'all':
+        if effective_branch_id and effective_branch_id != 'all':
             try:
-                branch_obj = Branch.objects.using(alias).filter(id=branch_id).first()
+                branch_obj = Branch.objects.using(alias).filter(id=effective_branch_id).first()
                 if branch_obj and branch_obj.timezone:
                     tz_name = branch_obj.timezone
             except Exception:
                 pass
+        elif user_home_branch and getattr(user_home_branch, 'timezone', None):
+            tz_name = user_home_branch.timezone
 
         try:
             import zoneinfo
@@ -1289,8 +1372,8 @@ class MobileScheduleView(APIView):
         )
 
         # Filter by branch (robust to 'all')
-        if branch_id and str(branch_id).lower() != 'all':
-            qs = qs.filter(branch_id=branch_id)
+        if effective_branch_id and effective_branch_id != 'all':
+            qs = qs.filter(branch_id=effective_branch_id)
 
         # Filter by category/format (accepts UUID, code, or name, robust to 'all')
         category_param = request.query_params.get('category') or category_id
@@ -1307,60 +1390,32 @@ class MobileScheduleView(APIView):
                     | models.Q(class_template__category__code__icontains=category_param)
                 )
 
-        # Authenticated user bookings for this day to show 'CONFIRMED' / 'WAITLISTED' badges
-        user_booking_map = {}
-        included_class_ids = None
-        active_mem = None
-        is_credit_based_user = False
-        user_credit_ent = None
-        user_passport_ent = None
-        user_home_ent = None
+        # Filter schedule occurrences by member's purchased program package(s)
+        if selected_program_id and str(selected_program_id).lower() != 'all':
+            qs = qs.filter(class_template__program_id=selected_program_id)
+        elif purchased_program_ids:
+            if len(purchased_programs) == 1:
+                # Single purchased program: strictly restrict view to this program's classes
+                single_prog_id = purchased_programs[0]['id']
+                qs = qs.filter(class_template__program_id=single_prog_id)
+                selected_program_id = single_prog_id
+            else:
+                # Multiple purchased programs: restrict view to classes across their purchased programs
+                qs = qs.filter(class_template__program_id__in=purchased_program_ids)
+                selected_program_id = 'all'
 
-        if request.user and request.user.is_authenticated:
-            user_profile = _get_or_create_user_profile(request.user, alias)
-            if not user_profile and getattr(request.user, 'email', None):
-                user_profile = UserProfile.objects.using(alias).filter(user__email__iexact=request.user.email).first()
-            if user_profile:
-                # Resolve active membership and its package class access rules
-                active_mem = (
-                    Membership.objects.using(alias)
-                    .filter(user_profile=user_profile, status='ACTIVE', end_date__gte=timezone.now().date())
-                    .order_by('-created_at')
-                    .first()
-                )
-                if active_mem:
-                    mem_ents = list(active_mem.entitlements.using(alias).filter(status='ACTIVE'))
-                    for e in mem_ents:
-                        if e.entitlement_type == 'CREDIT_WALLET':
-                            user_credit_ent = e
-                        elif e.entitlement_type in ('CROSS_BRANCH_SESSION', 'CROSS_BRANCH'):
-                            user_passport_ent = e
-                        elif e.entitlement_type == 'HOME_BRANCH_SESSION':
-                            user_home_ent = e
-                    if not user_home_ent:
-                        user_home_ent = next((e for e in mem_ents if e.entitlement_type not in ('CROSS_BRANCH_SESSION', 'CROSS_BRANCH', 'CREDIT_WALLET')), None)
-
-                    is_credit_based_user = bool(user_credit_ent and (user_credit_ent.is_unlimited or (user_credit_ent.remaining_units and user_credit_ent.remaining_units > 0) or user_credit_ent.allocated_units))
-
-                    if not is_credit_based_user and active_mem.package_version_id:
-                        rules = PackageClassAccessRule.objects.using(alias).filter(
-                            package_version_id=active_mem.package_version_id, access_type='INCLUDED'
-                        )
-                        rule_ids = {str(r.class_template_id) for r in rules if r.class_template_id}
-                        if rule_ids:
-                            included_class_ids = rule_ids
-
-                user_bookings = Booking.objects.using(alias).filter(
-                    user_profile=user_profile,
-                    occurrence__in=qs,
-                    status__in=['CONFIRMED', 'RESERVED', 'WAITLISTED']
-                )
-                for b in user_bookings:
-                    user_booking_map[str(b.occurrence_id)] = {
-                        'booking_id': str(b.id),
-                        'status': b.status,
-                        'waitlist_position': b.waitlist_position,
-                    }
+        if user_profile:
+            user_bookings = Booking.objects.using(alias).filter(
+                user_profile=user_profile,
+                occurrence__in=qs,
+                status__in=['CONFIRMED', 'RESERVED', 'WAITLISTED']
+            )
+            for b in user_bookings:
+                user_booking_map[str(b.occurrence_id)] = {
+                    'booking_id': str(b.id),
+                    'status': b.status,
+                    'waitlist_position': b.waitlist_position,
+                }
 
         # Check if caller requested trial slots only
         is_trial_filter = (
@@ -1554,6 +1609,8 @@ class MobileScheduleView(APIView):
                 'id': str(occ.id),
                 'class_id': str(template.id) if template else None,
                 'class_name': template.name if template else 'Reformer Session',
+                'program_id': str(template.program_id) if (template and template.program_id) else None,
+                'program_name': template.program.name if (template and template.program) else (category.name if category else 'Pilates Reformer'),
                 'category': category.name if category else 'Pilates Reformer',
                 'category_id': str(category.id) if category else None,
                 'category_code': category.code if category else None,
@@ -1609,16 +1666,32 @@ class MobileScheduleView(APIView):
                 'can_purchase_passport': can_purchase_passport,
             })
 
-        all_categories = [
-            {'id': str(cat.id), 'code': cat.code, 'name': cat.name}
-            for cat in ClassCategory.objects.using(alias).filter(status='ACTIVE').order_by('display_order', 'name')
-        ]
+        # Derive active categories strictly from returned schedule slots / purchased program classes
+        seen_cat_names = set()
+        dedup_categories = []
+        for s in results:
+            cat_name = s.get('category')
+            cat_id = s.get('category_id')
+            cat_code = s.get('category_code')
+            if cat_name:
+                norm_name = cat_name.strip().lower()
+                if norm_name not in seen_cat_names:
+                    seen_cat_names.add(norm_name)
+                    dedup_categories.append({
+                        'id': cat_id or norm_name,
+                        'code': cat_code or '',
+                        'name': cat_name.strip(),
+                    })
 
         return Response({
             'date': target_date.isoformat(),
-            'branch_id': branch_id,
+            'branch_id': effective_branch_id,
+            'home_branch_id': str(user_home_branch.id) if user_home_branch else None,
+            'home_branch_name': user_home_branch.name if user_home_branch else None,
             'classes_count': len(results),
-            'categories': all_categories,
+            'categories': dedup_categories,
+            'purchased_programs': purchased_programs,
+            'selected_program_id': selected_program_id or 'all',
             'slots': results,
         })
 
@@ -1990,18 +2063,25 @@ class MobileBookClassView(APIView):
                 'code': 'CLASS_ALREADY_STARTED',
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        # 2. Resolve active membership with remaining session units
-        active_membership = (
+        # 2. Resolve active membership matching the occurrence's program
+        prog_id = occurrence.class_template.program_id if occurrence.class_template else None
+        active_mems_qs = (
             Membership.objects.using(alias)
             .filter(
                 user_profile=profile,
                 status='ACTIVE',
                 end_date__gte=timezone.now().date(),
             )
-            .select_related('package', 'package_version')
+            .select_related('package', 'package_version', 'program')
             .order_by('-created_at')
-            .first()
         )
+        active_membership = None
+        if prog_id:
+            active_membership = active_mems_qs.filter(
+                models.Q(program_id=prog_id) | models.Q(package__program_id=prog_id)
+            ).first()
+        if not active_membership:
+            active_membership = active_mems_qs.first()
 
         if not active_membership:
             return Response(

@@ -508,8 +508,9 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
             lead_t = trainers_list[0].get('trainer_name')
         ret['trainer_name'] = lead_t or getattr(instance, 'lead_trainer_snapshot', None) or 'Unassigned'
 
-        # Fallback online_join_url from direct assignment or date-aware workout item
-        if not ret.get('online_join_url'):
+        if ret.get('online_join_url') == '__NONE__' or getattr(instance, 'online_provider', None) == 'NO_VIDEO':
+            ret['online_join_url'] = ''
+        elif not ret.get('online_join_url'):
             if ret.get('active_content') and ret['active_content'].get('external_url'):
                 ret['online_join_url'] = ret['active_content']['external_url']
             elif instance.occurrence_date and getattr(instance, 'class_template_id', None):
