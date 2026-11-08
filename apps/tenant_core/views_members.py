@@ -501,6 +501,15 @@ def get_member_available_actions(profile: UserProfile, active_m: Membership, out
     return actions
 
 
+def safe_order_attr(obj, attr='order_number', default=''):
+    if not getattr(obj, 'order_id', None):
+        return default
+    try:
+        o = getattr(obj, 'order', None)
+        return getattr(o, attr, default) if o else default
+    except Exception:
+        return default
+
 def build_member_timeline(profile: UserProfile, alias: str = 'default', limit: int = 100) -> list:
     """
     Pure read-model aggregation assembling a unified chronological timeline across CRM, Commerce,
@@ -597,7 +606,7 @@ def build_member_timeline(profile: UserProfile, alias: str = 'default', limit: i
             'category': 'COMMERCE',
             'event_type': 'PAYMENT_RECORDED',
             'title': f"Payment Received: ₹{ptxn.amount}",
-            'description': f"Paid via {ptxn.provider} ({ptxn.payment_method or 'Cash'}) for Order {ptxn.order.order_number if ptxn.order else ''}",
+            'description': f"Paid via {ptxn.provider} ({ptxn.payment_method or 'Cash'})" + (f" for Order {safe_order_attr(ptxn)}" if safe_order_attr(ptxn) else ""),
             'occurred_at': ptxn.paid_at.isoformat() if ptxn.paid_at else ptxn.created_at.isoformat(),
             'actor': 'Finance / POS',
             'badge_color': 'emerald',
@@ -1509,7 +1518,7 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         {
             'id': str(pt.id),
             'order_id': str(pt.order_id) if pt.order_id else None,
-            'order_number': pt.order.order_number if pt.order else '',
+            'order_number': safe_order_attr(pt),
             'provider': pt.provider,
             'payment_method': pt.payment_method or pt.provider,
             'amount': float(pt.amount),
@@ -1526,7 +1535,7 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         {
             'id': str(inv.id),
             'invoice_number': inv.invoice_number,
-            'order_number': inv.order.order_number if inv.order else '',
+            'order_number': safe_order_attr(inv),
             'total_amount': float(inv.total_amount),
             'currency': inv.currency,
             'status': inv.status,
@@ -1539,7 +1548,7 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
     refunds_data = [
         {
             'id': str(rf.id),
-            'order_number': rf.order.order_number if rf.order else '',
+            'order_number': safe_order_attr(rf),
             'amount': float(rf.amount),
             'reason': rf.reason_text or rf.reason_code or 'Refund processed',
             'status': rf.status,
