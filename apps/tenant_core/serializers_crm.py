@@ -1,3 +1,4 @@
+from .security_utils import mask_phone_if_restricted
 """
 apps/tenant_core/serializers_crm.py — DRF Serializers for Layer 2 Module B: CRM, Leads, Trials & Sales
 """
@@ -155,7 +156,11 @@ class LeadSerializer(serializers.ModelSerializer):
             data['pan_number'] = None
         # Provide convenient frontend aliases
         data['email'] = instance.email_normalized
-        data['phone'] = instance.phone_normalized
+        req = self.context.get('request')
+        raw_p = instance.phone_normalized
+        data['phone'] = mask_phone_if_restricted(req, raw_p)
+        if 'phone_normalized' in data:
+            data['phone_normalized'] = mask_phone_if_restricted(req, data['phone_normalized'])
         data['location'] = instance.area
         data['goal'] = instance.fitness_goal
 
@@ -586,7 +591,7 @@ class LeadActivitySerializer(serializers.ModelSerializer):
         return f"{obj.lead.first_name} {obj.lead.last_name}".strip()
 
     def get_lead_phone(self, obj):
-        return obj.lead.phone_normalized if obj.lead else ''
+        return mask_phone_if_restricted(self.context.get('request'), obj.lead.phone_normalized) if (obj.lead and obj.lead.phone_normalized) else ''
 
     def get_lead_status(self, obj):
         return obj.lead.current_status if obj.lead else ''
@@ -799,7 +804,7 @@ class TrialBookingSerializer(serializers.ModelSerializer):
         return f"{obj.lead.first_name} {obj.lead.last_name}".strip()
 
     def get_lead_phone(self, obj):
-        return obj.lead.phone_normalized if obj.lead else ''
+        return mask_phone_if_restricted(self.context.get('request'), obj.lead.phone_normalized) if (obj.lead and obj.lead.phone_normalized) else ''
 
     def get_lead_email(self, obj):
         return obj.lead.email_normalized if obj.lead else ''
@@ -1001,7 +1006,7 @@ class SalesFollowupTaskSerializer(serializers.ModelSerializer):
         return f"{obj.lead.first_name} {obj.lead.last_name}".strip()
 
     def get_lead_phone(self, obj):
-        return obj.lead.phone_normalized if obj.lead else ''
+        return mask_phone_if_restricted(self.context.get('request'), obj.lead.phone_normalized) if (obj.lead and obj.lead.phone_normalized) else ''
 
     def get_lead_email(self, obj):
         return obj.lead.email_normalized if obj.lead else ''

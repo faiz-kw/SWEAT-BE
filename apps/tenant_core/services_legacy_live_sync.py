@@ -14,6 +14,7 @@ from .models_memberships import Membership, MembershipEntitlement
 from .models_org import Branch, Organization
 from .models_catalog import Package, PackageVersion, PackagePrice, Program
 from .models_crm import Lead
+from collections import defaultdict
 from .models_commerce import Order, OrderItem, PaymentTransaction, MemberInvoice
 from .models_bookings import Booking
 from .models_attendance import AttendanceRecord

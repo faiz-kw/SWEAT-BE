@@ -1,3 +1,4 @@
+from .security_utils import mask_phone_if_restricted, get_user_role_codes
 """
 apps/tenant_core/views_members.py — Comprehensive Production ViewSet for Members, Member Directory, Member 360 & Lifecycle Actions
 
@@ -111,8 +112,9 @@ def _get_org(request):
 
 def calculate_member_outstanding(profile: UserProfile, alias: str = 'default') -> Decimal:
     """
-    Computes total genuine outstanding balance across partially paid orders or active credit agreements for a member.
+    Computes total genuine outstanding balance across partially paid orders for a member.
     Excludes cancelled, refunded, draft, and abandoned unpaid checkout attempts.
+    Only orders with status='PARTIALLY_PAID' or genuine partial payment (net_paid > 0) are counted.
     """
     orders = Order.objects.using(alias).filter(
         user_profile=profile,
@@ -128,6 +130,11 @@ def calculate_member_outstanding(profile: UserProfile, alias: str = 'default') -
             order=order, status__in=['SUCCESS', 'success']
         ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
         net_paid = max(Decimal('0.00'), paid_sum - refund_sum)
+
+        # Exclude unpaid checkout attempts: an order with PENDING_PAYMENT and 0 payment is NOT an outstanding balance.
+        if order.status != 'PARTIALLY_PAID' and net_paid <= Decimal('0.00'):
+            continue
+
         diff = max(Decimal('0.00'), order.total_amount - net_paid)
         if diff > Decimal('0.00'):
             total_outstanding += diff
@@ -258,7 +265,7 @@ def get_member_sessions_summary(profile: UserProfile, active_m: Membership = Non
     return home_sessions, cross_sessions, detailed_balances
 
 
-def serialize_member(profile: UserProfile, alias: str = 'default', compact: bool = False) -> dict:
+def serialize_member(profile: UserProfile, alias: str = 'default', compact: bool = False, request=None) -> dict:
     user = profile.user
     first_name = profile.first_name_snapshot or getattr(user, 'first_name', '')
     last_name = profile.last_name_snapshot or getattr(user, 'last_name', '')
@@ -417,8 +424,9 @@ def serialize_member(profile: UserProfile, alias: str = 'default', compact: bool
         'name': full_name,
         'first_name': first_name,
         'last_name': last_name,
-        'phone': getattr(user, 'phone', '') or '',
+        'phone': mask_phone_if_restricted(request, getattr(user, 'phone', '') or '') if request else (getattr(user, 'phone', '') or ''),
         'email': getattr(user, 'email', '') or '',
+        'alternate_email': (profile.address_json or {}).get('alternate_email') if profile.address_json else None,
         'avatar_url': getattr(user, 'avatar_url', '') or (profile.address_json or {}).get('avatar_url', '') or '',
         'gender': profile.gender or 'M',
         'age': age,
@@ -1865,6 +1873,7 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         'contact': {
             'full_name': base_member['name'],
             'email': base_member['email'],
+            'alternate_email': base_member.get('alternate_email'),
             'phone': base_member['phone'],
             'gender': base_member['gender'],
             'age': base_member['age'],
@@ -2049,7 +2058,7 @@ class MemberViewSet(viewsets.ViewSet):
             | Q(member_type='MEMBER')
             | (Q(acquisition_source='MANUAL_CREATE') & Q(member_number__isnull=False) & ~Q(member_number=''))
         )
-        return qs.filter(member_condition).distinct()
+        return qs.filter(member_condition).exclude(member_status='ARCHIVED').distinct()
 
     def get_member_profile(self, alias: str, org, pk):
         """
@@ -2276,7 +2285,7 @@ class MemberViewSet(viewsets.ViewSet):
                 )
             elif quick_view == 'outstanding':
                 debt_profile_ids = set(Order.objects.using(alias).filter(
-                    status__in=['PENDING_PAYMENT', 'PARTIALLY_PAID'],
+                    status='PARTIALLY_PAID',
                     total_amount__gt=Decimal('0.00')
                 ).exclude(
                     status__in=['CANCELLED', 'REFUNDED', 'DRAFT']
@@ -2308,7 +2317,7 @@ class MemberViewSet(viewsets.ViewSet):
         page_qs = qs[start_idx:end_idx]
 
         is_compact = request.query_params.get('compact') == 'true'
-        results = [serialize_member(p, alias, compact=is_compact) for p in page_qs]
+        results = [serialize_member(p, alias, compact=is_compact, request=request) for p in page_qs]
 
         # If client explicitly specifies flat format
         if request.query_params.get('format') == 'flat':
@@ -2329,7 +2338,7 @@ class MemberViewSet(viewsets.ViewSet):
         if not profile:
             return Response({'detail': 'Member not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        return Response(serialize_member(profile, alias), status=status.HTTP_200_OK)
+        return Response(serialize_member(profile, alias, request=request), status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['get'], url_path='360')
     def member_360(self, request, pk=None):
@@ -2576,6 +2585,10 @@ class MemberViewSet(viewsets.ViewSet):
             st = str(data['status']).upper()
             profile.member_status = 'ACTIVE' if 'ACT' in st else ('FROZEN' if 'FROZ' in st else 'INACTIVE')
         if 'location' in data or 'locationId' in data or 'home_branch_id' in data:
+            u_roles = get_user_role_codes(request)
+            unmasked_roles = {'ORG_ADMIN', 'SUPER_ADMIN', 'ADMIN', 'BRANCH_MANAGER', 'PLATFORM_SUPERADMIN'}
+            if 'SALES_REP' in u_roles and not (u_roles & unmasked_roles):
+                return Response({'error': 'Sales users are not permitted to change a member\'s home branch.'}, status=status.HTTP_403_FORBIDDEN)
             loc_id = data.get('location') or data.get('locationId') or data.get('home_branch_id')
             branch = Branch.objects.using(alias).filter(id=loc_id).first()
             if branch:
@@ -3581,6 +3594,10 @@ class MemberViewSet(viewsets.ViewSet):
 
     @action(detail=True, methods=['post'], url_path='transfer')
     def transfer(self, request, pk=None):
+        u_roles = get_user_role_codes(request)
+        unmasked_roles = {'ORG_ADMIN', 'SUPER_ADMIN', 'ADMIN', 'BRANCH_MANAGER', 'PLATFORM_SUPERADMIN'}
+        if 'SALES_REP' in u_roles and not (u_roles & unmasked_roles):
+            return Response({'error': 'Sales users are not permitted to transfer a member\'s home branch.'}, status=status.HTTP_403_FORBIDDEN)
         """
         Transfers home branch of member and membership with program and package availability verification.
         """
@@ -4021,8 +4038,12 @@ class MemberViewSet(viewsets.ViewSet):
         if not order_id:
             # Pick first order with outstanding balance
             pending_order = Order.objects.using(alias).filter(
-                user_profile=profile, status__in=['PENDING_PAYMENT', 'PARTIALLY_PAID']
+                user_profile=profile, status='PARTIALLY_PAID'
             ).order_by('-created_at').first()
+            if not pending_order:
+                pending_order = Order.objects.using(alias).filter(
+                    user_profile=profile, status='PENDING_PAYMENT'
+                ).order_by('-created_at').first()
             if pending_order:
                 order_id = str(pending_order.id)
             else:

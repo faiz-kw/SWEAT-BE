@@ -157,6 +157,9 @@ class BookingWaitlistEventSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ['id', 'created_at']
 
+from .security_utils import mask_phone_if_restricted as _mask_phone_if_restricted
+
+
 class BookingListSerializer(serializers.ModelSerializer):
     """Lightweight list serializer — no nested prefetch, fast for table views."""
     user_profile_name = serializers.SerializerMethodField()
@@ -218,9 +221,12 @@ class BookingListSerializer(serializers.ModelSerializer):
 
     def get_member_phone(self, obj):
         up = getattr(obj, 'user_profile', None)
+        raw = None
         if up and getattr(up, 'user', None):
-            return getattr(up.user, 'phone', None) or getattr(up.user, 'phone_number', None)
-        return None
+            raw = getattr(up.user, 'phone', None) or getattr(up.user, 'phone_number', None)
+        if not raw:
+            return None
+        return _mask_phone_if_restricted(self.context.get('request'), raw)
 
     def get_parq_status(self, obj):
         if getattr(obj, 'has_parq_submission', None) is not None:
@@ -358,7 +364,10 @@ class BookingSerializer(serializers.ModelSerializer):
         return obj.user_profile.user.email if (obj.user_profile and obj.user_profile.user) else None
 
     def get_member_phone(self, obj):
-        return obj.user_profile.user.phone if (obj.user_profile and obj.user_profile.user) else None
+        raw = obj.user_profile.user.phone if (obj.user_profile and obj.user_profile.user) else None
+        if not raw:
+            return None
+        return _mask_phone_if_restricted(self.context.get('request'), raw)
 
     def get_member_number(self, obj):
         return obj.user_profile.member_number if obj.user_profile else None

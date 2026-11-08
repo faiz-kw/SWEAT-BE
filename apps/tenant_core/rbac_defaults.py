@@ -100,15 +100,19 @@ DEFAULT_ROLES_CONFIG: Dict[str, dict] = {
         'permissions': [
             # Core
             'core.settings.view', 'core.files.view',
-            # Ops (Assigned classes, roster, calendar)
+            # Ops (Assigned classes, roster, calendar, in-class booking)
             'ops.classes.view',
             'ops.calendar.view',
             'ops.trainers.view',
             'ops.bookings.view',
+            'ops.bookings.create',
             'ops.personal-training.view', 'ops.personal-training.edit',
             # Members & Attendance
             'members.client-360.view',
             'members.attendance.view', 'members.attendance.create',
+            # CRM Leads & Trial Passes (in-class trial pass booking)
+            'crm.leads.view', 'crm.leads.create',
+            'crm.trials.view', 'crm.trials.create',
             # Performance
             'performance.workouts.view', 'performance.workouts.create', 'performance.workouts.edit',
             'performance.analytics.view',
@@ -158,9 +162,12 @@ DEFAULT_ROLES_CONFIG: Dict[str, dict] = {
             'crm.communications.view', 'crm.communications.send',
             'crm.telephony.access',
             'crm.settings.view',
-            # Members Read
+            # Members & Memberships (Creation & renewals)
             'members.client-360.view', 'members.client-360.create',
-            'members.memberships.view',
+            'members.memberships.view', 'members.memberships.create', 'members.memberships.edit',
+            'members.renewals.view', 'members.renewals.create',
+            # Payment collection for membership sales & renewals
+            'finance.payments.create',
             # Ops View
             'ops.classes.view', 'ops.calendar.view',
             # Reports
