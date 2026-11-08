@@ -372,6 +372,30 @@ class BookingSerializer(serializers.ModelSerializer):
     def get_member_number(self, obj):
         return obj.user_profile.member_number if obj.user_profile else None
 
+    def get_program_name(self, obj):
+        if obj.occurrence and obj.occurrence.class_template and obj.occurrence.class_template.program:
+            return obj.occurrence.class_template.program.name
+        if obj.membership and obj.membership.package and obj.membership.package.program:
+            return obj.membership.package.program.name
+        if obj.occurrence and obj.occurrence.class_template and obj.occurrence.class_template.category:
+            return obj.occurrence.class_template.category.name
+        return None
+
+    def get_booked_by_name(self, obj):
+        if getattr(obj, 'created_by_user', None):
+            u = obj.created_by_user
+            name = f"{getattr(u, 'first_name', '')} {getattr(u, 'last_name', '')}".strip()
+            return name or getattr(u, 'email', 'Staff')
+        if obj.booking_source == 'MOBILE_APP':
+            return 'Member (Self - App)'
+        if obj.booking_source == 'WEB':
+            return 'Member (Self - Web)'
+        if obj.booking_source in ['FRONT_DESK', 'ADMIN', 'KIOSK']:
+            return 'Front Desk / Admin'
+        if obj.booking_source == 'TRAINER':
+            return 'Trainer'
+        return 'Staff'
+
     def get_parq_status(self, obj):
         if not obj.user_profile:
             return 'NOT_REQUIRED'
