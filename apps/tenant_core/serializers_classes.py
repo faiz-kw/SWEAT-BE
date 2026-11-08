@@ -508,6 +508,35 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
             lead_t = trainers_list[0].get('trainer_name')
         ret['trainer_name'] = lead_t or getattr(instance, 'lead_trainer_snapshot', None) or 'Unassigned'
 
+        # Fallback online_join_url from direct assignment or date-aware workout item
+        if not ret.get('online_join_url'):
+            if ret.get('active_content') and ret['active_content'].get('external_url'):
+                ret['online_join_url'] = ret['active_content']['external_url']
+            elif instance.occurrence_date and getattr(instance, 'class_template_id', None):
+                try:
+                    from .models_wod import WorkoutContentItem
+                    occ_dt_str = str(instance.occurrence_date)
+                    tmpl = getattr(instance, 'class_template', None)
+                    tmpl_name = (tmpl.name if tmpl else '').strip()
+                    cat_name = (tmpl.category.name if tmpl and tmpl.category else '').upper()
+                    
+                    wod_qs = WorkoutContentItem.objects.using(instance._state.db or 'default').filter(
+                        raw_import_data__date=occ_dt_str,
+                        status='ACTIVE',
+                    )
+                    if 'PILATES' in cat_name:
+                        wod_match = (
+                            wod_qs.filter(raw_import_data__category_code='PILATES').first()
+                            or wod_qs.filter(movement_name__icontains='Sweat Total').first()
+                        )
+                    else:
+                        wod_match = wod_qs.filter(movement_name__icontains=tmpl_name).first() if tmpl_name else None
+
+                    if wod_match and wod_match.video_url:
+                        ret['online_join_url'] = wod_match.video_url
+                except Exception:
+                    pass
+
         return ret
 
     def get_trainer_checked_in(self, obj):
