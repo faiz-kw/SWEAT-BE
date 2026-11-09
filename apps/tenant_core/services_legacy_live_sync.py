@@ -2,7 +2,7 @@ import os
 import re
 import uuid
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, time
 from decimal import Decimal
 
 from django.db import transaction
