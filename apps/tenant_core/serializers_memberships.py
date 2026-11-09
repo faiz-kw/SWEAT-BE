@@ -3,6 +3,7 @@ apps/tenant_core/serializers_memberships.py — Serializers for Layer 2 Module I
 """
 
 from rest_framework import serializers
+from .security_utils import mask_phone_if_restricted
 from .models_memberships import (
     Membership,
     MembershipContractSnapshot,
@@ -412,7 +413,8 @@ class MembershipSerializer(serializers.ModelSerializer):
 
     def get_member_phone(self, obj) -> str:
         if obj.user_profile and hasattr(obj.user_profile, 'user') and obj.user_profile.user:
-            return getattr(obj.user_profile.user, 'phone', '') or ''
+            raw_phone = getattr(obj.user_profile.user, 'phone', '') or ''
+            return mask_phone_if_restricted(self.context.get('request'), raw_phone)
         return ''
 
     def get_member_email(self, obj) -> str:

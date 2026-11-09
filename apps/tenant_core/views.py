@@ -2019,37 +2019,16 @@ class PermissionViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
     queryset = Permission.objects.all().select_related('module', 'submodule')
 
     def get_queryset(self):
-        qs = super().get_queryset().filter(is_active=True, module__is_enabled=True)
-        try:
-            tenant_id = self.get_tenant_id()
-            from apps.master.models_saas import TenantModule
-            entitled_codes = set(
-                TenantModule.objects.using('default').filter(
-                    tenant_id=tenant_id,
-                    is_enabled=True,
-                    status='ENABLED'
-                ).values_list('module__code', flat=True)
-            )
-            entitled_codes.add('core')
-            # Supplement from tenant's own ModuleCatalog if Master TenantModule is incomplete
-            db = self.get_db()
-            from apps.tenant_core.models_rbac import ModuleCatalog
-            tenant_mods = set(
-                ModuleCatalog.objects.using(db).filter(is_enabled=True)
-                .values_list('module_code', flat=True)
-            )
-            entitled_codes.update(tenant_mods)
-            codes_lower = [c.lower() for c in entitled_codes if c]
-            qs = qs.filter(module__module_code__in=codes_lower)
-        except Exception as e:
-            logger.warning("Failed to filter Permission by Master TenantModule: %s", e)
+        # Expose all active permissions in the catalog across all platform modules for complete matrix configuration
+        from django.db.models import Q
+        qs = super().get_queryset().filter(is_active=True)
 
         mod_code = self.request.query_params.get('module') or self.request.query_params.get('module_code')
-        if mod_code:
-            qs = qs.filter(module__module_code=mod_code)
+        if mod_code and mod_code.lower() != 'all':
+            qs = qs.filter(Q(module__module_code__iexact=mod_code) | Q(permission_code__istartswith=f"{mod_code}."))
         sub_code = self.request.query_params.get('submodule') or self.request.query_params.get('submodule_code')
-        if sub_code:
-            qs = qs.filter(submodule__submodule_code=sub_code)
+        if sub_code and sub_code.lower() != 'all':
+            qs = qs.filter(Q(submodule__submodule_code__iexact=sub_code) | Q(permission_code__icontains=f".{sub_code}."))
         return qs
 
 
