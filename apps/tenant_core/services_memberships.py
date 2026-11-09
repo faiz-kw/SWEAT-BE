@@ -1063,10 +1063,12 @@ class MembershipLifecycleService:
         cls,
         membership: Membership,
         days: int,
+        is_staff_override: bool = False,
         db_alias: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Quotes and validates a prospective package validity extension against tenant policy.
+        When is_staff_override=True (e.g. Admin Panel), day limits are not restricted.
         """
         alias = db_alias or get_current_tenant_db_alias() or 'default'
         config = cls.get_policy_config(membership.organization, db_alias=alias)
@@ -1078,19 +1080,20 @@ class MembershipLifecycleService:
                 'error': "Extension days must be greater than zero.",
             }
 
-        if days < config.extension_min_days:
-            return {
-                'membership_id': str(membership.id),
-                'can_extend': False,
-                'error': f"Minimum extension duration is {config.extension_min_days} day(s).",
-            }
+        if not is_staff_override:
+            if days < config.extension_min_days:
+                return {
+                    'membership_id': str(membership.id),
+                    'can_extend': False,
+                    'error': f"Minimum extension duration is {config.extension_min_days} day(s).",
+                }
 
-        if days > config.extension_max_days:
-            return {
-                'membership_id': str(membership.id),
-                'can_extend': False,
-                'error': f"Maximum extension duration is {config.extension_max_days} day(s).",
-            }
+            if days > config.extension_max_days:
+                return {
+                    'membership_id': str(membership.id),
+                    'can_extend': False,
+                    'error': f"Maximum extension duration is {config.extension_max_days} day(s).",
+                }
 
         # Check remaining sessions
         has_remaining, remaining_sessions = cls.check_remaining_sessions(membership, db_alias=alias)
@@ -1144,6 +1147,7 @@ class MembershipLifecycleService:
         days: int,
         reason_text: Optional[str] = None,
         approved_by_user: Optional[TenantUser] = None,
+        is_staff_override: Optional[bool] = None,
         db_alias: Optional[str] = None,
     ) -> Tuple[Membership, MembershipExtension]:
         """
@@ -1153,9 +1157,18 @@ class MembershipLifecycleService:
         - If active: charges per-day fee * days.
         - If already expired: charges activation fee + (per-day fee * days), reactivates membership and entitlements.
         - Records MembershipExtension and full audit history.
+        - Bypasses duration limits if is_staff_override=True.
         """
         alias = db_alias or get_current_tenant_db_alias() or 'default'
-        calc = cls.calculate_extension(membership, days, db_alias=alias)
+        if is_staff_override is None:
+            is_staff_override = bool(
+                approved_by_user and (
+                    getattr(approved_by_user, 'is_staff', False)
+                    or getattr(approved_by_user, 'is_superuser', False)
+                    or str(getattr(approved_by_user, 'user_type', '')).upper() in ['ADMIN', 'STAFF', 'ORG_ADMIN']
+                )
+            )
+        calc = cls.calculate_extension(membership, days, is_staff_override=is_staff_override, db_alias=alias)
         if not calc.get('can_extend'):
             raise ValidationError(calc.get('error') or "Cannot extend membership.")
 

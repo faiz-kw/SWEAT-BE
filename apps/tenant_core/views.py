@@ -1122,12 +1122,14 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
                 except Exception:
                     dept_obj = Department.objects.using(db).filter(code=dept_id).first()
                 if dept_obj:
-                    UserDepartment.objects.using(db).filter(user=instance, status='ACTIVE').update(status='INACTIVE')
-                    UserDepartment.objects.using(db).create(
+                    UserDepartment.objects.using(db).filter(user=instance).exclude(department=dept_obj).update(status='INACTIVE', is_primary=False)
+                    UserDepartment.objects.using(db).update_or_create(
                         user=instance,
                         department=dept_obj,
-                        is_primary=True,
-                        status='ACTIVE'
+                        defaults={
+                            'is_primary': True,
+                            'status': 'ACTIVE'
+                        }
                     )
 
 

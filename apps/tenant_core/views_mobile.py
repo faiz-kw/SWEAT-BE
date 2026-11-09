@@ -4698,22 +4698,37 @@ class MobileMembershipActionsView(APIView):
         frz_cfg = cfg.get('freeze_policy', {})
         tax_pct = float(getattr(os_obj, 'tax_rate_pct', 18.0) or 18.0)
 
-        # Build dynamic extension options
+        # Retrieve authoritative policy config from MembershipPolicyConfig
+        from .services_memberships import MembershipLifecycleService
+        pol_cfg = MembershipLifecycleService.get_policy_config(org, db_alias=alias)
+        ext_max_days = int(pol_cfg.extension_max_days or 90)
+        ext_min_days = int(pol_cfg.extension_min_days or 1)
+        ext_fee_per_day = float(pol_cfg.extension_per_day_fee or 35.0)
+        ext_activation_fee = float(pol_cfg.extension_activation_fee or 200.0)
+
+        # Build dynamic extension options (preset tiers + date picker allowance up to ext_max_days)
         ext_options_list = ext_cfg.get('available_options')
         if not ext_options_list:
-            ext_options_list = [
-                {'days': 7, 'base_fee': 500.0, 'tax_pct': tax_pct, 'tax_amount': round(500.0 * (tax_pct / 100.0), 2), 'total_fee': round(500.0 * (1.0 + (tax_pct / 100.0)), 2), 'name': '7 Days Extension'},
-                {'days': 14, 'base_fee': 900.0, 'tax_pct': tax_pct, 'tax_amount': round(900.0 * (tax_pct / 100.0), 2), 'total_fee': round(900.0 * (1.0 + (tax_pct / 100.0)), 2), 'name': '14 Days Extension'},
-                {'days': 30, 'base_fee': 1500.0, 'tax_pct': tax_pct, 'tax_amount': round(1500.0 * (tax_pct / 100.0), 2), 'total_fee': round(1500.0 * (1.0 + (tax_pct / 100.0)), 2), 'name': '30 Days Extension'},
-                {'days': 60, 'base_fee': 2800.0, 'tax_pct': tax_pct, 'tax_amount': round(2800.0 * (tax_pct / 100.0), 2), 'total_fee': round(2800.0 * (1.0 + (tax_pct / 100.0)), 2), 'name': '60 Days Extension'},
-            ]
+            preset_days = [d for d in [7, 14, 30, 60, 90] if d <= ext_max_days]
+            ext_options_list = []
+            for d in preset_days:
+                b_fee = round(ext_fee_per_day * d, 2)
+                t_amt = round(b_fee * (tax_pct / 100.0), 2)
+                ext_options_list.append({
+                    'days': d,
+                    'base_fee': b_fee,
+                    'tax_pct': tax_pct,
+                    'tax_amount': t_amt,
+                    'total_fee': round(b_fee + t_amt, 2),
+                    'name': f"{d} Days Extension",
+                })
 
-        # Build dynamic freeze options
+        # Build dynamic freeze options (enforcing studio freeze charges from backend policy config)
         freeze_enabled = frz_cfg.get('enabled', getattr(os_obj, 'allow_member_freeze', True))
-        freeze_min_days = int(frz_cfg.get('min_days', 7))
-        freeze_max_days = int(frz_cfg.get('max_days', getattr(os_obj, 'max_freeze_days_per_year', 60) or 60))
+        freeze_min_days = int(pol_cfg.freeze_min_days or frz_cfg.get('min_days', 7))
+        freeze_max_days = int(pol_cfg.freeze_max_days or frz_cfg.get('max_days', 60))
         freeze_fee_fixed = float(frz_cfg.get('fee_fixed', 0.0))
-        freeze_fee_per_day = float(frz_cfg.get('fee_per_day', 0.0))
+        freeze_fee_per_day = float(frz_cfg.get('fee_per_day', float(pol_cfg.freeze_per_day_fee or 25.0)))
 
         # Check existing PAR-Q
         prior_parq = IntakeSubmission.objects.using(alias).filter(user_profile=profile, status='COMPLETED').order_by('-submitted_at').first()
@@ -4927,8 +4942,13 @@ class MobileMembershipActionsView(APIView):
             'extend_options': {
                 'enabled': ext_cfg.get('enabled', True),
                 'available_options': ext_options_list,
+                'min_days': ext_min_days,
+                'max_days': ext_max_days,
+                'fee_per_day': ext_fee_per_day,
+                'activation_fee': ext_activation_fee,
+                'max_extension_date': ((active_m.end_date + timedelta(days=ext_max_days)).isoformat() if active_m and active_m.end_date else None),
                 'requires_approval': False,
-                'policy_note': 'Self-service extensions are processed immediately with secure Razorpay checkout.',
+                'policy_note': f'Self-service extensions on the mobile app are permitted up to {ext_max_days} days as configured.',
             },
             'freeze_options': {
                 'enabled': freeze_enabled,
@@ -5385,50 +5405,83 @@ class MobileMembershipExtendView(APIView):
         from .services_razorpay import RazorpayService
         from .services_memberships import MembershipLifecycleService
 
-        active_m = (
-            Membership.objects.using(alias)
-            .filter(user_profile=profile)
-            .select_related('home_branch')
-            .order_by('-created_at')
-            .first()
-        )
+        target_membership_id = request.data.get('membership_id')
+        if target_membership_id:
+            active_m = (
+                Membership.objects.using(alias)
+                .filter(id=target_membership_id, user_profile=profile)
+                .select_related('home_branch')
+                .first()
+            )
+        else:
+            active_m = (
+                Membership.objects.using(alias)
+                .filter(user_profile=profile)
+                .select_related('home_branch')
+                .order_by('-created_at')
+                .first()
+            )
+
         if not active_m:
             return Response({'detail': 'No membership found to extend.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        try:
-            days = int(request.data.get('days', 14))
-        except (ValueError, TypeError):
-            return Response({'detail': 'Extension duration must be an integer number of days.'}, status=status.HTTP_400_BAD_REQUEST)
+        # Resolve authoritative policy config
+        pol_cfg = MembershipLifecycleService.get_policy_config(active_m.organization, db_alias=alias)
+        max_allowed_days = int(pol_cfg.extension_max_days or 90)
+        min_allowed_days = int(pol_cfg.extension_min_days or 1)
+
+        # Support date picker (target_end_date) OR integer days count
+        target_end_date_str = request.data.get('target_end_date') or request.data.get('new_end_date')
+        base_date = max(active_m.end_date, timezone.now().date()) if active_m.end_date else timezone.now().date()
+
+        if target_end_date_str:
+            try:
+                from datetime import datetime as dt_cls
+                selected_target_date = dt_cls.strptime(str(target_end_date_str)[:10], '%Y-%m-%d').date()
+                days = (selected_target_date - base_date).days
+                if days <= 0:
+                    return Response({'detail': 'Selected extension date must be after current expiry date.'}, status=status.HTTP_400_BAD_REQUEST)
+            except Exception as e:
+                return Response({'detail': f'Invalid target_end_date format: {str(e)}. Use YYYY-MM-DD.'}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            try:
+                days = int(request.data.get('days', 14))
+            except (ValueError, TypeError):
+                return Response({'detail': 'Extension duration must be an integer number of days or a valid target_end_date.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Enforce mobile allowance from backend configuration (strictly up to max_allowed_days, e.g. 90)
+        if days < min_allowed_days:
+            return Response({'detail': f'Extension duration must be at least {min_allowed_days} day(s).'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if days > max_allowed_days:
+            return Response({
+                'detail': f'Self-service extension on the mobile app is permitted up to {max_allowed_days} days as per studio configuration. For longer durations, please contact studio administration.',
+                'code': 'EXTENSION_MAX_DAYS_EXCEEDED',
+                'max_allowed_days': max_allowed_days,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check remaining sessions eligibility
+        has_remaining, rem_sessions = MembershipLifecycleService.check_remaining_sessions(active_m, db_alias=alias)
+        if pol_cfg.extension_requires_remaining_sessions and not has_remaining:
+            return Response({
+                'detail': 'Cannot extend package: no remaining sessions left for consumption. Members can only extend if they have unused sessions.',
+                'code': 'NO_REMAINING_SESSIONS'
+            }, status=status.HTTP_400_BAD_REQUEST)
 
         reason = (request.data.get('reason') or '').strip()
         if not reason:
             return Response({'detail': 'Reason is required for validity extension.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Dynamic fee lookup from CRM configuration
+        # Dynamic fee calculation using MembershipPolicyConfig
         os_obj = OrganizationSettings.objects.using(alias).first()
-        cfg = getattr(os_obj, 'membership_config', {}) or {}
-        ext_cfg = cfg.get('extension_policy', {})
         tax_pct = Decimal(str(getattr(os_obj, 'tax_rate_pct', 18.0) or '18.0'))
 
-        allowed_days = [7, 14, 21, 30, 60]
-        configured_options = ext_cfg.get('available_options', [])
-        if configured_options:
-            allowed_days = [int(opt.get('days')) for opt in configured_options if 'days' in opt]
+        today_date = timezone.now().date()
+        is_expired = (active_m.status == 'EXPIRED' or (active_m.end_date and active_m.end_date < today_date))
+        fee_per_day = pol_cfg.extension_per_day_fee or Decimal('35.00')
+        activation_fee = pol_cfg.extension_activation_fee if is_expired else Decimal('0.00')
 
-        if days not in allowed_days:
-            return Response({'detail': f'Extension duration of {days} days is not permitted. Permitted options: {allowed_days}'}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Look up matched fee from config or calculate prorated tier
-        matched_base_fee = None
-        for opt in configured_options:
-            if int(opt.get('days', 0)) == days:
-                matched_base_fee = Decimal(str(opt.get('base_fee', opt.get('fee', 0.0))))
-                break
-
-        if matched_base_fee is None:
-            tier_defaults = {7: Decimal('500.00'), 14: Decimal('900.00'), 21: Decimal('1200.00'), 30: Decimal('1500.00'), 60: Decimal('2800.00')}
-            matched_base_fee = tier_defaults.get(days, Decimal(str(days * 50)))
-
+        matched_base_fee = activation_fee + (fee_per_day * Decimal(days))
         tax_amount = round(matched_base_fee * (tax_pct / Decimal('100.0')), 2)
         total_fee = matched_base_fee + tax_amount
 
@@ -5550,13 +5603,22 @@ class MobileMembershipFreezeView(APIView):
         from .services_razorpay import RazorpayService
         from .services_memberships import MembershipLifecycleService
 
-        active_m = (
-            Membership.objects.using(alias)
-            .filter(user_profile=profile, status='ACTIVE')
-            .select_related('home_branch', 'package')
-            .order_by('-created_at')
-            .first()
-        )
+        target_membership_id = request.data.get('membership_id')
+        if target_membership_id:
+            active_m = (
+                Membership.objects.using(alias)
+                .filter(id=target_membership_id, user_profile=profile, status='ACTIVE')
+                .select_related('home_branch', 'package')
+                .first()
+            )
+        else:
+            active_m = (
+                Membership.objects.using(alias)
+                .filter(user_profile=profile, status='ACTIVE')
+                .select_related('home_branch', 'package')
+                .order_by('-created_at')
+                .first()
+            )
         if not active_m:
             return Response({'detail': 'Only active memberships can be frozen.'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -5597,11 +5659,12 @@ class MobileMembershipFreezeView(APIView):
         if overlap:
             return Response({'detail': 'A freeze window already overlaps with these dates.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Dynamic fee from settings
+        # Dynamic fee from settings and MembershipPolicyConfig
+        pol_cfg = MembershipLifecycleService.get_policy_config(active_m.organization, db_alias=alias)
         cfg = getattr(os_obj, 'membership_config', {}) or {}
         frz_cfg = cfg.get('freeze_policy', {})
         fixed_fee = Decimal(str(frz_cfg.get('fee_fixed', '0.00')))
-        per_day_fee = Decimal(str(frz_cfg.get('fee_per_day', '0.00')))
+        per_day_fee = Decimal(str(frz_cfg.get('fee_per_day', str(getattr(pol_cfg, 'freeze_per_day_fee', '25.00') or '25.00'))))
         tax_pct = Decimal(str(getattr(os_obj, 'tax_rate_pct', 18.0) or '18.0'))
 
         base_freeze_fee = fixed_fee + (per_day_fee * Decimal(str(freeze_days)))
