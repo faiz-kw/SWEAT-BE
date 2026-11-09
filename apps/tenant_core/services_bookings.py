@@ -1,4 +1,5 @@
 import uuid
+import re
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import timedelta
 from decimal import Decimal
@@ -39,6 +40,37 @@ class ParqRequiredValidationError(ValidationError):
         self.code = code
         self.membership = membership
         self.form = form
+
+
+def is_matching_program_category(cat1, cat2, prog1=None, prog2=None) -> bool:
+    """
+    Robust comparison across ProgramCategory and ClassCategory.
+    Matches identical IDs, identical normalized names, and common naming variations
+    (e.g., 'Sweat Pilates - Group Classes' vs 'Sweat Pilates').
+    """
+    if not cat1 or not cat2:
+        return True
+    if str(getattr(cat1, 'id', '')) == str(getattr(cat2, 'id', '')):
+        return True
+    n1 = re.sub(r'[^a-z0-9]', '', str(getattr(cat1, 'name', '')).lower())
+    n2 = re.sub(r'[^a-z0-9]', '', str(getattr(cat2, 'name', '')).lower())
+    if n1 and n2 and (n1 in n2 or n2 in n1):
+        return True
+    strip_regex = r'(groupclasses|classes|class|group|reformer|sessions|session|sweat)'
+    c1 = re.sub(strip_regex, '', n1)
+    c2 = re.sub(strip_regex, '', n2)
+    if c1 and c2 and (c1 in c2 or c2 in c1):
+        return True
+    if prog1 and prog2:
+        pn1 = re.sub(r'[^a-z0-9]', '', str(getattr(prog1, 'name', '')).lower())
+        pn2 = re.sub(r'[^a-z0-9]', '', str(getattr(prog2, 'name', '')).lower())
+        if pn1 and pn2 and (pn1 in pn2 or pn2 in pn1):
+            return True
+        p_c1 = re.sub(strip_regex, '', pn1)
+        p_c2 = re.sub(strip_regex, '', pn2)
+        if p_c1 and p_c2 and (p_c1 in p_c2 or p_c2 in p_c1):
+            return True
+    return False
 
 
 class BookingWaitlistAttendanceService:
@@ -762,12 +794,7 @@ class BookingWaitlistAttendanceService:
             session_ent = next((e for e in active_ents if e.entitlement_type in ['HOME_BRANCH_SESSION', 'CROSS_BRANCH_SESSION', 'CROSS_BRANCH', 'CLASS_SESSION']), None)
             has_sessions = bool(session_ent and (session_ent.is_unlimited or (session_ent.remaining_units is not None and session_ent.remaining_units > 0) or (session_ent.allocated_units and session_ent.allocated_units > (session_ent.consumed_units or 0))))
 
-            is_cat_match = bool(
-                (occ_cat_id and mem_cat_id and occ_cat_id == mem_cat_id)
-                or (occ_cat_name and mem_cat_name and (occ_cat_name in mem_cat_name or mem_cat_name in occ_cat_name))
-                or (occ_prog_id and mem_prog_id and occ_prog_id == mem_prog_id)
-                or (occ_prog_name and mem_prog_name and (occ_prog_name in mem_prog_name or mem_prog_name in occ_prog_name))
-            )
+            is_cat_match = is_matching_program_category(mem_cat, occ_category, mem_prog, occ_program)
 
             if is_cat_match and has_sessions:
                 dedicated_candidates.append(mem)
@@ -1022,7 +1049,7 @@ class BookingWaitlistAttendanceService:
                     mem_prog = membership.program or (membership.package.program if membership.package else None)
                     mem_category = getattr(mem_prog, 'category', None) if mem_prog else None
 
-                    if mem_category and occ_category and str(mem_category.id) != str(occ_category.id):
+                    if mem_category and occ_category and not is_matching_program_category(mem_category, occ_category, mem_prog, occ_program):
                         # Allow if explicit PackageClassAccessRule grants cross-category access
                         access_res = cls.resolve_package_class_access(membership.package_version, occurrence, db_alias=alias)
                         if not access_res.get('allowed', False) or not access_res.get('rule'):
