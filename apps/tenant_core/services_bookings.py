@@ -742,10 +742,17 @@ class BookingWaitlistAttendanceService:
 
         active_memberships = list(
             Membership.objects.using(alias)
-            .filter(user_profile=user_profile, status__in=['ACTIVE', 'FROZEN'], end_date__gte=occ_date)
+            .filter(
+                user_profile=user_profile,
+                status__in=['ACTIVE', 'FROZEN'],
+                end_date__gte=occ_date
+            )
+            .filter(
+                models.Q(start_date__lte=occ_date) | models.Q(start_date__isnull=True)
+            )
             .select_related('package', 'package__program', 'package__program__category', 'program', 'program__category', 'home_branch')
             .prefetch_related('entitlements')
-            .order_by('-start_date')
+            .order_by('end_date', 'start_date')
         )
 
         if not active_memberships:
@@ -965,6 +972,12 @@ class BookingWaitlistAttendanceService:
 
                 if membership.status not in ('ACTIVE', 'FROZEN'):
                     raise ValidationError(f"Membership is in '{membership.status}' status (must be ACTIVE).")
+
+                if membership.start_date and membership.start_date > occ_date:
+                    raise ValidationError(
+                        f"Your '{membership.package.name if membership.package else 'membership'}' pack starts on {membership.start_date} and cannot be used for a class on {occ_date}.",
+                        code="MEMBERSHIP_NOT_STARTED"
+                    )
 
                 if membership.end_date < occ_date:
                     raise ValidationError(f"Membership expires on {membership.end_date}, before class date {occ_date}.")
@@ -1609,12 +1622,9 @@ class BookingWaitlistAttendanceService:
                 membership = candidate.membership
                 entitlement = None
                 if candidate.booking_type == 'MEMBER':
-                    if not membership or membership.status != 'ACTIVE' or membership.end_date < timezone.now().date():
-                        membership = Membership.objects.using(alias).filter(
-                            user_profile=cand_prof,
-                            status='ACTIVE',
-                            end_date__gte=timezone.now().date()
-                        ).first()
+                    occ_d = occurrence.start_at.date() if occurrence.start_at else timezone.now().date()
+                    if not membership or membership.status != 'ACTIVE' or membership.end_date < occ_d or (membership.start_date and membership.start_date > occ_d):
+                        membership = cls.resolve_member_booking_membership(cand_prof, occurrence, db_alias=alias)
 
                     if not membership:
                         candidate.status = 'CANCELLED'

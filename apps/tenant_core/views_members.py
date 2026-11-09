@@ -1072,7 +1072,7 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
                 actual_purchase_price = float(m.package_price.base_price)
 
         sessions_left = max(0, base_alloc - base_consumed)
-        passport_left = max(0, passport_alloc - passport_consumed)
+        passport_left = min(max(0, passport_alloc - passport_consumed), sessions_left)
 
         m_obj = {
             'id': str(m.id),
@@ -1866,6 +1866,10 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         passport_remaining = cross_rem
     else:
         passport_remaining = 0
+
+    eff_home_remaining = int(base_member.get('home_sessions_remaining') or 0)
+    passport_remaining = min(passport_remaining, eff_home_remaining)
+    header['cross_branch_sessions_remaining'] = passport_remaining
 
     passport_data = {
         'passport_allowed': passport_allowed,
