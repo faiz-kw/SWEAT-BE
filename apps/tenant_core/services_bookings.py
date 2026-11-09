@@ -688,6 +688,107 @@ class BookingWaitlistAttendanceService:
         }
 
     @classmethod
+    def resolve_member_booking_membership(
+        cls,
+        user_profile: UserProfile,
+        occurrence: ClassOccurrence,
+        db_alias: str = None,
+    ) -> Optional[Membership]:
+        """
+        Intelligently resolves the most appropriate active membership for a class booking.
+        Priority:
+        1. Dedicated Session-based membership matching the class occurrence's Program Category (or Program)
+           with active sessions remaining (deducts 1 session, preserving flexible Elite credits).
+        2. Elite / Universal Credit-based membership (CREDIT_WALLET) with sufficient credits remaining
+           to cover the category's required credits.
+        3. Any active membership with PackageClassAccessRule permitting this class.
+        4. Fallback to any active membership valid on the occurrence date.
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        occ_date = occurrence.start_at.date() if occurrence.start_at else timezone.now().date()
+
+        active_memberships = list(
+            Membership.objects.using(alias)
+            .filter(user_profile=user_profile, status__in=['ACTIVE', 'FROZEN'], end_date__gte=occ_date)
+            .select_related('package', 'package__program', 'package__program__category', 'program', 'program__category', 'home_branch')
+            .prefetch_related('entitlements')
+            .order_by('-start_date')
+        )
+
+        if not active_memberships:
+            return None
+
+        template = occurrence.class_template
+        occ_program = getattr(template, 'program', None) if template else None
+        occ_category = getattr(template, 'category', None) or (getattr(occ_program, 'category', None) if occ_program else None)
+        occ_cat_id = str(occ_category.id) if occ_category else None
+        occ_cat_name = str(getattr(occ_category, 'name', '')).strip().lower() if occ_category else ''
+        occ_prog_id = str(occ_program.id) if occ_program else None
+        occ_prog_name = str(getattr(occ_program, 'name', '')).strip().lower() if occ_program else ''
+
+        # Determine required credits for elite check
+        cat_credits = None
+        if occ_category and getattr(occ_category, 'credits', None) is not None:
+            cat_credits = occ_category.credits
+        elif occ_program and getattr(occ_program, 'credits', None) is not None:
+            cat_credits = occ_program.credits
+        units_needed = Decimal(str(cat_credits)) if (cat_credits is not None and Decimal(str(cat_credits)) > 0) else Decimal('1.00')
+
+        dedicated_candidates = []
+        elite_candidates = []
+        fallback_candidates = []
+
+        for mem in active_memberships:
+            active_ents = [e for e in mem.entitlements.all() if e.status == 'ACTIVE']
+            credit_ent = next((e for e in active_ents if e.entitlement_type == 'CREDIT_WALLET'), None)
+            is_elite = bool(credit_ent and (credit_ent.is_unlimited or (credit_ent.remaining_units is not None and credit_ent.remaining_units > 0) or credit_ent.allocated_units))
+
+            if is_elite:
+                has_enough = credit_ent.is_unlimited or (credit_ent.remaining_units is not None and credit_ent.remaining_units >= units_needed)
+                if has_enough:
+                    elite_candidates.append(mem)
+                continue
+
+            # Dedicated session-based membership
+            mem_prog = mem.program or (mem.package.program if mem.package else None)
+            mem_cat = getattr(mem_prog, 'category', None) if mem_prog else None
+            mem_cat_id = str(mem_cat.id) if mem_cat else None
+            mem_cat_name = str(getattr(mem_cat, 'name', '')).strip().lower() if mem_cat else ''
+            mem_prog_id = str(mem_prog.id) if mem_prog else None
+            mem_prog_name = str(getattr(mem_prog, 'name', '')).strip().lower() if mem_prog else ''
+
+            # Check remaining sessions in home or cross pool
+            session_ent = next((e for e in active_ents if e.entitlement_type in ['HOME_BRANCH_SESSION', 'CROSS_BRANCH_SESSION', 'CROSS_BRANCH', 'CLASS_SESSION']), None)
+            has_sessions = bool(session_ent and (session_ent.is_unlimited or (session_ent.remaining_units is not None and session_ent.remaining_units > 0) or (session_ent.allocated_units and session_ent.allocated_units > (session_ent.consumed_units or 0))))
+
+            is_cat_match = bool(
+                (occ_cat_id and mem_cat_id and occ_cat_id == mem_cat_id)
+                or (occ_cat_name and mem_cat_name and (occ_cat_name in mem_cat_name or mem_cat_name in occ_cat_name))
+                or (occ_prog_id and mem_prog_id and occ_prog_id == mem_prog_id)
+                or (occ_prog_name and mem_prog_name and (occ_prog_name in mem_prog_name or mem_prog_name in occ_prog_name))
+            )
+
+            if is_cat_match and has_sessions:
+                dedicated_candidates.append(mem)
+            else:
+                fallback_candidates.append(mem)
+
+        # 1. Dedicated category pack matching occurrence first (preserves flexible Elite credits)
+        if dedicated_candidates:
+            return dedicated_candidates[0]
+
+        # 2. Elite Universal Credit Pack fallback
+        if elite_candidates:
+            return elite_candidates[0]
+
+        # 3. Fallback to general active membership
+        if fallback_candidates:
+            return fallback_candidates[0]
+
+        return active_memberships[0]
+
+
+    @classmethod
     def create_booking(
         cls,
         user_profile: UserProfile,
@@ -813,11 +914,7 @@ class BookingWaitlistAttendanceService:
             if booking_type == 'MEMBER':
                 occ_date = occurrence.start_at.date() if occurrence.start_at else timezone.now().date()
                 if not membership:
-                    membership = Membership.objects.using(alias).filter(
-                        user_profile=user_profile,
-                        status__in=['ACTIVE', 'FROZEN'],
-                        end_date__gte=occ_date
-                    ).first()
+                    membership = cls.resolve_member_booking_membership(user_profile, occurrence, db_alias=alias)
 
                 if not membership:
                     raise ValidationError("Active membership required for member class booking.")
@@ -917,6 +1014,22 @@ class BookingWaitlistAttendanceService:
                     units_to_consume = Decimal(str(cat_credits)) if (cat_credits is not None and Decimal(str(cat_credits)) > 0) else Decimal('1.00')
                     ent_type_filter = 'CREDIT_WALLET'
                 else:
+                    # Validate dedicated pack category match (only Elite has universal cross-category privileges)
+                    template = occurrence.class_template
+                    occ_program = getattr(template, 'program', None) if template else None
+                    occ_category = getattr(template, 'category', None) or (getattr(occ_program, 'category', None) if occ_program else None)
+                    mem_prog = membership.program or (membership.package.program if membership.package else None)
+                    mem_category = getattr(mem_prog, 'category', None) if mem_prog else None
+
+                    if mem_category and occ_category and str(mem_category.id) != str(occ_category.id):
+                        # Allow if explicit PackageClassAccessRule grants cross-category access
+                        access_res = cls.resolve_package_class_access(membership.package_version, occurrence, db_alias=alias)
+                        if not access_res.get('allowed', False) or not access_res.get('rule'):
+                            raise ValidationError(
+                                f"Your '{membership.package.name if membership.package else 'membership'}' pack belongs to '{mem_category.name}' and cannot be used for '{occ_category.name}' classes. Only Elite packages have cross-category booking privileges.",
+                                code="CATEGORY_MISMATCH"
+                            )
+
                     # Validate PackageClassAccessRule against member's package_version
                     access_res = cls.resolve_package_class_access(membership.package_version, occurrence, db_alias=alias)
                     if not access_res['allowed']:

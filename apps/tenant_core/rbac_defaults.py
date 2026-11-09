@@ -62,6 +62,10 @@ DEFAULT_ROLES_CONFIG: Dict[str, dict] = {
             'reports.business.view', 'reports.sales.view', 'reports.members.view', 'reports.trainers.view',
             'cs.member-health.view', 'cs.at-risk.view', 'cs.feedback.view',
             'cs.grievances.view', 'cs.grievances.create', 'cs.grievances.edit',
+            # CMS (Banners, Media, Visual Categories)
+            'cms.banners.view', 'cms.banners.manage',
+            'cms.categories.view', 'cms.categories.manage',
+            'cms.media.view', 'cms.media.manage',
         ],
     },
     'FRONT_DESK': {
@@ -202,6 +206,64 @@ DEFAULT_ROLES_CONFIG: Dict[str, dict] = {
 }
 
 
+
+CANONICAL_MODULES = {
+    'core': {'name': 'Core System & Administration', 'description': 'System governance, branches, roles, and platform users.'},
+    'crm': {'name': 'CRM & Sales Automation', 'description': 'Lead capture, sales pipeline, trial bookings, and promotional campaigns.'},
+    'members': {'name': 'Member Lifecycle Management', 'description': 'Member 360, membership tiers, renewals, freeze, and check-in attendance.'},
+    'ops': {'name': 'Studio Operations & Classes', 'description': 'Class scheduling, trainer roster, room allocation, and personal training.'},
+    'finance': {'name': 'Finance, Billing & POS', 'description': 'Tax invoices, POS collections, payment gateways, expenses, and revenue reports.'},
+    'performance': {'name': 'Performance & Workouts', 'description': 'Workout logs, personal records, and leaderboard rankings.'},
+    'cms': {'name': 'Content Management System', 'description': 'Mobile app banners, visual program category assets, audio tracks, and video clips.'},
+    'cs': {'name': 'Customer Success & Retention', 'description': 'Member health scores, at-risk churn detection, and grievances.'},
+    'reports': {'name': 'Business & Operational Reports', 'description': 'Executive dashboards, revenue, attendance, and trainer utilization analytics.'},
+    'automation': {'name': 'Workflows & Automation', 'description': 'Automated notifications, reminders, and trigger workflows.'},
+}
+
+CANONICAL_SUBMODULES = {
+    ('core', 'settings'): {'name': 'Settings & Governance'},
+    ('core', 'users'): {'name': 'User Management'},
+    ('core', 'roles'): {'name': 'Role Management'},
+    ('core', 'permissions'): {'name': 'Permissions Management'},
+    ('core', 'files'): {'name': 'File & Storage Management'},
+    ('core', 'locations'): {'name': 'Locations & Facilities'},
+    ('core', 'branches'): {'name': 'Branches & Studios'},
+    ('core', 'departments'): {'name': 'Department Management'},
+
+    ('crm', 'dashboard'): {'name': 'CRM Dashboard & Sales Analytics'},
+    ('crm', 'leads'): {'name': 'Lead Management'},
+    ('crm', 'pipeline'): {'name': 'Sales Pipeline'},
+    ('crm', 'trials'): {'name': 'Free Trial Passes'},
+    ('crm', 'campaigns'): {'name': 'SMS & WhatsApp Campaigns'},
+    ('crm', 'follow-ups'): {'name': 'Tasks & Follow-ups'},
+    ('crm', 'communications'): {'name': 'Communications'},
+    ('crm', 'telephony'): {'name': 'Telephony & Calling'},
+    ('crm', 'settings'): {'name': 'CRM Setup & Settings'},
+
+    ('members', 'client-360'): {'name': 'Member 360 & Profiles'},
+    ('members', 'memberships'): {'name': 'Membership Plans & Packages'},
+    ('members', 'attendance'): {'name': 'Check-In & Attendance'},
+    ('members', 'renewals'): {'name': 'Renewals & Upgrades'},
+    ('members', 'freeze'): {'name': 'Membership Freeze'},
+    ('members', 'transfers'): {'name': 'Branch Transfers'},
+
+    ('ops', 'calendar'): {'name': 'Master Facility Calendar'},
+    ('ops', 'classes'): {'name': 'Group Fitness Classes & Schedules'},
+    ('ops', 'bookings'): {'name': 'Class Slot Bookings'},
+    ('ops', 'personal-training'): {'name': 'Personal Training'},
+    ('ops', 'pilates'): {'name': 'Pilates & Reformer'},
+    ('ops', 'trainers'): {'name': 'Trainer Rosters & Shifts'},
+
+    ('cms', 'banners'): {'name': 'Home Screen Banners'},
+    ('cms', 'categories'): {'name': 'Program Categories & Media'},
+    ('cms', 'media'): {'name': 'Media Library (Audio/Video/Image)'},
+
+    ('performance', 'workouts'): {'name': 'Workout Tracking'},
+    ('performance', 'analytics'): {'name': 'Performance Analytics'},
+    ('performance', 'pr-tracker'): {'name': 'Personal Records Tracker'},
+    ('performance', 'leaderboards'): {'name': 'Studio Leaderboards'},
+}
+
 def sync_default_role_permissions(
     db_alias: str,
     org=None,
@@ -237,13 +299,87 @@ def sync_default_role_permissions(
     if not org:
         raise ValueError(f"No Organization found in tenant database '{db_alias}'.")
 
+    # Ensure all canonical modules exist in ModuleCatalog
+    for m_code, m_meta in CANONICAL_MODULES.items():
+        m_obj = ModuleCatalog.objects.using(db_alias).filter(module_code__iexact=m_code).first()
+        if not m_obj:
+            m_obj, _ = ModuleCatalog.objects.using(db_alias).get_or_create(
+                module_code=m_code.lower(),
+                defaults={
+                    'name': m_meta['name'],
+                    'description': m_meta.get('description', ''),
+                    'is_enabled': True,
+                    'status': 'ACTIVE',
+                }
+            )
+        elif not m_obj.is_enabled or m_obj.status != 'ACTIVE':
+            m_obj.is_enabled = True
+            m_obj.status = 'ACTIVE'
+            m_obj.save(using=db_alias, update_fields=['is_enabled', 'status'])
+
+    # Ensure all canonical submodules exist in SubmoduleCatalog
+    all_mods_current = {m.module_code.lower(): m for m in ModuleCatalog.objects.using(db_alias).all()}
+    for (m_code, sm_code), sm_meta in CANONICAL_SUBMODULES.items():
+        parent_mod = all_mods_current.get(m_code.lower())
+        if parent_mod:
+            sm_obj = SubmoduleCatalog.objects.using(db_alias).filter(
+                module=parent_mod, submodule_code__iexact=sm_code
+            ).first()
+            if not sm_obj:
+                SubmoduleCatalog.objects.using(db_alias).create(
+                    module=parent_mod,
+                    submodule_code=sm_code.lower(),
+                    name=sm_meta['name'],
+                    description=sm_meta.get('description', ''),
+                    is_enabled=True,
+                    status='ACTIVE',
+                )
+            elif not sm_obj.is_enabled or sm_obj.status != 'ACTIVE':
+                sm_obj.is_enabled = True
+                sm_obj.status = 'ACTIVE'
+                sm_obj.save(using=db_alias, update_fields=['is_enabled', 'status'])
+
+    # Also entitle modules in Master DB TenantModule if active tenant exists
+    try:
+        from apps.master.models_tenant import Tenant
+        from apps.master.models_saas import ProductModule, TenantModule
+        master_tenants = Tenant.objects.using('default').filter(status='ACTIVE')
+        for t_obj in master_tenants:
+            for p_mod in ProductModule.objects.using('default').filter(is_active=True):
+                TenantModule.objects.using('default').update_or_create(
+                    tenant=t_obj,
+                    module=p_mod,
+                    defaults={'is_enabled': True, 'status': 'ENABLED', 'availability_mode': 'ALL_BRANCHES'}
+                )
+    except Exception as tm_err:
+        logger.debug("Notice: auto-entitle in master: %s", tm_err)
+
     # Load all available permissions and modules in the tenant DB
-    all_perms = {p.permission_code.lower(): p for p in Permission.objects.using(db_alias).select_related('module', 'submodule').all()}
     all_modules = {m.module_code.lower(): m for m in ModuleCatalog.objects.using(db_alias).all()}
     all_submodules = {
         (sm.module.module_code.lower(), sm.submodule_code.lower()): sm
         for sm in SubmoduleCatalog.objects.using(db_alias).select_related('module').all()
     }
+
+    # Auto-link any existing Permission records whose module/submodule foreign key is NULL
+    for perm in Permission.objects.using(db_alias).filter(module__isnull=True):
+        p_code = perm.permission_code or perm.code or ''
+        parts = p_code.split('.')
+        m_code = parts[0].lower() if parts else None
+        sm_code = parts[1].lower() if len(parts) > 2 else None
+        m_obj = all_modules.get(m_code)
+        sm_obj = all_submodules.get((m_code, sm_code)) if sm_code else None
+        update_fields = []
+        if m_obj and perm.module_id != m_obj.id:
+            perm.module = m_obj
+            update_fields.append('module')
+        if sm_obj and perm.submodule_id != sm_obj.id:
+            perm.submodule = sm_obj
+            update_fields.append('submodule')
+        if update_fields:
+            perm.save(using=db_alias, update_fields=update_fields)
+
+    all_perms = {p.permission_code.lower(): p for p in Permission.objects.using(db_alias).select_related('module', 'submodule').all()}
 
     # Pre-seed any permissions from DEFAULT_ROLES_CONFIG that don't exist yet in tenant DB
     for r_conf in DEFAULT_ROLES_CONFIG.values():

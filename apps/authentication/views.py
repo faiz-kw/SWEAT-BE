@@ -1074,18 +1074,20 @@ class MeView(APIView):
                 )
                 from apps.tenant_core.models_org import Branch
 
-                # Fallback if master TenantModule was empty: load enabled modules from tenant DB ModuleCatalog
-                if not enabled_modules:
-                    for mc in ModuleCatalog.objects.using(db_alias).filter(is_enabled=True).prefetch_related('submodules'):
-                        mc_code = (mc.module_code or mc.code or '').lower()
-                        if mc_code and mc_code not in enabled_modules:
-                            enabled_modules.append(mc_code)
-                        for sm in mc.submodules.filter(is_enabled=True):
-                            sm_code = (sm.submodule_code or sm.code or '').lower()
-                            if mc_code and sm_code:
-                                sm_path = f"/{mc_code}/{sm_code}"
-                                if sm_path not in enabled_modules:
-                                    enabled_modules.append(sm_path)
+                # Supplement enabled modules from tenant DB ModuleCatalog to guarantee full feature coverage
+                for mc in ModuleCatalog.objects.using(db_alias).filter(is_enabled=True).prefetch_related('submodules'):
+                    mc_code = (mc.module_code or mc.code or '').lower()
+                    if mc_code and mc_code not in enabled_modules:
+                        enabled_modules.append(mc_code)
+                        root_path = f"/{mc_code}"
+                        if root_path not in enabled_modules:
+                            enabled_modules.append(root_path)
+                    for sm in mc.submodules.filter(is_enabled=True):
+                        sm_code = (sm.submodule_code or sm.code or '').lower()
+                        if mc_code and sm_code:
+                            sm_path = f"/{mc_code}/{sm_code}"
+                            if sm_path not in enabled_modules:
+                                enabled_modules.append(sm_path)
 
                 assignments = (
                     RoleAssignment.objects.using(db_alias)

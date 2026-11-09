@@ -112,8 +112,14 @@ class TenantDBMixin:
             )
 
     def perform_update(self, serializer):
+        instance = serializer.instance
+        from .models_users import TenantUser
+        # RoleAssignment, branch_access, and UserDepartment updates are strictly for TenantUser instances.
+        # Roles and other non-user models must bypass user-specific assignment logic.
+        if not (isinstance(instance, TenantUser) or hasattr(instance, 'user_type') or instance.__class__.__name__ == 'TenantUser'):
+            return super().perform_update(serializer)
+
         with transaction.atomic(using=self.get_db()):
-            instance = serializer.instance
             db = self.get_db()
             data = self.request.data
             from .models_rbac import Role, RoleAssignment
@@ -1629,6 +1635,11 @@ class RoleViewSet(TenantDBMixin, viewsets.ModelViewSet):
         )
         # Always allow core module
         entitled_module_codes.add('core')
+        # Supplement from tenant's own ModuleCatalog so catalog grants match tenant capabilities
+        tenant_mods = set(
+            ModuleCatalog.objects.using(db).filter(is_enabled=True).values_list('module_code', flat=True)
+        )
+        entitled_module_codes.update(tenant_mods)
         entitled_module_codes = {c.lower() for c in entitled_module_codes if c}
 
         try:
@@ -1977,6 +1988,14 @@ class SubmoduleCatalogViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
                 ).values_list('module__code', flat=True)
             )
             entitled_codes.add('core')
+            # Supplement from tenant's own ModuleCatalog if Master TenantModule is incomplete
+            db = self.get_db()
+            from apps.tenant_core.models_rbac import ModuleCatalog
+            tenant_mods = set(
+                ModuleCatalog.objects.using(db).filter(is_enabled=True)
+                .values_list('module_code', flat=True)
+            )
+            entitled_codes.update(tenant_mods)
             codes_lower = [c.lower() for c in entitled_codes if c]
             qs = qs.filter(module__module_code__in=codes_lower)
         except Exception as e:
@@ -2010,6 +2029,14 @@ class PermissionViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
                 ).values_list('module__code', flat=True)
             )
             entitled_codes.add('core')
+            # Supplement from tenant's own ModuleCatalog if Master TenantModule is incomplete
+            db = self.get_db()
+            from apps.tenant_core.models_rbac import ModuleCatalog
+            tenant_mods = set(
+                ModuleCatalog.objects.using(db).filter(is_enabled=True)
+                .values_list('module_code', flat=True)
+            )
+            entitled_codes.update(tenant_mods)
             codes_lower = [c.lower() for c in entitled_codes if c]
             qs = qs.filter(module__module_code__in=codes_lower)
         except Exception as e:
