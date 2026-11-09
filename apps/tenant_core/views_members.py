@@ -2658,10 +2658,37 @@ class MemberViewSet(viewsets.ViewSet):
         target_membership_id = request.data.get('membership_id')
         if target_membership_id:
             active_m = Membership.objects.using(alias).filter(id=target_membership_id, user_profile=profile).first()
-        if not active_m and pk:
-            active_m = Membership.objects.using(alias).filter(id=pk, user_profile=profile).first()
         if not active_m:
-            active_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
+            today = timezone.now().date()
+            # 1. First priority: Currently ongoing ACTIVE pack (start_date <= today <= end_date), expiring soonest (FIFO)
+            active_m = (
+                Membership.objects.using(alias)
+                .filter(user_profile=profile, status='ACTIVE')
+                .filter(Q(start_date__lte=today) | Q(start_date__isnull=True))
+                .filter(Q(end_date__gte=today) | Q(end_date__isnull=True))
+                .order_by('end_date', 'start_date')
+                .first()
+            )
+            # 2. Second priority: Any unexpired ACTIVE pack
+            if not active_m:
+                active_m = (
+                    Membership.objects.using(alias)
+                    .filter(user_profile=profile, status='ACTIVE')
+                    .filter(Q(end_date__gte=today) | Q(end_date__isnull=True))
+                    .order_by('start_date')
+                    .first()
+                )
+            # 3. Third priority: FROZEN pack
+            if not active_m:
+                active_m = (
+                    Membership.objects.using(alias)
+                    .filter(user_profile=profile, status='FROZEN')
+                    .order_by('-end_date')
+                    .first()
+                )
+            # 4. Fallback: Latest created
+            if not active_m:
+                active_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
         if not active_m:
             return Response({'error': 'No existing membership found to renew.'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -3492,22 +3519,64 @@ class MemberViewSet(viewsets.ViewSet):
         target_membership_id = request.data.get('membership_id')
         if target_membership_id:
             active_m = Membership.objects.using(alias).filter(id=target_membership_id, user_profile=profile).first()
-        if not active_m and pk:
-            active_m = Membership.objects.using(alias).filter(id=pk, user_profile=profile).first()
         if not active_m:
-            active_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
+            today = timezone.now().date()
+            # 1. First priority: Currently ongoing ACTIVE pack (start_date <= today <= end_date), expiring soonest (FIFO)
+            active_m = (
+                Membership.objects.using(alias)
+                .filter(user_profile=profile, status='ACTIVE')
+                .filter(Q(start_date__lte=today) | Q(start_date__isnull=True))
+                .filter(Q(end_date__gte=today) | Q(end_date__isnull=True))
+                .order_by('end_date', 'start_date')
+                .first()
+            )
+            # 2. Second priority: Any unexpired ACTIVE pack
+            if not active_m:
+                active_m = (
+                    Membership.objects.using(alias)
+                    .filter(user_profile=profile, status='ACTIVE')
+                    .filter(Q(end_date__gte=today) | Q(end_date__isnull=True))
+                    .order_by('start_date')
+                    .first()
+                )
+            # 3. Third priority: FROZEN pack
+            if not active_m:
+                active_m = (
+                    Membership.objects.using(alias)
+                    .filter(user_profile=profile, status='FROZEN')
+                    .order_by('-end_date')
+                    .first()
+                )
+            # 4. Fallback: Latest created
+            if not active_m:
+                active_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
         if not active_m:
             return Response({'error': 'No membership found to extend.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        days = int(request.data.get('days', 7))
+        target_end_date_str = request.data.get('target_end_date') or request.data.get('new_end_date')
+        if target_end_date_str:
+            try:
+                from datetime import datetime as dt_cls
+                t_date = dt_cls.strptime(str(target_end_date_str)[:10], '%Y-%m-%d').date()
+                base_d = max(active_m.end_date, timezone.now().date()) if active_m.end_date else timezone.now().date()
+                days = (t_date - base_d).days
+                if days <= 0:
+                    return Response({'error': 'Target end date must be after current expiry date.'}, status=status.HTTP_400_BAD_REQUEST)
+            except Exception as e:
+                return Response({'error': f'Invalid target_end_date format: {str(e)}. Use YYYY-MM-DD.'}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            days = int(request.data.get('days', 7))
+
         reason = request.data.get('reason', f'Extended by {days} days')
 
         try:
+            # Admin Panel has zero 90-day ceiling: is_staff_override=True permits as many days as the admin wants
             res = MembershipLifecycleService.extend_membership(
                 membership=active_m,
                 days=days,
                 reason_text=reason,
                 approved_by_user=request.user,
+                is_staff_override=True,
                 db_alias=alias,
             )
             mem = res[0] if isinstance(res, (tuple, list)) else res
@@ -3731,10 +3800,37 @@ class MemberViewSet(viewsets.ViewSet):
         target_membership_id = request.data.get('membership_id')
         if target_membership_id:
             active_m = Membership.objects.using(alias).filter(id=target_membership_id, user_profile=profile).first()
-        if not active_m and pk:
-            active_m = Membership.objects.using(alias).filter(id=pk, user_profile=profile).first()
         if not active_m:
-            active_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
+            today = timezone.now().date()
+            # 1. First priority: Currently ongoing ACTIVE pack (start_date <= today <= end_date), expiring soonest (FIFO)
+            active_m = (
+                Membership.objects.using(alias)
+                .filter(user_profile=profile, status='ACTIVE')
+                .filter(Q(start_date__lte=today) | Q(start_date__isnull=True))
+                .filter(Q(end_date__gte=today) | Q(end_date__isnull=True))
+                .order_by('end_date', 'start_date')
+                .first()
+            )
+            # 2. Second priority: Any unexpired ACTIVE pack
+            if not active_m:
+                active_m = (
+                    Membership.objects.using(alias)
+                    .filter(user_profile=profile, status='ACTIVE')
+                    .filter(Q(end_date__gte=today) | Q(end_date__isnull=True))
+                    .order_by('start_date')
+                    .first()
+                )
+            # 3. Third priority: FROZEN pack
+            if not active_m:
+                active_m = (
+                    Membership.objects.using(alias)
+                    .filter(user_profile=profile, status='FROZEN')
+                    .order_by('-end_date')
+                    .first()
+                )
+            # 4. Fallback: Latest created
+            if not active_m:
+                active_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
         if not active_m:
             return Response({'error': 'No membership found to adjust.'}, status=status.HTTP_400_BAD_REQUEST)
         if active_m.legacy_reference and 'PROVISIONAL_CASH_PENDING' in active_m.legacy_reference:
