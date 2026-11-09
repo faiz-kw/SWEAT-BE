@@ -262,6 +262,28 @@ CANONICAL_SUBMODULES = {
     ('performance', 'analytics'): {'name': 'Performance Analytics'},
     ('performance', 'pr-tracker'): {'name': 'Personal Records Tracker'},
     ('performance', 'leaderboards'): {'name': 'Studio Leaderboards'},
+
+    ('finance', 'invoices'): {'name': 'Invoices & Billing'},
+    ('finance', 'payments'): {'name': 'Payments & Transactions'},
+    ('finance', 'refunds'): {'name': 'Refunds & Adjustments'},
+    ('finance', 'outstanding'): {'name': 'Dues & Outstanding Balances'},
+    ('finance', 'expenses'): {'name': 'Expenses & Disbursements'},
+    ('finance', 'revenue'): {'name': 'Revenue Analytics'},
+
+    ('reports', 'business'): {'name': 'Business & Operational Reports'},
+    ('reports', 'sales'): {'name': 'Sales Reports'},
+    ('reports', 'members'): {'name': 'Member Lifecycle Reports'},
+    ('reports', 'trainers'): {'name': 'Trainer Utilization Reports'},
+    ('reports', 'financial'): {'name': 'Financial Reports'},
+    ('reports', 'performance'): {'name': 'Performance Reports'},
+
+    ('automation', 'workflows'): {'name': 'Automation Workflows'},
+    ('automation', 'executions'): {'name': 'Trigger Executions & History'},
+
+    ('cs', 'member-health'): {'name': 'Member Health & Retention'},
+    ('cs', 'at-risk'): {'name': 'At-Risk Churn Detection'},
+    ('cs', 'feedback'): {'name': 'Feedback & NPS'},
+    ('cs', 'grievances'): {'name': 'Member Grievances & Tickets'},
 }
 
 def sync_default_role_permissions(

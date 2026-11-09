@@ -2021,6 +2021,16 @@ class PermissionViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         # Expose all active permissions in the catalog across all platform modules for complete matrix configuration
         from django.db.models import Q
+        db = self.get_db()
+        try:
+            from .models_rbac import Permission
+            # Auto-seed canonical permissions if missing so all modules appear on UI
+            if Permission.objects.using(db).filter(is_active=True).count() < 70:
+                from .rbac_defaults import sync_default_role_permissions
+                sync_default_role_permissions(db_alias=db, overwrite_custom=False)
+        except Exception as e:
+            logger.warning("Auto-sync permissions catalog warning: %s", e)
+
         qs = super().get_queryset().filter(is_active=True)
 
         mod_code = self.request.query_params.get('module') or self.request.query_params.get('module_code')
@@ -2030,6 +2040,18 @@ class PermissionViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
         if sub_code and sub_code.lower() != 'all':
             qs = qs.filter(Q(submodule__submodule_code__iexact=sub_code) | Q(permission_code__icontains=f".{sub_code}."))
         return qs
+
+    @action(detail=False, methods=['get', 'post'], url_path='sync-catalog')
+    def sync_catalog(self, request):
+        """Explicitly re-sync canonical permissions across all platform modules."""
+        db = self.get_db()
+        from .rbac_defaults import sync_default_role_permissions
+        results = sync_default_role_permissions(db_alias=db, overwrite_custom=False)
+        return Response({
+            'status': 'SUCCESS',
+            'message': 'Successfully synchronized all module permissions into the catalog.',
+            'results': results,
+        }, status=status.HTTP_200_OK)
 
 
 class CompanyEntityViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
