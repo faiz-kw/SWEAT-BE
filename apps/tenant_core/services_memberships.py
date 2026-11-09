@@ -283,6 +283,15 @@ class MembershipLifecycleService:
                 db_alias=alias,
             )
 
+            # Synchronize member profile & user home branch with package purchase branch
+            if order.user_profile and order.branch:
+                if order.user_profile.preferred_branch_id != order.branch_id:
+                    order.user_profile.preferred_branch = order.branch
+                    order.user_profile.save(using=alias, update_fields=['preferred_branch', 'updated_at'])
+                if getattr(order.user_profile, 'user', None) and order.user_profile.user.home_branch_id != order.branch_id:
+                    order.user_profile.user.home_branch = order.branch
+                    order.user_profile.user.save(using=alias, update_fields=['home_branch', 'updated_at'])
+
             return membership
 
     @classmethod

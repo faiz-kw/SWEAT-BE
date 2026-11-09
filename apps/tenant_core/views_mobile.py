@@ -779,7 +779,7 @@ class MobileMeView(APIView):
                 status='ACTIVE',
                 end_date__gte=timezone.now().date(),
             )
-            .select_related('package', 'package_version')
+            .select_related('package', 'package_version', 'purchase_branch', 'home_branch')
             .order_by('-created_at')
             .first()
         )
@@ -814,6 +814,12 @@ class MobileMeView(APIView):
         )
 
         total_remaining_credits = float(membership_data.get('remaining_sessions', 0.0)) if membership_data else 0.0
+        active_branch = (
+            (active_membership.purchase_branch or active_membership.home_branch)
+            if active_membership else None
+        )
+        resolved_branch = active_branch or getattr(profile, 'preferred_branch', None) or getattr(user, 'home_branch', None)
+
         return Response({
             'user': {
                 'id': str(user.id),
@@ -828,9 +834,9 @@ class MobileMeView(APIView):
                 'date_of_birth': user.date_of_birth.isoformat() if user.date_of_birth else None,
                 'gender': user.gender or '',
                 'home_branch': {
-                    'id': str(user.home_branch.id) if user.home_branch else None,
-                    'name': user.home_branch.name if user.home_branch else 'SWEAT Studio',
-                } if user.home_branch else None,
+                    'id': str(resolved_branch.id) if resolved_branch else None,
+                    'name': resolved_branch.name if resolved_branch else 'SWEAT Studio',
+                } if resolved_branch else None,
             },
             'profile': {
                 'member_number': profile.member_number,
@@ -838,9 +844,9 @@ class MobileMeView(APIView):
                 'member_type': profile.member_type,
                 'joining_date': profile.joining_date.isoformat() if profile.joining_date else None,
                 'preferred_branch': {
-                    'id': str(profile.preferred_branch.id) if profile.preferred_branch else None,
-                    'name': profile.preferred_branch.name if profile.preferred_branch else 'SWEAT Studio',
-                } if profile.preferred_branch else None,
+                    'id': str(resolved_branch.id) if resolved_branch else None,
+                    'name': resolved_branch.name if resolved_branch else 'SWEAT Studio',
+                } if resolved_branch else None,
             },
             'credits': total_remaining_credits,
             'credits_available': total_remaining_credits,
@@ -1252,12 +1258,16 @@ class MobileScheduleView(APIView):
                 active_mems = list(
                     Membership.objects.using(alias)
                     .filter(user_profile=user_profile, status='ACTIVE', end_date__gte=timezone.now().date())
-                    .select_related('program', 'package', 'package_version', 'home_branch')
+                    .select_related('program', 'package', 'package_version', 'home_branch', 'purchase_branch')
                     .order_by('-created_at')
                 )
+                active_pkg_branch = (
+                    (active_mems[0].purchase_branch or active_mems[0].home_branch)
+                    if active_mems else None
+                )
                 user_home_branch = (
-                    getattr(user_profile, 'preferred_branch', None)
-                    or (active_mems[0].home_branch if active_mems and getattr(active_mems[0], 'home_branch', None) else None)
+                    active_pkg_branch
+                    or getattr(user_profile, 'preferred_branch', None)
                     or getattr(user, 'home_branch', None)
                 )
 

@@ -427,6 +427,26 @@ def sync_live_legacy_member_to_tenant(primary_uid: int, tenant_alias: str, org_i
                     }
                 )
 
+        # Align user_profile and user home/preferred branch with active/latest package branch
+        latest_pkg_mem = (
+            Membership.objects.using(tenant_alias)
+            .filter(user_profile=profile)
+            .order_by(
+                (models.Q(status='ACTIVE') & models.Q(end_date__gte=timezone.now().date())).desc(),
+                (models.Q(status='ACTIVE')).desc(),
+                '-end_date',
+                '-created_at',
+            )
+            .first()
+        )
+        if latest_pkg_mem and (latest_pkg_mem.purchase_branch_id or latest_pkg_mem.home_branch_id):
+            target_branch_id = latest_pkg_mem.purchase_branch_id or latest_pkg_mem.home_branch_id
+            if profile.preferred_branch_id != target_branch_id:
+                profile.preferred_branch_id = target_branch_id
+                profile.save(using=tenant_alias, update_fields=['preferred_branch'])
+            if user.home_branch_id != target_branch_id:
+                user.home_branch_id = target_branch_id
+                user.save(using=tenant_alias, update_fields=['home_branch'])
 
         # 4. Synchronize Transactions & Purchases
         for t in txns:

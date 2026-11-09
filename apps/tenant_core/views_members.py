@@ -333,7 +333,13 @@ def serialize_member(profile: UserProfile, alias: str = 'default', compact: bool
     else:
         membership_status = 'INACTIVE'
 
-    branch = profile.preferred_branch
+    # Resolve home branch: prioritize package branch (purchase_branch or home_branch),
+    # falling back to profile.preferred_branch or user.home_branch
+    branch = (
+        (active_m.purchase_branch or active_m.home_branch)
+        if (active_m and (active_m.purchase_branch or active_m.home_branch))
+        else (profile.preferred_branch or getattr(user, 'home_branch', None))
+    )
 
     # Emergency contact string
     emergency_contact = ""
@@ -2112,9 +2118,17 @@ class MemberViewSet(viewsets.ViewSet):
         if branch_ids_param:
             b_ids = [b.strip() for b in branch_ids_param.split(',') if b.strip()]
             if b_ids:
-                qs = qs.filter(Q(preferred_branch_id__in=b_ids) | Q(memberships__home_branch_id__in=b_ids))
+                qs = qs.filter(
+                    Q(preferred_branch_id__in=b_ids)
+                    | Q(memberships__home_branch_id__in=b_ids)
+                    | Q(memberships__purchase_branch_id__in=b_ids)
+                )
         elif location and location not in ['all', 'ALL']:
-            qs = qs.filter(Q(preferred_branch_id=location) | Q(memberships__home_branch_id=location))
+            qs = qs.filter(
+                Q(preferred_branch_id=location)
+                | Q(memberships__home_branch_id=location)
+                | Q(memberships__purchase_branch_id=location)
+            )
 
         # Program filter
         program_ids_param = request.query_params.get('program_ids')
@@ -2721,7 +2735,7 @@ class MemberViewSet(viewsets.ViewSet):
             unit_price = price_obj.base_price if price_obj else Decimal('5000.00')
 
         price_obj = package_version.prices.using(alias).filter(status='ACTIVE').first()
-        branch = active_m.home_branch or profile.preferred_branch
+        branch = active_m.purchase_branch or active_m.home_branch or profile.preferred_branch
 
         # Determine start date: respect start_schedule / custom_start_date or day after active_m.end_date
         today = timezone.now().date()
@@ -3063,7 +3077,12 @@ class MemberViewSet(viewsets.ViewSet):
         branch_id = request.data.get('branch_id')
         branch = Branch.objects.using(alias).filter(id=branch_id).first() if branch_id else None
         if not branch:
-            branch = profile.preferred_branch or Branch.objects.using(alias).filter(status='ACTIVE').first()
+            active_m = get_primary_membership(profile, alias)
+            branch = (
+                (active_m.purchase_branch or active_m.home_branch)
+                if active_m
+                else (profile.preferred_branch or Branch.objects.using(alias).filter(status='ACTIVE').first())
+            )
 
         # Start Date
         start_schedule = request.data.get('start_schedule', 'CONTINUOUS')
