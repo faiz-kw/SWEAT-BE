@@ -1715,11 +1715,12 @@ class RoleViewSet(TenantDBMixin, viewsets.ModelViewSet):
                             module=perm_obj.module,
                             defaults={'permission_set': permission_set, 'can_access': True, 'is_visible': True}
                         )
-                        RoleSubmoduleAccess.objects.using(db).update_or_create(
-                            role=role,
-                            submodule=perm_obj.submodule,
-                            defaults={'permission_set': permission_set, 'can_access': True, 'is_visible': True}
-                        )
+                        if perm_obj.submodule:
+                            RoleSubmoduleAccess.objects.using(db).update_or_create(
+                                role=role,
+                                submodule=perm_obj.submodule,
+                                defaults={'permission_set': permission_set, 'can_access': True, 'is_visible': True}
+                            )
 
                     RolePermissionSetItem.objects.using(db).update_or_create(
                         permission_set=permission_set,
@@ -2025,7 +2026,7 @@ class PermissionViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
         try:
             from .models_rbac import Permission
             # Auto-seed canonical permissions if missing so all modules appear on UI
-            if Permission.objects.using(db).filter(is_active=True).count() < 70:
+            if Permission.objects.using(db).filter(is_active=True).count() < 100:
                 from .rbac_defaults import sync_default_role_permissions
                 sync_default_role_permissions(db_alias=db, overwrite_custom=False)
         except Exception as e:
