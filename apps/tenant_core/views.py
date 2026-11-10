@@ -2107,6 +2107,7 @@ class OrganizationSettingsViewSet(TenantDBMixin, viewsets.ModelViewSet):
         'retrieve': 'core.settings.view',
         'current': 'core.settings.view',
         'payment_policy': 'core.settings.view',
+        'fallback_otp': 'core.settings.edit',
         'create': 'core.settings.edit',
         'update': 'core.settings.edit',
         'partial_update': 'core.settings.edit',
@@ -2175,6 +2176,95 @@ class OrganizationSettingsViewSet(TenantDBMixin, viewsets.ModelViewSet):
 
         policy = PaymentPolicyService.get_effective_policy(org, db_alias=db)
         return Response(policy, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get', 'post'], url_path='fallback-otp')
+    def fallback_otp(self, request):
+        """
+        Manage dynamic fallback verification code (toggle ON/OFF, set/rotate code, auto-expiry).
+        Allows administrators to temporarily enable a master verification code to troubleshoot
+        member app issues without compromising permanent security.
+        """
+        from datetime import datetime, timedelta
+        import secrets
+
+        db = self.get_db()
+        org = Organization.objects.using(db).first()
+        if not org:
+            return Response({'error': 'Organization not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        settings_obj, _ = OrganizationSettings.objects.using(db).get_or_create(
+            organization=org,
+            defaults={'currency': org.currency or 'INR'}
+        )
+
+        now = timezone.now()
+        cfg = settings_obj.membership_config or {}
+        fb_cfg = cfg.get('fallback_otp', {})
+
+        if request.method == 'POST':
+            data = request.data or {}
+            is_enabled = bool(data.get('is_enabled', False))
+
+            if is_enabled:
+                custom_code = str(data.get('fallback_code') or '').strip()
+                if not custom_code:
+                    custom_code = str(secrets.randbelow(900000) + 100000)
+
+                duration_hours = int(data.get('duration_hours') or 2)
+                duration_hours = max(1, min(duration_hours, 72))  # between 1 and 72 hours
+                expires_at = now + timedelta(hours=duration_hours)
+
+                target_phone = str(data.get('target_phone') or '').strip() or None
+
+                fb_cfg = {
+                    'is_enabled': True,
+                    'fallback_code': custom_code,
+                    'expires_at': expires_at.isoformat(),
+                    'target_phone': target_phone,
+                    'updated_at': now.isoformat(),
+                    'updated_by': getattr(request.user, 'email', str(getattr(request.user, 'id', 'system'))),
+                }
+            else:
+                fb_cfg = {
+                    'is_enabled': False,
+                    'fallback_code': None,
+                    'expires_at': None,
+                    'target_phone': None,
+                    'updated_at': now.isoformat(),
+                    'updated_by': getattr(request.user, 'email', str(getattr(request.user, 'id', 'system'))),
+                }
+
+            cfg['fallback_otp'] = fb_cfg
+            settings_obj.membership_config = cfg
+            settings_obj.save(using=db, update_fields=['membership_config', 'updated_at'])
+
+        # Compute current status
+        is_active = fb_cfg.get('is_enabled', False)
+        exp_str = fb_cfg.get('expires_at')
+        is_expired = False
+        remaining_seconds = 0
+        if is_active and exp_str:
+            try:
+                exp_dt = datetime.fromisoformat(str(exp_str))
+                if timezone.is_naive(exp_dt):
+                    exp_dt = timezone.make_aware(exp_dt)
+                if now > exp_dt:
+                    is_expired = True
+                    is_active = False
+                else:
+                    remaining_seconds = int((exp_dt - now).total_seconds())
+            except Exception:
+                pass
+
+        return Response({
+            'is_enabled': is_active and not is_expired,
+            'fallback_code': fb_cfg.get('fallback_code') if is_active and not is_expired else None,
+            'expires_at': exp_str if is_active and not is_expired else None,
+            'remaining_seconds': remaining_seconds,
+            'target_phone': fb_cfg.get('target_phone'),
+            'updated_at': fb_cfg.get('updated_at'),
+            'updated_by': fb_cfg.get('updated_by'),
+        }, status=status.HTTP_200_OK)
 
 
 class BranchSettingsViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):

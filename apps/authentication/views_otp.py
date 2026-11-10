@@ -14,7 +14,7 @@ import re
 import secrets
 import hashlib
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 from django.utils import timezone
 from django.conf import settings
 from django.core.cache import cache
@@ -421,7 +421,40 @@ class VerifyOTPView(APIView):
         # Developer master override in DEBUG mode (e.g. 123456)
         is_dev_override = getattr(settings, 'DEBUG', False) and otp_input == '123456'
 
-        if not record and not is_dev_override:
+        # Check dynamic database-driven fallback OTP toggle
+        is_dynamic_fallback = False
+        try:
+            from apps.tenant_core.models_govern import OrganizationSettings
+            org_settings = OrganizationSettings.objects.using(alias).first()
+            if org_settings and isinstance(org_settings.membership_config, dict):
+                fb_cfg = org_settings.membership_config.get('fallback_otp', {})
+                if fb_cfg.get('is_enabled'):
+                    exp_str = fb_cfg.get('expires_at')
+                    is_active_window = True
+                    if exp_str:
+                        exp_dt = datetime.fromisoformat(str(exp_str))
+                        if timezone.is_naive(exp_dt):
+                            exp_dt = timezone.make_aware(exp_dt)
+                        if now > exp_dt:
+                            is_active_window = False
+
+                    target_p = fb_cfg.get('target_phone')
+                    phone_matches = True
+                    if target_p:
+                        clean_target = re.sub(r'\D', '', str(target_p))[-10:]
+                        clean_sub = re.sub(r'\D', '', str(phone))[-10:]
+                        phone_matches = (clean_target == clean_sub)
+
+                    active_code = str(fb_cfg.get('fallback_code', '')).strip()
+                    if is_active_window and phone_matches and active_code and (otp_input == active_code):
+                        is_dynamic_fallback = True
+                        logger.info("[DYNAMIC FALLBACK OTP] Authorized dynamic fallback OTP verified for %s (tenant: %s)", phone, alias)
+        except Exception as e:
+            logger.warning("[FALLBACK OTP CHECK] Failed to inspect fallback OTP: %s", e)
+
+        is_authorized_bypass = is_dev_override or is_dynamic_fallback
+
+        if not record and not is_authorized_bypass:
             return Response(
                 {
                     'success': False,
@@ -458,7 +491,7 @@ class VerifyOTPView(APIView):
 
             # Check hash match
             submitted_hash = hashlib.sha256(otp_input.encode('utf-8')).hexdigest()
-            if submitted_hash != record['hash'] and not is_dev_override:
+            if submitted_hash != record['hash'] and not is_authorized_bypass:
                 record['attempts'] = record.get('attempts', 0) + 1
                 _save_otp_record(phone, record, tenant_slug=tenant_slug, ttl_seconds=300)
                 remaining = 5 - record['attempts']
