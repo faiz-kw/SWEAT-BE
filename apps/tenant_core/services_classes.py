@@ -452,18 +452,28 @@ class ClassSchedulingService:
                 if not is_avail:
                     raise ValidationError(f"Trainer availability check failed: {reason}")
 
-            # 4. Conflict check with other class occurrences including buffer
+            # 4. Conflict check with other class occurrences
+            # At the same branch, back-to-back classes (end_at == next_start_at) are permitted (zero gap).
+            # Across different branches, travel buffer (minimum_schedule_buffer_minutes) is enforced.
             buffer_min = getattr(trainer, 'minimum_schedule_buffer_minutes', 0) or 0
             from datetime import timedelta
+            from django.db.models import Q
             buffer_delta = timedelta(minutes=buffer_min)
             target_start = occ.start_at - buffer_delta
             target_end = occ.end_at + buffer_delta
 
+            if occ.branch_id:
+                time_filter = (
+                    (Q(occurrence__branch_id=occ.branch_id) & Q(occurrence__start_at__lt=occ.end_at, occurrence__end_at__gt=occ.start_at)) |
+                    (~Q(occurrence__branch_id=occ.branch_id) & Q(occurrence__start_at__lt=target_end, occurrence__end_at__gt=target_start))
+                )
+            else:
+                time_filter = Q(occurrence__start_at__lt=target_end, occurrence__end_at__gt=target_start)
+
             conflict = ClassOccurrenceTrainer.objects.using(alias).filter(
-                trainer_profile=trainer,
-                status__in=['ASSIGNED', 'CONFIRMED'],
-                occurrence__start_at__lt=target_end,
-                occurrence__end_at__gt=target_start,
+                Q(trainer_profile=trainer) &
+                Q(status__in=['ASSIGNED', 'CONFIRMED']) &
+                time_filter
             ).exclude(occurrence=occ).exists()
 
             if conflict:
