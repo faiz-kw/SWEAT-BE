@@ -427,36 +427,59 @@ class VerifyOTPView(APIView):
         # Developer master override in DEBUG mode (e.g. 123456)
         is_dev_override = getattr(settings, 'DEBUG', False) and otp_input == '123456'
 
-        # Check dynamic database-driven fallback OTP toggle
+        # Check dynamic database & Redis driven fallback OTP toggle
         is_dynamic_fallback = False
+        fb_candidates = []
+
+        # 1. Check Redis first (fastest and cross-process)
+        try:
+            r = _get_redis()
+            if r:
+                raw_fb = r.get('sweat_dynamic_fallback_otp')
+                if raw_fb:
+                    fb_candidates.append(json.loads(raw_fb.decode('utf-8')))
+        except Exception as e:
+            logger.debug("[REDIS FALLBACK OTP CHECK] Note: %s", e)
+
+        # 2. Check tenant OrganizationSettings in DB
         try:
             from apps.tenant_core.models_govern import OrganizationSettings
-            org_settings = OrganizationSettings.objects.using(alias).first()
-            if org_settings and isinstance(org_settings.membership_config, dict):
-                fb_cfg = org_settings.membership_config.get('fallback_otp', {})
-                if fb_cfg.get('is_enabled'):
-                    exp_str = fb_cfg.get('expires_at')
-                    is_active_window = True
-                    if exp_str:
-                        exp_dt = datetime.fromisoformat(str(exp_str))
-                        if timezone.is_naive(exp_dt):
-                            exp_dt = timezone.make_aware(exp_dt)
-                        if now > exp_dt:
-                            is_active_window = False
-
-                    target_p = fb_cfg.get('target_phone')
-                    phone_matches = True
-                    if target_p:
-                        clean_target = re.sub(r'\D', '', str(target_p))[-10:]
-                        clean_sub = re.sub(r'\D', '', str(phone))[-10:]
-                        phone_matches = (clean_target == clean_sub)
-
-                    active_code = str(fb_cfg.get('fallback_code', '')).strip()
-                    if is_active_window and phone_matches and active_code and (otp_input == active_code):
-                        is_dynamic_fallback = True
-                        logger.info("[DYNAMIC FALLBACK OTP] Authorized dynamic fallback OTP verified for %s (tenant: %s)", phone, alias)
+            for s_obj in OrganizationSettings.objects.using(alias).all():
+                if isinstance(s_obj.membership_config, dict):
+                    fb = s_obj.membership_config.get('fallback_otp')
+                    if isinstance(fb, dict) and fb.get('is_enabled'):
+                        fb_candidates.append(fb)
         except Exception as e:
-            logger.warning("[FALLBACK OTP CHECK] Failed to inspect fallback OTP: %s", e)
+            logger.warning("[FALLBACK OTP CHECK] Failed to inspect fallback OTP in DB: %s", e)
+
+        # Evaluate candidate configs
+        clean_sub = re.sub(r'\D', '', str(phone))[-10:]
+        for fb_cfg in fb_candidates:
+            if not fb_cfg.get('is_enabled'):
+                continue
+            exp_str = fb_cfg.get('expires_at')
+            is_active_window = True
+            if exp_str:
+                try:
+                    exp_dt = datetime.fromisoformat(str(exp_str))
+                    if timezone.is_naive(exp_dt):
+                        exp_dt = timezone.make_aware(exp_dt)
+                    if now > exp_dt:
+                        is_active_window = False
+                except Exception:
+                    pass
+
+            target_p = fb_cfg.get('target_phone')
+            phone_matches = True
+            if target_p:
+                allowed_targets = [re.sub(r'\D', '', p.strip())[-10:] for p in str(target_p).split(',') if p.strip()]
+                phone_matches = (clean_sub in allowed_targets)
+
+            active_code = str(fb_cfg.get('fallback_code', '')).strip()
+            if is_active_window and phone_matches and active_code and (otp_input == active_code):
+                is_dynamic_fallback = True
+                logger.info("[DYNAMIC FALLBACK OTP] Authorized dynamic fallback OTP verified for %s (tenant: %s)", phone, alias)
+                break
 
         is_authorized_bypass = is_dev_override or is_dynamic_fallback
 
@@ -470,7 +493,7 @@ class VerifyOTPView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if record:
+        if record and not is_authorized_bypass:
             # Check expiry
             if now > record['expires_at']:
                 _delete_otp_record(phone, tenant_slug=tenant_slug)

@@ -164,6 +164,16 @@ def manage_fallback_otp(action='status', code=None, hours=2, phone=None):
                 cfg['fallback_otp'] = fb_cfg
                 settings_obj.membership_config = cfg
                 settings_obj.save(using=alias, update_fields=['membership_config', 'updated_at'])
+
+                # Dual persistence: Also store in Redis for instant cross-process verification
+                try:
+                    import json
+                    from apps.authentication.views_otp import _get_redis
+                    r = _get_redis()
+                    if r:
+                        r.set('sweat_dynamic_fallback_otp', json.dumps(fb_cfg), ex=int(duration * 3600))
+                except Exception:
+                    pass
                 print(f"  >>> Fallback OTP successfully turned ON!")
                 print(f"      Code:         {custom_code}")
                 print(f"      Expires At:   {exp_dt.strftime('%Y-%m-%d %H:%M:%S %Z')} ({duration} hours)")
@@ -181,6 +191,13 @@ def manage_fallback_otp(action='status', code=None, hours=2, phone=None):
                 cfg['fallback_otp'] = fb_cfg
                 settings_obj.membership_config = cfg
                 settings_obj.save(using=alias, update_fields=['membership_config', 'updated_at'])
+                try:
+                    from apps.authentication.views_otp import _get_redis
+                    r = _get_redis()
+                    if r:
+                        r.delete('sweat_dynamic_fallback_otp')
+                except Exception:
+                    pass
                 print(f"  >>> Fallback OTP successfully turned OFF!")
 
             else:  # status
