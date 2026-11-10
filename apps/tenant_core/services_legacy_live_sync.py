@@ -446,12 +446,25 @@ def sync_live_legacy_member_to_tenant(primary_uid: int, tenant_alias: str, org_i
                 )
 
         # Align user_profile and user home/preferred branch with active/latest package branch
+        today_val = timezone.now().date()
         latest_pkg_mem = (
             Membership.objects.using(tenant_alias)
             .filter(user_profile=profile)
+            .annotate(
+                is_currently_active=models.Case(
+                    models.When(status='ACTIVE', end_date__gte=today_val, then=models.Value(1)),
+                    default=models.Value(0),
+                    output_field=models.IntegerField(),
+                ),
+                is_status_active=models.Case(
+                    models.When(status='ACTIVE', then=models.Value(1)),
+                    default=models.Value(0),
+                    output_field=models.IntegerField(),
+                ),
+            )
             .order_by(
-                (models.Q(status='ACTIVE') & models.Q(end_date__gte=timezone.now().date())).desc(),
-                (models.Q(status='ACTIVE')).desc(),
+                '-is_currently_active',
+                '-is_status_active',
                 '-end_date',
                 '-created_at',
             )
