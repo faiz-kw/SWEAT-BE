@@ -80,7 +80,7 @@ class SarvamVoiceAdapter(BaseCommunicationAdapter):
         org_id = self.config.get('org_id') or os.getenv('SARVAM_ORG_ID')
         workspace_id = self.config.get('workspace_id') or os.getenv('SARVAM_WORKSPACE_ID')
         app_id = self.config.get('app_id') or os.getenv('SARVAM_APP_ID')
-        app_version = self.config.get('app_version') or os.getenv('SARVAM_APP_VERSION') or 1
+        app_version = os.getenv('SARVAM_APP_VERSION') or self.config.get('app_version') or 3
         connection_id = self.config.get('connection_id') or os.getenv('SARVAM_CONNECTION_ID')
         agent_phone = self.config.get('agent_phone_number') or os.getenv('SARVAM_AGENT_PHONE_NUMBER')
 
