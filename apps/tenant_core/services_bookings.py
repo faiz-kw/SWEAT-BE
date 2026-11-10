@@ -485,7 +485,14 @@ class BookingWaitlistAttendanceService:
             # Package Branch Availability
             from .models_catalog import PackageBranchAvailability
             pkg = membership.package_version.package if membership.package_version else membership.package
-            if pkg:
+            # Cross-branch bookings are governed by the passport entitlement below, so skip the
+            # home-branch validity gate when booking at a non-home branch with passport sessions.
+            _is_cross_branch = bool(membership.home_branch_id and occurrence.branch_id != membership.home_branch_id)
+            _has_passport = membership.entitlements.using(alias).filter(
+                status='ACTIVE',
+                entitlement_type__in=['CROSS_BRANCH', 'CROSS_BRANCH_SESSION'],
+            ).filter(models.Q(is_unlimited=True) | models.Q(allocated_units__gt=0)).exists()
+            if pkg and not (_is_cross_branch and _has_passport):
                 pba_qs = PackageBranchAvailability.objects.using(alias).filter(package=pkg)
                 if pba_qs.exists() and not pba_qs.filter(branch=occurrence.branch, status='ENABLED').exists():
                     return {
