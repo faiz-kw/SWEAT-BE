@@ -74,6 +74,25 @@ from .services_crm import CRMLeadService
 logger = logging.getLogger(__name__)
 
 
+def _primary_entitlements(entitlements):
+    """For the session/credit headline: de-duplicate rows to one per type (migration
+    created duplicates) and return the member's PRIMARY allowance only -- credit wallet
+    for credit/Elite members, else home sessions -- EXCLUDING cross-branch/passport,
+    which is shown separately. Mirrors what the CRM/web displays (it never sums rows)."""
+    PASSPORT = {'CROSS_BRANCH', 'CROSS_BRANCH_SESSION'}
+    CREDIT = {'CREDIT_WALLET'}
+    by_type = {}
+    for e in entitlements:
+        k = getattr(e, 'entitlement_type', None)
+        cur = by_type.get(k)
+        if cur is None or float(getattr(e, 'consumed_units', 0) or 0) > float(getattr(cur, 'consumed_units', 0) or 0):
+            by_type[k] = e
+    credit = [v for k, v in by_type.items() if k in CREDIT]
+    if credit:
+        return credit
+    return [v for k, v in by_type.items() if k not in PASSPORT and k not in CREDIT]
+
+
 def _resolve_mobile_tenant_and_db(request):
     """
     Resolves the tenant and registers/returns the active tenant DB alias.
@@ -794,7 +813,7 @@ class MobileMeView(APIView):
 
         membership_data = None
         if active_membership:
-            entitlements = list(active_membership.entitlements.using(alias).filter(status='ACTIVE'))
+            entitlements = _primary_entitlements(active_membership.entitlements.using(alias).filter(status='ACTIVE'))
             total_allocated = sum(e.allocated_units for e in entitlements)
             total_consumed = sum(e.consumed_units for e in entitlements)
             total_remaining = max(Decimal('0'), total_allocated - total_consumed)
@@ -2805,7 +2824,7 @@ class MobileMyCreditsView(APIView):
         total_remaining_credits = 0
 
         for m in memberships:
-            entitlements = list(m.entitlements.all())
+            entitlements = _primary_entitlements(m.entitlements.all())
             allocated = sum(float(e.allocated_units or 0.0) for e in entitlements)
             consumed = sum(float(e.consumed_units or 0.0) for e in entitlements)
             remaining = max(0.0, allocated - consumed)
