@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, date, time
 from decimal import Decimal
 
-from django.db import transaction
+from django.db import models, transaction
 from django.utils import timezone
 
 from .models_users import TenantUser
