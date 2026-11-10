@@ -112,8 +112,14 @@ class TenantDBMixin:
             )
 
     def perform_update(self, serializer):
+        instance = serializer.instance
+        from .models_users import TenantUser
+        # RoleAssignment, branch_access, and UserDepartment updates are strictly for TenantUser instances.
+        # Roles and other non-user models must bypass user-specific assignment logic.
+        if not (isinstance(instance, TenantUser) or hasattr(instance, 'user_type') or instance.__class__.__name__ == 'TenantUser'):
+            return super().perform_update(serializer)
+
         with transaction.atomic(using=self.get_db()):
-            instance = serializer.instance
             db = self.get_db()
             data = self.request.data
             from .models_rbac import Role, RoleAssignment
@@ -1116,12 +1122,14 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
                 except Exception:
                     dept_obj = Department.objects.using(db).filter(code=dept_id).first()
                 if dept_obj:
-                    UserDepartment.objects.using(db).filter(user=instance, status='ACTIVE').update(status='INACTIVE')
-                    UserDepartment.objects.using(db).create(
+                    UserDepartment.objects.using(db).filter(user=instance).exclude(department=dept_obj).update(status='INACTIVE', is_primary=False)
+                    UserDepartment.objects.using(db).update_or_create(
                         user=instance,
                         department=dept_obj,
-                        is_primary=True,
-                        status='ACTIVE'
+                        defaults={
+                            'is_primary': True,
+                            'status': 'ACTIVE'
+                        }
                     )
 
 
@@ -1629,6 +1637,11 @@ class RoleViewSet(TenantDBMixin, viewsets.ModelViewSet):
         )
         # Always allow core module
         entitled_module_codes.add('core')
+        # Supplement from tenant's own ModuleCatalog so catalog grants match tenant capabilities
+        tenant_mods = set(
+            ModuleCatalog.objects.using(db).filter(is_enabled=True).values_list('module_code', flat=True)
+        )
+        entitled_module_codes.update(tenant_mods)
         entitled_module_codes = {c.lower() for c in entitled_module_codes if c}
 
         try:
@@ -1702,11 +1715,12 @@ class RoleViewSet(TenantDBMixin, viewsets.ModelViewSet):
                             module=perm_obj.module,
                             defaults={'permission_set': permission_set, 'can_access': True, 'is_visible': True}
                         )
-                        RoleSubmoduleAccess.objects.using(db).update_or_create(
-                            role=role,
-                            submodule=perm_obj.submodule,
-                            defaults={'permission_set': permission_set, 'can_access': True, 'is_visible': True}
-                        )
+                        if perm_obj.submodule:
+                            RoleSubmoduleAccess.objects.using(db).update_or_create(
+                                role=role,
+                                submodule=perm_obj.submodule,
+                                defaults={'permission_set': permission_set, 'can_access': True, 'is_visible': True}
+                            )
 
                     RolePermissionSetItem.objects.using(db).update_or_create(
                         permission_set=permission_set,
@@ -1977,6 +1991,14 @@ class SubmoduleCatalogViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
                 ).values_list('module__code', flat=True)
             )
             entitled_codes.add('core')
+            # Supplement from tenant's own ModuleCatalog if Master TenantModule is incomplete
+            db = self.get_db()
+            from apps.tenant_core.models_rbac import ModuleCatalog
+            tenant_mods = set(
+                ModuleCatalog.objects.using(db).filter(is_enabled=True)
+                .values_list('module_code', flat=True)
+            )
+            entitled_codes.update(tenant_mods)
             codes_lower = [c.lower() for c in entitled_codes if c]
             qs = qs.filter(module__module_code__in=codes_lower)
         except Exception as e:
@@ -1995,33 +2017,43 @@ class PermissionViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
     required_submodule = 'permissions'
     permission_prefix = 'core.permissions'
     serializer_class = PermissionSerializer
+    pagination_class = None
     queryset = Permission.objects.all().select_related('module', 'submodule')
 
     def get_queryset(self):
-        qs = super().get_queryset().filter(is_active=True, module__is_enabled=True)
+        # Expose all active permissions in the catalog across all platform modules for complete matrix configuration
+        from django.db.models import Q
+        db = self.get_db()
         try:
-            tenant_id = self.get_tenant_id()
-            from apps.master.models_saas import TenantModule
-            entitled_codes = set(
-                TenantModule.objects.using('default').filter(
-                    tenant_id=tenant_id,
-                    is_enabled=True,
-                    status='ENABLED'
-                ).values_list('module__code', flat=True)
-            )
-            entitled_codes.add('core')
-            codes_lower = [c.lower() for c in entitled_codes if c]
-            qs = qs.filter(module__module_code__in=codes_lower)
+            from .models_rbac import Permission
+            # Auto-seed canonical permissions if missing so all modules appear on UI
+            if Permission.objects.using(db).filter(is_active=True).count() < 100:
+                from .rbac_defaults import sync_default_role_permissions
+                sync_default_role_permissions(db_alias=db, overwrite_custom=False)
         except Exception as e:
-            logger.warning("Failed to filter Permission by Master TenantModule: %s", e)
+            logger.warning("Auto-sync permissions catalog warning: %s", e)
+
+        qs = super().get_queryset().filter(is_active=True)
 
         mod_code = self.request.query_params.get('module') or self.request.query_params.get('module_code')
-        if mod_code:
-            qs = qs.filter(module__module_code=mod_code)
+        if mod_code and mod_code.lower() != 'all':
+            qs = qs.filter(Q(module__module_code__iexact=mod_code) | Q(permission_code__istartswith=f"{mod_code}."))
         sub_code = self.request.query_params.get('submodule') or self.request.query_params.get('submodule_code')
-        if sub_code:
-            qs = qs.filter(submodule__submodule_code=sub_code)
+        if sub_code and sub_code.lower() != 'all':
+            qs = qs.filter(Q(submodule__submodule_code__iexact=sub_code) | Q(permission_code__icontains=f".{sub_code}."))
         return qs
+
+    @action(detail=False, methods=['get', 'post'], url_path='sync-catalog')
+    def sync_catalog(self, request):
+        """Explicitly re-sync canonical permissions across all platform modules."""
+        db = self.get_db()
+        from .rbac_defaults import sync_default_role_permissions
+        results = sync_default_role_permissions(db_alias=db, overwrite_custom=False)
+        return Response({
+            'status': 'SUCCESS',
+            'message': 'Successfully synchronized all module permissions into the catalog.',
+            'results': results,
+        }, status=status.HTTP_200_OK)
 
 
 class CompanyEntityViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):

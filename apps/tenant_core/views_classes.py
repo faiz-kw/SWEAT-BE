@@ -11,6 +11,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.core.exceptions import ValidationError
 from django.db import transaction
+from django.db.models import Q
 
 
 class ClassesPagination(PageNumberPagination):
@@ -1059,7 +1060,7 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
 
         # 2. Date-Aware Lookup in WorkoutContentItem (WOD Library)
         workout_item = None
-        if not video_url and occ_date_str:
+        if occ_date_str:
             matching_items = list(WorkoutContentItem.objects.using(alias).filter(
                 raw_import_data__date=occ_date_str,
                 status='ACTIVE'
@@ -1091,10 +1092,12 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             )
 
         if workout_item:
-            video_url = workout_item.video_url or ''
+            if not video_url:
+                video_url = workout_item.video_url or ''
             if not instructions:
                 instructions = workout_item.description or ''
-            movement_title = workout_item.movement_name or template_name
+            if not movement_title or movement_title == template_name:
+                movement_title = workout_item.movement_name or template_name
             
             # Extract targeted muscles from raw_import_data or tags
             raw_muscles = workout_item.raw_import_data.get('muscles') if workout_item.raw_import_data else None

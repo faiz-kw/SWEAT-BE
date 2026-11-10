@@ -2,7 +2,7 @@ import os
 import re
 import uuid
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, time
 from decimal import Decimal
 
 from django.db import transaction
@@ -14,6 +14,7 @@ from .models_memberships import Membership, MembershipEntitlement
 from .models_org import Branch, Organization
 from .models_catalog import Package, PackageVersion, PackagePrice, Program
 from .models_crm import Lead
+from collections import defaultdict
 from .models_commerce import Order, OrderItem, PaymentTransaction, MemberInvoice
 from .models_bookings import Booking
 from .models_attendance import AttendanceRecord
@@ -367,23 +368,41 @@ def sync_live_legacy_member_to_tenant(primary_uid: int, tenant_alias: str, org_i
             m_number = f"MEMSHIP-{p_uid:06d}"
             branch_uuid = uuid.UUID(BRANCH_MAP.get(branch_id_num, DEFAULT_BRANCH_ID))
 
-            mem, created = Membership.objects.using(tenant_alias).update_or_create(
-                membership_number=m_number,
-                defaults={
-                    'user_profile': profile,
-                    'start_date': datetime.strptime(start_d_str, '%Y-%m-%d').date() if start_d_str else timezone.now().date(),
-                    'end_date': datetime.strptime(end_d_str, '%Y-%m-%d').date() if end_d_str else timezone.now().date(),
-                    'status': status_val,
-                    'home_branch_id': branch_uuid,
-                    'purchase_branch_id': branch_uuid,
-                    'package_id': uuid.UUID(DEFAULT_PACKAGE_ID),
-                    'package_price_id': uuid.UUID(DEFAULT_PRICE_ID),
-                    'package_version_id': uuid.UUID(DEFAULT_VERSION_ID),
-                    'program_id': uuid.UUID(DEFAULT_PROGRAM_ID),
-                    'legacy_reference': f"userplan:{p_uid}",
-                    'parq_status': 'PENDING',
-                }
-            )
+            existing_mem = Membership.objects.using(tenant_alias).filter(membership_number=m_number).first()
+            if existing_mem:
+                Membership.objects.using(tenant_alias).filter(pk=existing_mem.pk).update(
+                    user_profile=profile,
+                    start_date=datetime.strptime(start_d_str, '%Y-%m-%d').date() if start_d_str else timezone.now().date(),
+                    end_date=datetime.strptime(end_d_str, '%Y-%m-%d').date() if end_d_str else timezone.now().date(),
+                    status=status_val,
+                    home_branch_id=branch_uuid,
+                    purchase_branch_id=branch_uuid,
+                    package_id=uuid.UUID(DEFAULT_PACKAGE_ID),
+                    package_price_id=uuid.UUID(DEFAULT_PRICE_ID),
+                    package_version_id=uuid.UUID(DEFAULT_VERSION_ID),
+                    program_id=uuid.UUID(DEFAULT_PROGRAM_ID),
+                    legacy_reference=f"userplan:{p_uid}",
+                    parq_status=getattr(existing_mem, 'parq_status', 'PENDING') or 'PENDING',
+                    updated_at=timezone.now(),
+                )
+                existing_mem.refresh_from_db()
+                mem = existing_mem
+            else:
+                mem = Membership.objects.using(tenant_alias).create(
+                    membership_number=m_number,
+                    user_profile=profile,
+                    start_date=datetime.strptime(start_d_str, '%Y-%m-%d').date() if start_d_str else timezone.now().date(),
+                    end_date=datetime.strptime(end_d_str, '%Y-%m-%d').date() if end_d_str else timezone.now().date(),
+                    status=status_val,
+                    home_branch_id=branch_uuid,
+                    purchase_branch_id=branch_uuid,
+                    package_id=uuid.UUID(DEFAULT_PACKAGE_ID),
+                    package_price_id=uuid.UUID(DEFAULT_PRICE_ID),
+                    package_version_id=uuid.UUID(DEFAULT_VERSION_ID),
+                    program_id=uuid.UUID(DEFAULT_PROGRAM_ID),
+                    legacy_reference=f"userplan:{p_uid}",
+                    parq_status='PENDING',
+                )
 
             # Entitlement (Base Sessions) - update existing pool or deterministic UUID
             existing_base = MembershipEntitlement.objects.using(tenant_alias).filter(
@@ -426,6 +445,26 @@ def sync_live_legacy_member_to_tenant(primary_uid: int, tenant_alias: str, org_i
                     }
                 )
 
+        # Align user_profile and user home/preferred branch with active/latest package branch
+        latest_pkg_mem = (
+            Membership.objects.using(tenant_alias)
+            .filter(user_profile=profile)
+            .order_by(
+                (models.Q(status='ACTIVE') & models.Q(end_date__gte=timezone.now().date())).desc(),
+                (models.Q(status='ACTIVE')).desc(),
+                '-end_date',
+                '-created_at',
+            )
+            .first()
+        )
+        if latest_pkg_mem and (latest_pkg_mem.purchase_branch_id or latest_pkg_mem.home_branch_id):
+            target_branch_id = latest_pkg_mem.purchase_branch_id or latest_pkg_mem.home_branch_id
+            if profile.preferred_branch_id != target_branch_id:
+                profile.preferred_branch_id = target_branch_id
+                profile.save(using=tenant_alias, update_fields=['preferred_branch'])
+            if user.home_branch_id != target_branch_id:
+                user.home_branch_id = target_branch_id
+                user.save(using=tenant_alias, update_fields=['home_branch'])
 
         # 4. Synchronize Transactions & Purchases
         for t in txns:

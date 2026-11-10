@@ -68,7 +68,7 @@ def fix_leads_for_alias(alias: str) -> dict:
     }
 
 
-if __name__ == '__main__' or True:
+if __name__ == '__main__':
     # Determine which tenant aliases to fix
     try:
         from apps.tenants.models import Tenant

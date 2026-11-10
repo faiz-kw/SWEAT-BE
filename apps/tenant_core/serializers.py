@@ -1101,11 +1101,44 @@ class SubmoduleCatalogSerializer(serializers.ModelSerializer):
 
 
 class PermissionSerializer(serializers.ModelSerializer):
-    module_code = serializers.CharField(source='module.module_code', read_only=True)
-    module_name = serializers.CharField(source='module.name', read_only=True, default='')
-    submodule_code = serializers.CharField(source='submodule.submodule_code', read_only=True, default=None)
-    submodule_name = serializers.CharField(source='submodule.name', read_only=True, default='')
+    module_code = serializers.SerializerMethodField()
+    module_name = serializers.SerializerMethodField()
+    submodule_code = serializers.SerializerMethodField()
+    submodule_name = serializers.SerializerMethodField()
     code = serializers.CharField(source='permission_code', read_only=True)
+
+    def get_module_code(self, obj) -> str:
+        if obj.module and obj.module.module_code:
+            return obj.module.module_code
+        p_code = obj.permission_code or obj.code or ''
+        parts = p_code.split('.')
+        return parts[0] if parts else ''
+
+    def get_module_name(self, obj) -> str:
+        if obj.module and obj.module.name:
+            return obj.module.name
+        mod_code = self.get_module_code(obj)
+        from .rbac_defaults import CANONICAL_MODULES
+        if mod_code and mod_code.lower() in CANONICAL_MODULES:
+            return CANONICAL_MODULES[mod_code.lower()]['name']
+        return mod_code.upper() if mod_code else 'System Core'
+
+    def get_submodule_code(self, obj) -> str:
+        if obj.submodule and obj.submodule.submodule_code:
+            return obj.submodule.submodule_code
+        p_code = obj.permission_code or obj.code or ''
+        parts = p_code.split('.')
+        return parts[1] if len(parts) > 2 else ''
+
+    def get_submodule_name(self, obj) -> str:
+        if obj.submodule and obj.submodule.name:
+            return obj.submodule.name
+        mod_code = self.get_module_code(obj)
+        sub_code = self.get_submodule_code(obj)
+        from .rbac_defaults import CANONICAL_SUBMODULES
+        if (mod_code.lower(), sub_code.lower()) in CANONICAL_SUBMODULES:
+            return CANONICAL_SUBMODULES[(mod_code.lower(), sub_code.lower())]['name']
+        return sub_code.replace('_', ' ').replace('-', ' ').title() if sub_code else ''
 
     class Meta:
         from .models_rbac import Permission

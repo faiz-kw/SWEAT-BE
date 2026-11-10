@@ -92,7 +92,7 @@ class Membership(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     def save(self, *args, **kwargs):
-        if not self._state.adding and self.pk:
+        if not self._state.adding and self.pk and not getattr(self, '_allow_purchase_branch_update', False):
             db = kwargs.get('using') or self._state.db or 'default'
             orig = Membership.objects.using(db).filter(pk=self.pk).first()
             if orig and orig.purchase_branch_id != self.purchase_branch_id:
