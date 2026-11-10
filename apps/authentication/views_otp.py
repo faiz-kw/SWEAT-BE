@@ -525,11 +525,25 @@ class VerifyOTPView(APIView):
         from apps.tenant_core.models_users import TenantUser
         from apps.tenant_core.models_rbac import Role, RoleAssignment
         from apps.tenant_core.models_crm import UserProfile, Lead, LeadSource
+        from apps.tenant_core.models_memberships import Membership
         from apps.tenant_core.services_crm import CRMLeadService
 
         # Match user by phone formats
         phone_no_plus = phone.replace('+', '')
         phone_10_digit = phone[-10:] if len(phone) >= 10 else phone
+
+        # Annotate membership existence to prioritize genuine accounts holding active packages
+        has_active_mem = models.Exists(
+            Membership.objects.using(alias).filter(
+                user_profile__user=models.OuterRef('pk'),
+                status__in=['ACTIVE', 'FROZEN'],
+            )
+        )
+        has_any_mem = models.Exists(
+            Membership.objects.using(alias).filter(
+                user_profile__user=models.OuterRef('pk'),
+            )
+        )
 
         user = (
             TenantUser.objects.using(alias)
@@ -538,11 +552,42 @@ class VerifyOTPView(APIView):
                 | models.Q(phone=phone_no_plus)
                 | models.Q(phone=phone_10_digit)
             )
+            .annotate(
+                has_active_mem=has_active_mem,
+                has_any_mem=has_any_mem,
+            )
             .order_by(
+                # 1. Never pick an inactive/blocked row if an active login-allowed row exists
                 models.Case(
                     models.When(status='ACTIVE', is_login_allowed=True, then=0),
                     default=1,
                 ),
+                # 2. Prefer account holding active/frozen memberships
+                models.Case(
+                    models.When(has_active_mem=True, then=0),
+                    default=1,
+                ),
+                # 3. Prefer account holding any historical memberships
+                models.Case(
+                    models.When(has_any_mem=True, then=0),
+                    default=1,
+                ),
+                # 4. Prefer genuine MEMBER account over LEAD/Trial accounts
+                models.Case(
+                    models.When(user_type='MEMBER', then=0),
+                    default=1,
+                ),
+                # 5. Prefer genuine personal email over placeholder (@sweatfit.local, @member.sweat.local, @test.com)
+                models.Case(
+                    models.When(
+                        ~models.Q(email__contains='@sweatfit.local')
+                        & ~models.Q(email__contains='@member.sweat.local')
+                        & ~models.Q(email__contains='@test.com'),
+                        then=0,
+                    ),
+                    default=1,
+                ),
+                # 6. Prefer account with previous login history
                 models.F('last_login_at').desc(nulls_last=True),
                 '-created_at',
             )

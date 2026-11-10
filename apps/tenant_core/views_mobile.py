@@ -359,13 +359,21 @@ class MobileLoginView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # Lookup user by email, username, or phone
+        # Lookup user by email, username, or phone (prioritize active login-allowed account)
         user = (
             TenantUser.objects.using(alias)
             .filter(
                 models.Q(email__iexact=identifier)
                 | models.Q(username__iexact=identifier)
                 | models.Q(phone=identifier)
+            )
+            .order_by(
+                models.Case(
+                    models.When(status='ACTIVE', is_login_allowed=True, then=0),
+                    default=1,
+                ),
+                models.F('last_login_at').desc(nulls_last=True),
+                '-created_at',
             )
             .select_related('home_branch')
             .first()
