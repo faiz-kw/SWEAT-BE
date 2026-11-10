@@ -505,6 +505,14 @@ class VerifyOTPView(APIView):
                 | models.Q(phone=phone_no_plus)
                 | models.Q(phone=phone_10_digit)
             )
+            .order_by(
+                models.Case(
+                    models.When(status='ACTIVE', is_login_allowed=True, then=0),
+                    default=1,
+                ),
+                models.F('last_login_at').desc(nulls_last=True),
+                '-created_at',
+            )
             .select_related('home_branch')
             .first()
         )
