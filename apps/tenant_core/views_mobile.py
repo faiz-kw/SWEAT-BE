@@ -1420,12 +1420,22 @@ class MobileScheduleView(APIView):
                 cat_uuid = uuid.UUID(str(category_param))
                 qs = qs.filter(class_template__category_id=cat_uuid)
             except (ValueError, AttributeError):
-                qs = qs.filter(
+                cat_term = str(category_param).strip()
+                cat_base = cat_term.split(' - ')[0].strip()
+                cat_q = (
                     models.Q(class_template__category__name__iexact=category_param)
                     | models.Q(class_template__category__name__icontains=category_param)
                     | models.Q(class_template__category__code__iexact=category_param)
                     | models.Q(class_template__category__code__icontains=category_param)
+                    | models.Q(class_template__category__name__iexact=cat_base)
+                    | models.Q(class_template__category__name__icontains=cat_base)
                 )
+                cat_lower = cat_term.lower()
+                if 'pilates' in cat_lower:
+                    cat_q = cat_q | models.Q(class_template__category__code='PILATES')
+                elif 'bootcamp' in cat_lower:
+                    cat_q = cat_q | models.Q(class_template__category__code='BOOTCAMP')
+                qs = qs.filter(cat_q)
 
         # Filter schedule occurrences by member's purchased program package(s)
         if selected_program_id and str(selected_program_id).lower() != 'all':
@@ -3424,8 +3434,10 @@ class MobileCheckoutVerifyView(APIView):
         # Check for test / sandbox bypass or zero-amount coupon order
         is_sandbox_payment = (
             order.total_amount <= Decimal('0.00')
-            or str(payment_id).startswith(('pay_test', 'test_', 'mock_'))
-            or signature in ['mock_signature', 'test_signature', 'bypass', 'TEST']
+            or (getattr(settings, 'DEBUG', False) and (
+                str(payment_id).startswith(('pay_test', 'test_', 'mock_'))
+                or signature in ['mock_signature', 'test_signature', 'bypass', 'TEST']
+            ))
         )
 
         if not is_sandbox_payment:
@@ -4912,7 +4924,7 @@ class MobileMembershipActionsView(APIView):
         upgrade_options = []
         all_pkg_qs = (
             Package.objects.using(alias)
-            .filter(status='ACTIVE')
+            .filter(status='ACTIVE', program__status='ACTIVE')
             .select_related('program')
             .prefetch_related('versions__prices')
         )
@@ -5314,22 +5326,9 @@ class MobileMembershipUpgradeView(APIView):
 
         # If price difference is zero, execute upgrade immediately
         if diff_total <= Decimal('0.00'):
-            upgraded_m = MembershipLifecycleService.execute_upgrade(
-                membership=active_m,
-                target_package=target_pkg,
-                target_package_version=target_ver,
-                target_branch=target_branch,
-                actor_user=user,
-                db_alias=alias,
-            )
-            return Response({
-                'detail': f"Membership upgraded to {target_pkg.name} successfully at no additional charge.",
-                'status': 'COMPLETED',
-                'membership_id': str(upgraded_m.id),
-                'package_name': target_pkg.name,
-                'price_difference': 0.0,
-                'requires_payment': False,
-            }, status=status.HTTP_200_OK)
+            diff_base = target_base
+            diff_tax = round(target_total - target_base, 2)
+            diff_total = target_total
 
         # Create pending order for upgrade
         metadata_dict = {
@@ -5530,20 +5529,7 @@ class MobileMembershipExtendView(APIView):
 
         # If zero fee, extend immediately
         if total_fee <= Decimal('0.00'):
-            ext_m = MembershipLifecycleService.extend_membership(
-                membership=active_m,
-                days=days,
-                reason_text=reason,
-                approved_by_user=user,
-                db_alias=alias,
-            )
-            return Response({
-                'detail': f"Membership validity extended by {days} days. New expiry: {ext_m.end_date}.",
-                'status': 'COMPLETED',
-                'days': days,
-                'new_end_date': str(ext_m.end_date),
-                'requires_payment': False,
-            }, status=status.HTTP_200_OK)
+            return Response({'detail': 'This extension is not available on the app. Please contact studio administration.', 'code': 'EXTENSION_NOT_PERMITTED'}, status=status.HTTP_403_FORBIDDEN)
 
         branch = active_m.home_branch
         metadata_dict = {
@@ -5664,6 +5650,12 @@ class MobileMembershipFreezeView(APIView):
             )
         if not active_m:
             return Response({'detail': 'Only active memberships can be frozen.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        _os_perm = OrganizationSettings.objects.using(alias).first()
+        _frz_perm = (getattr(_os_perm, 'membership_config', {}) or {}).get('freeze_policy', {}) if _os_perm else {}
+        _freeze_enabled = _frz_perm.get('enabled', getattr(_os_perm, 'allow_member_freeze', True) if _os_perm else True)
+        if not _freeze_enabled:
+            return Response({'detail': 'Self-service freezing is not enabled for your active package as per studio configuration. For special accommodations, please contact studio administration.', 'code': 'FREEZE_NOT_PERMITTED'}, status=status.HTTP_403_FORBIDDEN)
 
         freeze_from_str = request.data.get('freeze_from')
         freeze_until_str = request.data.get('freeze_until')
@@ -5946,6 +5938,8 @@ class MobilePassportTopupView(APIView):
                 unit_price = pdef.extra_unit_price
 
         total_price = unit_price * Decimal(str(quantity))
+
+        return Response({'detail': 'Passport purchase is not available on the app. Please contact studio administration.', 'code': 'PASSPORT_NOT_PERMITTED'}, status=status.HTTP_403_FORBIDDEN)
 
         # 4. Top up passport session entitlement
         from django.db import transaction
