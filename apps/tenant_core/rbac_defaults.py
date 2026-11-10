@@ -554,6 +554,10 @@ def sync_default_role_permissions(
         RoleModuleAccess, RoleSubmoduleAccess,
     )
     from django.db import transaction
+    from config.routers import set_tenant_db_alias
+
+    # Activate tenant routing context for this thread
+    set_tenant_db_alias(db_alias)
 
     if not org:
         org = Organization.objects.using(db_alias).filter(status='ACTIVE').first()
