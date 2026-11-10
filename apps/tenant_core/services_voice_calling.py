@@ -394,7 +394,12 @@ class VoiceCallingService:
         # 2. Database transaction is committed and row lock released BEFORE external HTTP request.
         # Construct Callback Webhook URL and Metadata
         public_id = adapter.config.get('public_integration_id') or getattr(org, 'code', None) or (str(integration.id) if integration else 'sarvam')
-        webhook_base = adapter.config.get('webhook_base_url') or 'https://api.fitness.vibecopilot.ai'
+        webhook_base = (
+            adapter.config.get('webhook_base_url')
+            or os.getenv('SARVAM_WEBHOOK_BASE_URL')
+            or os.getenv('BACKEND_BASE_URL')
+            or 'https://api.sweatfitwellness.com'
+        )
         webhook_token = adapter.config.get('webhook_token')
         webhook_url = f"{webhook_base.rstrip('/')}/api/v1/webhooks/communications/sarvam/{public_id}/"
         if webhook_token:
