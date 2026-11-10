@@ -19,7 +19,7 @@ class CMSBannerSerializer(serializers.ModelSerializer):
             'display_order', 'is_active', 'start_date', 'end_date',
             'created_at', 'updated_at', 'created_by',
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at', 'created_by']
+        read_only_fields = ['id', 'organization', 'created_at', 'updated_at', 'created_by']
 
 
 class ProgramCategoryMediaSerializer(serializers.ModelSerializer):
@@ -38,7 +38,7 @@ class ProgramCategoryMediaSerializer(serializers.ModelSerializer):
             'display_order', 'is_active',
             'created_at', 'updated_at',
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'organization', 'created_at', 'updated_at']
 
 
 class CMSMediaAssetSerializer(serializers.ModelSerializer):
@@ -53,7 +53,7 @@ class CMSMediaAssetSerializer(serializers.ModelSerializer):
             'is_published', 'created_at', 'updated_at', 'uploaded_by',
             'uploaded_by_name',
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at', 'uploaded_by']
+        read_only_fields = ['id', 'organization', 'created_at', 'updated_at', 'uploaded_by']
 
     def get_uploaded_by_name(self, obj):
         if obj.uploaded_by:
