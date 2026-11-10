@@ -2017,6 +2017,7 @@ class PermissionViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
     required_submodule = 'permissions'
     permission_prefix = 'core.permissions'
     serializer_class = PermissionSerializer
+    pagination_class = None
     queryset = Permission.objects.all().select_related('module', 'submodule')
 
     def get_queryset(self):
