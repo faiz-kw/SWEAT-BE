@@ -1431,15 +1431,21 @@ class MobileScheduleView(APIView):
         if selected_program_id and str(selected_program_id).lower() != 'all':
             qs = qs.filter(class_template__program_id=selected_program_id)
         elif purchased_program_ids:
-            if len(purchased_programs) == 1:
-                # Single purchased program: strictly restrict view to this program's classes
-                single_prog_id = purchased_programs[0]['id']
-                qs = qs.filter(class_template__program_id=single_prog_id)
-                selected_program_id = single_prog_id
-            else:
-                # Multiple purchased programs: restrict view to classes across their purchased programs
-                qs = qs.filter(class_template__program_id__in=purchased_program_ids)
-                selected_program_id = 'all'
+            # Map the member's purchased program(s) to their class CATEGORY code (PILATES/BOOTCAMP).
+            # Migration created duplicate program AND category IDs, so a membership's exact
+            # program_id often has no scheduled classes; matching by the stable category code
+            # (from the program name) shows the correct classes. Unknown names -> no restriction
+            # so the schedule is never empty.
+            member_cat_codes = set()
+            for _pp in purchased_programs:
+                _nm = (_pp.get('name') or '').lower()
+                if 'pilates' in _nm:
+                    member_cat_codes.add('PILATES')
+                elif 'bootcamp' in _nm:
+                    member_cat_codes.add('BOOTCAMP')
+            if member_cat_codes:
+                qs = qs.filter(class_template__category__code__in=member_cat_codes)
+            selected_program_id = 'all'
 
         if user_profile:
             user_bookings = Booking.objects.using(alias).filter(
