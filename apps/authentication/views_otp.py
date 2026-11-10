@@ -65,19 +65,25 @@ def _get_redis():
 
 
 def normalize_phone(phone: str) -> str:
-    """Sanitizes phone number into E.164 string format (+91...)."""
+    """Sanitizes phone number into standard E.164 string format (+91...)."""
     if not phone:
         return ''
-    clean = re.sub(r'[\s\-\(\)]', '', str(phone).strip())
-    if clean.startswith('00'):
-        clean = '+' + clean[2:]
-    elif not clean.startswith('+'):
-        # Default to India (+91) if 10-digit mobile number starting with 6, 7, 8, or 9
-        if len(clean) == 10 and clean[0] in '6789':
-            clean = '+91' + clean
-        else:
-            clean = '+' + clean
-    return clean
+    digits = re.sub(r'\D', '', str(phone).strip())
+    if not digits:
+        return ''
+    # If 10-digit Indian mobile number (e.g. 9820818798)
+    if len(digits) == 10 and digits[0] in '6789':
+        return f'+91{digits}'
+    # If 11-digit starting with 0 (e.g. 09820818798)
+    if len(digits) == 11 and digits.startswith('0') and digits[1] in '6789':
+        return f'+91{digits[1:]}'
+    # If 12-digit with country code 91 (e.g. 919820818798)
+    if len(digits) == 12 and digits.startswith('91') and digits[2] in '6789':
+        return f'+{digits}'
+    # If duplicate country code / double prefix (e.g. +91 +919820818798 -> 91919820818798)
+    if len(digits) >= 12 and digits[-10] in '6789':
+        return f'+91{digits[-10:]}'
+    return f'+{digits}'
 
 
 def _generate_candidate_keys(phone: str, tenant_slug: str = '') -> list[str]:
@@ -529,8 +535,10 @@ class VerifyOTPView(APIView):
         from apps.tenant_core.services_crm import CRMLeadService
 
         # Match user by phone formats
-        phone_no_plus = phone.replace('+', '')
-        phone_10_digit = phone[-10:] if len(phone) >= 10 else phone
+        phone_digits = re.sub(r'\D', '', str(phone))
+        phone_10_digit = phone_digits[-10:] if len(phone_digits) >= 10 else phone_digits
+        phone_e164 = f"+91{phone_10_digit}" if len(phone_10_digit) == 10 else phone
+        phone_no_plus = phone_e164.replace('+', '')
 
         # Annotate membership existence to prioritize genuine accounts holding active packages
         has_active_mem = models.Exists(
@@ -549,8 +557,10 @@ class VerifyOTPView(APIView):
             TenantUser.objects.using(alias)
             .filter(
                 models.Q(phone=phone)
+                | models.Q(phone=phone_e164)
                 | models.Q(phone=phone_no_plus)
                 | models.Q(phone=phone_10_digit)
+                | models.Q(phone__endswith=phone_10_digit)
             )
             .annotate(
                 has_active_mem=has_active_mem,
