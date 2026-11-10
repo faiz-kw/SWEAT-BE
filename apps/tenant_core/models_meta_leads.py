@@ -47,6 +47,20 @@ class MetaPageConnection(models.Model):
     is_subscribed_to_webhooks = models.BooleanField(default=False)
     subscribed_at = models.DateTimeField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
+    # Sync health tracking — updated when leads arrive or reconciliation runs
+    last_lead_received_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='Timestamp of the most recently received lead event for this Page.'
+    )
+    last_reconcile_attempted_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='Last time the scheduled reconciliation task ran for this Page.'
+    )
+    last_reconcile_leads_found = models.PositiveIntegerField(
+        default=0,
+        help_text='Number of leads backfilled during the most recent reconciliation run.'
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -72,6 +86,13 @@ class MetaLeadMapping(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     organization = models.ForeignKey('tenant_core.Organization', on_delete=models.PROTECT)
+    # FK to the MetaConnection that owns the page this mapping was created under.
+    # Nullable SET_NULL so that mappings survive account reconnections and re-auths.
+    connection = models.ForeignKey(
+        'MetaConnection', null=True, blank=True,
+        on_delete=models.SET_NULL, related_name='mappings',
+        help_text='The Facebook account connection that owns this Page/Form mapping.'
+    )
     page_id = models.CharField(max_length=100)
     form_id = models.CharField(max_length=100)
     name = models.CharField(max_length=200)

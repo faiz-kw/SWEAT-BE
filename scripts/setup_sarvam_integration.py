@@ -44,7 +44,7 @@ def main():
                     'org_id': os.getenv('SARVAM_ORG_ID', '01a07bde-3218-733b-ab77-04a1471f05fe'),
                     'workspace_id': os.getenv('SARVAM_WORKSPACE_ID', '01a07bde-3220-7f17-8eaf-4e72b5899657'),
                     'app_id': os.getenv('SARVAM_APP_ID', 'Conversatio-556997a2-b9bf'),
-                    'app_version': 1,
+                    'app_version': int(os.getenv('SARVAM_APP_VERSION', '3')),
                     'connection_id': os.getenv('SARVAM_CONNECTION_ID', 'b352f251-b1-c3ad4184-2187'),
                     'agent_phone_number': os.getenv('SARVAM_AGENT_PHONE_NUMBER', '+917971443277'),
                     'webhook_token': os.getenv('SARVAM_WEBHOOK_SECRET', 'r7LpmuA8tRzfFbNUKfGr9rW4e6vMkeYDWRn6VPkM80I'),

@@ -17,6 +17,7 @@ import json
 import logging
 from django.conf import settings
 from django.http import HttpResponse
+from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
 from rest_framework.views import APIView
@@ -31,6 +32,7 @@ from apps.tenant_core.meta_lead_rules import verify_signature
 from apps.tenant_core.services_meta_graph import get_meta_app_credentials
 from apps.tenant_core.services_meta_leads import receive_live_webhook_event, process_live_import
 from apps.tenant_core.tasks_meta_leads import process_meta_lead_import_task
+from apps.tenant_core.models_meta_leads import MetaPageConnection
 from apps.tenant_core.meta_logging import (
     log_meta_event,
     EVT_WEBHOOK_RECEIVED,
@@ -199,6 +201,15 @@ class MetaLeadWebhookView(APIView):
                         )
 
                         if created:
+                            # Stamp last_lead_received_at on the page connection (best-effort)
+                            try:
+                                MetaPageConnection.objects.using(alias).filter(
+                                    organization=org,
+                                    page_id=change_page_id,
+                                ).update(last_lead_received_at=timezone.now())
+                            except Exception:
+                                pass  # non-fatal — sync health field only
+
                             # 2. Celery dispatch with worker presence check & immediate fallback
                             dispatched = False
                             try:

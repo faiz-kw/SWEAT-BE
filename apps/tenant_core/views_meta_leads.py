@@ -484,6 +484,10 @@ def _format_page_connection_payload(p: dict) -> dict:
     page_name_str = str(p.get('page_name') or '')
     sub_at = p.get('subscribed_at')
     sub_at_str = sub_at.isoformat() if sub_at and hasattr(sub_at, 'isoformat') else (str(sub_at) if sub_at else None)
+    last_lead = p.get('last_lead_received_at')
+    last_lead_str = last_lead.isoformat() if last_lead and hasattr(last_lead, 'isoformat') else (str(last_lead) if last_lead else None)
+    last_recon = p.get('last_reconcile_attempted_at')
+    last_recon_str = last_recon.isoformat() if last_recon and hasattr(last_recon, 'isoformat') else (str(last_recon) if last_recon else None)
     return {
         'id': page_id_str,
         'page_id': page_id_str,
@@ -493,6 +497,9 @@ def _format_page_connection_payload(p: dict) -> dict:
         'page_name': page_name_str,
         'is_subscribed_to_webhooks': bool(p.get('is_subscribed_to_webhooks', False)),
         'subscribed_at': sub_at_str,
+        'last_lead_received_at': last_lead_str,
+        'last_reconcile_attempted_at': last_recon_str,
+        'last_reconcile_leads_found': p.get('last_reconcile_leads_found', 0),
     }
 
 
@@ -650,7 +657,19 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
             if req_redirect and 'localhost:8000' not in req_redirect and '127.0.0.1:8000' not in req_redirect:
                 redirect_uri = req_redirect
             elif getattr(settings, 'DEPLOYMENT_ENVIRONMENT', '') == 'production' or not settings.DEBUG:
-                redirect_uri = "https://api.fitness.vibecopilot.ai/api/v1/tenant/meta-lead-mappings/oauth-callback/"
+                # BACKEND_PUBLIC_URL is not configured — cannot construct a valid redirect URI.
+                # This is a configuration error; do not fall back to any hardcoded domain.
+                logger.error(
+                    "oauth_init: BACKEND_PUBLIC_URL and META_REDIRECT_URI are both unset. "
+                    "Set BACKEND_PUBLIC_URL in production .env to fix this."
+                )
+                return Response({
+                    'live_available': False,
+                    'error': (
+                        'OAuth redirect URI could not be determined. '
+                        'Set BACKEND_PUBLIC_URL in the backend environment configuration.'
+                    ),
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
             else:
                 redirect_uri = request.build_absolute_uri('/api/v1/tenant/meta-lead-mappings/oauth-callback/')
 
@@ -749,6 +768,12 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
                                 page_id=p_id,
                                 defaults={'tenant': tenant_obj, 'page_name': p_name, 'is_active': True}
                             )
+
+                    # Stamp the connection FK on any existing mappings for this page so they
+                    # remain traceable to their owning account after reconnect.
+                    MetaLeadMapping.objects.using(db_alias).filter(
+                        organization=organization, page_id=p_id, connection__isnull=True
+                    ).update(connection=conn)
 
                     discovered_pages.append({
                         'page_id': p_id,
@@ -1130,9 +1155,132 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
     def pages(self, request):
         raw_pages = list(MetaPageConnection.objects.using(self.alias).filter(
             organization=self.organization, is_active=True
-        ).values('id', 'page_id', 'page_name', 'is_subscribed_to_webhooks', 'subscribed_at', 'connection_id'))
+        ).values(
+            'id', 'page_id', 'page_name', 'is_subscribed_to_webhooks',
+            'subscribed_at', 'connection_id',
+            'last_lead_received_at', 'last_reconcile_attempted_at', 'last_reconcile_leads_found',
+        ))
         pages = [_format_page_connection_payload(p) for p in raw_pages]
         return Response({'results': pages, 'pages': pages})
+
+    @action(detail=False, methods=['post'], url_path='refresh-pages')
+    def refresh_pages(self, request):
+        """
+        Re-discover and refresh all Facebook Pages for a specific connected account
+        without requiring a full disconnect/reconnect cycle.
+
+        Accepts optional body param: { "connection_id": "<uuid>" }
+        If omitted, refreshes the most recently connected active account.
+        """
+        connection_id = request.data.get('connection_id') or request.query_params.get('connection_id')
+
+        if connection_id:
+            conn = MetaConnection.objects.using(self.alias).filter(
+                organization=self.organization, id=connection_id
+            ).first()
+        else:
+            conn = MetaConnection.objects.using(self.alias).filter(
+                organization=self.organization,
+                status__in=('CONNECTED', 'LIVE_CONNECTED'),
+            ).order_by('-last_connected_at').first()
+
+        if not conn:
+            return Response(
+                {'error': 'No active Facebook connection found to refresh.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if not conn.encrypted_user_access_token:
+            return Response(
+                {'error': 'Facebook connection has no stored token. Please reconnect this account.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        from .meta_crypto import decrypt_token as _decrypt
+        user_token = _decrypt(conn.encrypted_user_access_token)
+        if not user_token:
+            return Response(
+                {'error': 'Could not decrypt Facebook token. Please reconnect this account.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        client = MetaGraphClient()
+        master_tenant_id = self.get_tenant_id()
+        from apps.master.models_tenant import Tenant, MetaPageRegistry
+
+        try:
+            pages_data = client.fetch_user_pages(user_token)
+        except (MetaTokenExpiredError,) as exc:
+            conn.status = 'TOKEN_EXPIRED'
+            conn.last_error = str(exc)[:500]
+            conn.save(using=self.alias, update_fields=['status', 'last_error', 'updated_at'])
+            return Response(
+                {'error': 'Facebook token has expired. Please reconnect this account.'},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        except Exception as exc:
+            logger.error("refresh_pages: failed to fetch pages for connection %s: %s", conn.id, exc)
+            return Response(
+                {'error': f'Could not fetch pages from Meta: {_sanitize_meta_error(str(exc))}'},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        tenant_obj = Tenant.objects.using('default').filter(id=master_tenant_id).first()
+        refreshed = []
+
+        with transaction.atomic(using=self.alias):
+            for p in pages_data:
+                p_id = str(p['id'])
+                p_name = p.get('name', f"Page {p_id}")
+                p_token = p.get('access_token', '')
+
+                subscribed = False
+                if p_token:
+                    try:
+                        subscribed = client.subscribe_page_to_webhooks(p_id, p_token)
+                    except Exception as sub_err:
+                        logger.warning("refresh_pages: could not subscribe page %s: %s", p_id, sub_err)
+
+                MetaPageConnection.objects.using(self.alias).update_or_create(
+                    organization=self.organization,
+                    page_id=p_id,
+                    defaults={
+                        'connection': conn,
+                        'page_name': p_name,
+                        'encrypted_page_access_token': encrypt_token(p_token),
+                        'is_subscribed_to_webhooks': subscribed,
+                        'subscribed_at': timezone.now() if subscribed else None,
+                        'is_active': True,
+                    }
+                )
+
+                if tenant_obj:
+                    MetaPageRegistry.objects.using('default').update_or_create(
+                        page_id=p_id,
+                        defaults={'tenant': tenant_obj, 'page_name': p_name, 'is_active': True}
+                    )
+
+                # Stamp connection FK on any existing mappings for this page
+                MetaLeadMapping.objects.using(self.alias).filter(
+                    organization=self.organization, page_id=p_id, connection__isnull=True
+                ).update(connection=conn)
+
+                refreshed.append({'page_id': p_id, 'page_name': p_name, 'is_subscribed': subscribed})
+
+        record_business_audit(
+            organization=self.organization, module='crm', action_code='META_PAGES_REFRESHED',
+            entity_type='MetaConnection', entity_id=conn.id, actor_user=request.user,
+            metadata={'pages_refreshed': len(refreshed), 'connection_id': str(conn.id)},
+            db_alias=self.alias,
+        )
+
+        return Response({
+            'status': 'REFRESHED',
+            'connection_id': str(conn.id),
+            'meta_user_name': conn.meta_user_name,
+            'pages_refreshed': len(refreshed),
+            'pages': refreshed,
+        })
 
     @action(detail=False, methods=['get'], url_path='forms')
     def forms(self, request):

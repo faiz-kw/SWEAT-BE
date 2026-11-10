@@ -614,6 +614,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'apps.tenant_core.tasks_meta_leads.recover_meta_imports_periodic_task',
         'schedule': float(os.getenv('CELERY_SCHEDULE_META_RECOVERY_SECONDS', '120.0')),  # every 2 min
     },
+    'tenant-reconcile-meta-leads': {
+        'task': 'apps.tenant_core.tasks_meta_leads.reconcile_meta_leads_task',
+        'schedule': float(os.getenv('CELERY_SCHEDULE_META_RECONCILE_SECONDS', '21600.0')),  # every 6 hours
+    },
     'master-process-booking-auto-cancellations': {
         'task': 'apps.master.tasks.process_all_tenants_booking_auto_cancellations_async',
         'schedule': float(os.getenv('CELERY_SCHEDULE_BOOKING_AUTOCANCEL_SECONDS', '120.0')),  # every 2 min
@@ -660,8 +664,8 @@ META_APP_ID = os.getenv('META_APP_ID', '').strip()
 META_APP_SECRET = os.getenv('META_APP_SECRET', '').strip()
 META_WEBHOOK_VERIFY_TOKEN = os.getenv('META_WEBHOOK_VERIFY_TOKEN', '').strip()
 META_TOKEN_ENCRYPTION_KEY = os.getenv('META_TOKEN_ENCRYPTION_KEY', '').strip()
-BACKEND_PUBLIC_URL = os.getenv('BACKEND_PUBLIC_URL', '').strip()
-META_REDIRECT_URI = os.getenv('META_REDIRECT_URI', '').strip()
+# NOTE: BACKEND_PUBLIC_URL and META_REDIRECT_URI are defined at line ~220 above
+# with smart environment-aware defaults. Do NOT redefine them here.
 GUPSHUP_API_KEY = os.getenv('GUPSHUP_API_KEY', 'sk_e6941c4bab9947adaf787a47f17577aa').strip()
 GUPSHUP_APP_NAME = os.getenv('GUPSHUP_APP_NAME', 'SweatFit').strip()
 GUPSHUP_SOURCE_NUMBER = os.getenv('GUPSHUP_SOURCE_NUMBER', '917834811114').strip()
