@@ -1348,12 +1348,32 @@ class PerformanceOSTokenRefreshSerializer(serializers.Serializer):
     refresh = serializers.CharField()
     access = serializers.CharField(read_only=True)
     token_class = RefreshToken
+    reuse_grace_seconds = 60
+
+    def _load_refresh(self, raw):
+        try:
+            return self.token_class(raw)
+        except TokenError as exc:
+            if 'blacklisted' not in str(exc).lower():
+                raise
+            from datetime import timedelta
+            from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken
+            token = self.token_class(raw, verify=False)
+            token.token_backend.decode(raw, verify=True)
+            token.check_exp()
+            recently_rotated = BlacklistedToken.objects.filter(
+                token__jti=token.payload.get('jti'),
+                blacklisted_at__gte=timezone.now() - timedelta(seconds=self.reuse_grace_seconds),
+            ).exists()
+            if not recently_rotated:
+                raise
+            return token
 
     def validate(self, attrs: dict) -> dict:
         from rest_framework_simplejwt.settings import api_settings
         from rest_framework.exceptions import AuthenticationFailed
 
-        refresh = self.token_class(attrs["refresh"])
+        refresh = self._load_refresh(attrs["refresh"])
         user_type = refresh.payload.get('user_type')
         user_id = refresh.payload.get(api_settings.USER_ID_CLAIM)
 

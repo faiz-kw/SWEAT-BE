@@ -65,19 +65,25 @@ def _get_redis():
 
 
 def normalize_phone(phone: str) -> str:
-    """Sanitizes phone number into E.164 string format (+91...)."""
+    """Sanitizes phone number into standard E.164 string format (+91...)."""
     if not phone:
         return ''
-    clean = re.sub(r'[\s\-\(\)]', '', str(phone).strip())
-    if clean.startswith('00'):
-        clean = '+' + clean[2:]
-    elif not clean.startswith('+'):
-        # Default to India (+91) if 10-digit mobile number starting with 6, 7, 8, or 9
-        if len(clean) == 10 and clean[0] in '6789':
-            clean = '+91' + clean
-        else:
-            clean = '+' + clean
-    return clean
+    digits = re.sub(r'\D', '', str(phone).strip())
+    if not digits:
+        return ''
+    # If 10-digit Indian mobile number (e.g. 9820818798)
+    if len(digits) == 10 and digits[0] in '6789':
+        return f'+91{digits}'
+    # If 11-digit starting with 0 (e.g. 09820818798)
+    if len(digits) == 11 and digits.startswith('0') and digits[1] in '6789':
+        return f'+91{digits[1:]}'
+    # If 12-digit with country code 91 (e.g. 919820818798)
+    if len(digits) == 12 and digits.startswith('91') and digits[2] in '6789':
+        return f'+{digits}'
+    # If duplicate country code / double prefix (e.g. +91 +919820818798 -> 91919820818798)
+    if len(digits) >= 12 and digits[-10] in '6789':
+        return f'+91{digits[-10:]}'
+    return f'+{digits}'
 
 
 def _generate_candidate_keys(phone: str, tenant_slug: str = '') -> list[str]:
@@ -421,36 +427,59 @@ class VerifyOTPView(APIView):
         # Developer master override in DEBUG mode (e.g. 123456)
         is_dev_override = getattr(settings, 'DEBUG', False) and otp_input == '123456'
 
-        # Check dynamic database-driven fallback OTP toggle
+        # Check dynamic database & Redis driven fallback OTP toggle
         is_dynamic_fallback = False
+        fb_candidates = []
+
+        # 1. Check Redis first (fastest and cross-process)
+        try:
+            r = _get_redis()
+            if r:
+                raw_fb = r.get('sweat_dynamic_fallback_otp')
+                if raw_fb:
+                    fb_candidates.append(json.loads(raw_fb.decode('utf-8')))
+        except Exception as e:
+            logger.debug("[REDIS FALLBACK OTP CHECK] Note: %s", e)
+
+        # 2. Check tenant OrganizationSettings in DB
         try:
             from apps.tenant_core.models_govern import OrganizationSettings
-            org_settings = OrganizationSettings.objects.using(alias).first()
-            if org_settings and isinstance(org_settings.membership_config, dict):
-                fb_cfg = org_settings.membership_config.get('fallback_otp', {})
-                if fb_cfg.get('is_enabled'):
-                    exp_str = fb_cfg.get('expires_at')
-                    is_active_window = True
-                    if exp_str:
-                        exp_dt = datetime.fromisoformat(str(exp_str))
-                        if timezone.is_naive(exp_dt):
-                            exp_dt = timezone.make_aware(exp_dt)
-                        if now > exp_dt:
-                            is_active_window = False
-
-                    target_p = fb_cfg.get('target_phone')
-                    phone_matches = True
-                    if target_p:
-                        clean_target = re.sub(r'\D', '', str(target_p))[-10:]
-                        clean_sub = re.sub(r'\D', '', str(phone))[-10:]
-                        phone_matches = (clean_target == clean_sub)
-
-                    active_code = str(fb_cfg.get('fallback_code', '')).strip()
-                    if is_active_window and phone_matches and active_code and (otp_input == active_code):
-                        is_dynamic_fallback = True
-                        logger.info("[DYNAMIC FALLBACK OTP] Authorized dynamic fallback OTP verified for %s (tenant: %s)", phone, alias)
+            for s_obj in OrganizationSettings.objects.using(alias).all():
+                if isinstance(s_obj.membership_config, dict):
+                    fb = s_obj.membership_config.get('fallback_otp')
+                    if isinstance(fb, dict) and fb.get('is_enabled'):
+                        fb_candidates.append(fb)
         except Exception as e:
-            logger.warning("[FALLBACK OTP CHECK] Failed to inspect fallback OTP: %s", e)
+            logger.warning("[FALLBACK OTP CHECK] Failed to inspect fallback OTP in DB: %s", e)
+
+        # Evaluate candidate configs
+        clean_sub = re.sub(r'\D', '', str(phone))[-10:]
+        for fb_cfg in fb_candidates:
+            if not fb_cfg.get('is_enabled'):
+                continue
+            exp_str = fb_cfg.get('expires_at')
+            is_active_window = True
+            if exp_str:
+                try:
+                    exp_dt = datetime.fromisoformat(str(exp_str))
+                    if timezone.is_naive(exp_dt):
+                        exp_dt = timezone.make_aware(exp_dt)
+                    if now > exp_dt:
+                        is_active_window = False
+                except Exception:
+                    pass
+
+            target_p = fb_cfg.get('target_phone')
+            phone_matches = True
+            if target_p:
+                allowed_targets = [re.sub(r'\D', '', p.strip())[-10:] for p in str(target_p).split(',') if p.strip()]
+                phone_matches = (clean_sub in allowed_targets)
+
+            active_code = str(fb_cfg.get('fallback_code', '')).strip()
+            if is_active_window and phone_matches and active_code and (otp_input == active_code):
+                is_dynamic_fallback = True
+                logger.info("[DYNAMIC FALLBACK OTP] Authorized dynamic fallback OTP verified for %s (tenant: %s)", phone, alias)
+                break
 
         is_authorized_bypass = is_dev_override or is_dynamic_fallback
 
@@ -464,7 +493,7 @@ class VerifyOTPView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if record:
+        if record and not is_authorized_bypass:
             # Check expiry
             if now > record['expires_at']:
                 _delete_otp_record(phone, tenant_slug=tenant_slug)
@@ -529,8 +558,10 @@ class VerifyOTPView(APIView):
         from apps.tenant_core.services_crm import CRMLeadService
 
         # Match user by phone formats
-        phone_no_plus = phone.replace('+', '')
-        phone_10_digit = phone[-10:] if len(phone) >= 10 else phone
+        phone_digits = re.sub(r'\D', '', str(phone))
+        phone_10_digit = phone_digits[-10:] if len(phone_digits) >= 10 else phone_digits
+        phone_e164 = f"+91{phone_10_digit}" if len(phone_10_digit) == 10 else phone
+        phone_no_plus = phone_e164.replace('+', '')
 
         # Annotate membership existence to prioritize genuine accounts holding active packages
         has_active_mem = models.Exists(
@@ -549,8 +580,10 @@ class VerifyOTPView(APIView):
             TenantUser.objects.using(alias)
             .filter(
                 models.Q(phone=phone)
+                | models.Q(phone=phone_e164)
                 | models.Q(phone=phone_no_plus)
                 | models.Q(phone=phone_10_digit)
+                | models.Q(phone__endswith=phone_10_digit)
             )
             .annotate(
                 has_active_mem=has_active_mem,

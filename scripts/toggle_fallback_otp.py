@@ -45,24 +45,78 @@ from apps.tenant_core.models_org import Organization
 
 
 def resolve_tenant_aliases():
+    from django.conf import settings
     targets = []
+    seen = set()
+
+    # 1. First scan all provisioned TenantDataSources in master DB
+    try:
+        data_sources = TenantDataSource.objects.using('default').select_related('tenant').all()
+        for ds in data_sources:
+            try:
+                t = getattr(ds, 'tenant', None)
+                if not t:
+                    continue
+                alias = build_tenant_db_alias(t.id)
+                effective_db = ds.database_name or ds.db_name
+                if not effective_db:
+                    continue
+
+                if alias not in settings.DATABASES:
+                    settings.DATABASES[alias] = dict(settings.DATABASES['default'])
+                    settings.DATABASES[alias]['NAME'] = effective_db
+
+                try:
+                    _register_tenant_connection(alias, db_name=effective_db, data_source=ds, tenant_id=t.id)
+                except Exception:
+                    pass
+
+                if alias not in seen:
+                    targets.append((alias, t.slug))
+                    seen.add(alias)
+            except Exception as e:
+                print(f"Master tenant data source scan note: {e}")
+    except Exception as exc:
+        print(f"TenantDataSource lookup note: {exc}")
+
+    # 2. Check Tenants directly for any additional tenants
     try:
         tenants = Tenant.objects.using('default').all()
         for t in tenants:
             alias = build_tenant_db_alias(t.id)
-            ds = TenantDataSource.objects.using('default').filter(tenant=t).first()
-            if ds:
-                _register_tenant_connection(alias, db_name=ds.db_name, data_source=ds, tenant_id=t.id)
-                targets.append((alias, t.slug))
-            else:
-                db_name = f"tenant_{t.slug.replace('-', '_')}"
-                _register_tenant_connection(alias, db_name=db_name, tenant_id=t.id)
-                targets.append((alias, t.slug))
+            if alias in seen:
+                continue
+            try:
+                ds = TenantDataSource.objects.using('default').filter(tenant=t).first()
+                if ds:
+                    effective_db = ds.database_name or ds.db_name
+                    if alias not in settings.DATABASES:
+                        settings.DATABASES[alias] = dict(settings.DATABASES['default'])
+                        settings.DATABASES[alias]['NAME'] = effective_db
+                    try:
+                        _register_tenant_connection(alias, db_name=effective_db, data_source=ds, tenant_id=t.id)
+                    except Exception:
+                        pass
+                    targets.append((alias, t.slug))
+                    seen.add(alias)
+                else:
+                    db_name = f"tenant_{t.slug.replace('-', '_')}"
+                    if alias not in settings.DATABASES:
+                        settings.DATABASES[alias] = dict(settings.DATABASES['default'])
+                        settings.DATABASES[alias]['NAME'] = db_name
+                    targets.append((alias, t.slug))
+                    seen.add(alias)
+            except Exception as exc:
+                print(f"Skipping tenant {t.slug}: {exc}")
     except Exception as exc:
         print(f"Master tenant lookup note: {exc}")
 
     if not targets:
-        targets.append(('tenant_sweat_demo', 'sweat_demo'))
+        for fallback_alias, fallback_slug in [('tenant_test', 'test'), ('tenant_sweat_demo', 'sweat_demo')]:
+            if fallback_alias not in settings.DATABASES:
+                settings.DATABASES[fallback_alias] = dict(settings.DATABASES['default'])
+                settings.DATABASES[fallback_alias]['NAME'] = fallback_slug
+            targets.append((fallback_alias, fallback_slug))
 
     return targets
 
@@ -110,6 +164,16 @@ def manage_fallback_otp(action='status', code=None, hours=2, phone=None):
                 cfg['fallback_otp'] = fb_cfg
                 settings_obj.membership_config = cfg
                 settings_obj.save(using=alias, update_fields=['membership_config', 'updated_at'])
+
+                # Dual persistence: Also store in Redis for instant cross-process verification
+                try:
+                    import json
+                    from apps.authentication.views_otp import _get_redis
+                    r = _get_redis()
+                    if r:
+                        r.set('sweat_dynamic_fallback_otp', json.dumps(fb_cfg), ex=int(duration * 3600))
+                except Exception:
+                    pass
                 print(f"  >>> Fallback OTP successfully turned ON!")
                 print(f"      Code:         {custom_code}")
                 print(f"      Expires At:   {exp_dt.strftime('%Y-%m-%d %H:%M:%S %Z')} ({duration} hours)")
@@ -127,6 +191,13 @@ def manage_fallback_otp(action='status', code=None, hours=2, phone=None):
                 cfg['fallback_otp'] = fb_cfg
                 settings_obj.membership_config = cfg
                 settings_obj.save(using=alias, update_fields=['membership_config', 'updated_at'])
+                try:
+                    from apps.authentication.views_otp import _get_redis
+                    r = _get_redis()
+                    if r:
+                        r.delete('sweat_dynamic_fallback_otp')
+                except Exception:
+                    pass
                 print(f"  >>> Fallback OTP successfully turned OFF!")
 
             else:  # status
