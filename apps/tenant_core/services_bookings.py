@@ -185,7 +185,7 @@ class BookingWaitlistAttendanceService:
                 name=f"{org.name} Standard Attendance Policy",
                 defaults={
                     'rule_behavior': 'OPERATIONAL',
-                    'normal_max_advance_bookings': 3,
+                    'normal_max_advance_bookings': 7,
                     'restricted_max_advance_bookings': 1,
                     'restriction_threshold': 2,
                     'reset_on_successful_attendance': True,
@@ -887,24 +887,26 @@ class BookingWaitlistAttendanceService:
             if existing:
                 raise ValidationError(f"User already has an active booking ({existing.booking_number}) for this class occurrence.")
 
-            # 3. Check Attendance / No-Show restrictions via restriction service
-            can_book, restriction_reason = cls.can_member_book(user_profile, organization, occurrence=occurrence, db_alias=alias)
-            if not can_book:
-                raise ValidationError(restriction_reason)
+            # 3. Check Attendance / No-Show restrictions via restriction service (staff/admin bypasses restriction)
+            if not is_staff_override:
+                can_book, restriction_reason = cls.can_member_book(user_profile, organization, occurrence=occurrence, db_alias=alias)
+                if not can_book:
+                    raise ValidationError(restriction_reason)
 
             # 4. Check Booking Policy via canonical hierarchy
             booking_policy = cls.resolve_booking_policy(occurrence, db_alias=alias)
 
-            if booking_policy:
+            if booking_policy and not is_staff_override:
                 now = timezone.now()
-                # Check max upcoming bookings
+                # Check max upcoming bookings (allows up to 7 advance sessions)
+                max_upcoming = max(int(getattr(booking_policy, 'max_upcoming_bookings', 7) or 7), 7)
                 upcoming_count = Booking.objects.using(alias).filter(
                     user_profile=user_profile,
                     status__in=['CONFIRMED', 'RESERVED'],
                     occurrence__start_at__gt=now
                 ).count()
-                if upcoming_count >= booking_policy.max_upcoming_bookings:
-                    raise ValidationError(f"Maximum upcoming bookings ({booking_policy.max_upcoming_bookings}) exceeded.")
+                if upcoming_count >= max_upcoming:
+                    raise ValidationError(f"Maximum upcoming bookings ({max_upcoming}) exceeded.")
 
                 # Check booking window
                 diff_minutes = int((occurrence.start_at - now).total_seconds() / 60)
@@ -936,9 +938,9 @@ class BookingWaitlistAttendanceService:
                 if normalized_type not in normalized_allowed:
                     raise ValidationError(f"Booking type '{booking_type}' is not permitted by current booking policy.")
 
-            # Check advance booking window limit
-            adv_days_max = effective_bp.get('advance_booking_days_max')
-            if adv_days_max and occurrence.occurrence_date:
+            # Check advance booking window limit (up to 7 days ahead; staff/admin bypasses)
+            adv_days_max = effective_bp.get('advance_booking_days_max') or 7
+            if not is_staff_override and adv_days_max and occurrence.occurrence_date:
                 max_allowed_date = timezone.now().date() + timedelta(days=int(adv_days_max))
                 if occurrence.occurrence_date > max_allowed_date:
                     raise ValidationError(f"Advance bookings beyond {adv_days_max} days are not permitted.")

@@ -160,7 +160,7 @@ class AttendancePolicySet(models.Model):
     )
     effective_from = models.DateTimeField(default=timezone.now)
     effective_until = models.DateTimeField(null=True, blank=True)
-    normal_max_advance_bookings = models.IntegerField(default=3)
+    normal_max_advance_bookings = models.IntegerField(default=7)
     restricted_max_advance_bookings = models.IntegerField(default=1)
     restriction_threshold = models.IntegerField(default=2)
     reset_on_successful_attendance = models.BooleanField(default=True)
@@ -230,7 +230,7 @@ class MemberAttendanceState(models.Model):
         default='NORMAL',
         choices=[('NORMAL', 'NORMAL'), ('SINGLE_BOOKING', 'SINGLE_BOOKING')]
     )
-    current_max_advance_bookings = models.IntegerField(default=3)
+    current_max_advance_bookings = models.IntegerField(default=7)
     restriction_started_at = models.DateTimeField(null=True, blank=True)
     restriction_reason = models.TextField(null=True, blank=True)
     last_no_show_at = models.DateTimeField(null=True, blank=True)

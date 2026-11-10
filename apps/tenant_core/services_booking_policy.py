@@ -57,8 +57,8 @@ DEFAULT_BOOKING_POLICY: Dict[str, Any] = {
     # 5. Eligibility & Types
     'allowed_booking_types': ['MEMBER', 'TRIAL', 'PAY_PER_USE', 'WALK_IN', 'COMPLIMENTARY'],
     'require_active_membership': True,
-    'max_upcoming_bookings': 5,
-    'advance_booking_days_max': 14,
+    'max_upcoming_bookings': 7,
+    'advance_booking_days_max': 7,
 
     # 6. Turnstile QR Access Configuration
     'qr_activation_minutes_before_class': 20,
