@@ -11,6 +11,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.core.exceptions import ValidationError
 from django.db import transaction
+from django.db.models import Q
 
 
 class ClassesPagination(PageNumberPagination):
