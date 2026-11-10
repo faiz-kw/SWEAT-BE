@@ -54,12 +54,13 @@ class SarvamVoiceAdapter(BaseCommunicationAdapter):
         """
         Validates whether all required workspace identifiers and API credentials exist.
         """
+        import os
         api_key = self._get_api_key()
-        org_id = self.config.get('org_id')
-        workspace_id = self.config.get('workspace_id')
-        app_id = self.config.get('app_id')
-        connection_id = self.config.get('connection_id')
-        agent_phone = self.config.get('agent_phone_number')
+        org_id = self.config.get('org_id') or os.getenv('SARVAM_ORG_ID')
+        workspace_id = self.config.get('workspace_id') or os.getenv('SARVAM_WORKSPACE_ID')
+        app_id = self.config.get('app_id') or os.getenv('SARVAM_APP_ID')
+        connection_id = self.config.get('connection_id') or os.getenv('SARVAM_CONNECTION_ID')
+        agent_phone = self.config.get('agent_phone_number') or os.getenv('SARVAM_AGENT_PHONE_NUMBER')
 
         return bool(api_key and org_id and workspace_id and app_id and connection_id and agent_phone)
 
@@ -74,27 +75,29 @@ class SarvamVoiceAdapter(BaseCommunicationAdapter):
         Submits an individual outbound call to Sarvam Instant Outbound API.
         Does not log API key or PII.
         """
-        if not self.is_configured():
+        import os
+        api_key = self._get_api_key()
+        org_id = self.config.get('org_id') or os.getenv('SARVAM_ORG_ID')
+        workspace_id = self.config.get('workspace_id') or os.getenv('SARVAM_WORKSPACE_ID')
+        app_id = self.config.get('app_id') or os.getenv('SARVAM_APP_ID')
+        app_version = self.config.get('app_version') or os.getenv('SARVAM_APP_VERSION') or 1
+        connection_id = self.config.get('connection_id') or os.getenv('SARVAM_CONNECTION_ID')
+        agent_phone = self.config.get('agent_phone_number') or os.getenv('SARVAM_AGENT_PHONE_NUMBER')
+
+        if not (api_key and org_id and workspace_id and app_id and connection_id and agent_phone):
             missing = []
-            if not self._get_api_key(): missing.append('api_key')
-            if not self.config.get('org_id'): missing.append('org_id')
-            if not self.config.get('workspace_id'): missing.append('workspace_id')
-            if not self.config.get('app_id'): missing.append('app_id')
-            if not self.config.get('connection_id'): missing.append('connection_id')
-            if not self.config.get('agent_phone_number'): missing.append('agent_phone_number')
+            if not api_key: missing.append('api_key')
+            if not org_id: missing.append('org_id')
+            if not workspace_id: missing.append('workspace_id')
+            if not app_id: missing.append('app_id')
+            if not connection_id: missing.append('connection_id')
+            if not agent_phone: missing.append('agent_phone_number')
             return ProviderSendResult(
                 success=False,
                 status='FAILED',
                 error_code='UNCONFIGURED',
                 error_message=f"Sarvam Voice adapter is missing required configuration: {', '.join(missing)}",
             )
-
-        org_id = self.config['org_id']
-        workspace_id = self.config['workspace_id']
-        app_id = self.config['app_id']
-        app_version = self.config.get('app_version', 1)
-        connection_id = self.config['connection_id']
-        agent_phone = self.config['agent_phone_number']
 
         endpoint_url = f"{SARVAM_OUTBOUND_BASE_URL}/orgs/{org_id}/workspaces/{workspace_id}/outbounds"
 
