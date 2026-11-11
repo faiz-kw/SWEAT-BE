@@ -823,16 +823,19 @@ class ClickToCallView(APIView):
         if not lead or not lead.phone_normalized:
             return Response({'error': 'Lead not found or has no phone number.'}, status=status.HTTP_404_NOT_FOUND)
 
-        # 2. Resolve Agent Presence & SIP Endpoint — prioritize user's own configured presence
+        # 2. Resolve Agent Presence & SIP Endpoint — strictly require the agent's own registered line
         presence = AgentPresence.objects.filter(user=user).first()
-        if not presence:
-            presence = AgentPresence.objects.filter(sip_username='sweatagent104201155654570218059').first() or AgentPresence.objects.filter(sip_username='iqra24030269280035568').first()
-        if not presence:
-            presence = AgentPresence.objects.create(
-                organization=lead.organization,
-                user=user,
-                sip_username='sweatagent104201155654570218059',
-                status='AVAILABLE',
+        if (
+            not presence
+            or not presence.sip_username
+            or presence.sip_username.startswith(('unassigned_', 'agent_'))
+        ):
+            return Response(
+                {
+                    'error': 'No dedicated Vobiz softphone line available for this account. Outbound manual calling requires a registered line.',
+                    'code': 'NO_TELEPHONY_LINE',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         # 3. Create CallSession record
@@ -1267,8 +1270,13 @@ class TelephonyEventsSseView(View):
             pubsub = sync_redis.pubsub()
             pubsub.subscribe(channel)
 
+            # Bound stream lifetime so synchronous Gunicorn/WSGI workers are recycled cleanly;
+            # browser EventSource automatically reconnects.
+            max_stream_seconds = 45.0
+            started_at = time.monotonic()
+
             try:
-                while True:
+                while (time.monotonic() - started_at) < max_stream_seconds:
                     try:
                         msg = pubsub.get_message(ignore_subscribe_messages=True, timeout=15.0)
                     except Exception as poll_err:
@@ -1289,6 +1297,7 @@ class TelephonyEventsSseView(View):
                             logger.error("Failed to parse SSE event message: %s", parse_err)
                     else:
                         yield f": heartbeat {timezone.now().isoformat()}\n\n"
+                yield ": stream_recycle\n\n"
             except GeneratorExit:
                 pass
             finally:
@@ -1375,17 +1384,19 @@ class AgentPresenceView(APIView):
         with resolve_telephony_tenant_context():
             presence = AgentPresence.objects.filter(user=request.user).first()
             if presence:
-                # 1. Self-healing check: If agent is marked ON_CALL, verify active session
-                if presence.status == 'ON_CALL':
+                sip_user = presence.sip_username
+                is_registered = bool(sip_user and not sip_user.startswith(('unassigned_', 'agent_')))
+
+                # 1. Self-healing check: If registered agent is stuck ON_CALL/WRAP_UP with finished session
+                if is_registered and presence.status == 'ON_CALL':
                     active = presence.active_session
-                    # If no session assigned, or session is concluded / cancelled, release to AVAILABLE
                     if not active or active.status in ('COMPLETED', 'NO_ANSWER', 'FAILED', 'BUSY', 'CANCELLED') or active.ended_at is not None:
                         logger.info("AgentPresenceView: Auto-releasing %s from stale ON_CALL to AVAILABLE", request.user.email)
                         presence.status = 'AVAILABLE'
                         presence.active_session = None
                         presence.last_heartbeat = timezone.now()
                         presence.save(update_fields=['status', 'active_session', 'last_heartbeat'])
-                elif presence.status == 'WRAP_UP':
+                elif is_registered and presence.status == 'WRAP_UP':
                     active = presence.active_session
                     two_min_ago = timezone.now() - timedelta(minutes=2)
                     is_session_done = not active or active.status in ('COMPLETED', 'NO_ANSWER', 'FAILED', 'BUSY', 'CANCELLED') or active.ended_at is not None
@@ -1395,44 +1406,63 @@ class AgentPresenceView(APIView):
                         presence.active_session = None
                         presence.last_heartbeat = timezone.now()
                         presence.save(update_fields=['status', 'active_session', 'last_heartbeat'])
-                elif presence.status == 'AVAILABLE':
-                    # Active tab polling keeps the agent's heartbeat fresh so they are prioritized for routing
-                    presence.last_heartbeat = timezone.now()
-                    presence.save(update_fields=['last_heartbeat'])
 
-                status_val = presence.status
-                sip_user = presence.sip_username
+                # NOTE: Never write last_heartbeat on GET polls when status == AVAILABLE;
+                # explicit PUT heartbeats handle freshness without turning GET polling into write storms.
+                status_val = presence.status if is_registered else 'OFFLINE'
                 last_hb = presence.last_heartbeat
                 active_id = str(presence.active_session.id) if presence.active_session else None
             else:
-                status_val = 'AVAILABLE'
+                status_val = 'OFFLINE'
                 sip_user = ''
                 last_hb = None
                 active_id = None
+                is_registered = False
 
             return Response({
                 'status': status_val,
                 'sip_username': sip_user,
                 'last_heartbeat': last_hb,
                 'active_session_id': active_id,
+                'is_registered_endpoint': is_registered,
             }, status=status.HTTP_200_OK)
 
     def put(self, request):
+        from django.db import IntegrityError, transaction
+
         new_status = request.data.get('status', 'AVAILABLE').upper()
         if new_status not in ('AVAILABLE', 'WRAP_UP', 'OFFLINE'):
             return Response({'error': 'Invalid status.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        uid_hex = request.user.id.hex[:12] if hasattr(request.user.id, 'hex') else str(request.user.id)[:12]
+        unassigned_sip = f"unassigned_{uid_hex}"
+
         with resolve_telephony_tenant_context():
-            presence, _ = AgentPresence.objects.get_or_create(
-                user=request.user,
-                defaults={
-                    'organization': Organization.objects.first(),
-                    'sip_username': f"agent_{request.user.id.hex[:6]}",
-                    'status': new_status,
-                },
+            try:
+                with transaction.atomic():
+                    presence, _ = AgentPresence.objects.get_or_create(
+                        user=request.user,
+                        defaults={
+                            'organization': getattr(request.user, 'organization', None) or Organization.objects.first(),
+                            'sip_username': unassigned_sip,
+                            'status': 'OFFLINE',
+                        },
+                    )
+            except IntegrityError:
+                presence = AgentPresence.objects.filter(user=request.user).first()
+                if not presence:
+                    return Response({'error': 'Could not resolve agent presence.'}, status=status.HTTP_409_CONFLICT)
+
+            is_registered = bool(
+                presence.sip_username
+                and not presence.sip_username.startswith(('unassigned_', 'agent_'))
             )
-            presence.status = new_status
-            if new_status == 'AVAILABLE':
+
+            # Unassigned accounts without a dedicated Vobiz line must remain OFFLINE
+            # so they are never selected for inbound call dispatch.
+            effective_status = new_status if is_registered else 'OFFLINE'
+            presence.status = effective_status
+            if effective_status == 'AVAILABLE':
                 presence.active_session = None
             presence.last_heartbeat = timezone.now()
             presence.save(update_fields=['status', 'active_session', 'last_heartbeat'])
@@ -1442,6 +1472,7 @@ class AgentPresenceView(APIView):
                 'sip_username': presence.sip_username,
                 'last_heartbeat': presence.last_heartbeat,
                 'active_session_id': str(presence.active_session.id) if presence.active_session else None,
+                'is_registered_endpoint': is_registered,
             }, status=status.HTTP_200_OK)
 
 
@@ -1686,9 +1717,32 @@ class AgentWebRTCCredentialsView(APIView):
                 status=status.HTTP_403_FORBIDDEN
             )
 
-        with resolve_telephony_tenant_context():
-            creds = TelephonyConfigService.get_agent_webrtc_credentials(request.user)
-            return Response(creds, status=status.HTTP_200_OK)
+        try:
+            with resolve_telephony_tenant_context():
+                creds = TelephonyConfigService.get_agent_webrtc_credentials(request.user)
+                return Response(creds, status=status.HTTP_200_OK)
+        except Exception as exc:
+            logger.exception("Failed to resolve WebRTC credentials for user %s: %s", getattr(request.user, "email", request.user.id), exc)
+            return Response(
+                {
+                    "username": "",
+                    "sip_username": "",
+                    "password": "",
+                    "sip_password": "",
+                    "sip_domain": "",
+                    "sip_uri": "",
+                    "wss_url": "",
+                    "caller_id": "",
+                    "ring_timeout_sec": 30,
+                    "status": "UNASSIGNED",
+                    "line_status": "UNASSIGNED",
+                    "is_registered_endpoint": False,
+                    "available": False,
+                    "can_make_calls": False,
+                    "error": "No dedicated Vobiz softphone line available for this account.",
+                },
+                status=status.HTTP_200_OK,
+            )
 
 
 class TelephonyConfigView(APIView):

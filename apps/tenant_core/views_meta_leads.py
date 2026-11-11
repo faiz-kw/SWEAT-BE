@@ -1101,10 +1101,16 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
     @action(detail=False, methods=['post'], url_path='disconnect')
     def disconnect(self, request):
         connection_id = request.data.get('connection_id') or request.data.get('id')
+        conn = None
         if connection_id:
-            conn = MetaConnection.objects.using(self.alias).filter(
-                organization=self.organization, id=connection_id
-            ).first()
+            import uuid
+            try:
+                valid_uuid = uuid.UUID(str(connection_id).strip())
+                conn = MetaConnection.objects.using(self.alias).filter(
+                    organization=self.organization, id=valid_uuid
+                ).first()
+            except (ValueError, TypeError, Exception):
+                conn = None
             if not conn:
                 conn = MetaConnection.objects.using(self.alias).filter(
                     organization=self.organization, meta_user_id=str(connection_id)

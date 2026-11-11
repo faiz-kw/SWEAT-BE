@@ -175,13 +175,20 @@ class TelephonyConfigService:
 
         active_window = timezone.now() - timedelta(minutes=8)
 
-        # 1. Preferred user check (must be actively online in WebPhone)
+        eligible_agents = (
+            AgentPresence.objects.using(alias)
+            .exclude(sip_username="")
+            .exclude(sip_username__startswith="unassigned_")
+            .exclude(sip_username__startswith="agent_")
+            .exclude(sip_username__icontains="test")
+        )
+
+        # 1. Preferred user check (must be actively online with a real SIP line)
         if preferred_user:
-            assigned_presence = AgentPresence.objects.using(alias).filter(
+            assigned_presence = eligible_agents.filter(
                 user=preferred_user,
             ).select_related("user").first()
             if assigned_presence:
-                is_online = bool(assigned_presence.last_heartbeat and assigned_presence.last_heartbeat >= active_window)
                 if assigned_presence.status == "AVAILABLE":
                     logger.info("Telephony dispatch: Selected preferred assigned rep %s (%s)", preferred_user.email, assigned_presence.sip_username)
                     return assigned_presence
@@ -196,36 +203,36 @@ class TelephonyConfigService:
 
         # 2. Branch-specific available agent
         if caller_branch:
-            branch_agent = AgentPresence.objects.using(alias).filter(
+            branch_agent = eligible_agents.filter(
                 user__home_branch=caller_branch,
                 status="AVAILABLE",
-            ).exclude(sip_username__icontains="test").order_by("-last_heartbeat").select_related("user").first()
+            ).order_by("-last_heartbeat").select_related("user").first()
             if branch_agent:
                 logger.info("Telephony dispatch: Selected branch %s rep %s (%s)", caller_branch.name, branch_agent.user.email, branch_agent.sip_username)
                 return branch_agent
 
-        # 3. Any available rep in the organization (excluding test users), prioritizing active heartbeats
+        # 3. Any available rep in the organization (excluding test/unassigned users), prioritizing active heartbeats
         org_filter = {"organization": org} if org else {}
 
         # First priority: Agents with active heartbeats within the last 8 minutes
-        available = AgentPresence.objects.using(alias).filter(
+        available = eligible_agents.filter(
             status="AVAILABLE",
             last_heartbeat__gte=active_window,
             **org_filter,
-        ).exclude(sip_username__icontains="test").order_by("-last_heartbeat").select_related("user").first()
+        ).order_by("-last_heartbeat").select_related("user").first()
 
         # Second priority: Fall back to ANY agent marked AVAILABLE in the organization (even if heartbeat was missed)
         if not available:
-            available = AgentPresence.objects.using(alias).filter(
+            available = eligible_agents.filter(
                 status="AVAILABLE",
                 **org_filter,
-            ).exclude(sip_username__icontains="test").order_by("-last_heartbeat").select_related("user").first()
+            ).order_by("-last_heartbeat").select_related("user").first()
 
         # Resilient fallback across tenant database if org_filter yielded no results
         if not available:
-            available = AgentPresence.objects.using(alias).filter(
+            available = eligible_agents.filter(
                 status="AVAILABLE",
-            ).exclude(sip_username__icontains="test").order_by("-last_heartbeat").select_related("user").first()
+            ).order_by("-last_heartbeat").select_related("user").first()
 
         if available:
             logger.info("Telephony dispatch: Selected available rep %s (%s)", available.user.email, available.sip_username)
@@ -233,19 +240,19 @@ class TelephonyConfigService:
 
         # 4. Self-healing fallback: Release stale ON_CALL or WRAP_UP agents (> 5 minutes or completed sessions)
         five_min_ago = timezone.now() - timedelta(minutes=5)
-        stale_agent = AgentPresence.objects.using(alias).filter(
+        stale_agent = eligible_agents.filter(
             status__in=["WRAP_UP", "ON_CALL"],
             last_heartbeat__lt=five_min_ago,
-        ).exclude(sip_username__icontains="test").order_by("-last_heartbeat").select_related("user").first()
+        ).order_by("-last_heartbeat").select_related("user").first()
 
         if not stale_agent:
             # Check agents marked ON_CALL or WRAP_UP whose active session is already finished or None
-            stale_agent = AgentPresence.objects.using(alias).filter(
+            stale_agent = eligible_agents.filter(
                 status__in=["ON_CALL", "WRAP_UP"],
             ).filter(
                 models.Q(active_session__isnull=True) |
                 models.Q(active_session__status__in=["COMPLETED", "NO_ANSWER", "FAILED", "BUSY", "CANCELLED"])
-            ).exclude(sip_username__icontains="test").order_by("-last_heartbeat").select_related("user").first()
+            ).order_by("-last_heartbeat").select_related("user").first()
 
         if stale_agent:
             logger.info("Self-heal: Auto-releasing stale %s agent %s (%s) to AVAILABLE", stale_agent.status, stale_agent.user.email, stale_agent.sip_username)
@@ -262,8 +269,11 @@ class TelephonyConfigService:
         """
         Dynamically returns WebRTC SIP credentials for the authenticated user.
         Ensures the agent has an AgentPresence record and returns the exact WSS endpoint.
+        When all dedicated Vobiz endpoints are occupied, assigns an explicit
+        ``unassigned_<id>`` placeholder without colliding on the shared primary endpoint.
         """
         alias = db_alias or get_tenant_db_alias() or "default"
+        from django.db import IntegrityError, transaction
         from apps.tenant_core.models_crm import AgentPresence
         from apps.tenant_core.models_org import Organization
 
@@ -274,56 +284,107 @@ class TelephonyConfigService:
             os.getenv("VOBIZ_DEFAULT_SIP_USER")
             or "iqra24030269280035568"
         )
-        fallback_endpoints = [
+        fallback_endpoints = list(dict.fromkeys([
             primary_endpoint,
             "sweatagent104201155654570218059",
-        ]
+        ]))
 
-        # Look up or initialize AgentPresence for this user
+        def _is_registered_sip(sip_name: Optional[str]) -> bool:
+            return bool(sip_name and not sip_name.startswith(("unassigned_", "agent_")))
+
+        def _claim_free_endpoint(exclude_id=None) -> Optional[str]:
+            qs = AgentPresence.objects.using(alias)
+            for ep in fallback_endpoints:
+                ep_qs = qs.filter(sip_username=ep)
+                if exclude_id is not None:
+                    ep_qs = ep_qs.exclude(id=exclude_id)
+                if not ep_qs.exists():
+                    return ep
+            return None
+
+        uid_hex = user.id.hex[:12] if hasattr(user.id, "hex") else str(user.id)[:12]
+        unassigned_sip = f"unassigned_{uid_hex}"
+
+        # Look up or initialize AgentPresence for this user safely under concurrency
         presence = AgentPresence.objects.using(alias).filter(user=user).first()
         if not presence:
             user_org = getattr(user, 'organization', None) or Organization.objects.using(alias).first()
-            assigned_ep = None
-            for ep in fallback_endpoints:
-                if not AgentPresence.objects.using(alias).filter(sip_username=ep).exists():
-                    assigned_ep = ep
-                    break
-            default_sip_user = assigned_ep or primary_endpoint
+            assigned_ep = _claim_free_endpoint()
+            chosen_sip = assigned_ep or unassigned_sip
+            initial_status = "AVAILABLE" if assigned_ep else "OFFLINE"
 
-            presence = AgentPresence.objects.using(alias).create(
-                organization=user_org,
-                user=user,
-                sip_username=default_sip_user,
-                status="AVAILABLE",
-            )
-            logger.info("Provisioned new AgentPresence for user %s with sip_username=%s", user.email, default_sip_user)
-        elif not presence.sip_username or presence.sip_username.startswith("agent_"):
-            # Auto-heal: replace unregistered random dummy username with registered Vobiz endpoint
-            assigned_ep = None
-            for ep in fallback_endpoints:
-                if not AgentPresence.objects.using(alias).filter(sip_username=ep).exclude(id=presence.id).exists():
-                    assigned_ep = ep
-                    break
-            chosen_ep = assigned_ep or primary_endpoint
-            presence.sip_username = chosen_ep
-            presence.status = "AVAILABLE"
-            presence.save(using=alias, update_fields=["sip_username", "status"])
-            logger.info("Auto-healed placeholder SIP username for user %s -> %s", user.email, chosen_ep)
+            try:
+                with transaction.atomic(using=alias):
+                    presence, created = AgentPresence.objects.using(alias).get_or_create(
+                        user=user,
+                        defaults={
+                            "organization": user_org,
+                            "sip_username": chosen_sip,
+                            "status": initial_status,
+                        },
+                    )
+                    if created:
+                        logger.info(
+                            "Provisioned AgentPresence for user %s with sip_username=%s (registered=%s)",
+                            user.email,
+                            chosen_sip,
+                            bool(assigned_ep),
+                        )
+            except IntegrityError:
+                presence = AgentPresence.objects.using(alias).filter(user=user).first()
+                if not presence:
+                    with transaction.atomic(using=alias):
+                        presence, _ = AgentPresence.objects.using(alias).get_or_create(
+                            user=user,
+                            defaults={
+                                "organization": user_org,
+                                "sip_username": unassigned_sip,
+                                "status": "OFFLINE",
+                            },
+                        )
+        elif not _is_registered_sip(presence.sip_username):
+            # Auto-heal placeholder rows ONLY if an unclaimed real Vobiz endpoint is free.
+            # Never fall back to primary_endpoint when the pool is exhausted.
+            assigned_ep = _claim_free_endpoint(exclude_id=presence.id)
+            if assigned_ep:
+                try:
+                    with transaction.atomic(using=alias):
+                        presence.sip_username = assigned_ep
+                        presence.status = "AVAILABLE"
+                        presence.save(using=alias, update_fields=["sip_username", "status"])
+                        logger.info("Auto-healed placeholder SIP username for user %s -> %s", user.email, assigned_ep)
+                except IntegrityError:
+                    presence = AgentPresence.objects.using(alias).filter(user=user).first() or presence
+            elif not presence.sip_username or presence.sip_username.startswith("agent_"):
+                try:
+                    with transaction.atomic(using=alias):
+                        presence.sip_username = unassigned_sip
+                        presence.status = "OFFLINE"
+                        presence.save(using=alias, update_fields=["sip_username", "status"])
+                        logger.info("Pool exhausted; normalized agent %s -> %s (OFFLINE)", user.email, unassigned_sip)
+                except IntegrityError:
+                    presence = AgentPresence.objects.using(alias).filter(user=user).first() or presence
 
         sip_user = presence.sip_username
+        is_registered_endpoint = _is_registered_sip(sip_user)
         sip_domain = vobiz_cfg["registrar_host"]
-        sip_uri = f"sip:{sip_user}@{sip_domain}"
+        sip_uri = f"sip:{sip_user}@{sip_domain}" if is_registered_endpoint else ""
 
         return {
-            "username": sip_user,
-            "password": vobiz_cfg.get("endpoint_password", "Sweat@2026!"),
-            "sip_password": vobiz_cfg.get("endpoint_password", "Sweat@2026!"),
+            "username": sip_user if is_registered_endpoint else "",
+            "sip_username": sip_user,
+            "password": vobiz_cfg.get("endpoint_password", "Sweat@2026!") if is_registered_endpoint else "",
+            "sip_password": vobiz_cfg.get("endpoint_password", "Sweat@2026!") if is_registered_endpoint else "",
             "sip_domain": sip_domain,
             "sip_uri": sip_uri,
-            "wss_url": vobiz_cfg["webrtc_gateway_url"],
+            "wss_url": vobiz_cfg["webrtc_gateway_url"] if is_registered_endpoint else "",
             "caller_id": vobiz_cfg["from_number"],
             "ring_timeout_sec": vobiz_cfg["ring_timeout_sec"],
-            "status": presence.status,
+            "status": presence.status if is_registered_endpoint else "UNASSIGNED",
+            "line_status": "PROVISIONED" if is_registered_endpoint else "UNASSIGNED",
+            "is_registered_endpoint": is_registered_endpoint,
+            "available": is_registered_endpoint,
+            "can_make_calls": is_registered_endpoint,
             "display_name": f"{user.first_name} {user.last_name or ''}".strip() or user.email,
         }
 
