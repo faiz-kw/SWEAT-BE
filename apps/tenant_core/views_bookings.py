@@ -1406,6 +1406,24 @@ class TurnstileVerifyPunchView(APIView):
         from .services_bookings import BookingWaitlistAttendanceService
 
         token_str = str(raw_token).strip()
+
+        # Dedicated Vendor Bench Test Pass: Allows TimeWatch engineers to test hardware/relay repeatedly
+        if token_str in ('SWEAT_TEST_BENCH_PASS_001', 'TIMEWATCH_TEST_PASS_9999', 'SWEAT_BENCH_TEST'):
+            msg = (
+                f"Welcome TimeWatch Test Member! Access Granted."
+                if direction == 'ENTRY'
+                else f"Goodbye TimeWatch Test Member! Workout completed. Have a great day!"
+            )
+            return Response({
+                "allow_access": True,
+                "status": "GRANTED",
+                "direction": direction,
+                "user_name": "TimeWatch Test Member",
+                "member_number": "TEST-9999",
+                "class_name": "Bench Testing & Relay Validation",
+                "message": msg
+            }, status=status.HTTP_200_OK)
+
         # Compute SHA-256 hash if raw token; if already a 64-char hex hash, use directly
         if len(token_str) == 64 and all(c in '0123456789abcdefABCDEF' for c in token_str):
             token_hash = token_str.lower()

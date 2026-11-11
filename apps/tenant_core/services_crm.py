@@ -1129,23 +1129,24 @@ class CRMLeadService:
                             disp = line.replace("Disposition:", "").strip()
 
                 # Determine accurate disposition (preserve agent entered disposition)
-                if cs.disposition:
-                    disp = cs.disposition
-                elif has_trial_booking:
-                    disp = 'TRIAL_BOOKED'
-                elif not disp:
+                is_unanswered = cs.status in ('NO_ANSWER', 'MISSED', 'UNANSWERED', 'BUSY', 'FAILED', 'REJECTED')
+                if is_unanswered:
                     if cs.status in ('NO_ANSWER', 'MISSED', 'UNANSWERED'):
                         disp = 'NO_ANSWER'
                     elif cs.status == 'BUSY':
                         disp = 'BUSY'
-                    elif cs.status in ('FAILED', 'REJECTED'):
-                        disp = 'CALL_FAILED'
-                    elif cs.status == 'COMPLETED':
-                        disp = 'CALL_COMPLETED'
                     else:
-                        disp = cs.status
-
-                is_unanswered = cs.status in ('NO_ANSWER', 'MISSED', 'UNANSWERED', 'BUSY', 'FAILED', 'REJECTED')
+                        disp = 'CALL_FAILED'
+                elif cs.disposition:
+                    disp = cs.disposition
+                elif cs.status == 'COMPLETED':
+                    # Only map to TRIAL_BOOKED if a trial was actually booked during this call session
+                    if call_meta.get('trial_booked') or call_meta.get('trial_id'):
+                        disp = 'TRIAL_BOOKED'
+                    elif not disp:
+                        disp = 'CALL_COMPLETED'
+                elif not disp:
+                    disp = cs.status
                 has_rec = bool(cs.recording_url or cs.recording_storage_key or call_meta.get('recording_url') or call_meta.get('audio_url'))
                 rec_url = None
                 if has_rec:
