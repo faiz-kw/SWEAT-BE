@@ -1700,11 +1700,9 @@ class LeadViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
             else:
-                err_msg = session.error_message or 'Voice provider failed to initiate call.'
                 return Response(
                     {
-                        'error': err_msg,
-                        'detail': err_msg,
+                        'error': 'Voice provider failed to initiate call.',
                         'code': session.error_code or 'PROVIDER_FAILURE',
                         'call_session_id': str(session.id),
                         'status': 'FAILED',

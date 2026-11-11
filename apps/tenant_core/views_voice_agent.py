@@ -796,18 +796,24 @@ class VoiceAgentBookTrialView(View):
             if not lead and phone_number:
                 lead = _lookup_lead_by_phone(alias, phone_number)
 
-            # Resolve by explicit call_session_id param if provided
-            session_id_param = body_json.get('call_session_id') or body_json.get('session_id') or request.GET.get('call_session_id')
-            if not lead and session_id_param:
-                try:
-                    sess_uuid = uuid.UUID(str(session_id_param).strip())
-                    cs_obj = CallSession.objects.using(alias).filter(id=sess_uuid, organization=org).first()
-                    if cs_obj and cs_obj.lead:
-                        lead = cs_obj.lead
-                        if not phone_number:
-                            phone_number = cs_obj.user_phone_number or cs_obj.lead.phone_normalized
-                except Exception:
-                    pass
+            # Fallback: Correlate with active or recent CallSession within last 25 minutes
+            if not lead:
+                recent_cutoff = timezone.now() - timedelta(minutes=25)
+                active_cs = (
+                    CallSession.objects.using(alias)
+                    .filter(organization=org, created_at__gte=recent_cutoff)
+                    .exclude(status='FAILED')
+                    .order_by('-created_at')
+                    .first()
+                )
+                if active_cs and active_cs.lead:
+                    lead = active_cs.lead
+                    if not phone_number:
+                        phone_number = active_cs.user_phone_number or active_cs.lead.phone_normalized
+                    logger.info(
+                        "Resolved lead %s (%s, %s) from active CallSession %s for voice agent trial booking",
+                        lead.id, lead.first_name, phone_number, active_cs.id
+                    )
 
             if not lead and not phone_number:
                 return JsonResponse({
@@ -2474,21 +2480,12 @@ class VoiceAgentCallOutcomeView(View):
                 call_dur = float(active_cs.duration_seconds)
 
             recent_trial = TrialBooking.objects.using(alias).filter(lead=lead).order_by('-created_at').first() if lead else None
-            is_unanswered_sess = bool(
-                recent_sess and recent_sess.status in ('NO_ANSWER', 'MISSED', 'UNANSWERED', 'BUSY', 'FAILED', 'REJECTED')
-            )
-            is_recent_trial = bool(
-                recent_trial
-                and not is_unanswered_sess
-                and (timezone.now() - recent_trial.created_at).total_seconds() < 900
-            )
+            is_recent_trial = bool(recent_trial and (timezone.now() - recent_trial.created_at).total_seconds() < 900)
 
             first_name = lead.first_name if lead else 'the lead'
 
             if not disposition:
-                if is_unanswered_sess:
-                    disposition = 'NO_ANSWER' if recent_sess.status in ('NO_ANSWER', 'MISSED', 'UNANSWERED') else ('BUSY' if recent_sess.status == 'BUSY' else 'CALL_FAILED')
-                elif is_recent_trial and call_dur >= 10:
+                if is_recent_trial:
                     disposition = 'TRIAL_BOOKED'
                 elif call_dur > 0 and call_dur < 25:
                     disposition = 'HUNG_UP'

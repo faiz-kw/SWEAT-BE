@@ -587,129 +587,22 @@ class VoiceCallingService:
                 'ended_at', 'metadata', 'updated_at'
             ])
 
-            # 5. Lead Lifecycle Progression & Intelligent Unanswered Recovery
-            if session.lead:
+            # 5. Lead Lifecycle Progression (Connected -> Advance status if NEW_LEAD)
+            if session.lead and mapped_status == 'COMPLETED':
                 lead = session.lead
-                if mapped_status == 'COMPLETED':
-                    if getattr(lead, 'current_status', None) == 'NEW_LEAD':
-                        from apps.tenant_core.services_crm import CRMLeadService
-                        try:
-                            CRMLeadService.transition_lead_status(
-                                lead=lead,
-                                new_status='FOLLOW_UP_PENDING',
-                                reason_code='AI_CALL_CONNECTED',
-                                reason_text=f"AI voice call connected successfully ({int(session.duration_seconds)}s)",
-                                actor_user=None,
-                                db_alias=alias,
-                            )
-                        except Exception as e:
-                            logger.warning("Failed to auto-advance lead %s status: %s", lead.id, e)
-                elif mapped_status in ('NO_ANSWER', 'BUSY', 'FAILED'):
-                    session.disposition = mapped_status
-                    session.save(using=alias, update_fields=['disposition', 'updated_at'])
-
-                    from apps.tenant_core.models_crm import LeadActivity, SalesFollowupTask
-                    is_automated = bool(
-                        session.metadata.get('automated')
-                        or session.metadata.get('source') == 'AUTOMATED_LEAD_ACQUISITION'
-                    )
-
-                    if is_automated and lead.current_status not in ('CONVERTED', 'LOST', 'TRIAL_CONFIRMED', 'TRIAL_ATTENDED'):
-                        prior_attempts = CallSession.objects.using(alias).filter(
+                if getattr(lead, 'current_status', None) == 'NEW_LEAD':
+                    from apps.tenant_core.services_crm import CRMLeadService
+                    try:
+                        CRMLeadService.transition_lead_status(
                             lead=lead,
-                            provider='SARVAM',
-                        ).count()
-
-                        if prior_attempts <= 1:
-                            # Attempt 1 failed -> Schedule Attempt 2 for 30 minutes later (respecting IST calling hours)
-                            IST = zoneinfo.ZoneInfo('Asia/Kolkata')
-                            now_ist = timezone.now().astimezone(IST)
-                            target_retry = now_ist + timedelta(minutes=30)
-                            if target_retry.hour >= 21:
-                                target_retry = (now_ist + timedelta(days=1)).replace(hour=9, minute=15, second=0, microsecond=0)
-                            elif target_retry.hour < 9:
-                                target_retry = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
-
-                            delay_seconds = max(60, int((target_retry - now_ist).total_seconds()))
-
-                            tenant_slug = 'sweat'
-                            try:
-                                from apps.master.models_tenant import Tenant
-                                t_obj = Tenant.objects.using('default').first()
-                                if t_obj:
-                                    tenant_slug = str(t_obj.id)
-                            except Exception:
-                                pass
-
-                            from apps.tenant_core.tasks_voice_calling import trigger_automated_sarvam_call_task
-                            trigger_automated_sarvam_call_task.apply_async(
-                                kwargs={
-                                    'tenant_id': tenant_slug,
-                                    'lead_id': str(lead.id),
-                                    'attempt_number': 2,
-                                },
-                                countdown=delay_seconds,
-                            )
-
-                            LeadActivity.objects.using(alias).create(
-                                lead=lead,
-                                activity_type='CALL',
-                                outcome=f'AI Call Attempt 1: {mapped_status.replace("_", " ").title()}',
-                                notes=(
-                                    f"🤖 AI Outbound Call (Attempt 1) resulted in '{mapped_status}'. "
-                                    f"Intelligent recovery: Scheduled 2nd retry attempt in {int(delay_seconds / 60)} minutes ({target_retry.strftime('%I:%M %p IST')})."
-                                ),
-                                activity_at=timezone.now(),
-                            )
-                            logger.info("Scheduled 2nd AI call attempt for lead %s in %d seconds", lead.id, delay_seconds)
-                        else:
-                            # Attempt 2 failed -> Escalate to human sales team!
-                            assigned_user = lead.assigned_sales_user
-                            has_recent_task = SalesFollowupTask.objects.using(alias).filter(
-                                lead=lead,
-                                status='PENDING',
-                                title__icontains='Unanswered AI Call',
-                            ).exists()
-
-                            if not has_recent_task:
-                                due_at = timezone.now() + timedelta(hours=2)
-                                SalesFollowupTask.objects.using(alias).create(
-                                    organization=organization,
-                                    lead=lead,
-                                    assigned_to_user=assigned_user,
-                                    title=f"Unanswered AI Call (2 attempts) - Manual Outreach Required",
-                                    description=(
-                                        f"Prospect did not answer 2 automated AI calls ({mapped_status}). "
-                                        f"Please reach out via WhatsApp or manual phone call."
-                                    ),
-                                    priority='HIGH',
-                                    task_type='CALL',
-                                    due_date=due_at,
-                                    status='PENDING',
-                                )
-
-                            LeadActivity.objects.using(alias).create(
-                                lead=lead,
-                                activity_type='CALL',
-                                outcome='AI Call: Max Attempts Reached - Handed to Sales',
-                                notes=(
-                                    f"🤖 Both automated AI call attempts were unanswered ({mapped_status}). "
-                                    f"Created high-priority follow-up task for sales team manual outreach."
-                                ),
-                                activity_at=timezone.now(),
-                            )
-                            logger.info("Max AI call attempts reached for lead %s; created human sales follow-up task", lead.id)
-                    else:
-                        # Manual call initiated by staff
-                        LeadActivity.objects.using(alias).create(
-                            lead=lead,
-                            activity_type='CALL',
-                            outcome=f'AI Call: {mapped_status.replace("_", " ").title()}',
-                            notes=(
-                                f"Outbound AI call placed to {lead.first_name} timed out or was not answered ({mapped_status})."
-                            ),
-                            activity_at=timezone.now(),
+                            new_status='FOLLOW_UP_PENDING',
+                            reason_code='AI_CALL_CONNECTED',
+                            reason_text=f"AI voice call connected successfully ({int(session.duration_seconds)}s)",
+                            actor_user=None,
+                            db_alias=alias,
                         )
+                    except Exception as e:
+                        logger.warning("Failed to auto-advance lead %s status: %s", lead.id, e)
 
         return {
             'status': 'recorded',
