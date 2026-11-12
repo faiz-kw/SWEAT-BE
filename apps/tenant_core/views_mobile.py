@@ -2599,6 +2599,47 @@ class MobileCancelBookingView(APIView):
         })
 
 
+class MobileNotificationsView(APIView):
+    """
+    GET  /api/v1/mobile/notifications/   -> member's in-app notifications + unread count.
+    POST /api/v1/mobile/notifications/   -> mark read: {"ids": [...]} or {"all": true}.
+    Powers the app's notification bell/inbox (e.g. class-cancelled / credit-restored alerts).
+    """
+    permission_classes = [IsAuthenticated]
+
+    def _alias(self, request):
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        return alias or getattr(request.user._state, 'db', None) or get_tenant_db_alias() or 'default'
+
+    def get(self, request):
+        alias = self._alias(request)
+        from .models_govern import InAppNotification
+        qs = InAppNotification.objects.using(alias).filter(user=request.user).order_by('-created_at')[:50]
+        unread = InAppNotification.objects.using(alias).filter(user=request.user, is_read=False).count()
+        items = [{
+            'id': str(n.id),
+            'type': n.notification_type,
+            'title': n.title,
+            'message': n.message,
+            'is_read': n.is_read,
+            'deep_link': n.deep_link,
+            'data': n.data,
+            'created_at': n.created_at.isoformat() if n.created_at else None,
+        } for n in qs]
+        return Response({'unread_count': unread, 'notifications': items})
+
+    def post(self, request):
+        alias = self._alias(request)
+        from .models_govern import InAppNotification
+        data = request.data or {}
+        qs = InAppNotification.objects.using(alias).filter(user=request.user, is_read=False)
+        if not data.get('all'):
+            ids = data.get('ids') or []
+            qs = qs.filter(id__in=ids)
+        marked = qs.update(is_read=True, read_at=timezone.now())
+        return Response({'marked_read': marked})
+
+
 class MobileRescheduleBookingView(APIView):
     """
     POST /api/v1/mobile/bookings/<uuid:booking_id>/reschedule/
