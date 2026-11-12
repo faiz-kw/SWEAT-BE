@@ -250,12 +250,22 @@ class CommunicationWebhookView(APIView):
                     body_clean = inbound_msg_data.body.strip().upper()
                     if inbound_msg.lead and inbound_msg.related_trial:
                         trial = inbound_msg.related_trial
-                        if 'CONFIRM' in body_clean and trial.confirmation_status == 'PENDING':
-                            from apps.tenant_core.services_crm import CRMTrialService
-                            CRMTrialService.confirm_trial(trial, confirmed_by='INBOUND_REPLY', channel=inbound_msg_data.channel)
-                        elif 'RESCHEDULE' in body_clean:
-                            from apps.tenant_core.services_crm import CRMTrialService
-                            CRMTrialService.request_reschedule(trial, reason=inbound_msg_data.body[:200])
+                        from apps.tenant_core.services_crm import CRMLeadService
+                        if any(kw in body_clean for kw in ('CONFIRM', 'YES', 'ATTEND', 'COMING')) and trial.confirmation_status == 'PENDING':
+                            CRMLeadService.confirm_trial(
+                                trial=trial,
+                                channel=inbound_msg_data.channel or 'WHATSAPP',
+                                notes=f"Confirmed via inbound {inbound_msg_data.channel} message: '{inbound_msg_data.body[:100]}'",
+                                actor_user=None,
+                                db_alias=db_alias,
+                            )
+                        elif any(kw in body_clean for kw in ('RESCHEDULE', 'CHANGE', 'POSTPONE')):
+                            CRMLeadService.request_reschedule_trial(
+                                trial=trial,
+                                reason=f"Inbound {inbound_msg_data.channel} request: '{inbound_msg_data.body[:200]}'",
+                                actor_user=None,
+                                db_alias=db_alias,
+                            )
 
                     recorded_inbound += 1
                     last_inbound_resp = {

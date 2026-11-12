@@ -2028,7 +2028,7 @@ class MobileClaimFreeTrialView(APIView):
             if lead:
                 lead.current_status = 'TRIAL_BOOKED'
                 lead.save(using=alias, update_fields=['current_status'])
-                TrialBooking.objects.using(alias).get_or_create(
+                trial_obj, created_tb = TrialBooking.objects.using(alias).get_or_create(
                     lead=lead,
                     class_occurrence_id=occurrence.id,
                     defaults={
@@ -2041,6 +2041,21 @@ class MobileClaimFreeTrialView(APIView):
                         'booking_source': 'MOBILE_APP',
                     }
                 )
+                if created_tb:
+                    from .services_reliability import enqueue_outbox_event
+                    enqueue_outbox_event(
+                        organization=occurrence.branch.organization if occurrence.branch else (lead.organization if lead else None),
+                        event_type='CRM_TRIAL_BOOKED',
+                        aggregate_type='TrialBooking',
+                        aggregate_id=str(trial_obj.id),
+                        payload={
+                            'trial_id': str(trial_obj.id),
+                            'lead_id': str(lead.id),
+                            'branch_id': str(occurrence.branch.id) if occurrence.branch else None,
+                            'scheduled_start': occurrence.start_at.isoformat() if occurrence.start_at else None,
+                        },
+                        db_alias=alias,
+                    )
         except Exception as trial_crm_err:
             logger.warning("Could not sync CRM trial booking for %s: %s", user.email, trial_crm_err)
 

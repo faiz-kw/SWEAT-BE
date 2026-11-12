@@ -205,7 +205,8 @@ class VobizInboundWebhookView(APIView):
                 models.Q(sip_username=clean_from_sip) | models.Q(sip_username=raw_from)
             ).select_related('user', 'organization').first()
 
-            is_softphone_outbound = bool(agent_presence) or raw_from.startswith('sip:') or '@registrar.vobiz.ai' in raw_from
+            registrar_host = vobiz_cfg.get('registrar_host') or 'registrar.vobiz.ai'
+            is_softphone_outbound = bool(agent_presence) or raw_from.startswith('sip:') or f'@{registrar_host}' in raw_from or '@registrar.vobiz.ai' in raw_from
 
             if is_softphone_outbound:
                 # ── OUTBOUND CALL FROM AGENT SOFTPHONE ──
@@ -215,7 +216,7 @@ class VobizInboundWebhookView(APIView):
                 else:
                     customer_phone = f"+{digits_to}" if digits_to else raw_to
 
-                caller_id = vobiz_cfg.get('from_number') or "+919240954144"
+                caller_id = vobiz_cfg.get('from_number') or ""
                 rep_user = agent_presence.user if agent_presence else None
                 org = agent_presence.organization if agent_presence else Organization.objects.first()
 
@@ -457,9 +458,10 @@ class VobizInboundWebhookView(APIView):
                     'caller_type': caller_type,
                 })
 
-            xml = """<?xml version="1.0" encoding="UTF-8"?>
+            org_label = (org.name if org and getattr(org, 'name', None) else "our team")
+            xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Speak voice="WOMAN" language="en-IN">Welcome to SWEAT Elite. All our fitness consultants are currently on active calls. We have logged your priority callback.</Speak>
+  <Speak voice="WOMAN" language="en-IN">Welcome to {org_label}. All our consultants are currently on active calls. We have logged your priority callback.</Speak>
   <Hangup/>
 </Response>"""
             return HttpResponse(xml, content_type="application/xml; charset=utf-8")
@@ -504,8 +506,10 @@ class VobizInboundFallbackWebhookView(APIView):
                 last_heartbeat__gte=active_window,
             ).exclude(user=session.sales_rep if session else None).order_by('-last_heartbeat').first()
 
+            vobiz_cfg = TelephonyConfigService.get_vobiz_config()
             host = _get_webhook_host(request)
-            caller_id = session.agent_phone_number if session else "+919200000001"
+            session_caller_id = session.agent_phone_number if (session and session.agent_phone_number and str(session.agent_phone_number).startswith('+')) else ''
+            caller_id = session_caller_id or vobiz_cfg.get('from_number') or ""
 
             if secondary_presence:
                 secondary_user = secondary_presence.user
@@ -532,13 +536,15 @@ class VobizInboundFallbackWebhookView(APIView):
                 })
 
                 complete_url = f"{host}/api/v1/telephony/hangup/"
-                agent_sip = f"sip:{secondary_presence.sip_username}@registrar.vobiz.ai"
+                registrar_host = vobiz_cfg.get('registrar_host') or 'registrar.vobiz.ai'
+                agent_sip = f"sip:{secondary_presence.sip_username}@{registrar_host}"
                 xml = VobizVoiceAdapter.build_fallback_overflow_xml(
                     secondary_sip_uri=agent_sip,
                     caller_id=caller_id,
                     complete_action_url=complete_url,
                     whisper_prompt="Please stay on the line while we connect you to our senior consultant.",
-                    timeout=20,
+                    timeout=int(vobiz_cfg.get('ring_timeout_sec') or 20),
+                    registrar_host=registrar_host,
                 )
                 return HttpResponse(xml, content_type="application/xml; charset=utf-8")
 
@@ -853,23 +859,21 @@ class ClickToCallView(APIView):
             started_at=timezone.now(),
         )
 
+        vobiz_cfg = TelephonyConfigService.get_vobiz_config()
         host = _get_webhook_host(request)
         answer_url = f"{host}/api/v1/telephony/agent-answer-bridge/?session_id={session.id}"
         hangup_url = f"{host}/api/v1/telephony/hangup/?session_id={session.id}"
-        agent_sip_uri = f"sip:{presence.sip_username}@registrar.vobiz.ai"
+        registrar_host = vobiz_cfg.get('registrar_host') or 'registrar.vobiz.ai'
+        agent_sip_uri = f"sip:{presence.sip_username}@{registrar_host}"
 
-        # 4. Dispatch via VobizVoiceAdapter
-        did_number = os.getenv('VOBIZ_VIRTUAL_DID', '+919240954144')
-        adapter = VobizVoiceAdapter(configuration={
-            'from_number': did_number,
-            'api_base_url': 'https://api.vobiz.ai/api/v1',
-        })
+        # 4. Dispatch via VobizVoiceAdapter using dynamic tenant configuration
+        adapter = VobizVoiceAdapter(configuration=vobiz_cfg)
         result = adapter.initiate_click_to_call(
             agent_sip_uri=agent_sip_uri,
             customer_phone=lead.phone_normalized,
             answer_url=answer_url,
             hangup_url=hangup_url,
-            timeout=15,
+            timeout=int(vobiz_cfg.get('ring_timeout_sec') or 35),
         )
 
         if result.success and result.provider_message_id:
@@ -912,15 +916,18 @@ class AgentAnswerBridgeXmlView(APIView):
             lead_name = f"{lead.first_name} {lead.last_name or ''}".strip() or "Member"
             whisper = f"Connecting you to {lead_name}."
 
+            vobiz_cfg = TelephonyConfigService.get_vobiz_config()
             host = _get_webhook_host(request)
             rec_callback_url = f"{host}/api/v1/telephony/recording/?session_id={session.id}"
             hangup_url = f"{host}/api/v1/telephony/hangup/?session_id={session.id}"
+            session_caller_id = session.agent_phone_number if (session.agent_phone_number and str(session.agent_phone_number).startswith('+')) else ''
+            caller_id = session_caller_id or vobiz_cfg.get('from_number') or ""
 
             xml = VobizVoiceAdapter.build_agent_bridge_customer_xml(
                 customer_phone=lead.phone_normalized,
-                caller_id=session.agent_phone_number or "+919200000001",
+                caller_id=caller_id,
                 whisper_text=whisper,
-                record=True,
+                record=bool(vobiz_cfg.get('record_all_calls', True)),
                 recording_callback_url=rec_callback_url,
                 hangup_url=hangup_url,
             )
@@ -1752,26 +1759,30 @@ class TelephonyConfigView(APIView):
     """
     permission_classes = [permissions.IsAuthenticated]
 
+    @staticmethod
+    def _sanitize_config(cfg: dict) -> dict:
+        raw_token = cfg.get('auth_token', '')
+        masked_token = f"{raw_token[:4]}••••••••{raw_token[-4:]}" if len(raw_token) > 8 else ("••••••••" if raw_token else "")
+        raw_ep_pwd = cfg.get('endpoint_password', '')
+        safe_cfg = dict(cfg)
+        safe_cfg['auth_token_masked'] = masked_token
+        safe_cfg['endpoint_password_masked'] = "••••••••" if raw_ep_pwd else ""
+        safe_cfg.pop('auth_token', None)
+        safe_cfg.pop('endpoint_password', None)
+        return safe_cfg
+
     def get(self, request):
         with resolve_telephony_tenant_context():
             cfg = TelephonyConfigService.get_vobiz_config()
-            raw_token = cfg.get('auth_token', '')
-            masked_token = f"{raw_token[:4]}••••••••{raw_token[-4:]}" if len(raw_token) > 8 else "••••••••"
-            safe_cfg = dict(cfg)
-            safe_cfg['auth_token_masked'] = masked_token
-            safe_cfg.pop('auth_token', None)
-            return Response(safe_cfg, status=status.HTTP_200_OK)
+            return Response(self._sanitize_config(cfg), status=status.HTTP_200_OK)
 
     def post(self, request):
         with resolve_telephony_tenant_context():
             updated = TelephonyConfigService.update_vobiz_config(request.data)
-            safe_updated = dict(updated)
-            safe_updated['auth_token_masked'] = "••••••••"
-            safe_updated.pop('auth_token', None)
             return Response({
                 'success': True,
                 'message': 'Telephony configuration updated successfully.',
-                'config': safe_updated,
+                'config': self._sanitize_config(updated),
             }, status=status.HTTP_200_OK)
 
 

@@ -2892,8 +2892,13 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("You do not have permission to book trials at this branch.")
 
         org = _get_org(request)
-        lead = get_object_or_404(Lead.objects.using(alias), id=lead_id)
-        branch = get_object_or_404(Branch.objects.using(alias), id=branch_id)
+        lead_qs = Lead.objects.using(alias)
+        branch_qs = Branch.objects.using(alias)
+        if org:
+            lead_qs = lead_qs.filter(organization=org)
+            branch_qs = branch_qs.filter(organization=org)
+        lead = get_object_or_404(lead_qs, id=lead_id)
+        branch = get_object_or_404(branch_qs, id=branch_id)
 
         try:
             start_str = request.data.get('scheduled_start')
@@ -2901,6 +2906,11 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
             scheduled_start = parse_datetime(start_str) if start_str else None
             scheduled_end = parse_datetime(end_str) if end_str else None
 
+            confirm_upfront = bool(
+                request.data.get('confirm_upfront')
+                or request.data.get('is_confirmed')
+                or request.data.get('confirmation_status') == 'CONFIRMED'
+            )
             trial = CRMLeadService.book_trial(
                 lead=lead,
                 branch=branch,
@@ -2911,6 +2921,7 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
                 booking_source=request.data.get('booking_source', 'FRONT_DESK'),
                 notes=request.data.get('notes'),
                 actor_user=request.user,
+                confirm_upfront=confirm_upfront,
                 db_alias=alias,
             )
             return Response(TrialBookingSerializer(trial).data, status=status.HTTP_201_CREATED)

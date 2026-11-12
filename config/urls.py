@@ -33,6 +33,7 @@ from apps.tenant_core.views_voice_agent import (
     VoiceAgentStudioFaqView,
 )
 from apps.tenant_core import views_telephony
+from apps.tenant_core import views_public_trial
 
 # Django admin branding
 admin.site.site_header = "PerformanceOS • Platform Control Panel"
@@ -47,6 +48,14 @@ urlpatterns = [
     path('health/', HealthLivenessView.as_view(), name='platform-liveness'),
     path('ready/', HealthReadinessView.as_view(), name='platform-readiness'),
     path('admin/', admin.site.urls),
+
+    # 1-Tap Trial Confirmation & Reschedule Short-Links (WhatsApp Interactive Buttons)
+    path('c/<str:token>/', views_public_trial.PublicTrialConfirmationView.as_view(), name='trial-public-confirm-short'),
+    path('c/<str:token>', views_public_trial.PublicTrialConfirmationView.as_view(), name='trial-public-confirm-short-noslash'),
+    path('r/<str:token>/', views_public_trial.PublicTrialRescheduleView.as_view(), name='trial-public-reschedule-short'),
+    path('r/<str:token>', views_public_trial.PublicTrialRescheduleView.as_view(), name='trial-public-reschedule-short-noslash'),
+    path('p/<str:token>/', views_public_trial.PublicTrialPassView.as_view(), name='trial-public-pass-short'),
+    path('p/<str:token>', views_public_trial.PublicTrialPassView.as_view(), name='trial-public-pass-short-noslash'),
 
     # Auth — Platform login, Tenant login, Token refresh
     path('api/v1/auth/', include('apps.authentication.urls')),

@@ -772,6 +772,7 @@ class TrialBooking(models.Model):
         ('FRONT_DESK', 'Front Desk'),
         ('SALES', 'Sales Rep'),
         ('ADMIN', 'Admin'),
+        ('VOICE_AGENT', 'AI Voice Agent'),
         ('OTHER', 'Other'),
     ]
     CONFIRMATION_STATUSES = [
