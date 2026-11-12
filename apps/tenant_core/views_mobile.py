@@ -1579,13 +1579,16 @@ class MobileScheduleView(APIView):
             if hide_full and not is_bookable:
                 continue
 
-            # Trainer details
+            # Trainer details.
+            # When no trainer is assigned we return TRUTHFUL empty values (no fake Pilates
+            # specialties/bio/photo) so the app can show its own fallback (e.g. company logo)
+            # and never prints "Reformer Pilates" on a non-Pilates class.
             trainer_name = 'SWEAT Trainer'
             trainer_photo = ''
-            trainer_title = 'Master Coach'
-            trainer_bio = 'Certified Reformer Pilates & Conditioning Specialist.'
-            trainer_specialties = ['Reformer Pilates', 'Strength & Core', 'Postural Alignment']
-            trainer_experience = 5.0
+            trainer_title = ''
+            trainer_bio = ''
+            trainer_specialties = []
+            trainer_experience = 0.0
 
             trainer_assignment = occ.trainer_assignments.filter(trainer_role='LEAD').first() or occ.trainer_assignments.first()
             if trainer_assignment and trainer_assignment.trainer_profile:
@@ -1661,10 +1664,13 @@ class MobileScheduleView(APIView):
             results.append({
                 'id': str(occ.id),
                 'class_id': str(template.id) if template else None,
-                'class_name': template.name if template else 'Reformer Session',
+                'class_name': template.name if template else 'SWEAT Class',
+                # Class/program image for the card. Empty when unset so the app shows the
+                # company-logo fallback instead of a generic Pilates placeholder.
+                'image_url': (template.image_url if (template and template.image_url) else ''),
                 'program_id': str(template.program_id) if (template and template.program_id) else None,
-                'program_name': template.program.name if (template and template.program) else (category.name if category else 'Pilates Reformer'),
-                'category': category.name if category else 'Pilates Reformer',
+                'program_name': template.program.name if (template and template.program) else (category.name if category else ''),
+                'category': category.name if category else '',
                 'category_id': str(category.id) if category else None,
                 'category_code': category.code if category else None,
                 'branch': {
