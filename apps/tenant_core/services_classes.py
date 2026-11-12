@@ -20,7 +20,7 @@ from decimal import Decimal
 from datetime import date, datetime, timedelta, time, timezone as dt_timezone
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, List
-from django.db import transaction, models
+from django.db import transaction, models, IntegrityError
 from django.db.models import Q
 from django.utils import timezone
 from django.core.exceptions import ValidationError
@@ -261,14 +261,18 @@ class ClassSchedulingService:
                 local_end = datetime.combine(curr, rule.end_time).replace(tzinfo=branch_tz)
                 end_dt = local_end.astimezone(dt_timezone.utc)
 
-                # Check existence before inserting to prevent duplicate generation
-                exists = ClassOccurrence.objects.using(alias).filter(
+                # Idempotent + parallel-safe: only one ACTIVE occurrence may exist per
+                # (branch, class_template, start_at). The DB partial-unique constraint
+                # (uniq_active_occurrence_branch_tpl_start) is the real guard; the pre-check
+                # avoids churn, and the IntegrityError catch handles a concurrent insert that
+                # wins the race between the check and our save.
+                exists_active = ClassOccurrence.objects.using(alias).filter(
                     branch=rule.branch,
                     class_template=rule.class_template,
                     start_at=start_dt,
-                ).exists()
+                ).exclude(status__in=['CANCELLED', 'DEACTIVATED']).exists()
 
-                if not exists:
+                if not exists_active:
                     occ = ClassOccurrence(
                         class_template=rule.class_template,
                         schedule_rule=rule,
@@ -282,8 +286,14 @@ class ClassSchedulingService:
                         waitlist_capacity=wait_cap,
                         status='OPEN',
                     )
-                    occ.save(using=alias)
-                    created_occurrences.append(occ)
+                    try:
+                        with transaction.atomic(using=alias):
+                            occ.save(using=alias)
+                        created_occurrences.append(occ)
+                    except IntegrityError:
+                        # A concurrent generation run inserted this slot first. Not an error:
+                        # the slot is now filled, so skip it.
+                        pass
 
             curr += timedelta(days=1)
 

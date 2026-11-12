@@ -279,6 +279,14 @@ class ClassOccurrence(models.Model):
         ]
         constraints = [
             models.CheckConstraint(condition=models.Q(end_at__gt=models.F('start_at')), name='chk_occurrence_end_gt_start'),
+            # One ACTIVE class per (branch, template, start time). Cancelled/deactivated
+            # rows are exempt so history is preserved. This is the parallel-proof guard:
+            # concurrent generation runs can no longer create duplicate slots.
+            models.UniqueConstraint(
+                fields=['branch', 'class_template', 'start_at'],
+                condition=~models.Q(status__in=['CANCELLED', 'DEACTIVATED']),
+                name='uniq_active_occurrence_branch_tpl_start',
+            ),
         ]
 
     def save(self, *args, **kwargs):
