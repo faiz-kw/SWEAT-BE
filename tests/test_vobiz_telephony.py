@@ -52,7 +52,7 @@ class VobizTelephonyTests(TestCase):
         self.presence = AgentPresence.objects.create(
             organization=self.org,
             user=self.rep,
-            sip_username="agent_priya",
+            sip_username="iqra24030269280035568",
             status="AVAILABLE",
         )
 
@@ -92,7 +92,7 @@ class VobizTelephonyTests(TestCase):
         self.assertIn('<Dial', xml)
         self.assertIn('timeout="15"', xml)
         self.assertIn('callerId="+919200000001"', xml)
-        self.assertIn('<User>agent_priya</User>', xml)
+        self.assertIn('<User>sip:agent_priya@registrar.vobiz.ai</User>', xml)
 
     def test_agent_bridge_customer_xml_generation(self):
         """Generates whisper tone and bridges customer on PSTN."""
@@ -117,8 +117,8 @@ class VobizTelephonyTests(TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res['Content-Type'], 'application/xml; charset=utf-8')
         content = res.content.decode('utf-8')
-        self.assertIn('<User>agent_priya</User>', content)
-        self.assertIn('timeout="20"', content)
+        self.assertIn('<User>sip:iqra24030269280035568@registrar.vobiz.ai</User>', content)
+        self.assertIn('timeout="35"', content)
 
         # Verify CallSession created in DB
         session = CallSession.objects.filter(provider_attempt_id='test-uuid-987').first()
@@ -207,7 +207,7 @@ class VobizTelephonyTests(TestCase):
 
         # Lead stage advanced
         self.lead.refresh_from_db()
-        self.assertEqual(self.lead.current_status, 'TRIAL_SCHEDULED')
+        self.assertEqual(self.lead.current_status, 'TRIAL_BOOKED')
 
         # Agent presence reset to AVAILABLE
         self.presence.refresh_from_db()
