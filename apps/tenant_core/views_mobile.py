@@ -3642,6 +3642,42 @@ class MobileCheckoutVerifyView(APIView):
                         )
                         membership = m_to_frz
 
+                elif action_type == 'PASSPORT':
+                    m_id = meta.get('membership_id')
+                    qty = Decimal(str(meta.get('quantity', 1) or 1))
+                    m_psp = Membership.objects.using(alias).filter(id=m_id).first() if m_id else None
+                    if not m_psp:
+                        m_psp = Membership.objects.using(alias).filter(user_profile=profile, status='ACTIVE').order_by('-created_at').first()
+                    if m_psp:
+                        from .models_memberships import MembershipEntitlement, MembershipEntitlementLedger
+                        p_ent = MembershipEntitlement.objects.using(alias).filter(
+                            membership=m_psp, entitlement_type__in=['CROSS_BRANCH_SESSION', 'CROSS_BRANCH']
+                        ).first()
+                        if p_ent:
+                            p_ent.allocated_units = (p_ent.allocated_units or Decimal('0.00')) + qty
+                            p_ent.status = 'ACTIVE'
+                            p_ent.save(using=alias, update_fields=['allocated_units', 'status', 'updated_at'])
+                        else:
+                            p_ent = MembershipEntitlement.objects.using(alias).create(
+                                membership=m_psp,
+                                entitlement_type='CROSS_BRANCH_SESSION',
+                                allocated_units=qty,
+                                consumed_units=Decimal('0.00'),
+                                valid_from=m_psp.start_date,
+                                valid_until=m_psp.end_date,
+                                status='ACTIVE',
+                            )
+                        MembershipEntitlementLedger.objects.using(alias).create(
+                            membership_entitlement=p_ent,
+                            transaction_type='ALLOCATION',
+                            units=qty,
+                            reason_code='PASSPORT_TOPUP_PURCHASE',
+                            reason_text=f"Paid passport purchase (Order {order.order_number})",
+                            balance_after=p_ent.remaining_units,
+                            created_by_user=user,
+                        )
+                        membership = m_psp
+
                 else:
                     # Default / NEW_MEMBERSHIP
                     order_item = order.items.filter(item_type='PACKAGE').first()
@@ -5939,51 +5975,72 @@ class MobilePassportTopupView(APIView):
 
         total_price = unit_price * Decimal(str(quantity))
 
-        return Response({'detail': 'Passport purchase is not available on the app. Please contact studio administration.', 'code': 'PASSPORT_NOT_PERMITTED'}, status=status.HTTP_403_FORBIDDEN)
-
-        # 4. Top up passport session entitlement
         from django.db import transaction
-        from .models_memberships import MembershipEntitlement, MembershipEntitlementLedger
+        from .models_commerce import Order, OrderItem
+        from .services_razorpay import RazorpayService
 
+        metadata_dict = {
+            'action_type': 'PASSPORT',
+            'membership_id': str(active_mem.id),
+            'quantity': quantity,
+            'unit_price': str(unit_price),
+        }
         with transaction.atomic(using=alias):
-            passport_ent = ent_qs.filter(
-                models.Q(entitlement_type='CROSS_BRANCH_SESSION') | models.Q(entitlement_type='CROSS_BRANCH')
-            ).first()
-
-            if passport_ent:
-                passport_ent.allocated_units = (passport_ent.allocated_units or Decimal('0.00')) + Decimal(str(quantity))
-                passport_ent.status = 'ACTIVE'
-                passport_ent.save(using=alias, update_fields=['allocated_units', 'status', 'updated_at'])
-            else:
-                passport_ent = MembershipEntitlement.objects.using(alias).create(
-                    membership=active_mem,
-                    entitlement_type='CROSS_BRANCH_SESSION',
-                    allocated_units=Decimal(str(quantity)),
-                    consumed_units=Decimal('0.00'),
-                    valid_from=active_mem.start_date,
-                    valid_until=active_mem.end_date,
-                    status='ACTIVE',
-                )
-
-            MembershipEntitlementLedger.objects.using(alias).create(
-                membership_entitlement=passport_ent,
-                transaction_type='ALLOCATION',
-                units=Decimal(str(quantity)),
-                reason_code='PASSPORT_TOPUP_PURCHASE',
-                reason_text=f"Purchased {quantity} passport session(s) at ₹{unit_price} each",
-                balance_after=passport_ent.remaining_units,
-                created_by_user=user,
+            order_num = f"PSP-{uuid.uuid4().hex[:8].upper()}"
+            order = Order.objects.using(alias).create(
+                branch=active_mem.home_branch,
+                user_profile=profile,
+                order_number=order_num,
+                order_type='OTHER',
+                source='MOBILE_APP',
+                status='PENDING_PAYMENT',
+                subtotal=total_price,
+                discount_amount=Decimal('0.00'),
+                tax_amount=Decimal('0.00'),
+                total_amount=total_price,
+                currency='INR',
+                notes=json.dumps(metadata_dict),
+            )
+            OrderItem.objects.using(alias).create(
+                order=order,
+                item_type='PACKAGE',
+                item_name_snapshot=f"Passport Sessions x{quantity}",
+                quantity=Decimal(str(quantity)),
+                unit_price_snapshot=unit_price,
+                tax_amount=Decimal('0.00'),
+                total_amount=total_price,
             )
 
+        amount_paise = RazorpayService.convert_inr_to_paise(total_price)
+        key_id = 'rzp_test_placeholder'
+        rzp_order_id = f"order_test_{order.order_number}"
+        if RazorpayService.is_configured(db_alias=alias) and amount_paise > 0:
+            key_id, _ = RazorpayService.get_credentials(db_alias=alias)
+            try:
+                rzp_order = RazorpayService.create_order(
+                    amount_paise=amount_paise,
+                    receipt=order.order_number,
+                    currency=order.currency,
+                    notes={'internal_order_id': str(order.id), 'order_type': 'PASSPORT'},
+                    db_alias=alias,
+                )
+                rzp_order_id = rzp_order['id']
+            except Exception as e:
+                logger.error("Razorpay passport order creation failed: %s", e)
+
         return Response({
-            'success': True,
-            'message': f"Successfully added {quantity} passport session(s).",
-            'quantity_added': quantity,
+            'order_id': str(order.id),
+            'order_number': order.order_number,
+            'razorpay_order_id': rzp_order_id,
+            'razorpay_key_id': key_id,
+            'amount': float(total_price),
+            'amount_paise': amount_paise,
+            'currency': order.currency,
+            'quantity': quantity,
             'unit_price': float(unit_price),
-            'total_price': float(total_price),
-            'passport_sessions_remaining': float(passport_ent.remaining_units or 0),
-            'home_sessions_remaining': float(home_ent.remaining_units or 0) if not home_ent.is_unlimited else 'UNLIMITED',
-        }, status=status.HTTP_200_OK)
+            'requires_payment': True,
+            'detail': f"Passport order for {quantity} session(s) created. Complete payment to activate.",
+        }, status=status.HTTP_201_CREATED)
 
 
 class MobileTicketsView(APIView):
