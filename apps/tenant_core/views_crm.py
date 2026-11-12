@@ -1459,7 +1459,10 @@ class LeadViewSet(viewsets.ModelViewSet):
     def trials(self, request, pk=None):
         lead = self.get_object()
         alias = _get_db(request)
-        all_trials = list(TrialBooking.objects.using(alias).filter(lead=lead).select_related(
+        # Exclude 'Experience the Studio' visit intents -- those have their own section/endpoint.
+        all_trials = list(TrialBooking.objects.using(alias).filter(lead=lead).exclude(
+            trial_type='STUDIO_EXPERIENCE'
+        ).select_related(
             'branch', 'assigned_trainer_profile'
         ).order_by('-created_at'))
 
@@ -1469,6 +1472,20 @@ class LeadViewSet(viewsets.ModelViewSet):
         else:
             trials_sorted = all_trials
         return Response(TrialBookingSerializer(trials_sorted, many=True).data)
+
+    @action(detail=True, methods=['get'], url_path='experience-studio')
+    def experience_studio(self, request, pk=None):
+        """
+        GET /api/v1/tenant/leads/{id}/experience-studio/
+        The lead's 'Experience the Studio' visit intents (branch + preferred date/time + class).
+        Dedicated section in the lead profile, separate from Trials.
+        """
+        lead = self.get_object()
+        alias = _get_db(request)
+        exps = TrialBooking.objects.using(alias).filter(
+            lead=lead, trial_type='STUDIO_EXPERIENCE'
+        ).select_related('branch').order_by('-created_at')
+        return Response(TrialBookingSerializer(exps, many=True).data)
 
     @action(detail=True, methods=['post'], url_path='call')
     def call(self, request, pk=None):

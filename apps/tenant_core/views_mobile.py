@@ -2093,6 +2093,123 @@ class MobileClaimFreeTrialView(APIView):
         return Response(resp_data, status=status.HTTP_201_CREATED)
 
 
+class ExperienceStudioView(APIView):
+    """
+    POST /api/v1/mobile/experience-studio/
+    Captures a lead's 'Experience the Studio' visit intent: branch + date + preferred time + class.
+    LOOSE preference -- no capacity check, no slot held, and does NOT consume the free trial.
+    Stored as a TrialBooking(trial_type='STUDIO_EXPERIENCE') so it surfaces in the CRM lead
+    profile under a dedicated 'Experience the Studio' section.
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        from datetime import time as dt_time, timezone as dt_timezone
+        from zoneinfo import ZoneInfo
+        from .models_crm import Lead, LeadSource, TrialBooking
+
+        alias, tenant = _resolve_mobile_tenant_and_db(request)
+        if not alias or not tenant:
+            return Response(
+                {'detail': 'Organization not found or inactive. Please specify a valid organization.',
+                 'code': 'TENANT_NOT_FOUND'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        data = request.data or {}
+        first_name = (data.get('first_name') or data.get('name') or '').strip()
+        last_name = (data.get('last_name') or '').strip()
+        email = (data.get('email') or '').strip().lower()
+        phone = (data.get('phone') or data.get('contactNumber') or '').strip()
+        branch_id = data.get('branch_id') or data.get('branch')
+        date_str = data.get('date')
+        time_str = (data.get('time') or data.get('time_slot') or data.get('preferred_time') or '').strip()
+        class_name = (data.get('class') or data.get('class_name') or data.get('program') or '').strip()
+        program_id = data.get('program_id')
+
+        if not email and not phone:
+            return Response({'detail': 'Please provide your name and email or phone number.',
+                             'code': 'GUEST_INFO_REQUIRED'}, status=status.HTTP_400_BAD_REQUEST)
+        if not branch_id:
+            return Response({'detail': 'Please select a branch to visit.', 'code': 'BRANCH_REQUIRED'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        branch = Branch.objects.using(alias).filter(id=branch_id).first()
+        if not branch:
+            return Response({'detail': 'Branch not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Build the preferred visit time (branch tz -> UTC). Loose: just a preference.
+        tz_name = getattr(branch, 'timezone', None) or 'Asia/Kolkata'
+        try:
+            btz = ZoneInfo(tz_name)
+        except Exception:
+            btz = ZoneInfo('Asia/Kolkata')
+        try:
+            d = datetime.strptime(date_str[:10], '%Y-%m-%d').date() if date_str else timezone.now().date()
+        except Exception:
+            d = timezone.now().date()
+        start_t = None
+        for fmt in ('%H:%M', '%I:%M %p', '%I %p', '%H:%M:%S', '%I:%M%p'):
+            try:
+                start_t = datetime.strptime(time_str, fmt).time()
+                break
+            except Exception:
+                continue
+        if not start_t:
+            start_t = dt_time(10, 0)
+        start_dt = datetime.combine(d, start_t).replace(tzinfo=btz).astimezone(dt_timezone.utc)
+        end_dt = start_dt + timedelta(hours=1)
+
+        org = Organization.objects.using(alias).filter(status='ACTIVE').first()
+
+        # Resolve or create the lead.
+        lead = None
+        if email:
+            lead = Lead.objects.using(alias).filter(email_normalized__iexact=email).first()
+        if not lead and phone:
+            lead = Lead.objects.using(alias).filter(phone_normalized=re.sub(r'\D', '', phone)[-10:]).first()
+        if not lead:
+            lead_source, _ = LeadSource.objects.using(alias).get_or_create(
+                organization=org, code='MOBILE_APP',
+                defaults={'name': 'Mobile App', 'source_type': 'MOBILE_APP', 'status': 'ACTIVE'})
+            lead = CRMLeadService.create_lead(
+                organization=org, first_name=first_name or 'Guest', last_name=last_name,
+                phone=phone, email=email, branch=branch, lead_source=lead_source, db_alias=alias)
+
+        # Optional: record the class/program of interest on the lead.
+        if program_id:
+            from .models_catalog import Program
+            prog = Program.objects.using(alias).filter(id=program_id).first()
+            if prog and hasattr(lead, 'interested_program_id'):
+                lead.interested_program = prog
+                try:
+                    lead.save(using=alias, update_fields=['interested_program', 'updated_at'])
+                except Exception:
+                    lead.save(using=alias, update_fields=['interested_program'])
+
+        note = ("Experience the Studio - class of interest: %s" % class_name) if class_name else "Experience the Studio visit"
+        exp = TrialBooking.objects.using(alias).create(
+            lead=lead,
+            branch=branch,
+            trial_type='STUDIO_EXPERIENCE',
+            scheduled_start=start_dt,
+            scheduled_end=end_dt,
+            status='BOOKED',
+            confirmation_status='PENDING',
+            booking_source='MOBILE_APP',
+            notes=note,
+        )
+
+        return Response({
+            'id': str(exp.id),
+            'type': 'STUDIO_EXPERIENCE',
+            'branch': {'id': str(branch.id), 'name': branch.name},
+            'date': d.isoformat(),
+            'time': start_t.strftime('%H:%M'),
+            'class': class_name or None,
+            'lead_id': str(lead.id) if lead else None,
+            'message': 'Thanks! See you at the studio. Our team will reach out to confirm your visit.',
+        }, status=status.HTTP_201_CREATED)
+
+
 class MobileBookClassView(APIView):
     """
     POST /api/v1/mobile/bookings/book/
