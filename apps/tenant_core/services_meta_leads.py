@@ -204,6 +204,12 @@ def process_live_import(organization, event_id, actor_user=None, graph_client=No
             organization=organization, page_id=event.page_id, is_active=True
         ).first()
 
+        # Resilient multi-account fallback: if page was connected under another connection in this tenant DB
+        if not page_conn or not page_conn.encrypted_page_access_token:
+            page_conn = MetaPageConnection.objects.using(alias).filter(
+                page_id=event.page_id, is_active=True
+            ).exclude(encrypted_page_access_token='').first()
+
         if not page_conn or not page_conn.encrypted_page_access_token:
             event.status = 'FAILED'
             event.error_code = 'PAGE_NOT_CONNECTED'
@@ -280,6 +286,21 @@ def process_live_import(organization, event_id, actor_user=None, graph_client=No
         mapping = MetaLeadMapping.objects.using(alias).filter(
             organization=organization, page_id=event.page_id, form_id=event.form_id, is_active=True,
         ).select_related('lead_source', 'branch', 'fallback_branch', 'assigned_sales_user').first()
+
+        # Fallback by globally-unique Meta form_id within the organization
+        if not mapping and event.form_id:
+            mapping = MetaLeadMapping.objects.using(alias).filter(
+                organization=organization, form_id=event.form_id, is_active=True,
+            ).select_related('lead_source', 'branch', 'fallback_branch', 'assigned_sales_user').first()
+
+        # Self-healing fallback across organizations if event was initially tagged with demo organization
+        if not mapping and event.form_id:
+            mapping = MetaLeadMapping.objects.using(alias).filter(
+                form_id=event.form_id, is_active=True,
+            ).select_related('lead_source', 'branch', 'fallback_branch', 'assigned_sales_user').first()
+            if mapping:
+                event.organization = mapping.organization
+                organization = mapping.organization
 
         if not mapping:
             event.status = 'NEEDS_MAPPING'
@@ -385,8 +406,22 @@ def _apply_mapping(event, mapping, alias, actor_user, is_live: bool = False):
         return
     # --- FIX: SUPPORT ALL BRANCHES IN META INGESTION END ---
 
-    email = validate_lead_email(mapped.get('email'), required=False)
-    phone = validate_lead_phone(mapped.get('phone'), required=False)
+    # Normalize dummy placeholder text sent by Meta Lead Ads Testing Tool
+    raw_first_name = mapped.get('first_name', '')
+    raw_last_name = mapped.get('last_name', '')
+    raw_email = mapped.get('email', '')
+    raw_phone = mapped.get('phone', '')
+
+    if '<test lead:' in str(raw_phone).lower() or 'dummy data' in str(raw_phone).lower():
+        raw_phone = '+919999999999'
+    if '<test lead:' in str(raw_email).lower() or 'dummy data' in str(raw_email).lower():
+        raw_email = 'meta_test@example.com'
+    if '<test lead:' in str(raw_first_name).lower():
+        mapped['first_name'] = 'Meta Test'
+        mapped['last_name'] = 'Lead'
+
+    email = validate_lead_email(raw_email, required=False)
+    phone = validate_lead_phone(raw_phone, required=False)
     contact = Q()
     if email:
         contact |= Q(email_normalized=email)

@@ -1684,6 +1684,29 @@ class MetaLeadImportViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retri
     pagination_class = MetaImportsPagination
 
     def get_queryset(self):
+        # Auto-reconcile any historical live imports whose page, form, or created lead
+        # belongs to self.organization but were legacy-stamped with a demo or mismatch organization
+        try:
+            org_page_ids = set(MetaPageConnection.objects.using(self.alias).filter(
+                organization=self.organization, is_active=True
+            ).values_list('page_id', flat=True))
+            org_form_ids = set(MetaLeadMapping.objects.using(self.alias).filter(
+                organization=self.organization, is_active=True
+            ).values_list('form_id', flat=True))
+
+            reconcile_filter = Q(lead__organization=self.organization)
+            if org_page_ids:
+                reconcile_filter |= Q(page_id__in=org_page_ids)
+            if org_form_ids:
+                reconcile_filter |= Q(form_id__in=org_form_ids)
+
+            MetaLeadImport.objects.using(self.alias).filter(
+                reconcile_filter,
+                mode='LIVE',
+            ).exclude(organization=self.organization).update(organization=self.organization)
+        except Exception as exc:
+            logger.debug("MetaLeadImport auto-reconciliation skipped: %s", exc)
+
         qs = MetaLeadImport.objects.using(self.alias).filter(organization=self.organization)
         params = getattr(self.request, 'query_params', getattr(self.request, 'GET', {}))
         mode = params.get('mode')
