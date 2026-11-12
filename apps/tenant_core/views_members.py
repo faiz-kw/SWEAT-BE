@@ -333,11 +333,11 @@ def serialize_member(profile: UserProfile, alias: str = 'default', compact: bool
     else:
         membership_status = 'INACTIVE'
 
-    # Resolve home branch: prioritize package branch (purchase_branch or home_branch),
-    # falling back to profile.preferred_branch or user.home_branch
+    # Resolve home branch: prioritize home_branch (where the member trains),
+    # falling back to purchase_branch, then profile.preferred_branch or user.home_branch
     branch = (
-        (active_m.purchase_branch or active_m.home_branch)
-        if (active_m and (active_m.purchase_branch or active_m.home_branch))
+        (active_m.home_branch or active_m.purchase_branch)
+        if (active_m and (active_m.home_branch or active_m.purchase_branch))
         else (profile.preferred_branch or getattr(user, 'home_branch', None))
     )
 

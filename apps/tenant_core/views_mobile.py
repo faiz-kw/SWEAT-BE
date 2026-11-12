@@ -1289,7 +1289,7 @@ class MobileScheduleView(APIView):
                     .order_by('-created_at')
                 )
                 active_pkg_branch = (
-                    (active_mems[0].purchase_branch or active_mems[0].home_branch)
+                    (active_mems[0].home_branch or active_mems[0].purchase_branch)
                     if active_mems else None
                 )
                 user_home_branch = (
