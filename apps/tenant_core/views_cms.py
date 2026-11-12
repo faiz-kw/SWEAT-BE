@@ -266,7 +266,12 @@ class MobileCMSHomeFeedView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request):
-        alias = get_current_tenant_db_alias() or 'default'
+        # Public endpoint: resolve the tenant DB the same way the other mobile views do,
+        # so CMS tables are read from the tenant database (not the empty 'default').
+        from apps.tenant_core.views_mobile import _resolve_mobile_tenant_and_db
+        alias, _tenant = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            alias = get_current_tenant_db_alias() or 'default'
         now = timezone.now()
         branch_id = request.query_params.get('branch_id')
 
