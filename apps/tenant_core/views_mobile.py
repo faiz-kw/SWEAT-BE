@@ -2552,6 +2552,41 @@ class MobileCancelBookingView(APIView):
             else 'Booking cancelled. Session credit forfeited per gym policy.'
         )
 
+        # In-app notification to the member: class cancelled (+ whether the credit was restored).
+        try:
+            from zoneinfo import ZoneInfo
+            from .models_govern import InAppNotification
+            occ = booking.occurrence
+            tpl = occ.class_template if occ else None
+            cls_name = tpl.name if tpl else 'your class'
+            org = (tpl.category.organization if (tpl and tpl.category) else None) or getattr(user, 'organization', None)
+            when = ''
+            if occ and occ.start_at:
+                tz_name = getattr(booking.branch, 'timezone', None) or 'Asia/Kolkata'
+                try:
+                    when = ' on ' + occ.start_at.astimezone(ZoneInfo(tz_name)).strftime('%d %b, %I:%M %p')
+                except Exception:
+                    when = ''
+            if is_refunded:
+                msg = f"Your {cls_name} class{when} has been cancelled and 1 session credit has been restored to your account."
+                title = 'Class Cancelled - Credit Restored'
+            else:
+                msg = (f"Your {cls_name} class{when} has been cancelled. As it was within "
+                       f"{policy_eval.get('cutoff_hours', 12)} hours of the start time, the session was not refunded per studio policy.")
+                title = 'Class Cancelled'
+            if org and user:
+                InAppNotification.objects.using(alias).create(
+                    organization=org,
+                    user=user,
+                    notification_type='BOOKING_CANCELLED',
+                    title=title,
+                    message=msg,
+                    deep_link=f"/bookings?booking={booking.id}",
+                    data={'booking_id': str(booking.id), 'refunded': is_refunded},
+                )
+        except Exception as _notif_err:
+            logger.warning("Could not create cancellation in-app notification: %s", _notif_err)
+
         return Response({
             'detail': detail_msg,
             'booking_id': str(booking.id),
