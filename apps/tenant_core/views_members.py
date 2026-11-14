@@ -3616,6 +3616,9 @@ class MemberViewSet(viewsets.ViewSet):
                 return Response({'error': 'Amount must be greater than zero.'}, status=status.HTTP_400_BAD_REQUEST)
         if not reason:
             reason = f'Extended by {days} days'
+        attachment_url = (request.data.get('attachment_url') or '').strip() or None
+        if attachment_url:
+            reason = f"{reason} | attachment: {attachment_url}"
 
         try:
             with transaction.atomic(using=alias):
@@ -3646,7 +3649,7 @@ class MemberViewSet(viewsets.ViewSet):
                         provider_transaction_id=(str(txn_ref)[:255] if txn_ref else None),
                         amount=facility_amount, currency='INR', status='SUCCESS', paid_at=timezone.now(),
                         metadata={'kind': 'EXTENSION', 'days': days, 'membership_id': str(active_m.id),
-                                  'transaction_details': txn_ref or ''})
+                                  'transaction_details': txn_ref or '', 'attachment_url': attachment_url or ''})
                     payment_info = {'order_number': ext_order.order_number, 'amount': str(facility_amount),
                                     'provider': provider, 'transaction_id': str(ext_txn.id)}
             return Response({
