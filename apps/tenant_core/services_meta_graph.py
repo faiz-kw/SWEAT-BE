@@ -284,17 +284,12 @@ class MetaGraphClient:
             raise ValueError("META_APP_ID is not configured in settings.")
 
         scopes = [
-
             'leads_retrieval',
-
             'pages_show_list',
-
             'pages_read_engagement',
-
             'pages_manage_ads',
-
             'pages_manage_metadata',
-
+            'business_management',
         ]
 
         params = {
@@ -404,24 +399,49 @@ class MetaGraphClient:
 
 
     def fetch_user_pages(self, user_access_token: str) -> List[Dict[str, Any]]:
-
         """Fetch all Facebook Pages managed by the user with their Page Access Tokens."""
-
         url = f"{GRAPH_API_BASE}/me/accounts"
-
         resp = requests.get(url, params={
-
             'access_token': user_access_token,
-
             'fields': 'id,name,access_token,tasks,category',
-
             'limit': 100,
-
         }, timeout=self.timeout)
-
         data = self._handle_response(resp)
+        pages = list(data.get('data', []))
+        page_ids = {str(p['id']) for p in pages if p.get('id')}
 
-        return data.get('data', [])
+        # Also discover Pages managed via Meta Business Accounts / Portfolios
+        try:
+            biz_resp = requests.get(f"{GRAPH_API_BASE}/me/businesses", params={
+                'access_token': user_access_token,
+                'fields': 'id,name',
+                'limit': 50,
+            }, timeout=self.timeout)
+            if biz_resp.status_code == 200:
+                businesses = biz_resp.json().get('data', [])
+                for b in businesses:
+                    b_id = b.get('id')
+                    if not b_id:
+                        continue
+                    for endpoint in ('owned_pages', 'client_pages'):
+                        try:
+                            bp_resp = requests.get(f"{GRAPH_API_BASE}/{b_id}/{endpoint}", params={
+                                'access_token': user_access_token,
+                                'fields': 'id,name,access_token,tasks,category',
+                                'limit': 100,
+                            }, timeout=self.timeout)
+                            if bp_resp.status_code == 200:
+                                for bp in bp_resp.json().get('data', []):
+                                    bp_id = str(bp.get('id'))
+                                    if bp_id and bp_id not in page_ids:
+                                        pages.append(bp)
+                                        page_ids.add(bp_id)
+                        except Exception:
+                            pass
+        except Exception as exc:
+            logger.debug("Business pages discovery skipped: %s", exc)
+
+        return pages
 
 
 
