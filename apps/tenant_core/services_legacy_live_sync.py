@@ -375,12 +375,10 @@ def sync_live_legacy_member_to_tenant(primary_uid: int, tenant_alias: str, org_i
                     start_date=datetime.strptime(start_d_str, '%Y-%m-%d').date() if start_d_str else timezone.now().date(),
                     end_date=datetime.strptime(end_d_str, '%Y-%m-%d').date() if end_d_str else timezone.now().date(),
                     status=status_val,
-                    home_branch_id=branch_uuid,
-                    purchase_branch_id=branch_uuid,
-                    package_id=uuid.UUID(DEFAULT_PACKAGE_ID),
-                    package_price_id=uuid.UUID(DEFAULT_PRICE_ID),
-                    package_version_id=uuid.UUID(DEFAULT_VERSION_ID),
-                    program_id=uuid.UUID(DEFAULT_PROGRAM_ID),
+                    # home_branch/purchase_branch intentionally NOT overwritten on re-sync:
+                    # respect any ops-initiated branch transfer. Branch is set only on create.
+                    # package/program/version also NOT overwritten on re-sync:
+                    # sync owns balances+status+dates only; package identity comes from the order/catalog.
                     legacy_reference=f"userplan:{p_uid}",
                     parq_status=getattr(existing_mem, 'parq_status', 'PENDING') or 'PENDING',
                     updated_at=timezone.now(),
@@ -471,7 +469,7 @@ def sync_live_legacy_member_to_tenant(primary_uid: int, tenant_alias: str, org_i
             .first()
         )
         if latest_pkg_mem and (latest_pkg_mem.purchase_branch_id or latest_pkg_mem.home_branch_id):
-            target_branch_id = latest_pkg_mem.purchase_branch_id or latest_pkg_mem.home_branch_id
+            target_branch_id = latest_pkg_mem.home_branch_id or latest_pkg_mem.purchase_branch_id
             if profile.preferred_branch_id != target_branch_id:
                 profile.preferred_branch_id = target_branch_id
                 profile.save(using=tenant_alias, update_fields=['preferred_branch'])
