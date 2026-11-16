@@ -2325,7 +2325,7 @@ class UniversalImportEngine:
             embed_url = ''
             m_yt = re.search(r'(?:v=|\/embed\/|\/shorts\/|youtu\.be\/|\/v\/)([a-zA-Z0-9_-]{11})', raw_url)
             if m_yt:
-                embed_url = f"https://www.youtube-nocookie.com/embed/{m_yt.group(1)}?rel=0&modestbranding=1"
+                embed_url = f"https://www.youtube-nocookie.com/embed/{m_yt.group(1)}?rel=0&modestbranding=1&controls=1&showinfo=0&iv_load_policy=3&fs=0&cc_load_policy=0"
             else:
                 embed_url = raw_url
 

@@ -1,6 +1,8 @@
 import os
-from django.http import HttpResponseRedirect
+import re
 import urllib.parse
+import requests
+from django.http import HttpResponseRedirect
 """Organisation-wide CRM configuration, Meta OAuth lifecycle, and import APIs."""
 import uuid
 import logging
@@ -281,9 +283,23 @@ class ImportSerializer(serializers.ModelSerializer):
                     val = vals[0] if vals else None
                     if val:
                         if 'email' in name and not email:
-                            email = validate_lead_email(val, required=False)
+                            try:
+                                email = validate_lead_email(val, required=False)
+                            except Exception:
+                                email = None
                         elif any(p in name for p in ('phone', 'mobile', 'contact')) and not phone:
-                            phone = validate_lead_phone(val, required=False)
+                            try:
+                                phone = validate_lead_phone(val, required=False)
+                            except Exception:
+                                # Safe fallback for 11+ digit phone entries (e.g. Meta test submissions)
+                                digits = re.sub(r'\D', '', str(val))
+                                if len(digits) >= 10:
+                                    try:
+                                        phone = validate_lead_phone(digits[-10:], required=False)
+                                    except Exception:
+                                        phone = None
+                                else:
+                                    phone = None
 
             contact = Q()
             if email:
@@ -1247,6 +1263,20 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
                 p_name = p.get('name', f"Page {p_id}")
                 p_token = p.get('access_token', '')
 
+                # Self-healing fallback if token was omitted by business page edge
+                if not p_token and user_token:
+                    try:
+                        from .services_meta_graph import GRAPH_API_BASE
+                        pt_resp = requests.get(
+                            f"{GRAPH_API_BASE}/{p_id}",
+                            params={'access_token': user_token, 'fields': 'access_token'},
+                            timeout=10
+                        )
+                        if pt_resp.status_code == 200:
+                            p_token = pt_resp.json().get('access_token', '')
+                    except Exception:
+                        pass
+
                 subscribed = False
                 if p_token:
                     try:
@@ -1563,6 +1593,7 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
             'meta_app_configured': bool(app_id),
             'webhook_endpoint': '/api/v1/webhooks/meta/leads/',
             'simulator_enabled': simulator_enabled(),
+            'has_received_enquiries': MetaLeadImport.objects.using(self.alias).filter(organization=self.organization, status='IMPORTED').exists(),
             'simulator_requirement': 'Development/test deployment, DEBUG enabled, META_LEAD_SIMULATOR_ENABLED enabled and COMMUNICATIONS_OUTBOUND_ENABLED disabled.',
             'destination_fields': [{'value': k, 'label': v} for k, v in DESTINATION_FIELDS.items()],
             'allowed_default_fields': [
@@ -1721,7 +1752,15 @@ class MetaLeadImportViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retri
             qs = qs.filter(mode=mode)
         status = params.get('status')
         if status:
-            qs = qs.filter(status=status)
+            if status == 'NEEDS_ATTENTION':
+                qs = qs.filter(status__in=['NEEDS_MAPPING', 'NEEDS_ASSIGNMENT', 'NEEDS_REVIEW'])
+            elif status == 'FAILED':
+                qs = qs.filter(status__in=['FAILED', 'DEAD_LETTER'])
+            elif ',' in status:
+                statuses = [s.strip() for s in status.split(',') if s.strip()]
+                qs = qs.filter(status__in=statuses)
+            else:
+                qs = qs.filter(status=status)
         return qs
 
     def retrieve(self, request, *args, **kwargs):

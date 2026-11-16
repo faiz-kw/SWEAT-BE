@@ -434,6 +434,18 @@ class MetaGraphClient:
                                 for bp in bp_resp.json().get('data', []):
                                     bp_id = str(bp.get('id'))
                                     if bp_id and bp_id not in page_ids:
+                                        # If business edge didn't include access_token, fetch it directly
+                                        if not bp.get('access_token'):
+                                            try:
+                                                pt_resp = requests.get(
+                                                    f"{GRAPH_API_BASE}/{bp_id}",
+                                                    params={'access_token': user_access_token, 'fields': 'access_token'},
+                                                    timeout=self.timeout
+                                                )
+                                                if pt_resp.status_code == 200:
+                                                    bp['access_token'] = pt_resp.json().get('access_token', '')
+                                            except Exception:
+                                                pass
                                         pages.append(bp)
                                         page_ids.add(bp_id)
                         except Exception:
