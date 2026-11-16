@@ -210,18 +210,61 @@ def process_live_import(organization, event_id, actor_user=None, graph_client=No
                 page_id=event.page_id, is_active=True
             ).exclude(encrypted_page_access_token='').first()
 
-        if not page_conn or not page_conn.encrypted_page_access_token:
+        # Self-healing fallback: if token is missing or decryption fails, fetch directly via user token
+        page_token = decrypt_token(page_conn.encrypted_page_access_token) if (page_conn and page_conn.encrypted_page_access_token) else None
+        if not page_token:
+            active_conn = None
+            if page_conn and page_conn.connection_id:
+                active_conn = MetaConnection.objects.using(alias).filter(
+                    id=page_conn.connection_id
+                ).exclude(encrypted_user_access_token='').first()
+            if not active_conn:
+                active_conn = MetaConnection.objects.using(alias).filter(
+                    organization=organization, status__in=('CONNECTED', 'LIVE_CONNECTED')
+                ).exclude(encrypted_user_access_token='').first()
+            if not active_conn:
+                active_conn = MetaConnection.objects.using(alias).filter(
+                    status__in=('CONNECTED', 'LIVE_CONNECTED')
+                ).exclude(encrypted_user_access_token='').first()
+
+            if active_conn and active_conn.encrypted_user_access_token:
+                user_token = decrypt_token(active_conn.encrypted_user_access_token)
+                if user_token:
+                    try:
+                        import requests
+                        from .services_meta_graph import GRAPH_API_BASE
+                        from .meta_crypto import encrypt_token
+                        resp = requests.get(
+                            f"{GRAPH_API_BASE}/{event.page_id}",
+                            params={'access_token': user_token, 'fields': 'access_token,name'},
+                            timeout=10,
+                        )
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            fetched_page_token = data.get('access_token')
+                            if fetched_page_token:
+                                page_token = fetched_page_token
+                                enc_page_token = encrypt_token(fetched_page_token)
+                                if page_conn:
+                                    page_conn.encrypted_page_access_token = enc_page_token
+                                    page_conn.save(using=alias)
+                                else:
+                                    page_conn = MetaPageConnection.objects.using(alias).create(
+                                        organization=organization,
+                                        connection=active_conn,
+                                        page_id=event.page_id,
+                                        page_name=data.get('name', f"Page {event.page_id}"),
+                                        encrypted_page_access_token=enc_page_token,
+                                        is_active=True,
+                                    )
+                                logger.info("Self-healed Page Access Token for page %s via user token", event.page_id)
+                    except Exception as exc:
+                        logger.warning("Failed self-healing page token for page %s: %s", event.page_id, exc)
+
+        if not page_token:
             event.status = 'FAILED'
             event.error_code = 'PAGE_NOT_CONNECTED'
             event.error_message = 'Page access token is missing or page connection is inactive. Reconnect the Meta account.'
-            event.save(using=alias)
-            return event
-
-        page_token = decrypt_token(page_conn.encrypted_page_access_token)
-        if not page_token:
-            event.status = 'FAILED'
-            event.error_code = 'TOKEN_DECRYPTION_FAILED'
-            event.error_message = 'Failed to decrypt Page access token. Re-authorize Meta connection.'
             event.save(using=alias)
             return event
 
@@ -420,14 +463,41 @@ def _apply_mapping(event, mapping, alias, actor_user, is_live: bool = False):
         mapped['first_name'] = 'Meta Test'
         mapped['last_name'] = 'Lead'
 
-    email = validate_lead_email(raw_email, required=False)
-    phone = validate_lead_phone(raw_phone, required=False)
+    email = None
+    if raw_email:
+        try:
+            email = validate_lead_email(raw_email, required=False)
+        except Exception:
+            email = None
+
+    phone = None
+    if raw_phone:
+        try:
+            phone = validate_lead_phone(raw_phone, required=False)
+        except (ValueError, ValidationError, DjangoValidationError):
+            # If phone validation failed (e.g. 11+ digits like +9144443332211 or test number),
+            # attempt extracting the last 10 digits as national mobile number
+            import re
+            digits = re.sub(r'\D', '', str(raw_phone))
+            if len(digits) >= 10:
+                try:
+                    phone = validate_lead_phone(digits[-10:], required=False)
+                except Exception:
+                    phone = None
+            else:
+                phone = None
+
+    if not phone and not email:
+        event.status, event.error_code = 'FAILED', 'INVALID_LEAD_DATA'
+        event.error_message = 'Mapped lead data was rejected: Either a valid 10-digit mobile number or email address is required.'
+        return
+
     contact = Q()
     if email:
         contact |= Q(email_normalized=email)
     if phone:
         contact |= Q(phone_normalized=phone)
-    if mapping.repeat_policy == 'REVIEW' and Lead.objects.using(alias).filter(organization_id=event.organization_id).filter(contact).exists():
+    if (email or phone) and mapping.repeat_policy == 'REVIEW' and Lead.objects.using(alias).filter(organization_id=event.organization_id).filter(contact).exists():
         event.status, event.error_code, event.error_message = 'NEEDS_REVIEW', 'EXISTING_CONTACT', 'This contact already has a lead. The new enquiry is retained here. Review it before changing the repeat-enquiry policy and retrying.'
         return
 
