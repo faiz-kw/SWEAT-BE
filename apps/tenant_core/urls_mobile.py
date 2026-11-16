@@ -121,6 +121,7 @@ urlpatterns = [
     path('discounts/', MobileDiscountCouponsView.as_view(), name='mobile-discounts'),
     path('coupons/validate/', MobileValidateCouponView.as_view(), name='mobile-validate-coupon'),
     path('checkout/create-order/', MobileCheckoutOrderView.as_view(), name='mobile-checkout-create-order'),
+    path('checkout/create-payment-link/', MobileCheckoutOrderView.as_view(), name='mobile-checkout-create-payment-link'),
     path('checkout/verify/', MobileCheckoutVerifyView.as_view(), name='mobile-checkout-verify'),
     path('orders/', MobileOrdersView.as_view(), name='mobile-orders'),
 

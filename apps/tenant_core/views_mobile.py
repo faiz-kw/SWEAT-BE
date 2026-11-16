@@ -3370,6 +3370,7 @@ class MobileValidateCouponView(APIView):
         code = (request.data.get('code') or '').strip().upper()
         package_id = request.data.get('package_id')
         subtotal = Decimal(str(request.data.get('subtotal') or '0'))
+        order_type = (request.data.get('order_type') or 'NEW_MEMBERSHIP').strip().upper()
 
         if not code:
             return Response({'is_valid': False, 'detail': 'Promo code is required.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -3386,6 +3387,7 @@ class MobileValidateCouponView(APIView):
             order_subtotal=subtotal,
             package=pkg,
             db_alias=alias,
+            order_type=order_type,
         )
 
         if not result.get('is_valid'):
@@ -3396,13 +3398,20 @@ class MobileValidateCouponView(APIView):
 
         discount_amount = float(result.get('discount_amount', 0))
         final_payable = max(0.0, float(subtotal) - discount_amount)
+        _sub = float(subtotal) or 0.0
+        _pct = round((discount_amount / _sub) * 100, 2) if _sub else 0.0
 
         return Response({
             'is_valid': True,
             'code': code,
             'discount_amount': discount_amount,
+            'discount': discount_amount,
+            'discount_percent': _pct,
+            'percentage': _pct,
             'original_price': float(subtotal),
             'final_price': final_payable,
+            'final_amount': final_payable,
+            'payable_amount': final_payable,
             'detail': f'Promo code applied! You save ₹{discount_amount:.2f}',
         })
 
@@ -3504,6 +3513,7 @@ class MobileCheckoutOrderView(APIView):
                 order_subtotal=subtotal,
                 package=package,
                 db_alias=alias,
+                order_type='NEW_MEMBERSHIP',
             )
             if v_res.get('is_valid'):
                 discount_amount = Decimal(str(v_res.get('discount_amount', 0)))
