@@ -307,6 +307,51 @@ class DiscountCodeViewSet(viewsets.ModelViewSet):
         )
         return response
 
+    @action(detail=False, methods=['get'], url_path='applicable')
+    def applicable(self, request):
+        """Visible coupons valid for a package + member + transaction type, each with computed discount (web apply list)."""
+        from django.utils import timezone
+        from django.db.models import Q
+        db = _get_db(request)
+        package_id = request.query_params.get('package_id')
+        order_type = (request.query_params.get('order_type') or '').strip().upper() or None
+        user_profile_id = request.query_params.get('user_profile_id')
+        branch_id = request.query_params.get('branch_id')
+        order_subtotal = request.query_params.get('order_subtotal')
+        user_profile = UserProfile.objects.using(db).filter(id=user_profile_id).first() if user_profile_id else None
+        branch = Branch.objects.using(db).filter(id=branch_id).first() if branch_id else None
+        package = Package.objects.using(db).filter(id=package_id).first() if package_id else None
+        if package is None:
+            _pvid = request.query_params.get('package_version_id')
+            if _pvid:
+                from .models_catalog import PackageVersion as _PV
+                _pv = _PV.objects.using(db).filter(id=_pvid).select_related('package').first()
+                package = _pv.package if _pv else None
+        subtotal = Decimal(str(order_subtotal)) if order_subtotal else None
+        if subtotal is None and package:
+            _ver = package.versions.using(db).filter(status='ACTIVE').order_by('-version_number').first()
+            _pp = _ver.prices.using(db).filter(status='ACTIVE').first() if _ver else None
+            subtotal = _pp.base_price if _pp else Decimal('0.00')
+        now = timezone.now()
+        codes = DiscountCode.objects.using(db).filter(status='ACTIVE', campaign__status='ACTIVE', campaign__valid_from__lte=now).filter(Q(campaign__valid_until__isnull=True) | Q(campaign__valid_until__gte=now)).select_related('campaign')
+        out = []
+        for c in codes:
+            cfg = c.campaign.configuration if isinstance(c.campaign.configuration, dict) else {}
+            if cfg.get('hidden'):
+                continue
+            res = DiscountCouponEngineService.validate_coupon(code_str=c.code, user_profile=user_profile, order_subtotal=subtotal or Decimal('0.00'), branch=branch, package=package, db_alias=db, order_type=order_type)
+            if res.get('is_valid'):
+                out.append({
+                    'code': c.code,
+                    'name': c.campaign.name,
+                    'description': c.campaign.description or '',
+                    'discount_type': c.campaign.discount_type,
+                    'discount_value': float(c.campaign.discount_value),
+                    'discount_amount': float(res.get('discount_amount') or 0),
+                    'final_subtotal': float(res.get('final_subtotal') or 0),
+                })
+        return Response({'coupons': out, 'count': len(out)}, status=status.HTTP_200_OK)
+
     @action(detail=True, methods=['post'], url_path='toggle-status')
     def toggle_status(self, request, pk=None):
         code = self.get_object()

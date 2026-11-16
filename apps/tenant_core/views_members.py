@@ -151,13 +151,25 @@ def get_primary_membership(profile: UserProfile, alias: str = 'default'):
     3. If neither, the latest membership by end_date and created_at.
     """
     today = timezone.now().date()
-    # 1. Currently active and unexpired
+    # 1a. Currently RUNNING (started and unexpired) -- running-first-fix
+    m = (
+        Membership.objects.using(alias)
+        .filter(user_profile=profile, status='ACTIVE')
+        .filter(Q(end_date__gte=today) | Q(end_date__isnull=True))
+        .filter(Q(start_date__lte=today) | Q(start_date__isnull=True))
+        .select_related('package', 'package__program', 'package_version', 'package_price', 'home_branch', 'purchase_branch')
+        .order_by('end_date', '-created_at')
+        .first()
+    )
+    if m:
+        return m
+    # 1b. Active & unexpired but not yet started (future renewal) -- earliest to start
     m = (
         Membership.objects.using(alias)
         .filter(user_profile=profile, status='ACTIVE')
         .filter(Q(end_date__gte=today) | Q(end_date__isnull=True))
         .select_related('package', 'package__program', 'package_version', 'package_price', 'home_branch', 'purchase_branch')
-        .order_by('-end_date', '-created_at')
+        .order_by('start_date', '-end_date', '-created_at')
         .first()
     )
     if m:
@@ -1118,10 +1130,13 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             'passport_sessions_left': passport_left,
         }
 
-        # Check if membership is currently active or frozen
-        is_active_or_frozen = m.status in ('ACTIVE', 'FROZEN') and (not m.end_date or m.end_date >= timezone.now().date())
+        # Check if membership is currently RUNNING (started and unexpired) -- running-first-fix
+        _rf_today = timezone.now().date()
+        is_active_or_frozen = m.status in ('ACTIVE', 'FROZEN') and (not m.end_date or m.end_date >= _rf_today) and (not m.start_date or m.start_date <= _rf_today)
         if is_active_or_frozen or (m.id == getattr(active_m, 'id', None) and m.status in ('ACTIVE', 'FROZEN')):
-            if not active_membership_data:
+            if m.id == getattr(active_m, 'id', None):
+                active_membership_data = m_obj
+            elif not active_membership_data:
                 active_membership_data = m_obj
             active_memberships_list.append(m_obj)
             active_programs_list.append({
@@ -2046,6 +2061,7 @@ class MemberViewSet(viewsets.ViewSet):
         'cancel': 'core.users.edit',
         'rejoin': 'core.users.edit',
         'adjust_entitlement': 'core.users.edit',
+        'change_start_date': 'core.users.edit',
         'collect_outstanding': 'finance.payments.create',
     }
 
@@ -2753,6 +2769,15 @@ class MemberViewSet(viewsets.ViewSet):
         else:
             renewal_start = today
 
+        # Renewal coupon (web/CRM) - order-type gated to RENEWAL
+        renew_coupon_code = (request.data.get('coupon_code') or '').strip()
+        renew_discount = Decimal('0.00')
+        if renew_coupon_code:
+            from .services_discounts import DiscountCouponEngineService as _CPN
+            _cv = _CPN.validate_coupon(code_str=renew_coupon_code, user_profile=profile, order_subtotal=unit_price, package=package, branch=branch, db_alias=alias, order_type='RENEWAL')
+            if _cv.get('is_valid'):
+                renew_discount = Decimal(str(_cv.get('discount_amount') or 0))
+
         with transaction.atomic(using=alias):
             # 1. Create canonical renewal Order
             order = CommerceService.create_order(
@@ -2765,7 +2790,7 @@ class MemberViewSet(viewsets.ViewSet):
                     'item_name_snapshot': f"{package.name} (v{package_version.version_number}) - Renewal",
                     'quantity': Decimal('1.00'),
                     'unit_price': unit_price,
-                    'discount_amount': Decimal('0.00'),
+                    'discount_amount': renew_discount,
                     'tax_percent': Decimal('0.000'),
                 }],
                 user_profile=profile,
@@ -3495,6 +3520,17 @@ class MemberViewSet(viewsets.ViewSet):
                 }
             )
 
+        # Upgrade coupon (order-type gated to UPGRADE) - discounts the target package
+        upg_coupon_code = (request.data.get('coupon_code') or '').strip()
+        upg_discount = Decimal('0.00')
+        if upg_coupon_code:
+            from .services_discounts import DiscountCouponEngineService as _CPN
+            _tp = target_ver.prices.using(alias).filter(status='ACTIVE').first() if target_ver else None
+            _tbase = _tp.base_price if _tp else Decimal('0.00')
+            _cv = _CPN.validate_coupon(code_str=upg_coupon_code, user_profile=profile, order_subtotal=_tbase, package=target_pkg, db_alias=alias, order_type='UPGRADE')
+            if _cv.get('is_valid'):
+                upg_discount = Decimal(str(_cv.get('discount_amount') or 0))
+
         with transaction.atomic(using=alias):
             change_req = MembershipLifecycleService.quote_and_apply_change(
                 membership=active_m,
@@ -3504,6 +3540,7 @@ class MemberViewSet(viewsets.ViewSet):
                 reason=reason,
                 actor_user=request.user,
                 db_alias=alias,
+                coupon_discount=upg_discount,
             )
 
             # Record business audit
@@ -3590,26 +3627,133 @@ class MemberViewSet(viewsets.ViewSet):
         else:
             days = int(request.data.get('days', 7))
 
-        reason = request.data.get('reason', f'Extended by {days} days')
+        reason = (request.data.get('reason') or '').strip()
+        # Payment handling for the extension:
+        #   COMPLIMENTARY  -> no charge, reason mandatory (studio goodwill / correction)
+        #   PAY_AT_FACILITY-> record an offline payment (cash/card/UPI at the desk); amount mandatory, txn details optional
+        #   ONLINE         -> (reserved) online gateway flow
+        payment_mode_raw = request.data.get('payment_mode')
+        payment_mode = str(payment_mode_raw or 'COMPLIMENTARY').upper()
+        if payment_mode not in ('COMPLIMENTARY', 'PAY_AT_FACILITY', 'ONLINE'):
+            return Response({'error': 'Invalid payment_mode. Use COMPLIMENTARY, PAY_AT_FACILITY or ONLINE.'}, status=status.HTTP_400_BAD_REQUEST)
+        # Only enforce reason when the caller explicitly chose COMPLIMENTARY (keeps existing callers unaffected)
+        if payment_mode_raw and payment_mode == 'COMPLIMENTARY' and not reason:
+            return Response({'error': 'Reason is required for a complimentary extension.'}, status=status.HTTP_400_BAD_REQUEST)
+        facility_amount = None
+        if payment_mode == 'PAY_AT_FACILITY':
+            raw_amt = request.data.get('amount')
+            if raw_amt in (None, ''):
+                return Response({'error': 'Amount is required when paying at facility.'}, status=status.HTTP_400_BAD_REQUEST)
+            try:
+                facility_amount = Decimal(str(raw_amt))
+            except Exception:
+                return Response({'error': 'Invalid amount.'}, status=status.HTTP_400_BAD_REQUEST)
+            if facility_amount <= 0:
+                return Response({'error': 'Amount must be greater than zero.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not reason:
+            reason = f'Extended by {days} days'
+        attachment_url = (request.data.get('attachment_url') or '').strip() or None
+        if attachment_url:
+            reason = f"{reason} | attachment: {attachment_url}"
 
         try:
-            # Admin Panel has zero 90-day ceiling: is_staff_override=True permits as many days as the admin wants
-            res = MembershipLifecycleService.extend_membership(
-                membership=active_m,
-                days=days,
-                reason_text=reason,
-                approved_by_user=request.user,
-                is_staff_override=True,
-                db_alias=alias,
-            )
-            mem = res[0] if isinstance(res, (tuple, list)) else res
+            with transaction.atomic(using=alias):
+                # Admin Panel has zero 90-day ceiling: is_staff_override=True permits as many days as the admin wants
+                res = MembershipLifecycleService.extend_membership(
+                    membership=active_m,
+                    days=days,
+                    reason_text=reason,
+                    approved_by_user=request.user,
+                    is_staff_override=True,
+                    db_alias=alias,
+                )
+                mem = res[0] if isinstance(res, (tuple, list)) else res
+                payment_info = None
+                if payment_mode == 'PAY_AT_FACILITY':
+                    pay_method = str(request.data.get('payment_method') or 'CASH').upper()
+                    provider = 'CASH' if pay_method == 'CASH' else 'INTERNAL_TERMINAL'
+                    txn_ref = request.data.get('transaction_ref') or request.data.get('transaction_details')
+                    ext_order = Order.objects.using(alias).create(
+                        order_number=f"EXT-{uuid.uuid4().hex[:8].upper()}",
+                        user_profile=profile, branch=active_m.home_branch, order_type='EXTENSION',
+                        status='PAID', subtotal=facility_amount, discount_amount=Decimal('0.00'),
+                        reward_amount=Decimal('0.00'), tax_amount=Decimal('0.00'), total_amount=facility_amount,
+                        currency='INR', source='FRONT_DESK',
+                        notes=f"Validity extension ({days}d), pay at facility. {reason}")
+                    ext_txn = PaymentTransaction.objects.using(alias).create(
+                        order=ext_order, user_profile=profile, provider=provider, payment_method=pay_method,
+                        provider_transaction_id=(str(txn_ref)[:255] if txn_ref else None),
+                        amount=facility_amount, currency='INR', status='SUCCESS', paid_at=timezone.now(),
+                        metadata={'kind': 'EXTENSION', 'days': days, 'membership_id': str(active_m.id),
+                                  'transaction_details': txn_ref or '', 'attachment_url': attachment_url or ''})
+                    payment_info = {'order_number': ext_order.order_number, 'amount': str(facility_amount),
+                                    'provider': provider, 'transaction_id': str(ext_txn.id)}
             return Response({
                 'success': True,
                 'message': f"Extended until {mem.end_date}",
+                'payment_mode': payment_mode,
+                'payment': payment_info,
                 'member': serialize_member(profile, alias),
             }, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'], url_path='change-start-date')
+    def change_start_date(self, request, pk=None):
+        """
+        Change a membership's start date (admin). Allowed ONLY when no sessions have been
+        consumed on the package. Keeps the original duration: shifts the end date and the
+        entitlement validity window to match the new start.
+        """
+        alias = _get_db(request)
+        org = _get_org(request)
+        profile = self.get_member_profile(alias, org, pk)
+        if not profile:
+            return Response({'detail': 'Member not found.'}, status=status.HTTP_404_NOT_FOUND)
+        new_start_str = request.data.get('start_date') or request.data.get('new_start_date')
+        if not new_start_str:
+            return Response({'error': 'start_date (YYYY-MM-DD) is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        reason = (request.data.get('reason') or '').strip()
+        membership_id = request.data.get('membership_id')
+        if membership_id:
+            m = Membership.objects.using(alias).filter(id=membership_id, user_profile=profile).first()
+        else:
+            m = (Membership.objects.using(alias).filter(user_profile=profile, status='ACTIVE').order_by('-created_at').first()
+                 or Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first())
+        if not m:
+            return Response({'error': 'No membership found for this member.'}, status=status.HTTP_400_BAD_REQUEST)
+        consumed = MembershipEntitlement.objects.using(alias).filter(membership=m).aggregate(s=Sum('consumed_units'))['s'] or Decimal('0')
+        if consumed and Decimal(consumed) > 0:
+            return Response({'error': f'Cannot change start date: {consumed} session(s) already used on this package.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            new_start = date.fromisoformat(str(new_start_str)[:10])
+        except Exception:
+            return Response({'error': 'Invalid start_date format. Use YYYY-MM-DD.'}, status=status.HTTP_400_BAD_REQUEST)
+        dur = (m.end_date - m.start_date).days if (m.end_date and m.start_date) else 0
+        if not dur or dur <= 0:
+            pv = getattr(m, 'package_version', None)
+            dur = int(getattr(pv, 'total_days', 0) or getattr(pv, 'validity_days', 0) or 30)
+        new_end = new_start + timedelta(days=dur)
+        old_start, old_end = m.start_date, m.end_date
+        vf = timezone.make_aware(datetime.combine(new_start, datetime.min.time()))
+        vu = timezone.make_aware(datetime.combine(new_end, datetime.max.time()))
+        try:
+            with transaction.atomic(using=alias):
+                m.start_date = new_start
+                m.end_date = new_end
+                m.save(using=alias, update_fields=['start_date', 'end_date', 'updated_at'])
+                MembershipEntitlement.objects.using(alias).filter(membership=m, status='ACTIVE').update(valid_from=vf, valid_until=vu)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({
+            'success': True,
+            'message': f"Start date changed to {new_start} (valid until {new_end}).",
+            'membership_id': str(m.id),
+            'old_start_date': str(old_start), 'new_start_date': str(new_start),
+            'old_end_date': str(old_end), 'new_end_date': str(new_end),
+            'reason': reason,
+            'member': serialize_member(profile, alias),
+        }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'], url_path='freeze')
     def freeze(self, request, pk=None):
@@ -3717,7 +3861,7 @@ class MemberViewSet(viewsets.ViewSet):
         if getattr(target_branch, 'status', 'ACTIVE') != 'ACTIVE':
             return Response({'error': f"Target branch '{target_branch.name}' is inactive and cannot receive membership transfers."}, status=status.HTTP_400_BAD_REQUEST)
 
-        active_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
+        active_m = Membership.objects.using(alias).filter(user_profile=profile).exclude(status='CANCELLED').order_by('-created_at').first()
         if active_m:
             if active_m.home_branch_id == target_branch.id:
                 return Response({'error': f"Member is already assigned to '{target_branch.name}' as home branch."}, status=status.HTTP_400_BAD_REQUEST)

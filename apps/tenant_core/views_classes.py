@@ -1144,7 +1144,7 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
                     break
 
         embed_player_url = (
-            f"https://www.youtube-nocookie.com/embed/{yt_id}?rel=0&modestbranding=1&controls=1&showinfo=0&iv_load_policy=3&fs=0"
+            f"https://www.youtube-nocookie.com/embed/{yt_id}?rel=0&modestbranding=1&controls=1&showinfo=0&iv_load_policy=3&fs=0&cc_load_policy=0"
             if yt_id else (video_url or '')
         )
 
@@ -1410,7 +1410,7 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
                     break
 
         embed_player_url = (
-            f"https://www.youtube-nocookie.com/embed/{yt_id}?rel=0&modestbranding=1&controls=1&showinfo=0&iv_load_policy=3&fs=0"
+            f"https://www.youtube-nocookie.com/embed/{yt_id}?rel=0&modestbranding=1&controls=1&showinfo=0&iv_load_policy=3&fs=0&cc_load_policy=0"
             if yt_id else (video_url or '')
         )
 

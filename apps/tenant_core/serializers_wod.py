@@ -210,7 +210,7 @@ class WorkoutContentItemSerializer(serializers.ModelSerializer):
         yt_id = self.get_youtube_video_id(obj)
         if yt_id:
             # Privacy-enhanced embedded player: suppresses external recommendations, branding, and annotations
-            return f"https://www.youtube-nocookie.com/embed/{yt_id}?rel=0&modestbranding=1&controls=1&showinfo=0&iv_load_policy=3"
+            return f"https://www.youtube-nocookie.com/embed/{yt_id}?rel=0&modestbranding=1&controls=1&showinfo=0&iv_load_policy=3&cc_load_policy=0"
         if obj.has_stored_video:
             return f"/api/v1/tenant/wod/content-items/{obj.id}/stream-video/"
         return obj.video_url or ''

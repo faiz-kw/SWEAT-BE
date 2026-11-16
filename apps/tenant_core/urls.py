@@ -372,6 +372,8 @@ router.register(r'cms/media', views_cms.CMSMediaAssetViewSet, basename='cms-medi
 
 app_name = 'tenant_core'
 
+from .views_invoice import WebOrderInvoiceView, WebInvoiceRenderView
+
 urlpatterns = [
     path('database-health/', TenantDatabaseHealthView.as_view(), name='tenant-database-health'),
     path('verify-access/', VerifyAccessView.as_view(), name='verify-access'),
@@ -444,5 +446,7 @@ urlpatterns = [
 
     
 
+    path('invoice/order/<uuid:order_id>/', WebOrderInvoiceView.as_view(), name='web-order-invoice'),
+    path('invoice/<uuid:invoice_id>/', WebInvoiceRenderView.as_view(), name='web-invoice-render'),
     path('', include(router.urls)),
 ]
