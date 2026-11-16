@@ -908,10 +908,8 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
         status_param = self.request.query_params.get('status')
         if status_param and status_param.lower() != 'all':
             st_upper = status_param.strip().upper()
-            if st_upper == 'INACTIVE':
-                qs = qs.exclude(status__iexact='ACTIVE').exclude(status__iexact='INVITED')
-            elif st_upper == 'DEACTIVATED':
-                qs = qs.filter(Q(status__iexact='DEACTIVATED') | Q(is_accessible=False))
+            if st_upper in ('DEACTIVATED', 'INACTIVE'):
+                qs = qs.filter(Q(status__iexact='DEACTIVATED') | Q(status__iexact='INACTIVE') | Q(is_login_allowed=False))
             else:
                 qs = qs.filter(status__iexact=st_upper)
 

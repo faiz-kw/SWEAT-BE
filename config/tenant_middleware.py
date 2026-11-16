@@ -40,6 +40,9 @@ TENANT_EXEMPT_PREFIXES = (
     '/data-deletion/',
     '/health/',
     '/ready/',
+    '/c/',
+    '/r/',
+    '/p/',
 )
 
 # Thread lock to protect mutation of settings.DATABASES at runtime

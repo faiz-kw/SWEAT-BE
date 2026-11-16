@@ -111,6 +111,14 @@ class CommunicationProviderRegistry:
                     inst = adapter_cls()
                     if inst.is_configured():
                         return inst, None
+            # Fallback for Gupshup WhatsApp if configured in settings / .env
+            if channel_upper == 'WHATSAPP':
+                target_provider = provider_preference.upper() if provider_preference else 'GUPSHUP'
+                adapter_cls = cls.get_adapter_class('WHATSAPP', target_provider)
+                if adapter_cls:
+                    inst = adapter_cls()
+                    if inst.is_configured():
+                        return inst, None
             return None, None
 
         provider_name = integration.provider.upper()

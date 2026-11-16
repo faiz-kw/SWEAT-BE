@@ -1032,7 +1032,7 @@ class VoiceAgentBookTrialView(View):
                         "Carry a Fresh Pair of Grip Shoes: Please bring a fresh pair of shoes and socks to maintain hygiene at all times."
                     )
                     spoken_conf = (
-                        f"Good news, {lead.first_name}! You are already confirmed for {occurrence.class_template.name} "
+                        f"Good news, {lead.first_name}! You are already booked and confirmed for {occurrence.class_template.name} "
                         f"at our {branch_short} studio on {ist_dt.strftime('%A at %I:%M %p')}. "
                         f"I've sent your entry pass and directions straight to your WhatsApp. We look forward to seeing you!"
                     )
@@ -1051,6 +1051,26 @@ class VoiceAgentBookTrialView(View):
                     })
 
                 # Check if trial capacity or total capacity reached
+                if regular_booked + trial_booked >= effective_capacity:
+                    alt_occ = ClassOccurrence.objects.using(alias).filter(
+                        branch=occurrence.branch,
+                        start_at__gt=occurrence.start_at,
+                        class_template=occurrence.class_template,
+                        status__in=['OPEN', 'SCHEDULED', 'ACTIVE'],
+                    ).order_by('start_at').first()
+                    alt_str = f" on {alt_occ.start_at.astimezone(IST).strftime('%A at %I:%M %p')}" if alt_occ else ""
+
+                    logger.warning("Voice Agent trial booking rejected: total capacity full (%d/%d) for occurrence %s", regular_booked + trial_booked, effective_capacity, occurrence.id)
+                    return JsonResponse({
+                        'status': 'error',
+                        'error_code': 'SLOT_FULL',
+                        'message': f'Total capacity reached for this session ({regular_booked + trial_booked}/{effective_capacity} booked).',
+                        'spoken_apology': (
+                            f"I'm sorry, that session at our {branch_short} studio has just filled up to capacity! "
+                            f"We do have another open spot{alt_str}. Would that time work for you?"
+                        ),
+                    }, status=409)
+
                 if trial_booked >= effective_trial_cap:
                     alt_occ = ClassOccurrence.objects.using(alias).filter(
                         branch=occurrence.branch,
@@ -1071,26 +1091,6 @@ class VoiceAgentBookTrialView(View):
                         ),
                     }, status=409)
 
-                if regular_booked + trial_booked >= effective_capacity:
-                    alt_occ = ClassOccurrence.objects.using(alias).filter(
-                        branch=occurrence.branch,
-                        start_at__gt=occurrence.start_at,
-                        class_template=occurrence.class_template,
-                        status__in=['OPEN', 'SCHEDULED', 'ACTIVE'],
-                    ).order_by('start_at').first()
-                    alt_str = f" on {alt_occ.start_at.astimezone(IST).strftime('%A at %I:%M %p')}" if alt_occ else ""
-
-                    logger.warning("Voice Agent trial booking rejected: total capacity full (%d/%d) for occurrence %s", regular_booked + trial_booked, effective_capacity, occurrence.id)
-                    return JsonResponse({
-                        'status': 'error',
-                        'error_code': 'SLOT_FULL',
-                        'message': f'Total capacity reached for this session ({regular_booked + trial_booked}/{effective_capacity} booked).',
-                        'spoken_apology': (
-                            f"I'm sorry, that session at our {branch_short} studio is completely full! "
-                            f"We do have another open spot{alt_str}. Would that time work for you?"
-                        ),
-                    }, status=409)
-
                 # 4. Create Confirmed TrialBooking in CRM under lock
                 trial = TrialBooking.objects.using(alias).create(
                     lead=lead,
@@ -1103,7 +1103,7 @@ class VoiceAgentBookTrialView(View):
                     confirmation_status='CONFIRMED',
                     confirmation_channel='PHONE',
                     confirmed_at=timezone.now(),
-                    booking_source='OTHER',
+                    booking_source='VOICE_AGENT',
                     notes=notes,
                 )
 
@@ -1188,7 +1188,8 @@ class VoiceAgentBookTrialView(View):
                     maps_query = f"{branch_name}+{full_addr}+{city_str}".replace(' ', '+')
                     maps_url = f"https://maps.google.com/?q={maps_query}"
                     prog_name = occurrence.class_template.program.name if (occurrence.class_template and occurrence.class_template.program) else occurrence.class_template.name
-                    instructor_name = getattr(occurrence.instructor, 'name', None) or getattr(occurrence.instructor, 'first_name', None) or 'Master Studio Trainer'
+                    instructor_obj = getattr(occurrence, 'instructor', None)
+                    instructor_name = getattr(instructor_obj, 'name', None) or getattr(instructor_obj, 'first_name', None) or 'Master Studio Trainer'
                     pass_code = f"SWEAT-TRIAL-{str(trial.id).replace('-', '')[:6].upper()}"
 
                     wa_body = (
@@ -2228,14 +2229,14 @@ class VoiceAgentTransferCallView(View):
                 target_phone = preferred_rep.phone or ''
             else:
                 vobiz_cfg = TelephonyConfigService.get_vobiz_config(alias)
-                target_phone = vobiz_cfg.get('from_number') or os.getenv('VOBIZ_SALES_DID', '+919240954144')
+                target_phone = vobiz_cfg.get('from_number') or os.getenv('VOBIZ_SALES_DID', '')
                 dest_name = 'SWEAT Sales Team'
 
             if target_phone and not sip_endpoint:
                 target_phone = VoiceCallingService.normalize_phone(target_phone)
             elif not target_phone:
                 vobiz_cfg = TelephonyConfigService.get_vobiz_config(alias)
-                target_phone = vobiz_cfg.get('from_number') or os.getenv('VOBIZ_SALES_DID', '+919240954144')
+                target_phone = vobiz_cfg.get('from_number') or os.getenv('VOBIZ_SALES_DID', '')
 
             branch_short = _get_branch_spoken_name(resolved_branch) if resolved_branch else 'our studio'
 

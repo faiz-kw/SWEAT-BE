@@ -1972,6 +1972,16 @@ class CRMLeadService:
                 if ta and ta.trainer_profile:
                     assigned_trainer = ta.trainer_profile
 
+            confirm_upfront = bool(
+                kwargs.get('confirm_upfront')
+                or kwargs.get('is_confirmed')
+                or kwargs.get('confirmation_status') == 'CONFIRMED'
+            )
+            init_status = 'CONFIRMED' if confirm_upfront else 'BOOKED'
+            init_conf_status = 'CONFIRMED' if confirm_upfront else 'PENDING'
+            init_channel = 'PHONE' if (confirm_upfront and booking_source in ('FRONT_DESK', 'SALES')) else ('STAFF' if confirm_upfront else None)
+            init_confirmed_at = timezone.now() if confirm_upfront else None
+
             trial = TrialBooking.objects.using(alias).create(
                 lead=lead,
                 branch=branch,
@@ -1980,8 +1990,10 @@ class CRMLeadService:
                 trial_type=trial_type,
                 scheduled_start=scheduled_start,
                 scheduled_end=scheduled_end,
-                status='BOOKED',
-                confirmation_status='PENDING',
+                status=init_status,
+                confirmation_status=init_conf_status,
+                confirmation_channel=init_channel,
+                confirmed_at=init_confirmed_at,
                 booking_source=booking_source,
                 notes=notes,
                 created_by_user=actor_user,
@@ -1990,16 +2002,20 @@ class CRMLeadService:
             TrialStatusHistory.objects.using(alias).create(
                 trial_booking=trial,
                 from_status=None,
-                to_status='BOOKED',
-                reason_code='INITIAL_BOOKING',
+                to_status=init_status,
+                reason_code='CONFIRMED_UPFRONT_ON_BOOKING' if confirm_upfront else 'INITIAL_BOOKING',
                 changed_by_user=actor_user,
             )
 
-            # Configurable stage automation for TRIAL_BOOKED
+            if confirm_upfront:
+                lead.current_status = 'TRIAL_CONFIRMED'
+                lead.save(using=alias, update_fields=['current_status', 'updated_at'])
+
+            # Configurable stage automation for TRIAL_BOOKED / TRIAL_CONFIRMED
             from .services_stage_automation import CRMStageAutomationService
             CRMStageAutomationService.evaluate_and_transition(
                 lead=lead,
-                trigger_event='TRIAL_BOOKED',
+                trigger_event='TRIAL_CONFIRMED' if confirm_upfront else 'TRIAL_BOOKED',
                 context={'trial': trial, 'scheduled_start': scheduled_start},
                 actor_user=actor_user,
                 db_alias=alias,
@@ -2138,6 +2154,41 @@ class CRMLeadService:
                 event_description=f"Reschedule requested for trial {trial.id}: {reason or ''}",
                 db_alias=alias,
             )
+
+            # Create a sales follow-up task so rep can call and reschedule
+            lead = trial.lead
+            assignee = (lead.assigned_sales_user if lead else None) or trial.created_by_user
+            if lead and assignee:
+                from .models_crm import SalesFollowupTask
+                has_pending = SalesFollowupTask.objects.using(alias).filter(
+                    lead=lead,
+                    status='PENDING',
+                    task_type='CALL',
+                    outcome__icontains='Reschedule',
+                ).exists()
+                if not has_pending:
+                    creator = actor_user or assignee
+                    SalesFollowupTask.objects.using(alias).create(
+                        lead=lead,
+                        assigned_to_user=assignee,
+                        created_by_user=creator,
+                        task_type='CALL',
+                        due_at=timezone.now() + timedelta(hours=2),
+                        status='PENDING',
+                        priority='HIGH',
+                        outcome=f"Reschedule requested: {lead.first_name} {lead.last_name} ({reason or 'No reason provided'}). Please call to arrange a new date and time.",
+                    )
+            if lead:
+                cls.record_lead_activity(
+                    lead=lead,
+                    activity_type='CALL',
+                    outcome='Reschedule Requested',
+                    notes=f"Customer requested trial reschedule: {reason or ''}",
+                    performed_by_user=actor_user,
+                    actor_user=actor_user,
+                    db_alias=alias,
+                )
+
             return trial
 
     @classmethod

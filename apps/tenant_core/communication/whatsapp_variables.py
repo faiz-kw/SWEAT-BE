@@ -290,24 +290,32 @@ class WhatsAppVariableResolver:
             return _fmt_time(lockout_dt, self._tz)
         return ""
 
+    def _trial_tenant_id(self):
+        if not self._trial:
+            return None
+        return (
+            getattr(getattr(self._trial.lead, 'organization', None), 'tenant_id', None)
+            or getattr(getattr(self._trial.branch, 'organization', None), 'tenant_id', None)
+        )
+
     def _confirmation_token(self) -> str:
         if self._trial:
-            return generate_trial_action_token(self._trial.id, 'CONFIRM')
+            return generate_trial_action_token(self._trial.id, 'CONFIRM', self._trial_tenant_id())
         return ""
 
     def _reschedule_token(self) -> str:
         if self._trial:
-            return generate_trial_action_token(self._trial.id, 'RESCHEDULE')
+            return generate_trial_action_token(self._trial.id, 'RESCHEDULE', self._trial_tenant_id())
         return ""
 
     def _rebook_token(self) -> str:
         if self._trial:
-            return generate_trial_action_token(self._trial.id, 'REBOOK')
+            return generate_trial_action_token(self._trial.id, 'REBOOK', self._trial_tenant_id())
         return ""
 
     def _pass_token(self) -> str:
         if self._trial:
-            return generate_trial_action_token(self._trial.id, 'PASS')
+            return generate_trial_action_token(self._trial.id, 'PASS', self._trial_tenant_id())
         return ""
 
     def _qr_pass_url(self) -> str:

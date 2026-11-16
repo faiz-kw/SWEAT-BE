@@ -351,6 +351,7 @@ class MetaAccessMixin:
         'oauth_callback_alias': 'crm.settings.edit',
         'disconnect': 'crm.settings.edit',
         'reconnect': 'crm.settings.edit',
+        'refresh_pages': 'crm.settings.edit',
         'health': 'crm.settings.view',
         'retry_failed': 'crm.settings.edit',
         'connect_token': 'crm.settings.edit',
@@ -808,6 +809,12 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
     def oauth_callback(self, request):
         is_browser_redirect = (request.method == 'GET')
         frontend_origin = (getattr(settings, 'FRONTEND_URL', None) or os.getenv('FRONTEND_URL', '')).rstrip('/')
+        if not frontend_origin or 'localhost' in frontend_origin:
+            req_host = request.get_host().lower() if hasattr(request, 'get_host') else ''
+            if 'sweatfitwellness.com' in req_host:
+                frontend_origin = 'https://crm.sweatfitwellness.com'
+            elif not frontend_origin:
+                frontend_origin = 'https://crm.sweatfitwellness.com'
         target_path = '/crm/setup?tab=meta'
 
         # Ensure instance attributes exist immediately
@@ -1684,6 +1691,29 @@ class MetaLeadImportViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retri
     pagination_class = MetaImportsPagination
 
     def get_queryset(self):
+        # Auto-reconcile any historical live imports whose page, form, or created lead
+        # belongs to self.organization but were legacy-stamped with a demo or mismatch organization
+        try:
+            org_page_ids = set(MetaPageConnection.objects.using(self.alias).filter(
+                organization=self.organization, is_active=True
+            ).values_list('page_id', flat=True))
+            org_form_ids = set(MetaLeadMapping.objects.using(self.alias).filter(
+                organization=self.organization, is_active=True
+            ).values_list('form_id', flat=True))
+
+            reconcile_filter = Q(lead__organization=self.organization)
+            if org_page_ids:
+                reconcile_filter |= Q(page_id__in=org_page_ids)
+            if org_form_ids:
+                reconcile_filter |= Q(form_id__in=org_form_ids)
+
+            MetaLeadImport.objects.using(self.alias).filter(
+                reconcile_filter,
+                mode='LIVE',
+            ).exclude(organization=self.organization).update(organization=self.organization)
+        except Exception as exc:
+            logger.debug("MetaLeadImport auto-reconciliation skipped: %s", exc)
+
         qs = MetaLeadImport.objects.using(self.alias).filter(organization=self.organization)
         params = getattr(self.request, 'query_params', getattr(self.request, 'GET', {}))
         mode = params.get('mode')

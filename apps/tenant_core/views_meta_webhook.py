@@ -181,13 +181,58 @@ class MetaLeadWebhookView(APIView):
 
                 try:
                     with tenant_database_context(tenant.id) as alias:
-                        org = (
-                            Organization.objects.using(alias).filter(code__icontains=tenant.code, status='ACTIVE').first()
-                            or Organization.objects.using(alias).filter(status='ACTIVE', branches__isnull=False).distinct().first()
-                            or Organization.objects.using(alias).filter(status='ACTIVE').order_by('created_at').first()
-                        )
+                        from apps.tenant_core.models_meta_leads import MetaPageConnection, MetaLeadMapping
+
+                        # Reliable Multi-Account & Multi-Organization Resolution Hierarchy:
+                        # 1. Authoritative: Organization that configured the active lead mapping for this Page & Form
+                        org = None
+                        if form_id:
+                            mapping_org_id = MetaLeadMapping.objects.using(alias).filter(
+                                page_id=change_page_id,
+                                form_id=form_id,
+                                is_active=True,
+                            ).values_list('organization_id', flat=True).first()
+                            if not mapping_org_id:
+                                # Meta form IDs are globally unique across all Facebook/Instagram pages
+                                mapping_org_id = MetaLeadMapping.objects.using(alias).filter(
+                                    form_id=form_id,
+                                    is_active=True,
+                                ).values_list('organization_id', flat=True).first()
+                            if mapping_org_id:
+                                org = Organization.objects.using(alias).filter(id=mapping_org_id, status='ACTIVE').first()
+
+                        # 2. Secondary: Organization that connected this Facebook Page (prioritize active connected accounts)
                         if not org:
-                            logger.error("Active organization not found for tenant %s", tenant.slug)
+                            page_conn_org_id = (
+                                MetaPageConnection.objects.using(alias)
+                                .filter(page_id=change_page_id, is_active=True, connection__status__in=('CONNECTED', 'LIVE_CONNECTED'))
+                                .values_list('organization_id', flat=True)
+                                .first()
+                                or MetaPageConnection.objects.using(alias)
+                                .filter(page_id=change_page_id, is_active=True)
+                                .values_list('organization_id', flat=True)
+                                .first()
+                            )
+                            if page_conn_org_id:
+                                org = Organization.objects.using(alias).filter(id=page_conn_org_id, status='ACTIVE').first()
+
+                        # 3. Tertiary: Fallback to any mapping registered on this page
+                        if not org:
+                            any_mapping_org_id = MetaLeadMapping.objects.using(alias).filter(
+                                page_id=change_page_id
+                            ).values_list('organization_id', flat=True).first()
+                            if any_mapping_org_id:
+                                org = Organization.objects.using(alias).filter(id=any_mapping_org_id, status='ACTIVE').first()
+
+                        # 4. Fallback: Strict exact tenant code match (never fuzzy substring/icontains)
+                        if not org:
+                            org = (
+                                Organization.objects.using(alias).filter(code__iexact=tenant.code, status='ACTIVE').first()
+                                or Organization.objects.using(alias).filter(status='ACTIVE', branches__isnull=False).distinct().first()
+                                or Organization.objects.using(alias).filter(status='ACTIVE').order_by('created_at').first()
+                            )
+                        if not org:
+                            logger.error("Active organization not found for tenant %s (page %s)", tenant.slug, change_page_id)
                             continue
 
                         # 1. Durable PostgreSQL commit before async dispatch
@@ -204,7 +249,6 @@ class MetaLeadWebhookView(APIView):
                             # Stamp last_lead_received_at on the page connection (best-effort)
                             try:
                                 MetaPageConnection.objects.using(alias).filter(
-                                    organization=org,
                                     page_id=change_page_id,
                                 ).update(last_lead_received_at=timezone.now())
                             except Exception:

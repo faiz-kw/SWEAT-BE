@@ -4,6 +4,7 @@ auto-heal collisions, concurrency guards, outbound calling guard, read-only GET 
 SSE worker recycling, and inbound routing exclusion of unassigned/placeholder accounts.
 """
 
+import os
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
@@ -24,6 +25,16 @@ class TelephonyPoolAndLoadFixesTests(TestCase):
     def setUp(self):
         super().setUp()
         set_tenant_db_alias('tenant_test')
+        env_patch = patch.dict(
+            os.environ,
+            {
+                'VOBIZ_SIP_ENDPOINTS': 'iqra24030269280035568,sweatagent104201155654570218059',
+                'VOBIZ_AUTH_ID': '',
+                'VOBIZ_AUTH_TOKEN': '',
+            },
+        )
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
         self.org = Organization.objects.create(name="SWEAT Test Org", code="SWPOOL01")
         self.location = Location.objects.create(organization=self.org, name="Mumbai", code="LOCP01")
         self.branch = Branch.objects.create(
@@ -239,3 +250,48 @@ class TelephonyPoolAndLoadFixesTests(TestCase):
         fake_pubsub.unsubscribe.assert_called_once()
         fake_pubsub.close.assert_called_once()
         fake_redis.close.assert_called_once()
+
+    def test_dynamic_vobiz_api_discovers_and_auto_provisions_for_unlimited_users(self):
+        """With Vobiz Auth configured and zero hardcoded endpoints, users dynamically claim or auto-create SIP lines."""
+        with patch.dict(os.environ, {'VOBIZ_SIP_ENDPOINTS': '', 'VOBIZ_DEFAULT_SIP_USER': '', 'VOBIZ_AUTH_ID': 'MA_TEST', 'VOBIZ_AUTH_TOKEN': 'tok_test'}), \
+             patch('apps.tenant_core.communication.adapters.voice_vobiz.VobizVoiceAdapter.resolve_default_application_id', return_value='APP_SWEAT_1'), \
+             patch('apps.tenant_core.communication.adapters.voice_vobiz.VobizVoiceAdapter.list_endpoints', return_value=[
+                 {'username': 'play856334494652018', 'alias': 'Vobiz WebRTC Playground Endpoint', 'application': 'APP_PLAY'},
+                 {'username': 'existing_vobiz_ep1', 'alias': 'Sweat', 'application': 'APP_SWEAT_1'},
+             ]), \
+             patch('apps.tenant_core.communication.adapters.voice_vobiz.VobizVoiceAdapter.create_endpoint', side_effect=lambda username, password, alias='', application_id='': {'ok': True, 'username': username}) as mock_create:
+            c1 = TelephonyConfigService.get_agent_webrtc_credentials(self.user1, db_alias='tenant_test')
+            c2 = TelephonyConfigService.get_agent_webrtc_credentials(self.user2, db_alias='tenant_test')
+            c3 = TelephonyConfigService.get_agent_webrtc_credentials(self.user3, db_alias='tenant_test')
+            c4 = TelephonyConfigService.get_agent_webrtc_credentials(self.user4, db_alias='tenant_test')
+
+        # User 1 claims existing non-playground endpoint; User 2/3/4 each get auto-provisioned endpoints
+        self.assertTrue(c1['is_registered_endpoint'])
+        self.assertEqual(c1['username'], 'existing_vobiz_ep1')
+        self.assertEqual(mock_create.call_count, 3)
+
+        seen_usernames = {c1['username']}
+        for creds in (c2, c3, c4):
+            self.assertTrue(creds['is_registered_endpoint'])
+            self.assertTrue(creds['available'])
+            self.assertTrue(creds['username'].startswith('crm'))
+            self.assertTrue(bool(creds['password']))
+            self.assertNotIn(creds['username'], seen_usernames)
+            seen_usernames.add(creds['username'])
+
+    def test_inbound_routing_excludes_deactivated_users(self):
+        """Deactivated staff accounts (status='INACTIVE') are never selected for inbound call routing."""
+        TelephonyConfigService.get_agent_webrtc_credentials(self.user1, db_alias='tenant_test')
+        TelephonyConfigService.get_agent_webrtc_credentials(self.user2, db_alias='tenant_test')
+
+        self.user1.status = 'INACTIVE'
+        self.user1.save(update_fields=['status'])
+
+        selected = TelephonyConfigService.get_available_agent(
+            preferred_user=self.user1,
+            caller_branch=self.branch,
+            org=self.org,
+            db_alias='tenant_test',
+        )
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.user_id, self.user2.id)

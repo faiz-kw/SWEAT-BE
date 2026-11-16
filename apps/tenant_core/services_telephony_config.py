@@ -24,7 +24,7 @@ class TelephonyConfigService:
 
     DEFAULT_REGISTRAR = "registrar.vobiz.ai"
     DEFAULT_WSS_URL = "wss://registrar.vobiz.ai:5063"
-    DEFAULT_DID = "+919240954144"
+    DEFAULT_DID = ""
     DEFAULT_TIMEOUT_SEC = 35
 
     @classmethod
@@ -83,12 +83,18 @@ class TelephonyConfigService:
             config_data.get("endpoint_password")
             or os.getenv("VOBIZ_ENDPOINT_PASSWORD")
             or os.getenv("VOBIZ_SIP_PASSWORD")
-            or "Sweat@2026!"
+            or ""
         ).strip()
+
+        endpoint_prefix = (
+            config_data.get("endpoint_prefix")
+            or os.getenv("VOBIZ_ENDPOINT_PREFIX")
+            or "crm"
+        ).strip().lower()
 
         try:
             ring_timeout = int(config_data.get("ring_timeout_sec") or os.getenv("VOBIZ_RING_TIMEOUT", cls.DEFAULT_TIMEOUT_SEC))
-            ring_timeout = max(35, ring_timeout)
+            ring_timeout = max(5, min(60, ring_timeout))
         except (ValueError, TypeError):
             ring_timeout = cls.DEFAULT_TIMEOUT_SEC
 
@@ -96,16 +102,30 @@ class TelephonyConfigService:
         if isinstance(record_all, str):
             record_all = record_all.lower() in ("true", "1", "yes")
 
+        application_id = (
+            config_data.get("application_id")
+            or os.getenv("VOBIZ_APPLICATION_ID", "")
+        ).strip()
+
+        raw_sip_pool = config_data.get("sip_endpoints") or os.getenv("VOBIZ_SIP_ENDPOINTS") or os.getenv("VOBIZ_DEFAULT_SIP_USER") or ""
+        if isinstance(raw_sip_pool, list):
+            sip_endpoints = [str(ep).strip() for ep in raw_sip_pool if str(ep).strip()]
+        else:
+            sip_endpoints = [ep.strip() for ep in str(raw_sip_pool).split(",") if ep.strip()]
+
         return {
             "provider": "VOBIZ",
             "auth_id": auth_id,
             "auth_token": auth_token,
+            "application_id": application_id,
+            "sip_endpoints": sip_endpoints,
             "from_number": from_number,
             "registrar_host": registrar_host,
             "webrtc_gateway_url": webrtc_gateway,
             "ring_timeout_sec": ring_timeout,
             "record_all_calls": bool(record_all),
             "endpoint_password": endpoint_password,
+            "endpoint_prefix": endpoint_prefix,
             "status": "ACTIVE" if (auth_id or from_number) else "UNCONFIGURED",
         }
 
@@ -127,13 +147,15 @@ class TelephonyConfigService:
 
         # Merge updates cleanly
         new_cfg = dict(existing_cfg)
-        for key in ["from_number", "auth_id", "registrar_host", "webrtc_gateway_url", "ring_timeout_sec", "record_all_calls", "endpoint_password"]:
+        for key in ["from_number", "auth_id", "application_id", "sip_endpoints", "registrar_host", "webrtc_gateway_url", "ring_timeout_sec", "record_all_calls", "endpoint_prefix"]:
             if key in payload:
                 new_cfg[key] = payload[key]
 
-        # Handle secret auth_token safely: only update if non-empty and not masked
+        # Handle secret auth_token & endpoint_password safely: only update if non-empty and not masked
         if payload.get("auth_token") and "••••" not in str(payload["auth_token"]):
             new_cfg["auth_token"] = str(payload["auth_token"]).strip()
+        if payload.get("endpoint_password") and "••••" not in str(payload["endpoint_password"]):
+            new_cfg["endpoint_password"] = str(payload["endpoint_password"]).strip()
 
         target_status = payload.get("status", current_int.status if current_int else "ACTIVE")
 
@@ -177,6 +199,7 @@ class TelephonyConfigService:
 
         eligible_agents = (
             AgentPresence.objects.using(alias)
+            .exclude(user__status__in=["INACTIVE", "DISABLED", "SUSPENDED", "DEACTIVATED"])
             .exclude(sip_username="")
             .exclude(sip_username__startswith="unassigned_")
             .exclude(sip_username__startswith="agent_")
@@ -268,48 +291,96 @@ class TelephonyConfigService:
     def get_agent_webrtc_credentials(cls, user, db_alias: Optional[str] = None) -> Dict[str, Any]:
         """
         Dynamically returns WebRTC SIP credentials for the authenticated user.
-        Ensures the agent has an AgentPresence record and returns the exact WSS endpoint.
-        When all dedicated Vobiz endpoints are occupied, assigns an explicit
-        ``unassigned_<id>`` placeholder without colliding on the shared primary endpoint.
+        Removes all hardcoded SIP usernames and user caps:
+        1. Reuses the user's existing registered AgentPresence SIP endpoint.
+        2. Claims any unclaimed endpoint from tenant configuration or live Vobiz Account API.
+        3. Auto-provisions a dedicated Vobiz SIP endpoint via REST API for new users (scales to 100+).
+        4. Falls back cleanly to ``unassigned_<id>`` (OFFLINE) if Vobiz API is unconfigured/unavailable.
         """
         alias = db_alias or get_tenant_db_alias() or "default"
+        import uuid
         from django.db import IntegrityError, transaction
         from apps.tenant_core.models_crm import AgentPresence
         from apps.tenant_core.models_org import Organization
 
         vobiz_cfg = cls.get_vobiz_config(alias)
-
-        # Primary registered endpoints on Vobiz account
-        primary_endpoint = (
-            os.getenv("VOBIZ_DEFAULT_SIP_USER")
-            or "iqra24030269280035568"
-        )
-        fallback_endpoints = list(dict.fromkeys([
-            primary_endpoint,
-            "sweatagent104201155654570218059",
-        ]))
+        uid_hex = user.id.hex[:12] if hasattr(user.id, "hex") else str(user.id)[:12]
+        unassigned_sip = f"unassigned_{uid_hex}"
+        display_name = f"{user.first_name} {user.last_name or ''}".strip() or user.email
 
         def _is_registered_sip(sip_name: Optional[str]) -> bool:
             return bool(sip_name and not sip_name.startswith(("unassigned_", "agent_")))
 
-        def _claim_free_endpoint(exclude_id=None) -> Optional[str]:
-            qs = AgentPresence.objects.using(alias)
-            for ep in fallback_endpoints:
-                ep_qs = qs.filter(sip_username=ep)
-                if exclude_id is not None:
-                    ep_qs = ep_qs.exclude(id=exclude_id)
-                if not ep_qs.exists():
-                    return ep
-            return None
+        def _is_ep_available(ep_name: str, exclude_id=None) -> bool:
+            qs = AgentPresence.objects.using(alias).filter(sip_username=ep_name)
+            if exclude_id is not None:
+                qs = qs.exclude(id=exclude_id)
+            return not qs.exists()
 
-        uid_hex = user.id.hex[:12] if hasattr(user.id, "hex") else str(user.id)[:12]
-        unassigned_sip = f"unassigned_{uid_hex}"
+        def _resolve_or_provision_endpoint(exclude_id=None) -> Optional[str]:
+            # 1. Check any explicitly configured pool in Integration/env (zero hardcoded usernames)
+            for ep in vobiz_cfg.get("sip_endpoints") or []:
+                if _is_registered_sip(ep) and _is_ep_available(ep, exclude_id=exclude_id):
+                    return ep
+
+            # 2. Dynamically discover & auto-provision via Vobiz REST API
+            auth_id = vobiz_cfg.get("auth_id", "")
+            auth_token = vobiz_cfg.get("auth_token", "")
+            if not auth_id or not auth_token:
+                return None
+
+            from apps.tenant_core.communication.adapters.voice_vobiz import VobizVoiceAdapter
+            adapter = VobizVoiceAdapter(configuration=vobiz_cfg)
+            app_id = adapter.resolve_default_application_id()
+
+            # 2a. Reuse any unclaimed live endpoint on the Vobiz account (excluding Playground)
+            for ep_obj in adapter.list_endpoints():
+                ep_user = str(ep_obj.get("username") or "").strip()
+                if not ep_user or not _is_registered_sip(ep_user):
+                    continue
+                ep_alias = str(ep_obj.get("alias") or "").lower()
+                ep_app = str(ep_obj.get("application") or ep_obj.get("app_id") or "").strip()
+                if "playground" in ep_alias or ep_user.startswith("play"):
+                    continue
+                if app_id and ep_app and ep_app != app_id:
+                    continue
+                if _is_ep_available(ep_user, exclude_id=exclude_id):
+                    return ep_user
+
+            # 2b. All existing endpoints are claimed -> auto-create a dedicated endpoint for this user
+            ep_password = vobiz_cfg.get("endpoint_password")
+            if not ep_password:
+                import secrets
+                ep_password = f"Vz!{secrets.token_urlsafe(12)}"
+                vobiz_cfg["endpoint_password"] = ep_password
+                try:
+                    cls.update_vobiz_config({"endpoint_password": ep_password}, db_alias=alias)
+                except Exception as exc:
+                    logger.warning("Could not persist auto-generated endpoint_password to Integration: %s", exc)
+            ep_prefix = vobiz_cfg.get("endpoint_prefix") or "crm"
+            for candidate in (f"{ep_prefix}{uid_hex}", f"{ep_prefix}{uid_hex[:8]}{uuid.uuid4().hex[:4]}"):
+                created = adapter.create_endpoint(
+                    username=candidate,
+                    password=ep_password,
+                    alias=f"{display_name} ({user.email})",
+                    application_id=app_id,
+                )
+                if created.get("ok") and created.get("username"):
+                    logger.info(
+                        "Auto-provisioned Vobiz SIP endpoint %s for user %s (app_id=%s)",
+                        created["username"],
+                        user.email,
+                        app_id or "default",
+                    )
+                    return created["username"]
+
+            return None
 
         # Look up or initialize AgentPresence for this user safely under concurrency
         presence = AgentPresence.objects.using(alias).filter(user=user).first()
         if not presence:
             user_org = getattr(user, 'organization', None) or Organization.objects.using(alias).first()
-            assigned_ep = _claim_free_endpoint()
+            assigned_ep = _resolve_or_provision_endpoint()
             chosen_sip = assigned_ep or unassigned_sip
             initial_status = "AVAILABLE" if assigned_ep else "OFFLINE"
 
@@ -343,16 +414,15 @@ class TelephonyConfigService:
                             },
                         )
         elif not _is_registered_sip(presence.sip_username):
-            # Auto-heal placeholder rows ONLY if an unclaimed real Vobiz endpoint is free.
-            # Never fall back to primary_endpoint when the pool is exhausted.
-            assigned_ep = _claim_free_endpoint(exclude_id=presence.id)
+            # Auto-heal placeholder/unassigned rows dynamically via Vobiz pool or auto-provisioning
+            assigned_ep = _resolve_or_provision_endpoint(exclude_id=presence.id)
             if assigned_ep:
                 try:
                     with transaction.atomic(using=alias):
                         presence.sip_username = assigned_ep
                         presence.status = "AVAILABLE"
                         presence.save(using=alias, update_fields=["sip_username", "status"])
-                        logger.info("Auto-healed placeholder SIP username for user %s -> %s", user.email, assigned_ep)
+                        logger.info("Provisioned real SIP endpoint for user %s -> %s", user.email, assigned_ep)
                 except IntegrityError:
                     presence = AgentPresence.objects.using(alias).filter(user=user).first() or presence
             elif not presence.sip_username or presence.sip_username.startswith("agent_"):
@@ -361,7 +431,7 @@ class TelephonyConfigService:
                         presence.sip_username = unassigned_sip
                         presence.status = "OFFLINE"
                         presence.save(using=alias, update_fields=["sip_username", "status"])
-                        logger.info("Pool exhausted; normalized agent %s -> %s (OFFLINE)", user.email, unassigned_sip)
+                        logger.info("No Vobiz line available; normalized agent %s -> %s (OFFLINE)", user.email, unassigned_sip)
                 except IntegrityError:
                     presence = AgentPresence.objects.using(alias).filter(user=user).first() or presence
 
@@ -373,8 +443,8 @@ class TelephonyConfigService:
         return {
             "username": sip_user if is_registered_endpoint else "",
             "sip_username": sip_user,
-            "password": vobiz_cfg.get("endpoint_password", "Sweat@2026!") if is_registered_endpoint else "",
-            "sip_password": vobiz_cfg.get("endpoint_password", "Sweat@2026!") if is_registered_endpoint else "",
+            "password": vobiz_cfg.get("endpoint_password", "") if is_registered_endpoint else "",
+            "sip_password": vobiz_cfg.get("endpoint_password", "") if is_registered_endpoint else "",
             "sip_domain": sip_domain,
             "sip_uri": sip_uri,
             "wss_url": vobiz_cfg["webrtc_gateway_url"] if is_registered_endpoint else "",
@@ -385,6 +455,6 @@ class TelephonyConfigService:
             "is_registered_endpoint": is_registered_endpoint,
             "available": is_registered_endpoint,
             "can_make_calls": is_registered_endpoint,
-            "display_name": f"{user.first_name} {user.last_name or ''}".strip() or user.email,
+            "display_name": display_name,
         }
 

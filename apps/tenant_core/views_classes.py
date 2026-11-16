@@ -453,6 +453,35 @@ class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
                 Q(branch__name__icontains=search_param)
             )
 
+        start_time_param = (self.request.query_params.get('start_time') or self.request.query_params.get('time_from') or '').strip()
+        end_time_param = (self.request.query_params.get('end_time') or self.request.query_params.get('time_to') or '').strip()
+
+        if start_time_param or end_time_param:
+            from datetime import datetime as dt_parser
+
+            def _parse_rule_time(val_str):
+                if not val_str:
+                    return None
+                for fmt in ('%H:%M:%S', '%H:%M', '%I:%M %p', '%I:%M%p'):
+                    try:
+                        return dt_parser.strptime(val_str, fmt).time()
+                    except ValueError:
+                        continue
+                return None
+
+            r_start = _parse_rule_time(start_time_param)
+            r_end = _parse_rule_time(end_time_param)
+
+            if r_start and r_end:
+                if r_start <= r_end:
+                    qs = qs.filter(start_time__lt=r_end, end_time__gt=r_start)
+                else:
+                    qs = qs.filter(Q(start_time__gte=r_start) | Q(end_time__lte=r_end) | Q(start_time__lt=r_end))
+            elif r_start:
+                qs = qs.filter(end_time__gt=r_start)
+            elif r_end:
+                qs = qs.filter(start_time__lt=r_end)
+
         return qs.order_by('start_time', 'id')
 
     def create(self, request, *args, **kwargs):
@@ -740,6 +769,59 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
                 Q(branch__name__icontains=search_param) |
                 Exists(matching_trainer)
             )
+
+        start_time_param = (self.request.query_params.get('start_time') or self.request.query_params.get('time_from') or '').strip()
+        end_time_param = (self.request.query_params.get('end_time') or self.request.query_params.get('time_to') or '').strip()
+
+        if start_time_param or end_time_param:
+            from datetime import datetime as dt_parser
+            from django.db.models import F, Func, Value, TimeField
+            from django.db.models.functions import Coalesce
+
+            def _parse_time_val(val_str):
+                if not val_str:
+                    return None
+                for fmt in ('%H:%M:%S', '%H:%M', '%I:%M %p', '%I:%M%p'):
+                    try:
+                        return dt_parser.strptime(val_str, fmt).time()
+                    except ValueError:
+                        continue
+                return None
+
+            t_start = _parse_time_val(start_time_param)
+            t_end = _parse_time_val(end_time_param)
+
+            if t_start or t_end:
+                tz_expr = Coalesce(F('branch__timezone'), Value('Asia/Kolkata'))
+                qs = qs.annotate(
+                    local_start_time=Func(
+                        tz_expr,
+                        F('start_at'),
+                        function='timezone',
+                        output_field=TimeField(),
+                        template='(timezone(%(expressions)s))::time',
+                    ),
+                    local_end_time=Func(
+                        tz_expr,
+                        F('end_at'),
+                        function='timezone',
+                        output_field=TimeField(),
+                        template='(timezone(%(expressions)s))::time',
+                    ),
+                )
+                if t_start and t_end:
+                    if t_start <= t_end:
+                        qs = qs.filter(local_start_time__lt=t_end, local_end_time__gt=t_start)
+                    else:
+                        qs = qs.filter(
+                            Q(local_start_time__gte=t_start) |
+                            Q(local_end_time__lte=t_end) |
+                            Q(local_start_time__lt=t_end)
+                        )
+                elif t_start:
+                    qs = qs.filter(local_end_time__gt=t_start)
+                elif t_end:
+                    qs = qs.filter(local_start_time__lt=t_end)
 
         ordering = (self.request.query_params.get('ordering') or '').strip()
         order_fields = ('-start_at', '-id') if ordering in ['-start_at', '-occurrence_date'] else ('start_at', 'id')
