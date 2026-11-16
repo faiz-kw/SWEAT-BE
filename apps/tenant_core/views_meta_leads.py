@@ -809,6 +809,12 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
     def oauth_callback(self, request):
         is_browser_redirect = (request.method == 'GET')
         frontend_origin = (getattr(settings, 'FRONTEND_URL', None) or os.getenv('FRONTEND_URL', '')).rstrip('/')
+        if not frontend_origin or 'localhost' in frontend_origin:
+            req_host = request.get_host().lower() if hasattr(request, 'get_host') else ''
+            if 'sweatfitwellness.com' in req_host:
+                frontend_origin = 'https://crm.sweatfitwellness.com'
+            elif not frontend_origin:
+                frontend_origin = 'https://crm.sweatfitwellness.com'
         target_path = '/crm/setup?tab=meta'
 
         # Ensure instance attributes exist immediately
