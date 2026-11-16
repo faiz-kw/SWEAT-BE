@@ -351,6 +351,7 @@ class MetaAccessMixin:
         'oauth_callback_alias': 'crm.settings.edit',
         'disconnect': 'crm.settings.edit',
         'reconnect': 'crm.settings.edit',
+        'refresh_pages': 'crm.settings.edit',
         'health': 'crm.settings.view',
         'retry_failed': 'crm.settings.edit',
         'connect_token': 'crm.settings.edit',
