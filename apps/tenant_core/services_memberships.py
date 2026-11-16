@@ -283,12 +283,12 @@ class MembershipLifecycleService:
                 db_alias=alias,
             )
 
-            # Synchronize member profile & user home branch with package purchase branch
+            # Set member home branch ONLY on first purchase; do NOT auto-transfer an existing member's home branch
             if order.user_profile and order.branch:
-                if order.user_profile.preferred_branch_id != order.branch_id:
+                if not order.user_profile.preferred_branch_id:
                     order.user_profile.preferred_branch = order.branch
                     order.user_profile.save(using=alias, update_fields=['preferred_branch', 'updated_at'])
-                if getattr(order.user_profile, 'user', None) and order.user_profile.user.home_branch_id != order.branch_id:
+                if getattr(order.user_profile, 'user', None) and not order.user_profile.user.home_branch_id:
                     order.user_profile.user.home_branch = order.branch
                     order.user_profile.user.save(using=alias, update_fields=['home_branch', 'updated_at'])
 
@@ -723,6 +723,7 @@ class MembershipLifecycleService:
         reason: Optional[str] = None,
         actor_user: Optional[TenantUser] = None,
         db_alias: Optional[str] = None,
+        coupon_discount: Optional[Decimal] = None,
     ) -> MembershipChangeRequest:
         """
         Evaluates and applies a membership modification (upgrade, downgrade, cancellation).
@@ -755,7 +756,8 @@ class MembershipLifecycleService:
         if change_type == 'UPGRADE' and target_package_version:
             target_price_obj = target_package_version.prices.filter(status='ACTIVE').first()
             target_price = target_price_obj.base_price if target_price_obj else Decimal('8000.00')
-            additional_amount = max(Decimal('0.00'), target_price - original_remaining_val)
+            _upg_disc = coupon_discount or Decimal('0.00')
+            additional_amount = max(Decimal('0.00'), (target_price - _upg_disc) - original_remaining_val)
         elif change_type == 'CANCELLATION':
             if policy_rule.cancellation_fee_type == 'FIXED' and policy_rule.cancellation_fee_value:
                 penalty_amount = policy_rule.cancellation_fee_value

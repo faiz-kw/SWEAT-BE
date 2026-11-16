@@ -60,6 +60,7 @@ class DiscountCouponEngineService:
         package: Optional[Package] = None,
         db_alias: Optional[str] = None,
         order: Optional[Order] = None,
+        order_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Validate a coupon code against campaign rules, usage limits, and scopes.
@@ -113,13 +114,18 @@ class DiscountCouponEngineService:
         # Branch scope
         camp_cfg = campaign.configuration if isinstance(campaign.configuration, dict) else {}
         allowed_branch_id = str(discount_code.branch_id) if discount_code.branch_id else camp_cfg.get('branch_id')
+        allowed_branch_ids = camp_cfg.get('branch_ids') if isinstance(camp_cfg.get('branch_ids'), list) else None
         if allowed_branch_id:
             if not branch or str(branch.id) != str(allowed_branch_id):
                 branch_label = discount_code.branch.name if discount_code.branch else (Branch.objects.using(alias).filter(id=allowed_branch_id).values_list('name', flat=True).first() or 'the designated branch')
                 return {'is_valid': False, 'reason': f"Coupon is only valid at {branch_label}.", 'reason_code': 'BRANCH_NOT_ELIGIBLE'}
+        elif allowed_branch_ids:
+            if not branch or str(branch.id) not in [str(x) for x in allowed_branch_ids]:
+                return {'is_valid': False, 'reason': 'Coupon is not valid at this branch.', 'reason_code': 'BRANCH_NOT_ELIGIBLE'}
 
         # Package scope
         allowed_package_id = str(discount_code.package_id) if discount_code.package_id else camp_cfg.get('package_id')
+        allowed_package_ids = camp_cfg.get('package_ids') if isinstance(camp_cfg.get('package_ids'), list) else None
         if allowed_package_id:
             pkg_eligible = False
             if package and str(package.id) == str(allowed_package_id):
@@ -131,6 +137,53 @@ class DiscountCouponEngineService:
             if not pkg_eligible:
                 pkg_label = discount_code.package.name if discount_code.package else (Package.objects.using(alias).filter(id=allowed_package_id).values_list('name', flat=True).first() or 'the designated package')
                 return {'is_valid': False, 'reason': f"Coupon is only valid for package '{pkg_label}'.", 'reason_code': 'PACKAGE_NOT_ELIGIBLE'}
+        elif allowed_package_ids:
+            allowed_set = {str(x) for x in allowed_package_ids}
+            opids = []
+            if package:
+                opids.append(str(package.id))
+            if order is not None:
+                opids += [str(p) for p in order.items.using(alias).filter(package_id__isnull=False).values_list('package_id', flat=True)]
+            if not any(pid in allowed_set for pid in opids):
+                return {'is_valid': False, 'reason': 'Coupon is not valid for this package.', 'reason_code': 'PACKAGE_NOT_ELIGIBLE'}
+
+        # Program scope - a configured program_ids list (covers a whole program's packages)
+        allowed_program_ids = camp_cfg.get('program_ids') if isinstance(camp_cfg.get('program_ids'), list) else None
+        if allowed_program_ids:
+            prog_set = set()
+            if package is not None and getattr(package, 'program_id', None):
+                prog_set.add(str(package.program_id))
+            if order is not None:
+                for _it in order.items.using(alias).filter(package__isnull=False).select_related('package'):
+                    if getattr(_it, 'package', None) and getattr(_it.package, 'program_id', None):
+                        prog_set.add(str(_it.package.program_id))
+            if not (prog_set & {str(x) for x in allowed_program_ids}):
+                return {'is_valid': False, 'reason': 'Coupon is not valid for this program.', 'reason_code': 'PROGRAM_NOT_ELIGIBLE'}
+
+        # User lock - restrict a coupon to specific member(s) via configuration['allowed_user_ids']
+        allowed_user_ids = camp_cfg.get('allowed_user_ids') if isinstance(camp_cfg.get('allowed_user_ids'), list) else None
+        if allowed_user_ids:
+            uid = str(user_profile.id) if user_profile else None
+            if not uid or uid not in [str(x) for x in allowed_user_ids]:
+                return {'is_valid': False, 'reason': 'This coupon is not available for your account.', 'reason_code': 'USER_NOT_ELIGIBLE'}
+
+        # Order-type gate (RENEWAL-only / NEW-only / UPGRADE-only via configuration['order_types'])
+        allowed_order_types = camp_cfg.get('order_types') if isinstance(camp_cfg.get('order_types'), list) else None
+        if allowed_order_types:
+            otype = (str(order_type).upper() if order_type else (str(getattr(order, 'order_type', '') or '').upper() if order is not None else ''))
+            if not otype or otype not in [str(x).upper() for x in allowed_order_types]:
+                return {'is_valid': False, 'reason': 'This coupon is not valid for this transaction type.', 'reason_code': 'ORDER_TYPE_NOT_ELIGIBLE'}
+
+        # Member-type gate (NEW = first-time only / EXISTING = must already have a membership)
+        member_type = camp_cfg.get('member_type')
+        if member_type and user_profile is not None:
+            from .models_memberships import Membership as _Mem
+            has_prior = _Mem.objects.using(alias).filter(user_profile=user_profile).exclude(status='CANCELLED').exists()
+            mt = str(member_type).upper()
+            if mt == 'NEW' and has_prior:
+                return {'is_valid': False, 'reason': 'This offer is only for first-time members.', 'reason_code': 'MEMBER_TYPE_NOT_ELIGIBLE'}
+            if mt == 'EXISTING' and not has_prior:
+                return {'is_valid': False, 'reason': 'This offer is only for existing members.', 'reason_code': 'MEMBER_TYPE_NOT_ELIGIBLE'}
 
         # Minimum order amount & Authoritative Subtotal calculation
         if order is not None and order.items.using(alias).exists():
