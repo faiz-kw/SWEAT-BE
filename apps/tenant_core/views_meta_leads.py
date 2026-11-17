@@ -59,15 +59,16 @@ class MappingSerializer(serializers.ModelSerializer):
     lead_source = serializers.UUIDField()
     assigned_sales_user = serializers.UUIDField(allow_null=True, required=False)
     expected_version = serializers.IntegerField(write_only=True, required=False, min_value=1)
+    page_name = serializers.CharField(read_only=True, required=False)
 
     class Meta:
         model = MetaLeadMapping
-        fields = ['id', 'page_id', 'form_id', 'name', 'is_active', 'version', 'expected_version',
+        fields = ['id', 'page_id', 'page_name', 'form_id', 'name', 'is_active', 'version', 'expected_version',
                   'field_mappings', 'field_defaults', 'branch_mode', 'branch', 'branch_field', 'branch_answers',
                   'unmatched_branch_policy', 'fallback_branch', 'lead_source', 'initial_stage', 'repeat_policy',
                   'assignment_mode', 'assigned_sales_user', 'create_followup_task', 'followup_task_type',
                   'followup_due_hours', 'updated_at']
-        read_only_fields = ['id', 'version', 'updated_at']
+        read_only_fields = ['id', 'page_name', 'version', 'updated_at']
         validators = []
 
     def validate_page_id(self, value):
@@ -83,10 +84,24 @@ class MappingSerializer(serializers.ModelSerializer):
         return val
 
     def to_representation(self, instance):
-        result = super().to_representation({
+        fields_to_read = [k for k in self.Meta.fields if k not in ('expected_version', 'page_name')]
+        data_dict = {
             key: getattr(instance, key + '_id' if key in ('branch', 'fallback_branch', 'lead_source', 'assigned_sales_user') else key)
-            for key in self.Meta.fields if key != 'expected_version'
-        })
+            for key in fields_to_read
+        }
+        result = super().to_representation(data_dict)
+        alias = getattr(self.context.get('view'), 'alias', None) or self.context.get('alias')
+        page_name = None
+        if alias and getattr(instance, 'page_id', None):
+            try:
+                p_conn = MetaPageConnection.objects.using(alias).filter(
+                    organization_id=instance.organization_id, page_id=instance.page_id
+                ).first()
+                if p_conn and p_conn.page_name:
+                    page_name = p_conn.page_name
+            except Exception:
+                pass
+        result['page_name'] = page_name
         return result
 
     def validate(self, attrs):
@@ -339,7 +354,9 @@ class SimulationSerializer(serializers.Serializer):
 
 
 class MetaPagination(PageNumberPagination):
-    page_size = 25
+    page_size = 50
+    page_size_query_param = 'page_size'
+    max_page_size = 200
 
 
 class MetaAccessMixin:
@@ -564,9 +581,22 @@ def _format_connection_details(conn, db_alias=None, pages=None) -> dict:
 
 class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):
     serializer_class = MappingSerializer
+    pagination_class = MetaPagination
 
     def get_queryset(self):
-        return MetaLeadMapping.objects.using(self.alias).filter(organization=self.organization)
+        qs = MetaLeadMapping.objects.using(self.alias).filter(organization=self.organization)
+        params = getattr(self.request, 'query_params', getattr(self.request, 'GET', {}))
+        page_id = params.get('page_id')
+        if page_id and str(page_id).strip() and str(page_id).strip().upper() != 'ALL':
+            qs = qs.filter(page_id=str(page_id).strip())
+        is_active = params.get('is_active')
+        if is_active is not None and str(is_active).strip():
+            val = str(is_active).strip().lower()
+            if val in ('true', '1', 'active'):
+                qs = qs.filter(is_active=True)
+            elif val in ('false', '0', 'paused'):
+                qs = qs.filter(is_active=False)
+        return qs.order_by('-updated_at', '-id')
 
     def get_serializer_context(self):
         return {**super().get_serializer_context(), 'organization': self.organization, 'alias': self.alias}
@@ -1594,6 +1624,8 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
             'webhook_endpoint': '/api/v1/webhooks/meta/leads/',
             'simulator_enabled': simulator_enabled(),
             'has_received_enquiries': MetaLeadImport.objects.using(self.alias).filter(organization=self.organization, status='IMPORTED').exists(),
+            'active_mappings_count': MetaLeadMapping.objects.using(self.alias).filter(organization=self.organization, is_active=True).count(),
+            'total_mappings_count': MetaLeadMapping.objects.using(self.alias).filter(organization=self.organization).count(),
             'simulator_requirement': 'Development/test deployment, DEBUG enabled, META_LEAD_SIMULATOR_ENABLED enabled and COMMUNICATIONS_OUTBOUND_ENABLED disabled.',
             'destination_fields': [{'value': k, 'label': v} for k, v in DESTINATION_FIELDS.items()],
             'allowed_default_fields': [
