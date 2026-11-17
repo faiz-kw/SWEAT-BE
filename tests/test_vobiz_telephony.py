@@ -10,6 +10,7 @@ Validates:
 """
 
 import json
+import uuid
 from unittest.mock import patch, MagicMock
 from django.test import TestCase, override_settings
 from django.utils import timezone
@@ -19,6 +20,7 @@ from apps.tenant_core.models_org import Organization, Location, Branch
 from apps.tenant_core.models_users import TenantUser
 from apps.tenant_core.models_crm import Lead, CallSession, AgentPresence, LeadActivity
 from apps.tenant_core.communication.adapters.voice_vobiz import VobizVoiceAdapter
+from apps.tenant_core.views_telephony import push_agent_telephony_event
 
 
 class VobizTelephonyTests(TestCase):
@@ -218,3 +220,93 @@ class VobizTelephonyTests(TestCase):
         activity = LeadActivity.objects.filter(lead=self.lead, activity_type='CALL').first()
         self.assertIsNotNone(activity)
         self.assertIn('Trial Booked', activity.notes)
+
+    # ── Regression: Redis publish payloads must be JSON serializable ──────────
+
+    def _published_events(self, mock_from_url):
+        """Returns (channel, decoded_event) for every Redis publish call."""
+        publish = mock_from_url.return_value.publish
+        return [(c.args[0], json.loads(c.args[1])) for c in publish.call_args_list]
+
+    @patch('apps.tenant_core.views_telephony.redis.from_url')
+    def test_push_event_serializes_uuid_values(self, mock_from_url):
+        """A raw UUID in a payload must not block the Redis publish."""
+        lead_uuid = uuid.uuid4()
+        push_agent_telephony_event(str(self.rep.id), 'INCOMING_CALL_POPUP', {'lead_id': lead_uuid})
+
+        mock_from_url.return_value.publish.assert_called_once()
+        _, evt = self._published_events(mock_from_url)[0]
+        self.assertEqual(evt['data']['lead_id'], str(lead_uuid))
+
+    @patch('apps.tenant_core.views_telephony.redis.from_url')
+    def test_fallback_popup_publishes_lead_id_as_string(self, mock_from_url):
+        """Regression: overflow INCOMING_CALL_POPUP failed with 'UUID is not JSON serializable'."""
+        secondary = TenantUser.objects.create(
+            organization=self.org,
+            email="neha@sweatelite.in",
+            first_name="Neha",
+            last_name="Rao",
+        )
+        AgentPresence.objects.create(
+            organization=self.org,
+            user=secondary,
+            sip_username="neha0001",
+            status="AVAILABLE",
+            last_heartbeat=timezone.now(),
+        )
+        session = CallSession.objects.create(
+            organization=self.org,
+            lead=self.lead,
+            sales_rep=self.rep,
+            provider='VOBIZ',
+            provider_attempt_id='test-fallback-uuid',
+            direction='INBOUND',
+            call_mode='HUMAN_MANUAL',
+            status='RINGING',
+            user_phone_number='+919876543210',
+            started_at=timezone.now(),
+        )
+
+        res = self.client.post(
+            f'/api/v1/telephony/dial-fallback/?session_id={session.id}',
+            data={'CallUUID': 'test-fallback-uuid', 'DialStatus': 'no-answer'},
+        )
+        set_tenant_db_alias('tenant_test')
+        self.assertEqual(res.status_code, 200)
+
+        popups = [
+            (channel, evt)
+            for channel, evt in self._published_events(mock_from_url)
+            if evt['event'] == 'INCOMING_CALL_POPUP'
+        ]
+        self.assertEqual(len(popups), 1)
+        channel, evt = popups[0]
+        self.assertTrue(channel.endswith(str(secondary.id).lower()))
+        self.assertEqual(evt['data']['lead_id'], str(self.lead.id))
+
+    @patch('apps.tenant_core.views_telephony.redis.from_url')
+    def test_hangup_call_ended_publishes_lead_id_as_string(self, mock_from_url):
+        """Regression: CALL_ENDED failed with 'UUID is not JSON serializable' for lead callers."""
+        CallSession.objects.create(
+            organization=self.org,
+            lead=self.lead,
+            sales_rep=self.rep,
+            provider='VOBIZ',
+            provider_attempt_id='test-ended-uuid',
+            direction='INBOUND',
+            call_mode='HUMAN_MANUAL',
+            status='CONNECTED',
+            started_at=timezone.now(),
+        )
+
+        res = self.client.post('/api/v1/telephony/hangup/', data={
+            'CallUUID': 'test-ended-uuid',
+            'CallStatus': 'completed',
+            'Duration': '95',
+        })
+        set_tenant_db_alias('tenant_test')
+        self.assertEqual(res.status_code, 200)
+
+        ended = [evt for _, evt in self._published_events(mock_from_url) if evt['event'] == 'CALL_ENDED']
+        self.assertEqual(len(ended), 1)
+        self.assertEqual(ended[0]['data']['lead_id'], str(self.lead.id))

@@ -24,6 +24,7 @@ import asyncio
 import redis
 import redis.asyncio as aioredis
 from django.conf import settings
+from django.core.serializers.json import DjangoJSONEncoder
 from django.db import connections, transaction
 from django.http import HttpResponse, StreamingHttpResponse
 from django.views import View
@@ -145,7 +146,7 @@ def push_agent_telephony_event(user_id: str, event_type: str, payload: dict, ten
     try:
         redis_url = getattr(settings, 'REDIS_URL', 'redis://localhost:6379/0')
         r = redis.from_url(redis_url, socket_timeout=1.0, socket_connect_timeout=1.0)
-        r.publish(channel, json.dumps(evt))
+        r.publish(channel, json.dumps(evt, cls=DjangoJSONEncoder))
         logger.info("Published telephony event '%s' to channel '%s'", event_type, channel)
     except Exception as e:
         logger.error("Failed to publish telephony event '%s' to Redis (%s): %s", event_type, channel, e)
@@ -528,7 +529,7 @@ class VobizInboundFallbackWebhookView(APIView):
                 push_agent_telephony_event(str(secondary_user.id), 'INCOMING_CALL_POPUP', {
                     'session_id': str(session.id) if session else '',
                     'call_uuid': call_uuid,
-                    'lead_id': lead.id if lead else None,
+                    'lead_id': str(lead.id) if lead else None,
                     'lead_name': f"{lead.first_name} {lead.last_name or ''}".strip() if lead else "Member Call (Overflow)",
                     'masked_phone': masked_phone,
                     'branch': lead.branch.name if (lead and lead.branch) else "General",
@@ -681,7 +682,7 @@ class VobizHangupWebhookView(APIView):
                                 'is_meaningful': is_meaningful,
                                 'direction': session.direction,
                                 'caller_phone': session.user_phone_number or '',
-                                'lead_id': session.lead.id if session.lead else None,
+                                'lead_id': str(session.lead.id) if session.lead else None,
                                 'lead_name': f"{session.lead.first_name} {session.lead.last_name or ''}".strip() if session.lead else (session.user_phone_number or "Customer"),
                                 'recording_url': recording_url,
                             })
