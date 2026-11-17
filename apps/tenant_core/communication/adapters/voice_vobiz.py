@@ -375,19 +375,22 @@ class VobizVoiceAdapter(BaseCommunicationAdapter):
         secondary_sip_uri: str,
         caller_id: str,
         complete_action_url: str,
+        dial_events_url: Optional[str] = None,
         whisper_prompt: str = "Please stay on the line while we connect you to our senior consultant.",
         timeout: int = 20,
         registrar_host: str = '',
     ) -> str:
         """
         Builds VobizXML for the overflow fallback leg when the primary agent is busy or unavailable.
+        dial_events_url receives the overflow agent leg's real-time events (answer, connected, hangup).
         """
         sip_target = cls._normalize_sip_uri(secondary_sip_uri, registrar_host=registrar_host)
+        callback_attr = f' callbackUrl="{dial_events_url}"' if dial_events_url else ""
 
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Speak voice="WOMAN" language="en-IN">{whisper_prompt}</Speak>
-  <Dial action="{complete_action_url}" callerId="{caller_id}" record="true" timeout="{timeout}">
+  <Dial action="{complete_action_url}"{callback_attr} callerId="{caller_id}" record="true" timeout="{timeout}">
     <User>{sip_target}</User>
   </Dial>
 </Response>"""

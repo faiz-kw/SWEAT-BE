@@ -537,12 +537,14 @@ class VobizInboundFallbackWebhookView(APIView):
                 })
 
                 complete_url = f"{host}/api/v1/telephony/hangup/"
+                dial_events_url = f"{host}/api/v1/telephony/dial-events/?session_id={session.id}" if session else None
                 registrar_host = vobiz_cfg.get('registrar_host') or 'registrar.vobiz.ai'
                 agent_sip = f"sip:{secondary_presence.sip_username}@{registrar_host}"
                 xml = VobizVoiceAdapter.build_fallback_overflow_xml(
                     secondary_sip_uri=agent_sip,
                     caller_id=caller_id,
                     complete_action_url=complete_url,
+                    dial_events_url=dial_events_url,
                     whisper_prompt="Please stay on the line while we connect you to our senior consultant.",
                     timeout=int(vobiz_cfg.get('ring_timeout_sec') or 20),
                     registrar_host=registrar_host,
@@ -630,14 +632,20 @@ class VobizHangupWebhookView(APIView):
 
             if session:
                 bill_duration = VobizVoiceAdapter.calculate_billable_duration(duration_raw)
-                is_meaningful = (duration_raw >= 30.0)
+                # Caller-leg Duration includes ring time. An INBOUND call only counts as
+                # answered if /dial-events/ saw the agent leg answer (CONNECTED) or the Dial
+                # result already closed it as COMPLETED (keeps duplicate hangups idempotent).
+                was_answered = duration_raw > 0 and (
+                    session.direction != 'INBOUND' or session.status in ('CONNECTED', 'COMPLETED')
+                )
+                is_meaningful = was_answered and duration_raw >= 30.0
 
                 session.duration_seconds = duration_raw
                 session.bill_duration_seconds = bill_duration
                 session.is_meaningful = is_meaningful
                 session.recording_url = recording_url
                 session.hangup_cause = hangup_cause
-                session.status = 'COMPLETED' if duration_raw > 0 else 'NO_ANSWER'
+                session.status = 'COMPLETED' if was_answered else 'NO_ANSWER'
                 session.ended_at = timezone.now()
                 session.save(update_fields=[
                     'duration_seconds',
@@ -660,7 +668,7 @@ class VobizHangupWebhookView(APIView):
                 # Update rep presence based on whether the call actually connected
                 if session.sales_rep:
                     rep_id = str(session.sales_rep.id)
-                    if duration_raw > 0:
+                    if was_answered:
                         # If disposition was ALREADY submitted by agent from the browser WebRTC phone:
                         if session.disposition:
                             logger.info("Call %s already disposed as %s. Setting rep to AVAILABLE and skipping duplicate CALL_ENDED broadcast.", session.id, session.disposition)

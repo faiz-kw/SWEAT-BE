@@ -327,7 +327,11 @@ class VobizTelephonyTests(TestCase):
 
     @patch('apps.tenant_core.views_telephony.redis.from_url')
     def test_dial_events_never_change_session_or_presence(self, mock_from_url):
-        """answer / connected / hangup B-leg events are log-only."""
+        """hangup / digits B-leg events are log-only: they never close the call or free the rep.
+
+        (answer / connected are the only events that write, and only RINGING -> CONNECTED;
+        see test_dial_events_answer_marks_connected_but_hangup_event_does_not.)
+        """
         session = CallSession.objects.create(
             organization=self.org,
             lead=self.lead,
@@ -343,7 +347,7 @@ class VobizTelephonyTests(TestCase):
         self.presence.active_session = session
         self.presence.save()
 
-        for action in ('answer', 'connected', 'hangup'):
+        for action in ('hangup', 'digits'):
             with self.subTest(action=action):
                 res = self.client.post(f'/api/v1/telephony/dial-events/?session_id={session.id}', data={
                     'CallUUID': 'test-dial-events-uuid',
@@ -414,3 +418,187 @@ class VobizTelephonyTests(TestCase):
         res = api_client.get('/api/v1/tenant/crm/telephony/presence/')
         set_tenant_db_alias('tenant_test')
         self.assertEqual(res.data['status'], 'ON_CALL')
+
+    # ── Phase 2b: answered vs. ring time on inbound calls ─────────────────────
+
+    def _start_inbound_call(self, call_uuid):
+        """Runs the real inbound webhook for the known lead and returns the new CallSession."""
+        res = self.client.post('/api/v1/telephony/inbound/', data={
+            'CallUUID': call_uuid,
+            'From': '+919876543210',
+            'To': '+919200000001',
+        })
+        set_tenant_db_alias('tenant_test')
+        self.assertEqual(res.status_code, 200)
+        return CallSession.objects.get(provider_attempt_id=call_uuid)
+
+    @patch('apps.tenant_core.views_telephony.redis.from_url')
+    def test_dial_events_answer_marks_connected_but_hangup_event_does_not(self, mock_from_url):
+        """answer / connected move a ringing session to CONNECTED. hangup does not, and a
+        finished session is never reopened."""
+        session = CallSession.objects.create(
+            organization=self.org,
+            lead=self.lead,
+            sales_rep=self.rep,
+            provider='VOBIZ',
+            provider_attempt_id='test-connected-uuid',
+            direction='INBOUND',
+            call_mode='HUMAN_MANUAL',
+            status='RINGING',
+            started_at=timezone.now(),
+        )
+        self.presence.status = 'ON_CALL'
+        self.presence.active_session = session
+        self.presence.save()
+        url = f'/api/v1/telephony/dial-events/?session_id={session.id}'
+
+        self.client.post(url, data={'CallUUID': 'test-connected-uuid', 'DialAction': 'hangup'})
+        set_tenant_db_alias('tenant_test')
+        session.refresh_from_db()
+        self.assertEqual(session.status, 'RINGING')
+
+        for action in ('answer', 'connected'):
+            with self.subTest(action=action):
+                res = self.client.post(url, data={'CallUUID': 'test-connected-uuid', 'DialAction': action})
+                set_tenant_db_alias('tenant_test')
+                self.assertEqual(res.status_code, 200)
+                session.refresh_from_db()
+                self.presence.refresh_from_db()
+                self.assertEqual(session.status, 'CONNECTED')
+                self.assertIsNone(session.ended_at)
+                self.assertEqual(self.presence.status, 'ON_CALL')
+
+        finished = CallSession.objects.create(
+            organization=self.org,
+            lead=self.lead,
+            sales_rep=self.rep,
+            provider='VOBIZ',
+            provider_attempt_id='test-finished-uuid',
+            direction='INBOUND',
+            call_mode='HUMAN_MANUAL',
+            status='COMPLETED',
+            started_at=timezone.now(),
+        )
+        self.client.post(
+            f'/api/v1/telephony/dial-events/?session_id={finished.id}',
+            data={'CallUUID': 'test-finished-uuid', 'DialAction': 'answer'},
+        )
+        set_tenant_db_alias('tenant_test')
+        finished.refresh_from_db()
+        self.assertEqual(finished.status, 'COMPLETED')
+        mock_from_url.return_value.publish.assert_not_called()
+
+    @patch('apps.tenant_core.views_telephony.redis.from_url')
+    def test_answered_inbound_call_completes_with_wrap_up(self, mock_from_url):
+        """Agent leg answered -> the caller-leg hangup completes the call, puts the rep in
+        WRAP_UP and sends CALL_ENDED. A duplicate hangup does not turn it into a missed call."""
+        session = self._start_inbound_call('test-answered-uuid')
+        self.client.post(f'/api/v1/telephony/dial-events/?session_id={session.id}', data={
+            'CallUUID': 'test-answered-uuid',
+            'DialAction': 'answer',
+        })
+        set_tenant_db_alias('tenant_test')
+        session.refresh_from_db()
+        self.assertEqual(session.status, 'CONNECTED')
+
+        hangup = {'CallUUID': 'test-answered-uuid', 'CallStatus': 'completed', 'Duration': '60'}
+        res = self.client.post('/api/v1/telephony/hangup/', data=hangup)
+        set_tenant_db_alias('tenant_test')
+        self.assertEqual(res.status_code, 200)
+
+        session.refresh_from_db()
+        self.presence.refresh_from_db()
+        self.assertEqual(session.status, 'COMPLETED')
+        self.assertTrue(session.is_meaningful)
+        self.assertEqual(self.presence.status, 'WRAP_UP')
+        names = [evt['event'] for _, evt in self._published_events(mock_from_url)]
+        self.assertEqual(names.count('CALL_ENDED'), 1)
+        self.assertNotIn('MISSED_CALL', names)
+
+        # Vobiz sends duplicate hangups (seen in production nginx logs).
+        self.client.post('/api/v1/telephony/hangup/', data=hangup)
+        set_tenant_db_alias('tenant_test')
+        session.refresh_from_db()
+        self.assertEqual(session.status, 'COMPLETED')
+        names = [evt['event'] for _, evt in self._published_events(mock_from_url)]
+        self.assertNotIn('MISSED_CALL', names)
+
+    @patch('apps.tenant_core.views_telephony.redis.from_url')
+    def test_unanswered_inbound_call_with_ring_time_is_missed_not_completed(self, mock_from_url):
+        """Regression (prod 2026-11-16 19:07): 40s of ringing was saved as COMPLETED and
+        meaningful, sent CALL_ENDED, and never reached the Missed Calls desk."""
+        session = self._start_inbound_call('test-unanswered-uuid')
+
+        res = self.client.post('/api/v1/telephony/hangup/', data={
+            'CallUUID': 'test-unanswered-uuid',
+            'CallStatus': 'completed',
+            'Duration': '40',
+        })
+        set_tenant_db_alias('tenant_test')
+        self.assertEqual(res.status_code, 200)
+
+        session.refresh_from_db()
+        self.presence.refresh_from_db()
+        self.assertEqual(session.status, 'NO_ANSWER')
+        self.assertFalse(session.is_meaningful)
+        self.assertEqual(self.presence.status, 'AVAILABLE')
+        names = [evt['event'] for _, evt in self._published_events(mock_from_url)]
+        self.assertIn('MISSED_CALL', names)
+        self.assertNotIn('CALL_ENDED', names)
+
+        api_client = APIClient()
+        api_client.force_authenticate(user=self.rep)
+        res = api_client.get('/api/v1/tenant/crm/telephony/missed-calls/')
+        set_tenant_db_alias('tenant_test')
+        self.assertEqual(res.status_code, 200)
+        self.assertIn(str(session.id), [item['session_id'] for item in res.data['results']])
+
+    @patch('apps.tenant_core.views_telephony.redis.from_url')
+    def test_overflow_xml_callback_url_points_to_dial_events(self, mock_from_url):
+        """The overflow agent's leg also reports answer events to /dial-events/."""
+        xml = VobizVoiceAdapter.build_fallback_overflow_xml(
+            secondary_sip_uri="sip:neha0001@registrar.vobiz.ai",
+            caller_id="+919200000001",
+            complete_action_url="https://x/api/v1/telephony/hangup/",
+            dial_events_url="https://x/api/v1/telephony/dial-events/?session_id=1",
+        )
+        self.assertIn('callbackUrl="https://x/api/v1/telephony/dial-events/?session_id=1"', xml)
+        xml_without = VobizVoiceAdapter.build_fallback_overflow_xml(
+            secondary_sip_uri="sip:neha0001@registrar.vobiz.ai",
+            caller_id="+919200000001",
+            complete_action_url="https://x/api/v1/telephony/hangup/",
+        )
+        self.assertNotIn('callbackUrl', xml_without)
+
+        secondary = TenantUser.objects.create(
+            organization=self.org,
+            email="neha@sweatelite.in",
+            first_name="Neha",
+            last_name="Rao",
+        )
+        AgentPresence.objects.create(
+            organization=self.org,
+            user=secondary,
+            sip_username="neha0001",
+            status="AVAILABLE",
+            last_heartbeat=timezone.now(),
+        )
+        session = CallSession.objects.create(
+            organization=self.org,
+            lead=self.lead,
+            sales_rep=self.rep,
+            provider='VOBIZ',
+            provider_attempt_id='test-overflow-xml-uuid',
+            direction='INBOUND',
+            call_mode='HUMAN_MANUAL',
+            status='RINGING',
+            user_phone_number='+919876543210',
+            started_at=timezone.now(),
+        )
+        res = self.client.post(
+            f'/api/v1/telephony/dial-fallback/?session_id={session.id}',
+            data={'CallUUID': 'test-overflow-xml-uuid', 'DialStatus': 'no-answer'},
+        )
+        set_tenant_db_alias('tenant_test')
+        self.assertEqual(res.status_code, 200)
+        self.assertIn(f'/api/v1/telephony/dial-events/?session_id={session.id}', res.content.decode())
