@@ -4637,16 +4637,24 @@ class MemberViewSet(viewsets.ViewSet):
         import re
         for pkg in packages.order_by('name'):
             pv = pkg.versions.using(alias).filter(status='ACTIVE').order_by('-version_number').first()
-            price_val = 5000.0
+            price_val = 0.0
             currency = 'INR'
             duration_months = 1
             validity_days = 30
             total_sessions = None
+            # Resolve the real price: prefer the current version's active price, else fall back
+            # to any active price on this package (e.g. one left on a retired/older version after
+            # a migration created price-less new versions). Never fabricate a 5000 placeholder.
+            pr = pv.prices.using(alias).filter(status='ACTIVE').first() if pv else None
+            if not pr:
+                from .models_catalog import PackagePrice as _PPref
+                pr = _PPref.objects.using(alias).filter(
+                    package_version__package=pkg, status='ACTIVE'
+                ).order_by('-package_version__version_number').first()
+            if pr:
+                price_val = float(pr.display_price if pr.display_price else pr.base_price)
+                currency = pr.currency
             if pv:
-                pr = pv.prices.using(alias).filter(status='ACTIVE').first()
-                if pr:
-                    price_val = float(pr.base_price)
-                    currency = pr.currency
                 if getattr(pv, 'duration_unit', '') == 'MONTH':
                     duration_months = pv.duration_value or 1
                 elif getattr(pv, 'duration_unit', '') == 'YEAR':
