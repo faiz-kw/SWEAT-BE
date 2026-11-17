@@ -33,6 +33,7 @@ from apps.tenant_core.views_voice_agent import (
     VoiceAgentStudioFaqView,
 )
 from apps.tenant_core import views_telephony
+from apps.tenant_core import views_telephony_dial_events
 from apps.tenant_core import views_public_trial
 
 # Django admin branding
@@ -95,6 +96,7 @@ urlpatterns = [
     # Vobiz Carrier Telephony Direct Webhooks
     path('api/v1/telephony/inbound/', views_telephony.VobizInboundWebhookView.as_view(), name='vobiz-inbound-root'),
     path('api/v1/telephony/dial-fallback/', views_telephony.VobizInboundFallbackWebhookView.as_view(), name='vobiz-fallback-root'),
+    path('api/v1/telephony/dial-events/', views_telephony_dial_events.VobizDialEventView.as_view(), name='vobiz-dial-events-root'),
     path('api/v1/telephony/hangup/', views_telephony.VobizHangupWebhookView.as_view(), name='vobiz-hangup-root'),
     path('api/v1/telephony/recording/', views_telephony.VobizRecordingWebhookView.as_view(), name='vobiz-recording-root'),
     path('api/v1/telephony/agent-answer-bridge/', views_telephony.AgentAnswerBridgeXmlView.as_view(), name='vobiz-agent-bridge-root'),

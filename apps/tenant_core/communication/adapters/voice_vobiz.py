@@ -287,17 +287,19 @@ class VobizVoiceAdapter(BaseCommunicationAdapter):
         timeout: int = 35,
         record: bool = True,
         recording_callback_url: Optional[str] = None,
-        hangup_url: Optional[str] = None,
+        dial_events_url: Optional[str] = None,
         registrar_host: str = '',
     ) -> str:
         """
         Builds VobizXML to ring the assigned agent's registered SIP endpoint.
         If unanswered or busy, Vobiz fires fallback_action_url to execute the overflow ladder.
+        dial_events_url receives Vobiz's real-time B-leg events (answer, connected, hangup).
+        It must not point at the hangup webhook: one leg ending is not the end of the call.
         dialMusic="real" ensures the calling customer hears standard carrier ringback cadence.
         """
         rec_str = "true" if record else "false"
         sip_target = cls._normalize_sip_uri(agent_sip_uri, registrar_host=registrar_host)
-        callback_attr = f' callbackUrl="{hangup_url}"' if hangup_url else ""
+        callback_attr = f' callbackUrl="{dial_events_url}"' if dial_events_url else ""
 
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>

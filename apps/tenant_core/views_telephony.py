@@ -430,7 +430,7 @@ class VobizInboundWebhookView(APIView):
                 host = _get_webhook_host(request)
                 fallback_url = f"{host}/api/v1/telephony/dial-fallback/?session_id={session.id}"
                 rec_callback_url = f"{host}/api/v1/telephony/recording/?session_id={session.id}"
-                hangup_url = f"{host}/api/v1/telephony/hangup/?session_id={session.id}"
+                dial_events_url = f"{host}/api/v1/telephony/dial-events/?session_id={session.id}"
                 did_caller_id = did_number if did_number.startswith('+') else vobiz_cfg['from_number']
                 agent_sip = f"sip:{presence.sip_username}@{vobiz_cfg['registrar_host']}"
                 caller_display_id = did_caller_id
@@ -441,7 +441,7 @@ class VobizInboundWebhookView(APIView):
                     timeout=max(35, int(vobiz_cfg.get('ring_timeout_sec') or 35)),
                     record=vobiz_cfg['record_all_calls'],
                     recording_callback_url=rec_callback_url,
-                    hangup_url=hangup_url,
+                    dial_events_url=dial_events_url,
                 )
                 logger.info("Generated Inbound Dial XML:\n%s", xml)
                 return HttpResponse(xml, content_type="application/xml; charset=utf-8")

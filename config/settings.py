@@ -272,6 +272,8 @@ REST_FRAMEWORK = {
         'auth_refresh': os.getenv('THROTTLE_RATE_REFRESH', '20/minute'),
         # Wellness AI vision rate limit (per authenticated member)
         'wellness_ai_vision': os.getenv('THROTTLE_RATE_WELLNESS_AI_VISION', '10/minute'),
+        # Vobiz Dial callbackUrl events (log-only webhook, several events per call leg)
+        'telephony_dial_events': os.getenv('THROTTLE_RATE_TELEPHONY_DIAL_EVENTS', '600/minute'),
         # General API throttles (authenticated vs anonymous)
         'user': os.getenv('THROTTLE_RATE_API_USER', '1000/minute'),
         'anon': os.getenv('THROTTLE_RATE_API_ANON', '60/minute'),
@@ -579,6 +581,7 @@ if 'test' in sys.argv:
         'auth_mfa':     '10000/minute',
         'auth_refresh': '10000/minute',
         'wellness_ai_vision': '10000/minute',
+        'telephony_dial_events': '10000/minute',
         # Disable global API throttles in tests: all test requests share the same loopback IP.
         'user': '10000/minute',
         'anon': '10000/minute',
