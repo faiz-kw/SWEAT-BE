@@ -666,6 +666,34 @@ class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
+# Trial statuses that hold a seat in the class list "Booked" count. NO_SHOW and CONVERTED still
+# count (the prospect held the seat); CANCELLED / RESCHEDULED released it.
+TRIAL_SEAT_HOLDING_STATUSES = ('BOOKED', 'CONFIRMED', 'ATTENDED', 'NO_SHOW', 'CONVERTED')
+
+
+def annotate_trial_booking_count(qs, alias):
+    """Annotate each occurrence with `annotated_trial_count` (seat-holding trial bookings).
+
+    TrialBooking.class_occurrence_id is a plain UUID column, not a ForeignKey, so trials are not
+    reachable through `occurrence.bookings`. A correlated subquery keeps this to one SQL query.
+    """
+    from django.db.models import Count, IntegerField, OuterRef, Subquery
+    from django.db.models.functions import Coalesce
+    from .models_crm import TrialBooking
+
+    trial_counts = (
+        TrialBooking.objects.using(alias)
+        .filter(class_occurrence_id=OuterRef('pk'), status__in=TRIAL_SEAT_HOLDING_STATUSES)
+        .order_by()
+        .values('class_occurrence_id')
+        .annotate(total=Count('id'))
+        .values('total')
+    )
+    return qs.annotate(
+        annotated_trial_count=Coalesce(Subquery(trial_counts, output_field=IntegerField()), 0)
+    )
+
+
 class ClassOccurrenceViewSet(viewsets.ModelViewSet):
     serializer_class = ClassOccurrenceSerializer
     pagination_class = ClassesPagination
@@ -826,7 +854,7 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
         ordering = (self.request.query_params.get('ordering') or '').strip()
         order_fields = ('-start_at', '-id') if ordering in ['-start_at', '-occurrence_date'] else ('start_at', 'id')
 
-        return qs.select_related(
+        return annotate_trial_booking_count(qs, alias).select_related(
             'class_template', 'class_template__category', 'class_template__program', 'branch'
         ).prefetch_related(
             'trainer_assignments__trainer_profile__employee_profile__user_profile__user',
