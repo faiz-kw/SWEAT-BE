@@ -2053,8 +2053,16 @@ class PermissionViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
         db = self.get_db()
         try:
             from .models_rbac import Permission
-            # Auto-seed canonical permissions if missing so all modules appear on UI
-            if Permission.objects.using(db).filter(is_active=True).count() < 100:
+            from .security_utils import SENSITIVE_PERMISSION_CODES
+            # Auto-seed canonical permissions if missing so all modules & privacy controls appear on UI
+            existing_sensitive = Permission.objects.using(db).filter(
+                permission_code__in=list(SENSITIVE_PERMISSION_CODES),
+                is_active=True,
+            ).count()
+            if (
+                Permission.objects.using(db).filter(is_active=True).count() < 100
+                or existing_sensitive < len(SENSITIVE_PERMISSION_CODES)
+            ):
                 from .rbac_defaults import sync_default_role_permissions
                 sync_default_role_permissions(db_alias=db, overwrite_custom=False)
         except Exception as e:

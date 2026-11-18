@@ -266,9 +266,62 @@ class MappingSerializer(serializers.ModelSerializer):
         return attrs
 
 
+def _resolve_meta_form_info(organization_id, page_id: str, form_id: str, page_conn, request_cache: dict) -> dict:
+    """Resolve Meta form name & status dynamically with request + Django cache protection."""
+    cache_tuple = (str(page_id or ''), str(form_id or ''))
+    if not cache_tuple[0] or not cache_tuple[1]:
+        return {}
+    if cache_tuple in request_cache:
+        return request_cache[cache_tuple]
+
+    from django.core.cache import cache
+    cache_key = f"meta_form_info:{organization_id}:{cache_tuple[0]}:{cache_tuple[1]}"
+    try:
+        cached = cache.get(cache_key)
+        if isinstance(cached, dict):
+            request_cache[cache_tuple] = cached
+            return cached
+    except Exception as exc:
+        logger.debug("Meta form info cache read skipped for %s: %s", cache_key, exc)
+
+    info: dict = {}
+    enc_token = getattr(page_conn, 'encrypted_page_access_token', '') if page_conn else ''
+    if enc_token and not is_synthetic_token(enc_token):
+        try:
+            page_token = decrypt_token(enc_token)
+            if page_token:
+                client = MetaGraphClient(timeout=4)
+                details = client.fetch_form_details(cache_tuple[1], page_token)
+                if isinstance(details, dict):
+                    if details.get('name'):
+                        info['name'] = str(details['name']).strip()
+                    if details.get('status'):
+                        info['status'] = str(details['status']).strip()
+        except Exception as exc:
+            logger.warning(
+                "Could not fetch Meta form details for page_id=%s form_id=%s: %s",
+                cache_tuple[0], cache_tuple[1], exc,
+            )
+
+    request_cache[cache_tuple] = info
+    try:
+        # Cache resolved names for 6 hours; negative-cache misses for 10 minutes to prevent API thrashing
+        cache.set(cache_key, info, timeout=21600 if info.get('name') else 600)
+    except Exception as exc:
+        logger.debug("Meta form info cache write skipped for %s: %s", cache_key, exc)
+    return info
+
+
 class ImportSerializer(serializers.ModelSerializer):
     matched_lead = serializers.SerializerMethodField()
     resolution = serializers.SerializerMethodField()
+    facebook_account_name = serializers.SerializerMethodField()
+    facebook_account_id = serializers.SerializerMethodField()
+    page_name = serializers.SerializerMethodField()
+    form_name = serializers.SerializerMethodField()
+    meta_form_status = serializers.SerializerMethodField()
+    mapping_state = serializers.SerializerMethodField()
+    mapping_info = serializers.SerializerMethodField()
 
     class Meta:
         model = MetaLeadImport
@@ -276,9 +329,120 @@ class ImportSerializer(serializers.ModelSerializer):
             'id', 'mode', 'page_id', 'form_id', 'external_lead_id', 'status', 'lead',
             'mapping_version', 'attempt_count', 'error_code', 'error_message',
             'campaign_id', 'campaign_name', 'adset_id', 'adset_name', 'ad_id', 'ad_name', 'is_organic',
-            'received_at', 'processed_at', 'matched_lead', 'resolution', 'field_data', 'mapping_snapshot'
+            'received_at', 'processed_at', 'matched_lead', 'resolution', 'field_data', 'mapping_snapshot',
+            'facebook_account_name', 'facebook_account_id', 'page_name',
+            'form_name', 'meta_form_status', 'mapping_state', 'mapping_info',
         ]
         read_only_fields = fields
+
+    def _get_page_conn(self, obj):
+        page_id = str(getattr(obj, 'page_id', '') or '')
+        if not page_id:
+            return None
+        page_conn_map = self.context.get('page_conn_map')
+        if isinstance(page_conn_map, dict):
+            return page_conn_map.get(page_id)
+        alias = getattr(self.context.get('view'), 'alias', None) or self.context.get('alias')
+        if not alias:
+            return None
+        try:
+            return (
+                MetaPageConnection.objects.using(alias)
+                .filter(organization_id=obj.organization_id, page_id=page_id)
+                .select_related('connection')
+                .first()
+            )
+        except Exception as exc:
+            logger.warning("Failed to load MetaPageConnection for page_id=%s: %s", page_id, exc)
+            return None
+
+    def _get_mapping(self, obj):
+        key = (str(getattr(obj, 'page_id', '') or ''), str(getattr(obj, 'form_id', '') or ''))
+        if not key[0] or not key[1]:
+            return None
+        mapping_map = self.context.get('mapping_map')
+        if isinstance(mapping_map, dict):
+            return mapping_map.get(key)
+        alias = getattr(self.context.get('view'), 'alias', None) or self.context.get('alias')
+        if not alias:
+            return None
+        try:
+            return (
+                MetaLeadMapping.objects.using(alias)
+                .filter(organization_id=obj.organization_id, page_id=key[0], form_id=key[1])
+                .first()
+            )
+        except Exception as exc:
+            logger.warning("Failed to load MetaLeadMapping for page_id=%s form_id=%s: %s", key[0], key[1], exc)
+            return None
+
+    def _get_meta_form_info(self, obj):
+        snapshot = obj.mapping_snapshot if isinstance(obj.mapping_snapshot, dict) else {}
+        if snapshot.get('meta_form_name'):
+            return {
+                'name': snapshot.get('meta_form_name'),
+                'status': snapshot.get('meta_form_status'),
+            }
+        # Only query Meta Graph API (cached) when the form is not yet mapped in CRM
+        if self._get_mapping(obj) is not None:
+            return {}
+        if obj.status not in ('NEEDS_MAPPING', 'PENDING', 'FAILED'):
+            return {}
+        req_cache = self.context.setdefault('form_info_cache', {})
+        return _resolve_meta_form_info(
+            obj.organization_id,
+            str(obj.page_id or ''),
+            str(obj.form_id or ''),
+            self._get_page_conn(obj),
+            req_cache,
+        )
+
+    def get_facebook_account_name(self, obj):
+        pc = self._get_page_conn(obj)
+        conn = getattr(pc, 'connection', None) if pc else None
+        return getattr(conn, 'meta_user_name', None) or None
+
+    def get_facebook_account_id(self, obj):
+        pc = self._get_page_conn(obj)
+        conn = getattr(pc, 'connection', None) if pc else None
+        return getattr(conn, 'meta_user_id', None) or None
+
+    def get_page_name(self, obj):
+        pc = self._get_page_conn(obj)
+        return getattr(pc, 'page_name', None) or None
+
+    def get_form_name(self, obj):
+        mapping = self._get_mapping(obj)
+        if mapping and mapping.name:
+            return mapping.name
+        snapshot = obj.mapping_snapshot if isinstance(obj.mapping_snapshot, dict) else {}
+        if snapshot.get('name'):
+            return snapshot.get('name')
+        if snapshot.get('meta_form_name'):
+            return snapshot.get('meta_form_name')
+        info = self._get_meta_form_info(obj)
+        return info.get('name') or None
+
+    def get_meta_form_status(self, obj):
+        info = self._get_meta_form_info(obj)
+        return info.get('status') or None
+
+    def get_mapping_state(self, obj):
+        mapping = self._get_mapping(obj)
+        if not mapping:
+            return 'UNCONFIGURED'
+        return 'ACTIVE' if mapping.is_active else 'PAUSED'
+
+    def get_mapping_info(self, obj):
+        mapping = self._get_mapping(obj)
+        if not mapping:
+            return None
+        return {
+            'id': str(mapping.id),
+            'name': mapping.name,
+            'is_active': bool(mapping.is_active),
+            'version': mapping.version,
+        }
 
     def get_resolution(self, obj):
         if isinstance(obj.mapping_snapshot, dict):
@@ -325,18 +489,29 @@ class ImportSerializer(serializers.ModelSerializer):
                 lead = Lead.objects.using(alias).filter(organization_id=obj.organization_id).filter(contact).first()
 
         if lead:
+            from .security_utils import mask_phone_if_restricted
+            req = self.context.get('request')
+            masked_phone = mask_phone_if_restricted(req, lead.phone_normalized)
             name = f"{lead.first_name} {lead.last_name}".strip()
             return {
                 'id': str(lead.id),
-                'name': name or lead.phone_normalized or lead.email_normalized or 'Existing Lead',
+                'name': name or masked_phone or lead.email_normalized or 'Existing Lead',
                 'first_name': lead.first_name,
                 'last_name': lead.last_name,
                 'email': lead.email_normalized,
-                'phone': lead.phone_normalized,
+                'phone': masked_phone,
                 'status': lead.current_status,
                 'created_at': lead.created_at.isoformat() if lead.created_at else None,
             }
         return None
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        from .security_utils import sanitize_meta_field_data
+        req = self.context.get('request')
+        if 'field_data' in data:
+            data['field_data'] = sanitize_meta_field_data(req, data['field_data'])
+        return data
 
 
 class SimulationSerializer(serializers.Serializer):
@@ -1800,11 +1975,35 @@ class MetaLeadImportViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retri
                 qs = qs.filter(status=status)
         return qs
 
+    def get_serializer_context(self):
+        ctx = {**super().get_serializer_context(), 'organization': self.organization, 'alias': self.alias}
+        page_conn_map = {}
+        mapping_map = {}
+        try:
+            for pc in (
+                MetaPageConnection.objects.using(self.alias)
+                .filter(organization=self.organization)
+                .select_related('connection')
+            ):
+                page_conn_map[str(pc.page_id)] = pc
+        except Exception as exc:
+            logger.warning("Failed to preload MetaPageConnection map for imports list: %s", exc)
+        try:
+            for m in MetaLeadMapping.objects.using(self.alias).filter(organization=self.organization):
+                mapping_map[(str(m.page_id), str(m.form_id))] = m
+        except Exception as exc:
+            logger.warning("Failed to preload MetaLeadMapping map for imports list: %s", exc)
+        ctx['page_conn_map'] = page_conn_map
+        ctx['mapping_map'] = mapping_map
+        ctx['form_info_cache'] = {}
+        return ctx
+
     def retrieve(self, request, *args, **kwargs):
+        from .security_utils import sanitize_meta_field_data
         event = self.get_object()
         return Response({
             **self.get_serializer(event).data,
-            'field_data': event.field_data,
+            'field_data': sanitize_meta_field_data(request, event.field_data),
             'mapping_snapshot': event.mapping_snapshot,
         })
 

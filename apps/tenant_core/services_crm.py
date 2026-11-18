@@ -366,20 +366,64 @@ class CRMLeadService:
                         if cp_changed:
                             cp.save(using=alias)
 
-                notes_parts = [f"Repeat inquiry received via {source_label}."]
+                attr_for_notes = attribution_data or attribution_from_extra or {}
+                raw_meta_for_notes = attr_for_notes.get('raw_metadata') if isinstance(attr_for_notes, dict) else {}
+                if not isinstance(raw_meta_for_notes, dict):
+                    raw_meta_for_notes = {}
+
+                form_name_note = (
+                    (attr_for_notes.get('form_name') if isinstance(attr_for_notes, dict) else None)
+                    or raw_meta_for_notes.get('form_name')
+                )
+                form_id_note = (
+                    (attr_for_notes.get('form_external_id') if isinstance(attr_for_notes, dict) else None)
+                    or raw_meta_for_notes.get('form_id')
+                )
+                page_name_note = raw_meta_for_notes.get('page_name')
+                page_id_note = raw_meta_for_notes.get('page_id')
+                adset_name_note = (
+                    (attr_for_notes.get('ad_set_name') if isinstance(attr_for_notes, dict) else None)
+                    or raw_meta_for_notes.get('adset_name')
+                )
+                ad_name_note = (
+                    (attr_for_notes.get('ad_name') if isinstance(attr_for_notes, dict) else None)
+                    or raw_meta_for_notes.get('ad_name')
+                )
+
+                header_parts = [f"Repeat inquiry received via {source_label}."]
+                if form_name_note:
+                    header_parts.append(f"Form: {form_name_note}" + (f" (ID: {form_id_note})" if form_id_note else ""))
+                elif form_id_note:
+                    header_parts.append(f"Form ID: {form_id_note}")
+                if page_name_note:
+                    header_parts.append(f"Page: {page_name_note}")
+                elif page_id_note:
+                    header_parts.append(f"Page ID: {page_id_note}")
+                if camp_ref:
+                    header_parts.append(f"Campaign: {camp_ref}")
+                if adset_name_note:
+                    header_parts.append(f"Ad Set: {adset_name_note}")
+                if ad_name_note:
+                    header_parts.append(f"Ad: {ad_name_note}")
                 if extra.get('fitness_goal'):
-                    notes_parts.append(f"Goal: {extra.get('fitness_goal')}")
+                    header_parts.append(f"Goal: {extra.get('fitness_goal')}")
                 if extra.get('interested_program'):
                     prog_name = getattr(extra.get('interested_program'), 'name', str(extra.get('interested_program')))
-                    notes_parts.append(f"Program: {prog_name}")
-                if camp_ref:
-                    notes_parts.append(f"Campaign: {camp_ref}")
+                    header_parts.append(f"Program: {prog_name}")
+
+                notes_lines = [' | '.join(header_parts)]
+                submitted_answers = raw_meta_for_notes.get('form_answers')
+                if isinstance(submitted_answers, list) and submitted_answers:
+                    notes_lines.append("Submitted form answers:")
+                    for qa in submitted_answers:
+                        if isinstance(qa, dict) and qa.get('question') and qa.get('answer'):
+                            notes_lines.append(f"• {qa['question']}: {qa['answer']}")
 
                 cls.record_lead_activity(
                     lead=existing_lead,
                     activity_type='OTHER',
                     outcome='Repeat Inquiry',
-                    notes=' | '.join(notes_parts),
+                    notes='\n'.join(notes_lines),
                     performed_by_user=actor_user,
                     activity_at=timezone.now(),
                     external_reference=attribution_data.get('external_lead_id') if attribution_data else None,
@@ -814,6 +858,7 @@ class CRMLeadService:
         lead: Lead,
         limit: int = 50,
         db_alias: Optional[str] = None,
+        request=None,
     ) -> List[Dict[str, Any]]:
         alias = db_alias or get_tenant_db_alias() or 'default'
         events = []
@@ -878,19 +923,61 @@ class CRMLeadService:
 
         # 4. Attributions
         for attr in LeadAttribution.objects.using(alias).filter(lead=lead):
+            raw_meta = attr.raw_metadata if isinstance(attr.raw_metadata, dict) else {}
+            form_name = attr.form_name or raw_meta.get('form_name')
+            form_id = attr.form_external_id or raw_meta.get('form_id')
+            page_name = raw_meta.get('page_name')
+            page_id = raw_meta.get('page_id')
+            ad_set_name = attr.ad_set_name or raw_meta.get('adset_name')
+            ad_name = attr.ad_name or raw_meta.get('ad_name')
+            form_answers = raw_meta.get('form_answers') if isinstance(raw_meta.get('form_answers'), list) else []
+
+            desc_parts = [attr.platform or 'Digital']
+            if form_name:
+                desc_parts.append(f"Form: {form_name}" + (f" (ID: {form_id})" if form_id else ""))
+            elif form_id:
+                desc_parts.append(f"Form ID: {form_id}")
+            if page_name:
+                desc_parts.append(f"Page: {page_name}")
+            elif page_id:
+                desc_parts.append(f"Page ID: {page_id}")
+            desc_parts.append(f"Campaign: {attr.campaign_name or 'Direct'}")
+            if ad_set_name:
+                desc_parts.append(f"Ad Set: {ad_set_name}")
+            if ad_name:
+                desc_parts.append(f"Ad: {ad_name}")
+
+            desc_lines = [' • '.join(desc_parts)]
+            if form_answers:
+                desc_lines.append("Submitted form answers:")
+                for qa in form_answers:
+                    if isinstance(qa, dict) and qa.get('question') and qa.get('answer'):
+                        desc_lines.append(f"• {qa['question']}: {qa['answer']}")
+
             events.append({
                 'id': f"attr-{attr.id}",
                 'event_type': 'ATTRIBUTION_CAPTURED',
                 'occurred_at': attr.captured_at.isoformat(),
-                'title': f"Attribution: {attr.touch_type.replace('_', ' ').title()}",
-                'description': f"{attr.platform or 'Digital'} • Campaign: {attr.campaign_name or 'Direct'}",
+                'title': (
+                    f"Meta Form Submission: {form_name}"
+                    if (attr.platform == 'META' and form_name)
+                    else f"Attribution: {attr.touch_type.replace('_', ' ').title()}"
+                ),
+                'description': '\n'.join(desc_lines),
                 'actor': 'Marketing Engine',
                 'channel': attr.platform or 'WEB',
                 'metadata': {
                     'touch_type': attr.touch_type,
                     'platform': attr.platform,
+                    'form_name': form_name,
+                    'form_external_id': form_id,
+                    'page_name': page_name,
+                    'page_id': page_id,
                     'campaign_name': attr.campaign_name,
-                    'ad_name': attr.ad_name,
+                    'ad_set_name': ad_set_name,
+                    'ad_name': ad_name,
+                    'external_lead_id': attr.external_lead_id,
+                    'form_answers': form_answers,
                     'utm_source': attr.utm_source,
                     'utm_medium': attr.utm_medium,
                     'utm_campaign': attr.utm_campaign,
@@ -984,14 +1071,16 @@ class CRMLeadService:
             elif is_call_act and not has_call_sessions:
                 ev_type = 'VOICE_CALL'
 
+            is_repeat_inquiry = (act.outcome == 'Repeat Inquiry')
             is_verified = bool(act.external_reference)
             act_metadata = {
                 'activity_type': act.activity_type,
                 'outcome': act.outcome,
                 'notes': act.notes,
                 'is_reminder': is_reminder_act,
+                'is_repeat_inquiry': is_repeat_inquiry,
                 'is_verified_call': is_verified if is_call_act else None,
-                'call_session_id': act.external_reference if is_verified else None,
+                'call_session_id': act.external_reference if (is_verified and is_call_act) else None,
             }
             # Only attach audio card metadata to generic LeadActivity if no CallSession exists,
             # preventing duplicate audio players on the unified timeline.
@@ -1009,10 +1098,16 @@ class CRMLeadService:
                 'id': f"act-{act.id}",
                 'event_type': ev_type,
                 'occurred_at': act.activity_at.isoformat(),
-                'title': "AI Reminder Call" if is_reminder_act else f"{act.activity_type.replace('_', ' ').title()}",
-                'description': act.outcome or act.notes or '',
+                'title': (
+                    "AI Reminder Call"
+                    if is_reminder_act
+                    else "Repeat Lead Enquiry"
+                    if is_repeat_inquiry
+                    else f"{act.activity_type.replace('_', ' ').title()}"
+                ),
+                'description': (act.notes or act.outcome or '') if is_repeat_inquiry else (act.outcome or act.notes or ''),
                 'actor': act_user,
-                'channel': act.activity_type,
+                'channel': 'META' if (is_repeat_inquiry and act.notes and 'Meta' in act.notes) else act.activity_type,
                 'metadata': act_metadata,
             })
 
@@ -1070,6 +1165,8 @@ class CRMLeadService:
             actor_name = 'Customer' if comm.direction == 'INBOUND' else (
                 f"{comm.created_by_user.first_name} {comm.created_by_user.last_name}".strip() if comm.created_by_user else 'System'
             )
+            from .security_utils import mask_communication_identifier
+            masked_recipient = mask_communication_identifier(request, comm.channel, comm.recipient)
             title = f"{comm.channel.title()} ({comm.direction.title()}): {comm.status.title()}"
             events.append({
                 'id': f"comm-{comm.id}",
@@ -1085,7 +1182,7 @@ class CRMLeadService:
                     'direction': comm.direction,
                     'status': comm.status,
                     'purpose': comm.purpose,
-                    'recipient': comm.recipient,
+                    'recipient': masked_recipient,
                     'sender': comm.sender,
                 },
             })
@@ -1227,14 +1324,20 @@ class CRMLeadService:
             gst_number = fields_to_update.pop('gst_number', None)
             pan_number = fields_to_update.pop('pan_number', None)
 
+            from .security_utils import is_masked_phone
             if 'email_normalized' in fields_to_update and fields_to_update['email_normalized']:
                 fields_to_update['email_normalized'] = validate_lead_email(fields_to_update['email_normalized'])
             if 'email' in fields_to_update and fields_to_update['email']:
                 fields_to_update['email_normalized'] = validate_lead_email(fields_to_update.pop('email'))
             if 'phone_normalized' in fields_to_update and fields_to_update['phone_normalized']:
-                fields_to_update['phone_normalized'] = validate_lead_phone(fields_to_update['phone_normalized'])
+                if is_masked_phone(fields_to_update['phone_normalized']):
+                    fields_to_update.pop('phone_normalized', None)
+                else:
+                    fields_to_update['phone_normalized'] = validate_lead_phone(fields_to_update['phone_normalized'])
             if 'phone' in fields_to_update and fields_to_update['phone']:
-                fields_to_update['phone_normalized'] = validate_lead_phone(fields_to_update.pop('phone'))
+                raw_p = fields_to_update.pop('phone')
+                if not is_masked_phone(raw_p):
+                    fields_to_update['phone_normalized'] = validate_lead_phone(raw_p)
 
             assigned_sales_user = fields_to_update.pop('assigned_sales_user', None)
             if assigned_sales_user is not None and assigned_sales_user != lead.assigned_sales_user:

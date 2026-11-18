@@ -785,7 +785,22 @@ class BookingWaitlistAttendanceService:
         elite_candidates = []
         fallback_candidates = []
 
+        from .models_memberships import MembershipFreeze
         for mem in active_memberships:
+            # Multi-contract isolation: If this specific membership is frozen on occ_date,
+            # skip it as a booking candidate so other active/unfrozen contracts can be utilized.
+            is_frozen_on_date = (
+                mem.status == 'FROZEN'
+                or MembershipFreeze.objects.using(alias).filter(
+                    membership=mem,
+                    status__in=['ACTIVE', 'SCHEDULED'],
+                    freeze_from__lte=occ_date,
+                    freeze_until__gte=occ_date,
+                ).exists()
+            )
+            if is_frozen_on_date:
+                continue
+
             active_ents = [e for e in mem.entitlements.all() if e.status == 'ACTIVE']
             credit_ent = next((e for e in active_ents if e.entitlement_type == 'CREDIT_WALLET'), None)
             is_elite = bool(credit_ent and (credit_ent.is_unlimited or (credit_ent.remaining_units is not None and credit_ent.remaining_units > 0) or credit_ent.allocated_units))
@@ -974,9 +989,10 @@ class BookingWaitlistAttendanceService:
                     freeze_until__gte=occ_date,
                 ).first()
                 if matching_freeze:
+                    pkg_title = membership.package.name if (membership and membership.package) else "Membership"
                     raise ValidationError(
-                        f"Membership is frozen from {matching_freeze.freeze_from} to {matching_freeze.freeze_until}. "
-                        "No class bookings allowed during the freeze window."
+                        f"Membership '{pkg_title}' is frozen from {matching_freeze.freeze_from} to {matching_freeze.freeze_until}. "
+                        "No class bookings allowed under this membership during the freeze window."
                     )
 
                 if membership.status not in ('ACTIVE', 'FROZEN'):

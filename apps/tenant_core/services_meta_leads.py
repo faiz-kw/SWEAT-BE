@@ -346,6 +346,23 @@ def process_live_import(organization, event_id, actor_user=None, graph_client=No
                 organization = mapping.organization
 
         if not mapping:
+            # Opportunistically record Meta form name & status in mapping_snapshot so admins can identify unmapped forms immediately
+            snapshot = dict(event.mapping_snapshot) if isinstance(event.mapping_snapshot, dict) else {}
+            if event.form_id and not snapshot.get('meta_form_name') and page_token:
+                try:
+                    form_details = graph_client.fetch_form_details(event.form_id, page_token)
+                    if isinstance(form_details, dict):
+                        if form_details.get('name'):
+                            snapshot['meta_form_name'] = str(form_details['name']).strip()
+                        if form_details.get('status'):
+                            snapshot['meta_form_status'] = str(form_details['status']).strip()
+                        event.mapping_snapshot = snapshot
+                except Exception as exc:
+                    logger.warning(
+                        "Could not resolve Meta form name during NEEDS_MAPPING for page=%s form=%s: %s",
+                        event.page_id, event.form_id, exc,
+                    )
+
             event.status = 'NEEDS_MAPPING'
             event.error_code = 'MAPPING_MISSING'
             event.error_message = f"No active mapping matches Page '{event.page_id}' and Form '{event.form_id}'. Configure and activate mapping to import."
@@ -576,6 +593,37 @@ def _apply_mapping(event, mapping, alias, actor_user, is_live: bool = False):
     if getattr(mapping, 'assignment_mode', 'TENANT_POLICY') == 'SPECIFIC_USER' and getattr(mapping, 'assigned_sales_user_id', None):
         assigned_sales_user = mapping.assigned_sales_user
 
+    # Resolve human-readable Facebook Page name and structured Q&A answers for zero-data-loss timeline logging
+    page_name = None
+    if getattr(event, 'page_id', None):
+        try:
+            page_conn = MetaPageConnection.objects.using(alias).filter(
+                organization_id=event.organization_id,
+                page_id=event.page_id,
+            ).first()
+            if page_conn and page_conn.page_name:
+                page_name = page_conn.page_name
+        except Exception as exc:
+            logger.warning("Failed to resolve MetaPageConnection name for page_id=%s: %s", event.page_id, exc)
+
+    form_answers = []
+    if isinstance(event.field_data, list):
+        for item in event.field_data:
+            if not isinstance(item, dict):
+                continue
+            q_name = str(item.get('name') or '').strip()
+            vals = item.get('values') or []
+            if isinstance(vals, list):
+                a_val = ', '.join(str(v).strip() for v in vals if str(v).strip())
+            else:
+                a_val = str(vals).strip()
+            if q_name and a_val:
+                form_answers.append({
+                    'question': q_name.replace('_', ' ').strip(),
+                    'raw_key': q_name,
+                    'answer': a_val,
+                })
+
     if is_live:
         attribution_data = {
             'platform': 'META',
@@ -596,7 +644,11 @@ def _apply_mapping(event, mapping, alias, actor_user, is_live: bool = False):
                 'adset_name': event.adset_name,
                 'campaign_name': event.campaign_name,
                 'page_id': event.page_id,
+                'page_name': page_name,
+                'form_id': event.form_id,
+                'form_name': getattr(mapping, 'name', None),
                 'is_organic': event.is_organic,
+                'form_answers': form_answers,
             },
         }
     else:
@@ -604,7 +656,16 @@ def _apply_mapping(event, mapping, alias, actor_user, is_live: bool = False):
             'platform': 'META',
             'external_lead_id': f'simulation:{event.id}',
             'form_external_id': event.form_id,
-            'raw_metadata': {'is_test': True, 'import_id': str(event.id)},
+            'form_name': getattr(mapping, 'name', None),
+            'raw_metadata': {
+                'is_test': True,
+                'import_id': str(event.id),
+                'page_id': event.page_id,
+                'page_name': page_name,
+                'form_id': event.form_id,
+                'form_name': getattr(mapping, 'name', None),
+                'form_answers': form_answers,
+            },
         }
 
     allow_dedup = (mapping.repeat_policy != 'CREATE_NEW')
@@ -662,9 +723,9 @@ def _apply_mapping(event, mapping, alias, actor_user, is_live: bool = False):
         delattr(lead, '_cached_voice_consent')
     # --- FIX: RECORD SARVAM VOICE CONSENT AND COMPLIANCE RECORD END ---
 
-    # Initial pipeline stage transition if configured beyond NEW_LEAD
+    # Initial pipeline stage transition if configured beyond NEW_LEAD (skip for repeat enquiries to preserve existing lead stage)
     initial_stage = getattr(mapping, 'initial_stage', 'NEW_LEAD')
-    if initial_stage and initial_stage != 'NEW_LEAD':
+    if initial_stage and initial_stage != 'NEW_LEAD' and not getattr(lead, 'is_duplicate_intake', False):
         CRMLeadService.transition_lead_status(
             lead=lead,
             new_status=initial_stage,

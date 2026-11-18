@@ -439,6 +439,7 @@ class LeadSerializer(serializers.ModelSerializer):
                 attrs['current_status'] = 'CONVERTED' 
 
         from .services_crm import validate_lead_email, validate_lead_phone
+        from .security_utils import is_masked_phone
 
         email = attrs.get('email_normalized')
         if email:
@@ -449,10 +450,14 @@ class LeadSerializer(serializers.ModelSerializer):
 
         phone = attrs.get('phone_normalized')
         if phone:
-            try:
-                attrs['phone_normalized'] = validate_lead_phone(phone, required=True)
-            except DjangoValidationError as err:
-                raise serializers.ValidationError({'phone': 'Please enter a valid 10-digit mobile number.'})
+            if self.instance and is_masked_phone(phone):
+                # Never overwrite an existing lead's real phone number with a masked placeholder
+                attrs.pop('phone_normalized', None)
+            else:
+                try:
+                    attrs['phone_normalized'] = validate_lead_phone(phone, required=True)
+                except DjangoValidationError as err:
+                    raise serializers.ValidationError({'phone': 'Please enter a valid 10-digit mobile number.'})
 
         # Validate lead source is active if provided
         lead_source = attrs.get('lead_source')

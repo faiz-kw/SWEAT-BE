@@ -310,7 +310,7 @@ def get_member_sessions_summary(profile: UserProfile, active_m: Membership = Non
     return home_sessions, cross_sessions, detailed_balances
 
 
-def serialize_member(profile: UserProfile, alias: str = 'default', compact: bool = False, request=None) -> dict:
+def serialize_member(profile: UserProfile, alias: str = 'default', compact: bool = False, request=None, requesting_user=None) -> dict:
     user = profile.user
     first_name = profile.first_name_snapshot or getattr(user, 'first_name', '')
     last_name = profile.last_name_snapshot or getattr(user, 'last_name', '')
@@ -388,18 +388,36 @@ def serialize_member(profile: UserProfile, alias: str = 'default', compact: bool
         else (profile.preferred_branch or getattr(user, 'home_branch', None))
     )
 
-    # Emergency contact string
+    # Emergency contact string (mask phone component if caller lacks phone visibility permission)
     emergency_contact = ""
     if profile.emergency_contact_json:
         if isinstance(profile.emergency_contact_json, dict):
-            emergency_contact = (
-                profile.emergency_contact_json.get('name')
-                or profile.emergency_contact_json.get('phone')
-                or profile.emergency_contact_json.get('contact')
-                or str(profile.emergency_contact_json)
-            )
+            ec_name = profile.emergency_contact_json.get('name')
+            ec_phone = profile.emergency_contact_json.get('phone') or profile.emergency_contact_json.get('contact')
+            if ec_name:
+                emergency_contact = ec_name
+            elif ec_phone:
+                emergency_contact = mask_phone_if_restricted(
+                    request,
+                    str(ec_phone),
+                    target_user_id=getattr(user, 'id', None),
+                    user=requesting_user,
+                    db_alias=alias,
+                )
+            else:
+                emergency_contact = str(profile.emergency_contact_json)
         else:
-            emergency_contact = str(profile.emergency_contact_json)
+            ec_str = str(profile.emergency_contact_json)
+            if sum(c.isdigit() for c in ec_str) >= 7:
+                emergency_contact = mask_phone_if_restricted(
+                    request,
+                    ec_str,
+                    target_user_id=getattr(user, 'id', None),
+                    user=requesting_user,
+                    db_alias=alias,
+                )
+            else:
+                emergency_contact = ec_str
 
     if compact:
         home_sessions, cross_sessions = 0, 0
@@ -477,7 +495,13 @@ def serialize_member(profile: UserProfile, alias: str = 'default', compact: bool
         'name': full_name,
         'first_name': first_name,
         'last_name': last_name,
-        'phone': mask_phone_if_restricted(request, getattr(user, 'phone', '') or '') if request else (getattr(user, 'phone', '') or ''),
+        'phone': mask_phone_if_restricted(
+            request,
+            getattr(user, 'phone', '') or '',
+            target_user_id=getattr(user, 'id', None),
+            user=requesting_user,
+            db_alias=alias,
+        ),
         'email': getattr(user, 'email', '') or '',
         'alternate_email': (profile.address_json or {}).get('alternate_email') if profile.address_json else None,
         'avatar_url': getattr(user, 'avatar_url', '') or (profile.address_json or {}).get('avatar_url', '') or '',
@@ -927,7 +951,7 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
     Builds the complete authoritative 6-section Member 360 payload with sensitive health data protection.
     """
     user = profile.user
-    base_member = serialize_member(profile, alias)
+    base_member = serialize_member(profile, alias, request=request, requesting_user=requesting_user)
 
     active_m = get_primary_membership(profile, alias)
     outstanding = Decimal(str(base_member['outstanding_balance']))
@@ -1625,6 +1649,7 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             total_paid += paid_for_order
 
         is_ext = ('extension' in (ord_obj.notes or '').lower() or any('extension' in (it.item_name_snapshot or '').lower() for it in ord_obj.items.all()))
+        is_frz = ('freeze' in (ord_obj.notes or '').lower() or any('freeze' in (it.item_name_snapshot or '').lower() for it in ord_obj.items.all()))
         c_info = redemption_by_order.get(str(ord_obj.id)) or {}
         sold_by_display = (ord_obj.sold_by_user.display_name or ord_obj.sold_by_user.email) if ord_obj.sold_by_user else 'Sweat Front Desk POS'
 
@@ -1666,7 +1691,8 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         orders_data.append({
             'id': str(ord_obj.id),
             'order_number': ord_obj.order_number,
-            'order_type': 'EXTENSION' if is_ext else ord_obj.order_type,
+            'order_type': 'FREEZE' if is_frz else ('EXTENSION' if is_ext else ord_obj.order_type),
+            'is_freeze': is_frz,
             'is_extension': is_ext,
             'notes': ord_obj.notes or '',
             'sold_by': sold_by_display,
@@ -2762,7 +2788,7 @@ class MemberViewSet(viewsets.ViewSet):
                         }
                     )
 
-        return Response(serialize_member(profile, alias), status=status.HTTP_201_CREATED)
+        return Response(serialize_member(profile, alias, request=request), status=status.HTTP_201_CREATED)
 
     def partial_update(self, request, pk=None):
         alias = _get_db(request)
@@ -2799,7 +2825,8 @@ class MemberViewSet(viewsets.ViewSet):
                     sync_tenant_user_identity(profile.user, tenant_id=org.id, db=alias)
                 except Exception as ex:
                     logger.warning("Failed to sync identity for member user %s: %s", profile.user.id, ex)
-        if 'phone' in data and profile.user:
+        from .security_utils import is_masked_phone
+        if 'phone' in data and profile.user and not is_masked_phone(data['phone']):
             profile.user.phone = data['phone']
             profile.user.save(using=alias)
         if 'email' in data and profile.user:
@@ -2874,7 +2901,7 @@ class MemberViewSet(viewsets.ViewSet):
         except Exception as log_err:
             logger.warning(f"Failed to record member update audit: {log_err}")
 
-        return Response(serialize_member(profile, alias), status=status.HTTP_200_OK)
+        return Response(serialize_member(profile, alias, request=request), status=status.HTTP_200_OK)
 
     def destroy(self, request, pk=None):
         alias = _get_db(request)
@@ -3100,7 +3127,7 @@ class MemberViewSet(viewsets.ViewSet):
                     'amount': str(order.total_amount),
                     'old_membership_id': str(active_m.id),
                     'new_membership_id': str(new_membership.id),
-                    'member': serialize_member(profile, alias),
+                    'member': serialize_member(profile, alias, request=request),
                 }, status=status.HTTP_201_CREATED)
 
             if is_cash and pay_amt > Decimal('0.00'):
@@ -3182,7 +3209,7 @@ class MemberViewSet(viewsets.ViewSet):
                     'new_membership_id': str(new_membership.id),
                     'approval_request_id': str(approval_req.id),
                     'order_id': str(order.id),
-                    'member': serialize_member(profile, alias),
+                    'member': serialize_member(profile, alias, request=request),
                 }, status=status.HTTP_202_ACCEPTED)
 
             elif pay_amt == Decimal('0.00'):
@@ -3219,7 +3246,7 @@ class MemberViewSet(viewsets.ViewSet):
                     'old_membership_id': str(active_m.id),
                     'new_membership_id': str(new_membership.id),
                     'order_id': str(order.id),
-                    'member': serialize_member(profile, alias),
+                    'member': serialize_member(profile, alias, request=request),
                 }, status=status.HTTP_201_CREATED)
 
             else:
@@ -3312,7 +3339,7 @@ class MemberViewSet(viewsets.ViewSet):
                     'start_date': str(new_membership.start_date),
                     'end_date': str(new_membership.end_date),
                     'order_id': str(order.id),
-                    'member': serialize_member(profile, alias),
+                    'member': serialize_member(profile, alias, request=request),
                 }, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['post'], url_path='purchase-package')
@@ -3470,7 +3497,7 @@ class MemberViewSet(viewsets.ViewSet):
                     'order_number': order.order_number,
                     'amount': str(order.total_amount),
                     'new_membership_id': str(new_membership.id),
-                    'member': serialize_member(profile, alias),
+                    'member': serialize_member(profile, alias, request=request),
                 }, status=status.HTTP_201_CREATED)
 
             elif is_cash:
@@ -3554,7 +3581,7 @@ class MemberViewSet(viewsets.ViewSet):
                 'start_date': str(new_membership.start_date),
                 'end_date': str(new_membership.end_date),
                 'order_id': str(order.id),
-                'member': serialize_member(profile, alias),
+                'member': serialize_member(profile, alias, request=request),
             }, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['get'], url_path='upgrade-options')
@@ -3829,7 +3856,7 @@ class MemberViewSet(viewsets.ViewSet):
             'message': f"Upgraded to {target_pkg.name} ({target_ver.version_number})",
             'change_request_id': str(change_req.id),
             'additional_amount': float(change_req.additional_amount),
-            'member': serialize_member(profile, alias),
+            'member': serialize_member(profile, alias, request=request),
         }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'], url_path='extend')
@@ -3961,7 +3988,7 @@ class MemberViewSet(viewsets.ViewSet):
                 'message': f"Extended until {mem.end_date}",
                 'payment_mode': payment_mode,
                 'payment': payment_info,
-                'member': serialize_member(profile, alias),
+                'member': serialize_member(profile, alias, request=request),
             }, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -4020,7 +4047,7 @@ class MemberViewSet(viewsets.ViewSet):
             'old_start_date': str(old_start), 'new_start_date': str(new_start),
             'old_end_date': str(old_end), 'new_end_date': str(new_end),
             'reason': reason,
-            'member': serialize_member(profile, alias),
+            'member': serialize_member(profile, alias, request=request),
         }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'], url_path='freeze')
@@ -4063,12 +4090,135 @@ class MemberViewSet(viewsets.ViewSet):
                 approved_by_user=request.user,
                 db_alias=alias,
             )
-            profile.member_status = 'FROZEN'
+
+            # Check if member still has other active contracts running; if so, keep member_status ACTIVE
+            other_active = Membership.objects.using(alias).filter(
+                user_profile=profile,
+                status='ACTIVE'
+            ).exclude(id=active_m.id).exists()
+            profile.member_status = 'ACTIVE' if other_active else 'FROZEN'
             profile.save(using=alias, update_fields=['member_status'])
+
+            # Financial Recording: If a freeze fee was collected or a payment link requested
+            charge_fee = request.data.get('charge_fee', True)
+            raw_fee = request.data.get('fee_amount')
+            payment_method = request.data.get('payment_method', 'CASH')
+
+            order_id = None
+            order_num = None
+            payment_url = None
+
+            fee_val = Decimal('0.00')
+            if raw_fee is not None:
+                try:
+                    fee_val = Decimal(str(raw_fee))
+                except Exception:
+                    fee_val = Decimal('0.00')
+
+            if charge_fee and fee_val > Decimal('0.00'):
+                from .models_commerce import Order, OrderItem, PaymentTransaction, PaymentLink
+                from .models_workforce import Branch
+                import uuid
+
+                order_num = f"FRZ-{uuid.uuid4().hex[:8].upper()}"
+                is_link = (payment_method == 'PAYMENT_LINK')
+                order_status = 'PENDING_PAYMENT' if is_link else 'PAID'
+
+                order_branch = (
+                    active_m.home_branch
+                    or active_m.purchase_branch
+                    or getattr(profile, 'preferred_branch', None)
+                    or getattr(request.user, 'home_branch', None)
+                    or Branch.objects.using(alias).filter(status='ACTIVE').first()
+                )
+
+                order = Order.objects.using(alias).create(
+                    user_profile=profile,
+                    branch=order_branch,
+                    order_number=order_num,
+                    order_type='OTHER',
+                    source='FRONT_DESK',
+                    status=order_status,
+                    subtotal=fee_val,
+                    tax_amount=Decimal('0.00'),
+                    discount_amount=Decimal('0.00'),
+                    total_amount=fee_val,
+                    currency='INR',
+                    notes=f"Membership Freeze Fee ({from_d} to {until_d}) - {active_m.package.name if active_m.package else 'Plan'} [Membership: {active_m.id}]",
+                    sold_by_user=request.user,
+                )
+                order_id = str(order.id)
+
+                OrderItem.objects.using(alias).create(
+                    order=order,
+                    item_type='ADJUSTMENT',
+                    item_name_snapshot=f"Membership Freeze Fee ({from_d} to {until_d})",
+                    quantity=Decimal('1.00'),
+                    unit_price_snapshot=fee_val,
+                    total_amount=fee_val,
+                )
+
+                if not is_link:
+                    PaymentTransaction.objects.using(alias).create(
+                        order=order,
+                        user_profile=profile,
+                        amount=fee_val,
+                        currency='INR',
+                        provider='MANUAL_POS',
+                        payment_method=payment_method,
+                        status='SUCCESS',
+                        paid_at=timezone.now(),
+                        notes=f"Collected by {request.user.first_name or 'Staff'} at front desk ({payment_method})",
+                    )
+                else:
+                    # Generate live Razorpay payment link
+                    from .services_razorpay import RazorpayService
+                    try:
+                        amount_paise = RazorpayService.convert_inr_to_paise(fee_val)
+                        u = profile.user
+                        cust_name = f"{u.first_name} {u.last_name}".strip() if u else (profile.name or "Member")
+                        cust_phone = u.phone if u else getattr(profile, 'phone', '')
+                        cust_email = u.email if u else getattr(profile, 'email', '')
+                        link_res = RazorpayService.create_payment_link(
+                            amount_paise=amount_paise,
+                            description=f"Membership Freeze Fee ({from_d} to {until_d})",
+                            customer_name=cust_name,
+                            customer_phone=cust_phone,
+                            customer_email=cust_email,
+                            reference_id=order_num,
+                            notes={
+                                'order_id': str(order.id),
+                                'order_number': order_num,
+                                'member_id': str(profile.id),
+                                'membership_id': str(active_m.id),
+                            },
+                            db_alias=alias,
+                        )
+                        payment_url = link_res.get('short_url')
+                    except Exception as ex:
+                        logger.warning(f"Could not create Razorpay payment link: {ex}")
+                        payment_url = f"https://rzp.io/i/{order_num}"
+
+                    PaymentLink.objects.using(alias).create(
+                        order=order,
+                        user_profile=profile,
+                        provider='RAZORPAY',
+                        external_reference=order_num,
+                        payment_url=payment_url,
+                        amount=fee_val,
+                    )
+
+            msg = f"Membership frozen from {from_d} to {until_d}."
+            if fee_val > 0:
+                msg += f" Fee of ₹{fee_val} recorded via {payment_method}."
+
             return Response({
                 'success': True,
-                'message': f"Membership frozen from {from_d} to {until_d}",
-                'member': serialize_member(profile, alias),
+                'message': msg,
+                'order_id': order_id,
+                'order_number': order_num,
+                'payment_url': payment_url,
+                'member': serialize_member(profile, alias, request=request),
             }, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -4084,7 +4234,12 @@ class MemberViewSet(viewsets.ViewSet):
         if not profile:
             return Response({'detail': 'Member not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        mem = Membership.objects.using(alias).filter(user_profile=profile, status='FROZEN').order_by('-created_at').first()
+        target_m_id = request.data.get('membership_id')
+        mem = None
+        if target_m_id:
+            mem = Membership.objects.using(alias).filter(id=target_m_id, user_profile=profile).first()
+        if not mem:
+            mem = Membership.objects.using(alias).filter(user_profile=profile, status='FROZEN').order_by('-created_at').first()
         if not mem:
             mem = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
 
@@ -4100,7 +4255,7 @@ class MemberViewSet(viewsets.ViewSet):
             return Response({
                 'success': True,
                 'message': "Membership unfreezed and restored to Active status",
-                'member': serialize_member(profile, alias),
+                'member': serialize_member(profile, alias, request=request),
             }, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -4162,7 +4317,7 @@ class MemberViewSet(viewsets.ViewSet):
         return Response({
             'success': True,
             'message': f"Home branch transferred to {target_branch.name}",
-            'member': serialize_member(profile, alias),
+            'member': serialize_member(profile, alias, request=request),
         }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'], url_path='cancel')
@@ -4202,7 +4357,7 @@ class MemberViewSet(viewsets.ViewSet):
         return Response({
             'success': True,
             'message': "Membership has been cancelled.",
-            'member': serialize_member(profile, alias),
+            'member': serialize_member(profile, alias, request=request),
         }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'], url_path='adjust-entitlement')
@@ -4354,7 +4509,7 @@ class MemberViewSet(viewsets.ViewSet):
                     'success': True,
                     'message': f"Adjusted {units_delta:+f} {entitlement_type} units (Balance: {ledger.balance_after})",
                     'balance_after': float(ledger.balance_after) if ledger.balance_after is not None else None,
-                    'member': serialize_member(profile, alias),
+                    'member': serialize_member(profile, alias, request=request),
                 }
 
                 if idempotency_key:
@@ -4480,7 +4635,7 @@ class MemberViewSet(viewsets.ViewSet):
                     'order_number': order.order_number,
                     'amount': str(order.total_amount),
                     'membership_id': str(membership.id),
-                    'member': serialize_member(profile, alias),
+                    'member': serialize_member(profile, alias, request=request),
                 }, status=status.HTTP_201_CREATED)
 
             # Record payment if provided
@@ -4532,7 +4687,7 @@ class MemberViewSet(viewsets.ViewSet):
             'message': f"Member successfully rejoined under {package.name}.",
             'membership_id': str(membership.id),
             'order_id': str(order.id),
-            'member': serialize_member(profile, alias),
+            'member': serialize_member(profile, alias, request=request),
         }, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['post'], url_path='collect-outstanding')
@@ -4622,7 +4777,7 @@ class MemberViewSet(viewsets.ViewSet):
                     'message': f"Payment of ₹{existing_txn.amount} already recorded (idempotent replay).",
                     'transaction_id': str(existing_txn.id),
                     'invoice_id': str(invoice.id) if invoice else None,
-                    'member': serialize_member(profile, alias),
+                    'member': serialize_member(profile, alias, request=request),
                 }, status=status.HTTP_200_OK)
 
         # Route CASH payment through managerial approval workflow to prevent approval bypass
@@ -4689,7 +4844,7 @@ class MemberViewSet(viewsets.ViewSet):
                 'message': f"Cash payment of ₹{amt} recorded and submitted for manager approval (Approval Req: {approval_req.id}).",
                 'transaction_id': str(txn.id),
                 'approval_request_id': str(approval_req.id),
-                'member': serialize_member(profile, alias),
+                'member': serialize_member(profile, alias, request=request),
             }, status=status.HTTP_202_ACCEPTED)
 
         try:
@@ -4707,7 +4862,7 @@ class MemberViewSet(viewsets.ViewSet):
                 'message': f"Payment of ₹{amt} recorded successfully via {provider}.",
                 'transaction_id': str(txn.id),
                 'invoice_id': str(invoice.id) if invoice else None,
-                'member': serialize_member(profile, alias),
+                'member': serialize_member(profile, alias, request=request),
             }, status=status.HTTP_201_CREATED)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -4856,7 +5011,7 @@ class MemberViewSet(viewsets.ViewSet):
                 'booking_id': str(booking.id) if booking else None,
                 'type': 'CLASS' if (booking or consume_session or record_type == 'CLASS') else 'FACILITY',
             },
-            'member': serialize_member(profile, alias),
+            'member': serialize_member(profile, alias, request=request),
         }, status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=['get'], url_path='payment-methods')
@@ -4988,7 +5143,15 @@ class MemberViewSet(viewsets.ViewSet):
         from .services_legacy_live_sync import search_legacy_members
         try:
             results = search_legacy_members(query)
-            return Response({'results': results, 'count': len(results)}, status=status.HTTP_200_OK)
+            sanitized_results = []
+            for row in results:
+                if isinstance(row, dict) and row.get('phone'):
+                    copied = dict(row)
+                    copied['phone'] = mask_phone_if_restricted(request, copied['phone'])
+                    sanitized_results.append(copied)
+                else:
+                    sanitized_results.append(row)
+            return Response({'results': sanitized_results, 'count': len(sanitized_results)}, status=status.HTTP_200_OK)
         except Exception as e:
             logger.error(f"Legacy search failed: {e}", exc_info=True)
             return Response({'error': str(e), 'results': [], 'count': 0}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -5019,7 +5182,7 @@ class MemberViewSet(viewsets.ViewSet):
                 return Response({'error': 'primary_uid or valid query is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
             profile = sync_live_legacy_member_to_tenant(int(primary_uid), alias, org_id)
-            serialized = serialize_member(profile, alias)
+            serialized = serialize_member(profile, alias, request=request)
 
             return Response({
                 'message': f"Successfully synced {profile.first_name_snapshot} {profile.last_name_snapshot} ({profile.member_number}) with all packages, sessions, transactions, and bookings.",

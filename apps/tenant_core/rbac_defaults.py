@@ -239,6 +239,7 @@ CANONICAL_SUBMODULES = {
     ('core', 'departments'): {'name': 'Department Management'},
     ('core', 'audit'): {'name': 'Audit Logs & Governance'},
     ('core', 'security'): {'name': 'Security & Access Control'},
+    ('core', 'privacy'): {'name': 'Privacy & Data Protection'},
 
     ('crm', 'dashboard'): {'name': 'CRM Dashboard & Sales Analytics'},
     ('crm', 'leads'): {'name': 'Lead Management'},
@@ -531,6 +532,7 @@ CANONICAL_TAB_PERMISSIONS = [
     ('core', 'departments', 'core.departments.edit', 'Edit Departments', 'edit'),
     ('core', 'audit', 'core.audit.view', 'View Audit Logs', 'view'),
     ('core', 'security', 'core.security.view', 'View Security & Sessions', 'view'),
+    ('core', 'privacy', 'core.privacy.view_phone_number', 'View Complete Phone Numbers', 'view_phone_number'),
 
     # Community Module
     ('community', 'hub', 'community.view', 'View Community Hub', 'view'),

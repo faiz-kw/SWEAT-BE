@@ -401,12 +401,14 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
             'reason': instance.recommendation_reason,
         }
 
+        from .security_utils import mask_phone_if_restricted
+        req = getattr(self, 'request', None)
         return {
             'id': str(instance.id),
             'pairing_code': instance.pairing_code,
             'status': instance.status,
             'member_name': instance.member_name,
-            'member_phone': instance.member_phone,
+            'member_phone': mask_phone_if_restricted(req, instance.member_phone),
             'branch': {
                 'id': str(instance.branch.id),
                 'name': instance.branch.name,

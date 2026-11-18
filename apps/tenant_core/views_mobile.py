@@ -814,11 +814,17 @@ class MobileMeView(APIView):
             .select_related('package', 'package__program', 'program', 'package_version', 'purchase_branch', 'home_branch')
             .order_by('start_date', '-created_at')
             .first()
+        ) or (
+            Membership.objects.using(alias)
+            .filter(user_profile=profile, status='FROZEN', end_date__gte=_me_now)
+            .select_related('package', 'package__program', 'program', 'package_version', 'purchase_branch', 'home_branch')
+            .order_by('end_date', '-created_at')
+            .first()
         )
 
         membership_data = None
         if active_membership:
-            entitlements = _primary_entitlements(active_membership.entitlements.using(alias).filter(status='ACTIVE'))
+            entitlements = _primary_entitlements(active_membership.entitlements.using(alias).filter(status__in=['ACTIVE', 'FROZEN']))
             total_allocated = sum(e.allocated_units for e in entitlements)
             total_consumed = sum(e.consumed_units for e in entitlements)
             total_remaining = max(Decimal('0'), total_allocated - total_consumed)
@@ -835,6 +841,8 @@ class MobileMeView(APIView):
                 'raw_package_name': _pkg_name,
                 'program_name': _prog_name,
                 'display_package_name': _disp_name,
+                'status': active_membership.status,
+                'is_frozen': active_membership.status == 'FROZEN',
                 'allocated_sessions': float(total_allocated),
                 'consumed_sessions': float(total_consumed),
                 'remaining_sessions': float(total_remaining),
@@ -851,7 +859,7 @@ class MobileMeView(APIView):
                    .filter(models.Q(start_date__lte=_me_now) | models.Q(start_date__isnull=True))
                    .select_related('package', 'package__program', 'program', 'home_branch')
                    .order_by('end_date', '-created_at')):
-            _ents = _primary_entitlements(_m.entitlements.using(alias).filter(status='ACTIVE'))
+            _ents = _primary_entitlements(_m.entitlements.using(alias).filter(status__in=['ACTIVE', 'FROZEN']))
             _alloc = sum(e.allocated_units for e in _ents)
             _cons = sum(e.consumed_units for e in _ents)
             _rem = max(Decimal('0'), _alloc - _cons)
@@ -866,6 +874,8 @@ class MobileMeView(APIView):
                 'raw_package_name': _pk_name,
                 'program_name': _p_name,
                 'display_package_name': _d_name,
+                'status': _m.status,
+                'is_frozen': _m.status == 'FROZEN',
                 'allocated_sessions': float(_alloc),
                 'consumed_sessions': float(_cons),
                 'remaining_sessions': float(_rem),
@@ -3054,7 +3064,7 @@ class MobilePackagesView(APIView):
                 has_avail_rules = PackageBranchAvailability.objects.using(alias).filter(package=pkg).exists()
                 if has_avail_rules:
                     is_avail = PackageBranchAvailability.objects.using(alias).filter(
-                        package=pkg, branch_id=branch_id, is_available=True
+                        package=pkg, branch_id=branch_id, status='ENABLED'
                     ).exists()
                     if not is_avail:
                         continue
@@ -3139,6 +3149,8 @@ class MobileMyCreditsView(APIView):
 
         packs = []
         total_remaining_credits = 0
+        active_remaining_credits = 0
+        frozen_remaining_credits = 0
 
         for m in memberships:
             entitlements = _primary_entitlements(m.entitlements.all())
@@ -3153,8 +3165,12 @@ class MobileMyCreditsView(APIView):
             if m.status == 'ACTIVE' and m.end_date and m.end_date < today:
                 effective_status = 'EXPIRED'
 
-            if effective_status == 'ACTIVE' and not is_unlimited:
+            if effective_status in ('ACTIVE', 'FROZEN') and not is_unlimited:
                 total_remaining_credits += int(remaining)
+                if effective_status == 'ACTIVE':
+                    active_remaining_credits += int(remaining)
+                elif effective_status == 'FROZEN':
+                    frozen_remaining_credits += int(remaining)
 
             _m_prog = m.program or (m.package.program if m.package else None)
             _m_prog_name = _m_prog.name if _m_prog else ''
@@ -3168,6 +3184,7 @@ class MobileMyCreditsView(APIView):
                 'program_name': _m_prog_name,
                 'display_package_name': _m_disp,
                 'status': effective_status,
+                'is_frozen': effective_status == 'FROZEN',
                 'allocated_sessions': allocated,
                 'consumed_sessions': consumed,
                 'remaining_sessions': 'Unlimited' if is_unlimited else remaining,
@@ -3210,10 +3227,14 @@ class MobileMyCreditsView(APIView):
         packs.sort(key=lambda p: p['end_date'] or '', reverse=True)
         packs.sort(key=lambda p: status_rank.get(p['status'], 2))
         active_packs_count = sum(1 for p in packs if p['status'] == 'ACTIVE')
+        frozen_packs_count = sum(1 for p in packs if p['status'] == 'FROZEN')
 
         return Response({
             'total_credits_available': total_remaining_credits,
+            'active_credits': active_remaining_credits,
+            'frozen_credits': frozen_remaining_credits,
             'active_packs_count': active_packs_count,
+            'frozen_packs_count': frozen_packs_count,
             'packs': packs,
             'rewards_wallet': rewards_wallet,
             'reward_points': rewards_wallet,
@@ -5030,37 +5051,58 @@ class MobileMembershipActionsView(APIView):
             alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
         profile = _get_or_create_user_profile(user, alias)
 
-        def _get_ver_days(v):
+        def _extract_pkg_sessions_and_days(v):
             if not v:
-                return 30
-            if getattr(v, 'duration_days', None) is not None:
-                return v.duration_days
-            val = getattr(v, 'duration_value', 30) or 30
-            u = str(getattr(v, 'duration_unit', 'MONTH') or 'MONTH').upper().rstrip('S')
-            if u == 'DAY':
-                return val
-            elif u == 'WEEK':
-                return val * 7
-            elif u == 'MONTH':
-                return val * 30
-            elif u == 'YEAR':
-                return val * 365
-            return val
+                return {'home_sessions': 0, 'passport_sessions': 0, 'total_sessions': 12, 'is_unlimited': False, 'days': 30}
+            days = getattr(v, 'validity_days', None) or getattr(v, 'total_days', None)
+            if not days:
+                val = getattr(v, 'duration_value', 30) or 30
+                u = str(getattr(v, 'duration_unit', 'MONTH') or 'MONTH').upper().rstrip('S')
+                if u == 'DAY':
+                    days = val
+                elif u == 'WEEK':
+                    days = val * 7
+                elif u == 'MONTH':
+                    days = val * 30
+                elif u == 'YEAR':
+                    days = val * 365
+                else:
+                    days = val
+            home_sess = 0
+            cross_sess = 0
+            is_unlimited = bool(getattr(v, 'is_trial', False) or getattr(v, 'is_trial_package', False))
+            try:
+                ents = list(v.entitlement_definitions.using(alias).all())
+                if ents:
+                    for ed in ents:
+                        if getattr(ed, 'is_unlimited', False):
+                            is_unlimited = True
+                        etype = str(getattr(ed, 'entitlement_type', '')).upper()
+                        u_count = int(getattr(ed, 'allocated_units', 0) or 0)
+                        if 'CROSS' in etype or 'PASSPORT' in etype:
+                            cross_sess += u_count
+                        else:
+                            home_sess += u_count
+                else:
+                    raw_sc = getattr(v, 'session_count', None)
+                    home_sess = int(raw_sc) if raw_sc is not None else 12
+            except Exception:
+                raw_sc = getattr(v, 'session_count', None)
+                home_sess = int(raw_sc) if raw_sc is not None else 12
+            tot = 999 if is_unlimited else (home_sess + cross_sess)
+            return {
+                'home_sessions': home_sess,
+                'passport_sessions': cross_sess,
+                'total_sessions': tot,
+                'is_unlimited': is_unlimited,
+                'days': int(days or 30),
+            }
+
+        def _get_ver_days(v):
+            return _extract_pkg_sessions_and_days(v)['days']
 
         def _get_ver_sessions(v):
-            if not v:
-                return 12
-            if getattr(v, 'session_count', None) is not None:
-                return v.session_count
-            tot = 0
-            try:
-                for ped in v.entitlement_definitions.using(alias).all():
-                    if getattr(ped, 'is_unlimited', False):
-                        return 999
-                    tot += int(getattr(ped, 'allocated_units', 0) or 0)
-            except Exception:
-                pass
-            return tot or 12
+            return _extract_pkg_sessions_and_days(v)['total_sessions']
 
         from decimal import Decimal
         from django.db.models import Q
@@ -5135,7 +5177,11 @@ class MobileMembershipActionsView(APIView):
         )
 
         # Retrieve dynamic settings for extension & freeze
-        os_obj = OrganizationSettings.objects.using(alias).first()
+        os_obj = None
+        if org:
+            os_obj = OrganizationSettings.objects.using(alias).filter(organization=org).first()
+        if not os_obj:
+            os_obj = OrganizationSettings.objects.using(alias).filter(allow_member_freeze=True).first() or OrganizationSettings.objects.using(alias).first()
         cfg = getattr(os_obj, 'membership_config', {}) or {}
         ext_cfg = cfg.get('extension_policy', {})
         frz_cfg = cfg.get('freeze_policy', {})
@@ -5259,22 +5305,36 @@ class MobileMembershipActionsView(APIView):
 
         # RENEW OPTIONS: Strictly fixed to active_m.program!
         renew_options = []
+        from .models_catalog import PackageBranchAvailability, ProgramBranchAvailability
         if active_m.program:
             pkg_qs = (
                 Package.objects.using(alias)
                 .filter(status='ACTIVE', program=active_m.program)
                 .select_related('program')
-                .prefetch_related('versions__prices')
+                .prefetch_related('versions__prices', 'versions__entitlement_definitions', 'branch_availabilities__branch')
             )
             for pkg in pkg_qs:
                 ver = pkg.versions.filter(status='ACTIVE').order_by('-version_number').first()
                 if not ver:
                     continue
-                if effective_branch and hasattr(ver, 'available_branches'):
-                    if ver.available_branches.exists() and not ver.available_branches.filter(id=effective_branch.id).exists():
-                        continue
+                # Exclude trial packages from self-service renewal
+                if getattr(ver, 'is_trial', False) or getattr(ver, 'is_trial_package', False) or getattr(ver, 'only_for_trial', False):
+                    continue
+                if getattr(ver, 'show_on_app', True) is False and getattr(ver, 'show_on_web', True) is False:
+                    continue
+
+                # Authoritative Branch Availability from CRM PackageBranchAvailability
+                pbas = PackageBranchAvailability.objects.using(alias).filter(package=pkg, status='ENABLED')
+                pkg_branch_ids = [str(b.branch_id) for b in pbas if b.branch and b.branch.status == 'ACTIVE']
+                if not pkg_branch_ids and pkg.program:
+                    prog_pbas = ProgramBranchAvailability.objects.using(alias).filter(program=pkg.program, is_active=True)
+                    pkg_branch_ids = [str(b.branch_id) for b in prog_pbas if b.branch and b.branch.status == 'ACTIVE']
+
+                if filter_branch_id and pkg_branch_ids and filter_branch_id not in pkg_branch_ids:
+                    continue
+
                 price_obj = ver.prices.filter(status='ACTIVE').first()
-                if not price_obj:
+                if not price_obj or float(price_obj.base_price) <= 0:
                     continue
                 b_price = float(price_obj.base_price)
                 t_pct = float(price_obj.tax_percent or 18.0)
@@ -5282,6 +5342,8 @@ class MobileMembershipActionsView(APIView):
                 tot = round(b_price + t_amt, 2)
                 _rn_prog_name = pkg.program.name if pkg.program else ''
                 _rn_disp = format_program_package_name(_rn_prog_name, pkg.name)
+                metrics = _extract_pkg_sessions_and_days(ver)
+
                 renew_options.append({
                     'package_id': str(pkg.id),
                     'package_version_id': str(ver.id),
@@ -5291,8 +5353,12 @@ class MobileMembershipActionsView(APIView):
                     'program_id': str(pkg.program.id),
                     'program_name': _rn_prog_name,
                     'program_code': pkg.program.code,
-                    'duration_days': _get_ver_days(ver),
-                    'session_count': _get_ver_sessions(ver),
+                    'duration_days': metrics['days'],
+                    'session_count': metrics['total_sessions'],
+                    'home_sessions': metrics['home_sessions'],
+                    'passport_sessions': metrics['passport_sessions'],
+                    'is_unlimited': metrics['is_unlimited'],
+                    'available_branch_ids': pkg_branch_ids,
                     'base_price': b_price,
                     'tax_percent': t_pct,
                     'tax_amount': t_amt,
@@ -5318,7 +5384,7 @@ class MobileMembershipActionsView(APIView):
             Package.objects.using(alias)
             .filter(status='ACTIVE', program__status='ACTIVE')
             .select_related('program')
-            .prefetch_related('versions__prices')
+            .prefetch_related('versions__prices', 'versions__entitlement_definitions', 'branch_availabilities__branch')
         )
         for pkg in all_pkg_qs:
             ver = pkg.versions.filter(status='ACTIVE').order_by('-version_number').first()
@@ -5326,16 +5392,33 @@ class MobileMembershipActionsView(APIView):
                 continue
             if active_m.package and pkg.id == active_m.package.id and active_m.package_version and ver.id == active_m.package_version.id:
                 continue
+            # Exclude trial packages from self-service upgrade
+            if getattr(ver, 'is_trial', False) or getattr(ver, 'is_trial_package', False) or getattr(ver, 'only_for_trial', False):
+                continue
+            if getattr(ver, 'show_on_app', True) is False and getattr(ver, 'show_on_web', True) is False:
+                continue
+
+            # Branch availability
+            pbas = PackageBranchAvailability.objects.using(alias).filter(package=pkg, status='ENABLED')
+            pkg_branch_ids = [str(b.branch_id) for b in pbas if b.branch and b.branch.status == 'ACTIVE']
+            if not pkg_branch_ids and pkg.program:
+                prog_pbas = ProgramBranchAvailability.objects.using(alias).filter(program=pkg.program, is_active=True)
+                pkg_branch_ids = [str(b.branch_id) for b in prog_pbas if b.branch and b.branch.status == 'ACTIVE']
+
+            if filter_branch_id and pkg_branch_ids and filter_branch_id not in pkg_branch_ids:
+                continue
+
             price_obj = ver.prices.filter(status='ACTIVE').first()
-            if not price_obj:
+            if not price_obj or float(price_obj.base_price) <= 0:
                 continue
             b_price = float(price_obj.base_price)
             t_pct = float(price_obj.tax_percent or 18.0)
             t_amt = round(b_price * (t_pct / 100.0), 2)
             tot = round(b_price + t_amt, 2)
             price_diff = max(0.0, round(tot - cur_total_price, 2))
-            extra_sessions = max(0, _get_ver_sessions(ver) - cur_sessions)
-            extra_days = max(0, _get_ver_days(ver) - cur_days)
+            metrics = _extract_pkg_sessions_and_days(ver)
+            extra_sessions = max(0, metrics['total_sessions'] - cur_sessions)
+            extra_days = max(0, metrics['days'] - cur_days)
 
             upgrade_options.append({
                 'package_id': str(pkg.id),
@@ -5345,8 +5428,12 @@ class MobileMembershipActionsView(APIView):
                 'program_id': str(pkg.program.id) if pkg.program else '',
                 'program_name': pkg.program.name if pkg.program else '',
                 'program_code': pkg.program.code if pkg.program else '',
-                'duration_days': _get_ver_days(ver),
-                'session_count': _get_ver_sessions(ver),
+                'duration_days': metrics['days'],
+                'session_count': metrics['total_sessions'],
+                'home_sessions': metrics['home_sessions'],
+                'passport_sessions': metrics['passport_sessions'],
+                'is_unlimited': metrics['is_unlimited'],
+                'available_branch_ids': pkg_branch_ids,
                 'base_price': b_price,
                 'tax_percent': t_pct,
                 'tax_amount': t_amt,
@@ -6100,7 +6187,13 @@ class MobileMembershipFreezeView(APIView):
         if not active_m:
             return Response({'detail': 'Only active memberships can be frozen.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        _os_perm = OrganizationSettings.objects.using(alias).first()
+        _org = getattr(active_m, 'organization', None) or (active_m.package.organization if active_m and active_m.package else None) or getattr(user, 'organization', None)
+        _os_perm = None
+        if _org:
+            _os_perm = OrganizationSettings.objects.using(alias).filter(organization=_org).first()
+        if not _os_perm:
+            _os_perm = OrganizationSettings.objects.using(alias).filter(allow_member_freeze=True).first() or OrganizationSettings.objects.using(alias).first()
+
         _frz_perm = (getattr(_os_perm, 'membership_config', {}) or {}).get('freeze_policy', {}) if _os_perm else {}
         _freeze_enabled = _frz_perm.get('enabled', getattr(_os_perm, 'allow_member_freeze', True) if _os_perm else True)
         if not _freeze_enabled:

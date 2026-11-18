@@ -699,14 +699,25 @@ class MembershipLifecycleService:
                     occurrence__start_at__date__lte=freeze_until,
                     status__in=['CONFIRMED', 'RESERVED', 'WAITLISTED']
                 )
+                mem_prog_id = membership.program_id or (membership.package.program_id if membership.package else None)
                 for bk in freeze_bookings:
-                    BookingAttendanceService.cancel_booking(
-                        booking=bk,
-                        cancellation_source='ADMIN',
-                        reason_text=f"Membership frozen from {freeze_from} to {freeze_until}.",
-                        actor_user=approved_by_user,
-                        db_alias=alias,
-                    )
+                    # Scope cancellation: cancel if explicitly booked under this membership,
+                    # or unassigned but matching the frozen program. Do not cancel bookings
+                    # belonging to other distinct active contracts of the same member.
+                    is_for_this_mem = (bk.membership_id == membership.id)
+                    if not is_for_this_mem and not bk.membership_id:
+                        bk_prog_id = getattr(getattr(getattr(bk, 'occurrence', None), 'class_template', None), 'program_id', None)
+                        if not bk_prog_id or bk_prog_id == mem_prog_id:
+                            is_for_this_mem = True
+
+                    if is_for_this_mem:
+                        BookingAttendanceService.cancel_booking(
+                            booking=bk,
+                            cancellation_source='ADMIN',
+                            reason_text=f"Membership ({membership.package.name if membership.package else 'Plan'}) frozen from {freeze_from} to {freeze_until}.",
+                            actor_user=approved_by_user,
+                            db_alias=alias,
+                        )
             except Exception as e:
                 logger.warning(f"Error cancelling bookings during freeze: {e}")
 

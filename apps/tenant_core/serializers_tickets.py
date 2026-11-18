@@ -60,7 +60,12 @@ class SupportTicketSerializer(serializers.ModelSerializer):
 
     def get_member_phone(self, obj):
         if obj.user_profile and obj.user_profile.user:
-            return obj.user_profile.user.phone or ''
+            from .security_utils import mask_phone_if_restricted
+            return mask_phone_if_restricted(
+                self.context.get('request'),
+                obj.user_profile.user.phone or '',
+                target_user_id=obj.user_profile.user_id,
+            )
         return ''
 
     def get_member_email(self, obj):

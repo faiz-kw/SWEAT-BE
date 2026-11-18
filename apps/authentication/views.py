@@ -1236,12 +1236,27 @@ class MeView(APIView):
 
                     # Calculate role-permitted modules/submodules
                     if is_org_admin:
-                        # Org Admin gets all tenant-enabled modules and submodules + all catalog permissions
+                        # Org Admin gets all tenant-enabled modules and submodules + non-sensitive catalog permissions.
+                        # Sensitive privacy permissions (e.g. core.privacy.view_phone_number) are strictly
+                        # governed by live RolePermissionSetItem grants so Admin can configure/revoke them dynamically.
+                        from apps.tenant_core.security_utils import SENSITIVE_PERMISSION_CODES
+                        sensitive_lower = {c.lower() for c in SENSITIVE_PERMISSION_CODES}
                         user_accessible_modules = list(enabled_modules)
                         for p in Permission.objects.using(db_alias).all():
                             p_code = p.permission_code or p.code
-                            if p_code:
+                            if p_code and p_code.lower() not in sensitive_lower:
                                 perm_codes.add(p_code)
+                        # Transition safety: if a sensitive permission has not been synced to the tenant DB yet,
+                        # retain Org Admin visibility until catalog sync seeds the Permission row.
+                        existing_sensitive_lower = {
+                            c.lower()
+                            for c in Permission.objects.using(db_alias)
+                            .filter(permission_code__in=list(SENSITIVE_PERMISSION_CODES), is_active=True)
+                            .values_list('permission_code', flat=True)
+                        }
+                        for sc in SENSITIVE_PERMISSION_CODES:
+                            if sc.lower() not in existing_sensitive_lower:
+                                perm_codes.add(sc)
                         for essential in ['crm.settings.view', 'crm.settings.edit', 'core.settings.view', '*']:
                             perm_codes.add(essential)
                         user_permissions = sorted(list(perm_codes))

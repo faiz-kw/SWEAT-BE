@@ -243,6 +243,20 @@ class TenantUserSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("This username is already taken.")
         return cleaned
 
+    def validate(self, attrs):
+        from .security_utils import is_masked_phone
+        if self.instance and 'phone' in attrs and is_masked_phone(attrs.get('phone')):
+            attrs.pop('phone', None)
+        return super().validate(attrs)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        req = self.context.get('request')
+        if req is not None and data.get('phone'):
+            from .security_utils import mask_phone_if_restricted
+            data['phone'] = mask_phone_if_restricted(req, data['phone'], target_user_id=getattr(instance, 'id', None))
+        return data
+
     def get_reports_to_id(self, obj):
         try:
             profile = getattr(obj, 'profile', None)

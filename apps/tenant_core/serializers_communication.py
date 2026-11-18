@@ -12,6 +12,11 @@ from rest_framework import serializers
 from .models_communication import CommunicationMessage, CommunicationStatusEvent
 from .models_crm import Lead
 from .models_govern import NotificationTemplate
+from .security_utils import (
+    mask_communication_identifier,
+    mask_phone_if_restricted,
+    sanitize_meta_field_data,
+)
 
 
 class CommunicationStatusEventSerializer(serializers.ModelSerializer):
@@ -26,7 +31,7 @@ class CommunicationStatusEventSerializer(serializers.ModelSerializer):
 
 class CommunicationMessageSerializer(serializers.ModelSerializer):
     lead_name = serializers.SerializerMethodField()
-    lead_phone = serializers.CharField(source='lead.phone_normalized', read_only=True)
+    lead_phone = serializers.SerializerMethodField()
     lead_email = serializers.CharField(source='lead.email_normalized', read_only=True)
     created_by_user_name = serializers.SerializerMethodField()
     status_events = CommunicationStatusEventSerializer(many=True, read_only=True)
@@ -59,6 +64,23 @@ class CommunicationMessageSerializer(serializers.ModelSerializer):
             return None
         return f"{obj.lead.first_name} {obj.lead.last_name}".strip()
 
+    def get_lead_phone(self, obj):
+        if not obj.lead or not obj.lead.phone_normalized:
+            return ''
+        return mask_phone_if_restricted(self.context.get('request'), obj.lead.phone_normalized)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        req = self.context.get('request')
+        channel = getattr(instance, 'channel', None)
+        if data.get('recipient'):
+            data['recipient'] = mask_communication_identifier(req, channel, data['recipient'])
+        if data.get('sender_identifier'):
+            data['sender_identifier'] = mask_communication_identifier(req, channel, data['sender_identifier'])
+        if data.get('raw_sender_data'):
+            data['raw_sender_data'] = sanitize_meta_field_data(req, data['raw_sender_data'])
+        return data
+
     def get_created_by_user_name(self, obj):
         if not obj.created_by_user:
             return 'System'
@@ -70,7 +92,7 @@ class CommunicationMessageSerializer(serializers.ModelSerializer):
 
 class CommunicationSendInputSerializer(serializers.Serializer):
     channel = serializers.ChoiceField(choices=['WHATSAPP', 'EMAIL', 'SMS'])
-    recipient = serializers.CharField(max_length=255)
+    recipient = serializers.CharField(max_length=255, required=False, allow_blank=True, default='')
     lead_id = serializers.UUIDField(required=False, allow_null=True)
     template_id = serializers.UUIDField(required=False, allow_null=True)
     subject = serializers.CharField(max_length=300, required=False, allow_blank=True, default='')
@@ -87,6 +109,8 @@ class CommunicationSendInputSerializer(serializers.Serializer):
         body = attrs.get('body')
         if not template_id and not body:
             raise serializers.ValidationError("Either template_id or body must be provided.")
+        if not (attrs.get('recipient') or '').strip() and not attrs.get('lead_id'):
+            raise serializers.ValidationError("Either recipient or lead_id must be provided.")
         return attrs
 
 

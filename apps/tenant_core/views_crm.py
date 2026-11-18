@@ -1112,12 +1112,13 @@ class LeadViewSet(viewsets.ModelViewSet):
             Q(phone__icontains=q) |
             Q(profile__member_number__icontains=q)
         )
+        from .security_utils import mask_phone_if_restricted
         results = [
             {
                 'id': str(u.id),
                 'name': f"{u.first_name} {u.last_name}".strip() or u.email,
                 'email': u.email,
-                'phone': u.phone,
+                'phone': mask_phone_if_restricted(request, u.phone, target_user_id=u.id),
                 'member_number': getattr(getattr(u, 'profile', None), 'member_number', None),
             }
             for u in qs.filter(filter_q)[:20]
@@ -1155,11 +1156,12 @@ class LeadViewSet(viewsets.ModelViewSet):
         if exclude_id:
             qs = qs.exclude(id=exclude_id)
 
+        from .security_utils import mask_phone_if_restricted
         matches = [
             {
                 'id': str(lead.id),
                 'full_name': f"{lead.first_name} {lead.last_name}".strip() or "Unnamed Lead",
-                'phone': lead.phone_normalized,
+                'phone': mask_phone_if_restricted(request, lead.phone_normalized),
                 'email': lead.email_normalized,
                 'current_status': lead.current_status,
                 'branch_name': lead.branch.name if lead.branch else None,
@@ -1338,7 +1340,7 @@ class LeadViewSet(viewsets.ModelViewSet):
         lead = self.get_object()
         alias = _get_db(request)
         limit = int(request.query_params.get('limit', 50))
-        events = CRMLeadService.get_lead_timeline(lead, limit=limit, db_alias=alias)
+        events = CRMLeadService.get_lead_timeline(lead, limit=limit, db_alias=alias, request=request)
         return Response(events)
 
     @action(detail=True, methods=['get', 'post'], url_path='attributions')
@@ -4010,11 +4012,24 @@ class CommunicationMessageViewSet(viewsets.ReadOnlyModelViewSet):
         if data.get('related_followup_id'):
             followup = SalesFollowupTask.objects.using(alias).filter(id=data['related_followup_id'], organization=org).first()
 
+        from .security_utils import is_masked_phone
+        recipient_val = (data.get('recipient') or '').strip()
+        if lead and (not recipient_val or is_masked_phone(recipient_val)):
+            if data['channel'] == 'EMAIL':
+                recipient_val = (lead.email_normalized or '').strip()
+            else:
+                recipient_val = (lead.phone_normalized or '').strip()
+        if not recipient_val:
+            return Response(
+                {'error': 'Recipient phone or email is not available on this lead.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         try:
             msg = CommunicationService.send_communication(
                 organization=org,
                 channel=data['channel'],
-                recipient=data['recipient'],
+                recipient=recipient_val,
                 lead=lead,
                 template=template,
                 subject=data.get('subject', ''),
@@ -4027,7 +4042,10 @@ class CommunicationMessageViewSet(viewsets.ReadOnlyModelViewSet):
                 created_by_user=request.user,
                 provider_preference=data.get('provider_preference'),
             )
-            return Response(CommunicationMessageSerializer(msg).data, status=status.HTTP_201_CREATED)
+            return Response(
+                CommunicationMessageSerializer(msg, context={'request': request}).data,
+                status=status.HTTP_201_CREATED,
+            )
         except ConsentViolationError as cve:
             return Response({'error': str(cve), 'code': 'CONSENT_DENIED'}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as exc:
