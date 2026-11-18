@@ -85,6 +85,25 @@ from .permissions import RequireActiveTenantAndOrg, TenantRBACPermission
 logger = logging.getLogger(__name__)
 
 
+def format_program_package_name(prog_name: str, pkg_name: str) -> str:
+    """
+    Standardizes program and package display across all platforms:
+    Format: Program Name – Package Name
+    """
+    pkg = (pkg_name or '').strip()
+    prog = (prog_name or '').strip()
+    if not pkg and not prog:
+        return 'Standard Plan'
+    if not prog or prog.lower() in ('standard', 'none', 'unassigned'):
+        return pkg or 'Standard Plan'
+    if not pkg or pkg.lower() in ('none', 'plan'):
+        return prog
+    if pkg.lower().startswith(prog.lower()):
+        clean_pkg = pkg[len(prog):].lstrip(' -–—:·')
+        return f"{prog} – {clean_pkg}" if clean_pkg else prog
+    return f"{prog} – {pkg}"
+
+
 def _get_db(request):
     alias = (
         get_tenant_db_alias()
@@ -196,7 +215,7 @@ def get_primary_membership(profile: UserProfile, alias: str = 'default'):
     )
 
 
-def get_member_sessions_summary(profile: UserProfile, active_m: Membership = None, alias: str = 'default'):
+def get_member_sessions_summary(profile: UserProfile, active_m: Membership = None, alias: str = 'default', single_membership_only: bool = False):
     """
     Computes remaining sessions & credits breakdown across the member's ACTIVE package(s).
     Supports members with simultaneous active packages (e.g. Session Package + Elite Credit Package).
@@ -204,6 +223,8 @@ def get_member_sessions_summary(profile: UserProfile, active_m: Membership = Non
     """
     home_sessions = 0
     cross_sessions = 0
+    home_unlimited = False
+    cross_unlimited = False
     detailed_balances = []
 
     today = timezone.now().date()
@@ -211,17 +232,18 @@ def get_member_sessions_summary(profile: UserProfile, active_m: Membership = Non
     if active_m is not None and active_m.status in ('ACTIVE', 'FROZEN') and (active_m.end_date is None or active_m.end_date >= today):
         active_memberships.append(active_m)
 
-    # Query all active or frozen memberships to support members holding multiple simultaneous active packs
-    all_actives = list(Membership.objects.using(alias).filter(
-        user_profile=profile,
-        status__in=('ACTIVE', 'FROZEN')
-    ).filter(
-        Q(end_date__isnull=True) | Q(end_date__gte=today)
-    ).order_by('-start_date', '-created_at'))
+    if not single_membership_only:
+        # Query all active or frozen memberships to support members holding multiple simultaneous active packs
+        all_actives = list(Membership.objects.using(alias).filter(
+            user_profile=profile,
+            status__in=('ACTIVE', 'FROZEN')
+        ).filter(
+            Q(end_date__isnull=True) | Q(end_date__gte=today)
+        ).order_by('-start_date', '-created_at'))
 
-    for am in all_actives:
-        if am.id not in [m.id for m in active_memberships]:
-            active_memberships.append(am)
+        for am in all_actives:
+            if am.id not in [m.id for m in active_memberships]:
+                active_memberships.append(am)
 
     seen_categories = set()
     for m_obj in active_memberships:
@@ -254,7 +276,7 @@ def get_member_sessions_summary(profile: UserProfile, active_m: Membership = Non
             seen_categories.add(cat_key)
 
             rem = ent.remaining_units
-            rem_val = float(rem) if rem is not None else 999.0
+            rem_val = float(rem) if rem is not None else (999.0 if ent.is_unlimited else 0.0)
             detailed_balances.append({
                 'id': str(ent.id),
                 'membership_id': str(m_obj.id),
@@ -270,9 +292,20 @@ def get_member_sessions_summary(profile: UserProfile, active_m: Membership = Non
             })
 
             if category == 'CROSS_BRANCH':
-                cross_sessions = max(cross_sessions, int(rem_val) if not ent.is_unlimited else 999)
+                if ent.is_unlimited:
+                    cross_unlimited = True
+                else:
+                    cross_sessions += int(rem_val)
             elif category == 'HOME_SESSION':
-                home_sessions = max(home_sessions, int(rem_val) if not ent.is_unlimited else 999)
+                if ent.is_unlimited:
+                    home_unlimited = True
+                else:
+                    home_sessions += int(rem_val)
+
+    if cross_unlimited:
+        cross_sessions = 999
+    if home_unlimited:
+        home_sessions = 999
 
     return home_sessions, cross_sessions, detailed_balances
 
@@ -344,6 +377,8 @@ def serialize_member(profile: UserProfile, alias: str = 'default', compact: bool
         }
     else:
         membership_status = 'INACTIVE'
+
+    display_package_name = format_program_package_name(program_name, package_name)
 
     # Resolve home branch: prioritize home_branch (where the member trains),
     # falling back to purchase_branch, then profile.preferred_branch or user.home_branch
@@ -459,6 +494,8 @@ def serialize_member(profile: UserProfile, alias: str = 'default', compact: bool
         'program_name': program_name,
         'package_id': package_id,
         'package_name': package_name,
+        'display_package_name': display_package_name,
+        'display_name': display_package_name,
         'package_version_name': package_version_name,
         'start_date': start_date,
         'expiry_date': expiry_date,
@@ -821,6 +858,65 @@ def build_member_timeline(profile: UserProfile, alias: str = 'default', limit: i
     except Exception as _call_err:
         logger.warning("build_member_timeline: call session query failed: %s", _call_err)
 
+    # 9. Canonical Activity Audit Logs (Membership changes, freezes, turnstiles, bookings, orders, profile edits)
+    try:
+        from .models_activity_audit import ActivityAuditLog
+        related_entity_ids = [str(profile.id)]
+        if user:
+            related_entity_ids.append(str(user.id))
+
+        member_membership_ids = [
+            str(mid) for mid in Membership.objects.using(alias)
+            .filter(user_profile=profile).values_list('id', flat=True)[:50]
+        ]
+        member_booking_ids = [
+            str(bid) for bid in Booking.objects.using(alias)
+            .filter(user_profile=profile).values_list('id', flat=True)[:50]
+        ]
+        member_order_ids = [
+            str(oid) for oid in Order.objects.using(alias)
+            .filter(user_profile=profile).values_list('id', flat=True)[:50]
+        ]
+        related_entity_ids.extend(member_membership_ids)
+        related_entity_ids.extend(member_booking_ids)
+        related_entity_ids.extend(member_order_ids)
+
+        audit_filters = Q(entity_id__in=related_entity_ids)
+        if user:
+            audit_filters |= Q(actor_id=str(user.id))
+
+        audit_logs = ActivityAuditLog.objects.using(alias).filter(audit_filters).order_by('-occurred_at')[:40]
+        for log in audit_logs:
+            cat = 'AUDIT'
+            mod_upper = (log.module or '').upper()
+            if mod_upper in ('MEMBERSHIPS', 'MEMBERSHIP'):
+                cat = 'MEMBERSHIP'
+            elif mod_upper in ('BOOKINGS', 'OPERATIONS', 'CLASSES'):
+                cat = 'BOOKING' if 'BOOKING' in (log.action_code or '') else 'ATTENDANCE'
+            elif mod_upper in ('COMMERCE', 'PAYMENTS'):
+                cat = 'COMMERCE'
+
+            badge_col = 'emerald' if log.result == 'SUCCESS' else ('rose' if log.result == 'FAILURE' else 'amber')
+
+            events.append({
+                'id': f"audit-{log.id}",
+                'category': cat,
+                'event_type': log.action_code,
+                'title': f"{(log.action_verb or log.action_code or 'Activity').title()} ({(log.module or 'CRM').title()})",
+                'description': log.event_description,
+                'occurred_at': log.occurred_at.isoformat() if log.occurred_at else timezone.now().isoformat(),
+                'actor': log.actor_display or log.actor_name or 'Staff',
+                'badge_color': badge_col,
+                'metadata': {
+                    'audit_log_id': str(log.id),
+                    'field_changes': log.field_changes,
+                    'result': log.result,
+                    'channel': log.source_channel,
+                },
+            })
+    except Exception as _audit_err:
+        logger.warning("build_member_timeline: audit log query failed: %s", _audit_err)
+
     # Sort all events chronologically descending
     events.sort(key=lambda x: x['occurred_at'], reverse=True)
     return events[:limit]
@@ -891,6 +987,7 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         'home_branch_id': base_member['home_branch_id'],
         'current_program': base_member['program_name'],
         'current_package': base_member['package_name'],
+        'current_package_display': base_member.get('display_package_name', base_member['package_name']),
         'current_package_version': base_member['package_version_name'],
         'expiry_date': base_member['expiry_date'],
         'home_sessions_remaining': base_member['home_sessions_remaining'],
@@ -1018,9 +1115,16 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
                 branch_label = m.purchase_branch.name if m.purchase_branch else 'Branch'
                 discount_label = f"Offline Branch Authorized Rate ({branch_label} POS Staff)"
 
+            c_prog = m.program or (m.package.program if m.package else None)
+            c_prog_name = c_prog.name if c_prog else None
+            c_disp = format_program_package_name(c_prog_name, contract.package_name_snapshot)
+
             contract_data = {
                 'id': str(contract.id),
                 'package_name': contract.package_name_snapshot,
+                'display_package_name': c_disp,
+                'display_name': c_disp,
+                'program_name': c_prog_name or '',
                 'catalog_price': catalog_price or float(contract.purchase_price),
                 'purchase_price': float(contract.purchase_price),
                 'discount_amount': eff_discount,
@@ -1041,8 +1145,9 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
 
         prog_name = (m.program.name if m.program else (m.package.program.name if (m.package and m.package.program) else 'Standard'))
         pkg_name = m.package.name if m.package else 'Plan'
+        disp_name = format_program_package_name(prog_name, pkg_name)
 
-        m_home_s, m_cross_s, _ = get_member_sessions_summary(profile, m, alias)
+        m_home_s, m_cross_s, _ = get_member_sessions_summary(profile, m, alias, single_membership_only=True)
 
         actual_purchase_price = float(contract.purchase_price) if contract else (float(m.package_price.base_price) if m.package_price else 0)
         eff_discount = (contract_data.get('discount_amount') if contract_data else 0)
@@ -1055,8 +1160,6 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         base_consumed = 0
         passport_alloc = 0
         passport_consumed = 0
-
-
 
         seen_m_cats = set()
         for ent in sorted(ents, key=lambda x: (x.consumed_units or 0), reverse=True):
@@ -1073,7 +1176,6 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             else:
                 base_alloc = alloc
                 base_consumed = cons
-
 
         if not ents and m.package_version:
             base_alloc = int(getattr(m.package_version, 'session_count', 0) or 0)
@@ -1092,6 +1194,9 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         sessions_left = max(0, base_alloc - base_consumed)
         passport_left = min(max(0, passport_alloc - passport_consumed), sessions_left)
 
+        # Expiry status flags per membership contract card
+        _rf_today = timezone.now().date()
+        _m_days_left = (m.end_date - _rf_today).days if m.end_date else None
         m_obj = {
             'id': str(m.id),
             'membership_number': m.membership_number,
@@ -1099,12 +1204,17 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             'package_version_id': str(m.package_version_id) if m.package_version_id else None,
             'program_id': str(m.program_id) if m.program_id else (str(m.package.program_id) if m.package and m.package.program_id else None),
             'package_name': pkg_name,
-            'plan_name': pkg_name,
+            'plan_name': disp_name,
+            'display_name': disp_name,
+            'display_package_name': disp_name,
             'package_version_name': f"v{m.package_version.version_number}" if m.package_version else 'v1',
             'program_name': prog_name,
             'status': m.status,
             'start_date': str(m.start_date),
             'end_date': str(m.end_date),
+            'days_until_expiry': _m_days_left,
+            'near_expiry': _m_days_left is not None and _m_days_left <= 15 and _m_days_left >= 0,
+            'is_expired': _m_days_left is not None and _m_days_left < 0,
             'home_branch': m.home_branch.name if m.home_branch else 'Branch',
             'branch_name': m.home_branch.name if m.home_branch else (m.purchase_branch.name if m.purchase_branch else 'Sweat Pilates Malad West'),
             'purchase_branch': m.purchase_branch.name if m.purchase_branch else 'Branch',
@@ -1120,8 +1230,8 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             'sold_by': contract_data.get('sold_by') if contract_data else 'Sweat Front Desk POS',
             'coupon_code': contract_data.get('coupon_code') if contract_data else '',
             'campaign_name': contract_data.get('campaign_name') if contract_data else '',
-            'home_sessions_remaining': m_home_s,
-            'cross_branch_sessions_remaining': m_cross_s,
+            'home_sessions_remaining': sessions_left,
+            'cross_branch_sessions_remaining': passport_left,
             'sessions_used': base_consumed,
             'sessions_total': base_alloc,
             'sessions_left': sessions_left,
@@ -1131,7 +1241,6 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         }
 
         # Check if membership is currently RUNNING (started and unexpired) -- running-first-fix
-        _rf_today = timezone.now().date()
         is_active_or_frozen = m.status in ('ACTIVE', 'FROZEN') and (not m.end_date or m.end_date >= _rf_today) and (not m.start_date or m.start_date <= _rf_today)
         if is_active_or_frozen or (m.id == getattr(active_m, 'id', None) and m.status in ('ACTIVE', 'FROZEN')):
             if m.id == getattr(active_m, 'id', None):
@@ -1144,6 +1253,8 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
                 'membership_number': m.membership_number,
                 'program_name': prog_name,
                 'package_name': pkg_name,
+                'display_name': disp_name,
+                'display_package_name': disp_name,
                 'status': m.status,
                 'start_date': str(m.start_date) if m.start_date else None,
                 'expiry_date': str(m.end_date) if m.end_date else None,
@@ -1163,6 +1274,8 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             'membership_number': base_member.get('membership_number', ''),
             'program_name': base_member.get('program_name', 'Standard'),
             'package_name': base_member.get('package_name', 'Plan'),
+            'display_name': base_member.get('display_package_name', 'Standard Plan'),
+            'display_package_name': base_member.get('display_package_name', 'Standard Plan'),
             'status': base_member.get('membership_status', 'ACTIVE'),
             'start_date': base_member.get('start_date'),
             'expiry_date': base_member.get('expiry_date'),
@@ -1172,6 +1285,58 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         })
 
     header['active_programs'] = active_programs_list
+    if active_memberships_list:
+        header['home_sessions_remaining'] = sum(int(m.get('sessions_left', 0) or 0) for m in active_memberships_list)
+
+    # --- Item 2: Multi-contract expiry date logic ---
+    # When a member has multiple active contracts with different end dates,
+    # surface the EARLIEST expiring contract so staff/member can act on it.
+    # Also add per-contract near_expiry flag in active_programs_list.
+    _today_expiry = timezone.now().date()
+    if active_programs_list:
+        _dated = [
+            (p['expiry_date'], p.get('display_name') or p.get('display_package_name') or p.get('package_name', ''))
+            for p in active_programs_list
+            if p.get('expiry_date')
+        ]
+        if _dated:
+            _dated_sorted = sorted(_dated, key=lambda x: x[0])  # ascending = earliest first
+            _earliest_date_str, _earliest_pkg = _dated_sorted[0]
+            _latest_date_str = _dated_sorted[-1][0]
+            _is_multi = len(_dated) > 1
+
+            header['earliest_expiry_date'] = _earliest_date_str
+            header['latest_expiry_date'] = _latest_date_str
+            header['earliest_expiry_package'] = _earliest_pkg
+            header['multi_contract_expiry'] = _is_multi
+
+            # Override the top-level expiry_date to always show the EARLIEST expiry
+            header['expiry_date'] = _earliest_date_str
+        else:
+            header['earliest_expiry_date'] = header.get('expiry_date')
+            header['latest_expiry_date'] = header.get('expiry_date')
+            header['earliest_expiry_package'] = header.get('current_package_display', '')
+            header['multi_contract_expiry'] = False
+
+        # Add near_expiry flag per active_programs entry
+        for _p in active_programs_list:
+            if _p.get('expiry_date'):
+                try:
+                    from datetime import date as _date
+                    _exp = _date.fromisoformat(_p['expiry_date'])
+                    _days_left = (_exp - _today_expiry).days
+                    _p['days_until_expiry'] = _days_left
+                    _p['near_expiry'] = _days_left <= 15
+                    _p['is_expired'] = _days_left < 0
+                except (ValueError, TypeError):
+                    _p['days_until_expiry'] = None
+                    _p['near_expiry'] = False
+                    _p['is_expired'] = False
+            else:
+                _p['days_until_expiry'] = None
+                _p['near_expiry'] = False
+                _p['is_expired'] = False
+    # --- End Item 2 ---
 
     # Freezes & history
     freezes = [
@@ -1772,12 +1937,15 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
     for m in mem_records:
         p_name = m.program.name if m.program else (m.package.program.name if m.package and m.package.program else 'General')
         pkg_name = m.package.name if m.package else 'Membership'
+        disp_pkg = format_program_package_name(p_name, pkg_name)
         form_title = m.parq_form.name if m.parq_form else 'PAR-Q Form'
         parq_requirements.append({
             'membership_id': str(m.id),
             'membership_number': m.membership_number,
             'program_name': p_name,
             'package_name': pkg_name,
+            'display_package_name': disp_pkg,
+            'display_name': disp_pkg,
             'membership_status': m.status,
             'parq_status': getattr(m, 'parq_status', 'PENDING'),
             'parq_completed_at': m.parq_completed_at.isoformat() if getattr(m, 'parq_completed_at', None) else None,
@@ -1837,25 +2005,37 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
     }
     header['available_reward_coins'] = pts_balance
 
-    # Passport / Cross-Branch Sessions
-    passport_allowed = 0
-    if active_m and active_m.package_version:
-        pdef = PackageEntitlementDefinition.objects.using(alias).filter(
-            package_version=active_m.package_version
-        ).first()
-        if pdef and isinstance(pdef.configuration, dict):
-            passport_allowed = int(pdef.configuration.get('max_passport_sessions') or 0)
-    
-    if passport_allowed == 0 and active_m:
-        for ent in active_m.entitlements.using(alias).filter(status='ACTIVE').order_by('-consumed_units', '-updated_at'):
-            et_name = (ent.entitlement_type or '').lower()
-            if 'cross' in et_name or 'passport' in et_name:
-                passport_allowed = int(ent.allocated_units or 0)
-                break
+    # Passport / Cross-Branch Sessions aggregated across active memberships
+    agg_passport_allowed = 0
+    agg_passport_consumed = 0
+    agg_passport_remaining = 0
+    if active_memberships_list:
+        for am_data in active_memberships_list:
+            agg_passport_allowed += int(am_data.get('passport_sessions_total') or 0)
+            agg_passport_consumed += int(am_data.get('passport_sessions_used') or 0)
+            agg_passport_remaining += int(am_data.get('passport_sessions_left') or 0)
 
+    passport_allowed = agg_passport_allowed
+    passport_consumed = agg_passport_consumed
+    passport_remaining = agg_passport_remaining
 
     if passport_allowed == 0:
-        passport_allowed = int(base_member.get('cross_branch_sessions_remaining') or 0)
+        if active_m and active_m.package_version:
+            pdef = PackageEntitlementDefinition.objects.using(alias).filter(
+                package_version=active_m.package_version
+            ).first()
+            if pdef and isinstance(pdef.configuration, dict):
+                passport_allowed = int(pdef.configuration.get('max_passport_sessions') or 0)
+        
+        if passport_allowed == 0 and active_m:
+            for ent in active_m.entitlements.using(alias).filter(status='ACTIVE').order_by('-consumed_units', '-updated_at'):
+                et_name = (ent.entitlement_type or '').lower()
+                if 'cross' in et_name or 'passport' in et_name:
+                    passport_allowed = int(ent.allocated_units or 0)
+                    break
+
+        if passport_allowed == 0:
+            passport_allowed = int(base_member.get('cross_branch_sessions_remaining') or 0)
 
     cross_bookings = []
     if active_m and active_m.home_branch_id:
@@ -1878,17 +2058,17 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
                 'status': cb.status,
             })
 
-    passport_consumed = len(cross_bookings)
-    cross_rem = int(m_cross_s if 'm_cross_s' in locals() else (base_member.get('cross_branch_sessions_remaining') or 0))
-    if passport_allowed > 0:
-        passport_remaining = max(0, passport_allowed - passport_consumed)
-    elif cross_rem > 0:
-        passport_allowed = cross_rem + passport_consumed
-        passport_remaining = cross_rem
-    else:
-        passport_remaining = 0
+    if cross_bookings:
+        cb_count = len(cross_bookings)
+        if cb_count > passport_consumed:
+            passport_consumed = cb_count
+            if passport_allowed > 0:
+                passport_remaining = max(0, passport_allowed - passport_consumed)
 
-    eff_home_remaining = int(base_member.get('home_sessions_remaining') or 0)
+    if passport_remaining == 0 and passport_allowed > 0 and passport_consumed < passport_allowed:
+        passport_remaining = max(0, passport_allowed - passport_consumed)
+
+    eff_home_remaining = int(header.get('home_sessions_remaining') or 0)
     passport_remaining = min(passport_remaining, eff_home_remaining)
     header['cross_branch_sessions_remaining'] = passport_remaining
 
@@ -2591,6 +2771,18 @@ class MemberViewSet(viewsets.ViewSet):
         if not profile:
             return Response({'detail': 'Member not found.'}, status=status.HTTP_404_NOT_FOUND)
 
+        # Before state snapshot for granular audit comparison
+        user = profile.user
+        before_state = {
+            'name': f"{profile.first_name_snapshot or ''} {profile.last_name_snapshot or ''}".strip(),
+            'phone': user.phone if user else '',
+            'email': user.email if user else '',
+            'gender': profile.gender or (user.gender if user else ''),
+            'date_of_birth': str(profile.date_of_birth or (user.date_of_birth if user else '') or ''),
+            'status': profile.member_status,
+            'home_branch': profile.preferred_branch.name if profile.preferred_branch else '',
+        }
+
         data = request.data
         if 'name' in data:
             full = str(data['name']).strip()
@@ -2644,6 +2836,44 @@ class MemberViewSet(viewsets.ViewSet):
             profile.emergency_contact_json = {'contact': c}
 
         profile.save(using=alias)
+
+        # After state snapshot & Granular Audit Log
+        after_state = {
+            'name': f"{profile.first_name_snapshot or ''} {profile.last_name_snapshot or ''}".strip(),
+            'phone': profile.user.phone if profile.user else '',
+            'email': profile.user.email if profile.user else '',
+            'gender': profile.gender or (profile.user.gender if profile.user else ''),
+            'date_of_birth': str(profile.date_of_birth or (profile.user.date_of_birth if profile.user else '') or ''),
+            'status': profile.member_status,
+            'home_branch': profile.preferred_branch.name if profile.preferred_branch else '',
+        }
+
+        try:
+            from .audit_engine import UnifiedAuditEngine
+            actor = getattr(request, 'user', None)
+            member_display = after_state['name'] or after_state['email'] or str(profile.id)
+            UnifiedAuditEngine.record_activity(
+                action_code='MEMBER.PROFILE_UPDATED',
+                action_category='MEMBERSHIP',
+                action_verb='UPDATED',
+                module='MEMBERS',
+                submodule='DIRECTORY',
+                entity_type='Member',
+                entity_id=str(profile.id),
+                entity_name=member_display,
+                actor_user=actor if isinstance(actor, TenantUser) else None,
+                actor_type='STAFF' if actor else 'SYSTEM',
+                request=request,
+                branch=profile.preferred_branch,
+                organization=org,
+                before_state=before_state,
+                after_state=after_state,
+                reason=data.get('reason', '') or 'Staff updated member profile',
+                db_alias=alias,
+            )
+        except Exception as log_err:
+            logger.warning(f"Failed to record member update audit: {log_err}")
+
         return Response(serialize_member(profile, alias), status=status.HTTP_200_OK)
 
     def destroy(self, request, pk=None):
@@ -2652,6 +2882,9 @@ class MemberViewSet(viewsets.ViewSet):
         profile = self.get_member_profile(alias, org, pk)
         if not profile:
             return Response({'detail': 'Member not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        member_name = f"{profile.first_name_snapshot or ''} {profile.last_name_snapshot or ''}".strip() or (profile.user.email if profile.user else str(profile.id))
+        old_status = profile.member_status
 
         # If profile belongs to a staff/admin user, remove member identity without deleting the staff user
         if profile.user and getattr(profile.user, 'user_type', None) == 'STAFF':
@@ -2667,6 +2900,32 @@ class MemberViewSet(viewsets.ViewSet):
             profile.member_status = 'INACTIVE'
             profile.save(using=alias)
             Membership.objects.using(alias).filter(user_profile=profile).delete()
+
+        try:
+            from .audit_engine import UnifiedAuditEngine
+            actor = getattr(request, 'user', None)
+            UnifiedAuditEngine.record_activity(
+                action_code='MEMBER.DEACTIVATED',
+                action_category='MEMBERSHIP',
+                action_verb='DEACTIVATED',
+                module='MEMBERS',
+                submodule='DIRECTORY',
+                entity_type='Member',
+                entity_id=str(profile.id),
+                entity_name=member_name,
+                actor_user=actor if isinstance(actor, TenantUser) else None,
+                actor_type='STAFF' if actor else 'SYSTEM',
+                request=request,
+                branch=profile.preferred_branch,
+                organization=org,
+                before_state={'status': old_status},
+                after_state={'status': 'INACTIVE'},
+                reason=request.data.get('reason', '') or 'Staff deactivated member account',
+                event_description=f"Member account '{member_name}' was deactivated by staff.",
+                db_alias=alias,
+            )
+        except Exception as log_err:
+            logger.warning(f"Failed to record member deactivation audit: {log_err}")
 
         return Response(status=status.HTTP_204_NO_CONTENT)
 

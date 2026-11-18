@@ -114,6 +114,8 @@ MIDDLEWARE = [
     'config.middleware.CorrelationIDMiddleware',
     # Tenant DB routing middleware — resolves active tenant from verified JWT
     'config.tenant_middleware.TenantDatabaseMiddleware',
+    # Universal catch-all CRM mutation audit middleware — ensures zero blind spots across all modules
+    'apps.tenant_core.middleware_activity_audit.UniversalMutationAuditMiddleware',
 ]
 
 ROOT_URLCONF = 'config.urls'

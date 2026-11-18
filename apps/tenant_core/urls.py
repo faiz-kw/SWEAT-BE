@@ -23,6 +23,7 @@ from .views_voice_agent import (
     VoiceAgentTransferCallView,
     VoiceAgentStudioFaqView,
 )
+from .views_activity_audit import ActivityAuditLogViewSet
 from .views_storage import (
     FileViewSet,
     StorageConfirmUploadView,
@@ -331,6 +332,7 @@ router.register(r'branch-working-hours', BranchWorkingHoursViewSet, basename='br
 router.register(r'branch-operating-exceptions', BranchOperatingExceptionViewSet, basename='branch-operating-exceptions')
 router.register(r'notification-templates', NotificationTemplateViewSet, basename='notification-template')
 router.register(r'audit-events', TenantAuditEventViewSet, basename='audit-event')
+router.register(r'activity-logs', ActivityAuditLogViewSet, basename='activity-log')
 router.register(r'files', FileViewSet, basename='file')
 router.register(r'processing-purposes', ProcessingPurposeViewSet, basename='processing-purpose')
 router.register(r'consent-records', ConsentRecordViewSet, basename='consent-record')

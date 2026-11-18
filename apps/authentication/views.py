@@ -574,6 +574,41 @@ class UniversalLoginView(APIView):
 
         if not user.check_password(password):
             is_locked, rem = record_login_failure(request, identifier, tenant_id=tenant_id_str)
+            try:
+                from apps.tenant_core.audit_engine import UnifiedAuditEngine
+                if is_locked:
+                    UnifiedAuditEngine.record_activity(
+                        action_code='AUTH.ACCOUNT_LOCKED',
+                        module='AUTH',
+                        entity_type='TenantUser',
+                        entity_id=str(user.id),
+                        entity_name=user.email,
+                        actor_email=identifier,
+                        actor_id=str(user.id),
+                        request=request,
+                        result='FAILURE',
+                        error_code='ACCOUNT_LOCKED',
+                        error_message=f'Too many failed attempts. Locked for {rem} seconds.',
+                        db_alias=db_alias,
+                    )
+                else:
+                    UnifiedAuditEngine.record_activity(
+                        action_code='AUTH.LOGIN_FAILED',
+                        module='AUTH',
+                        entity_type='TenantUser',
+                        entity_id=str(user.id),
+                        entity_name=user.email,
+                        actor_email=identifier,
+                        actor_id=str(user.id),
+                        request=request,
+                        result='FAILURE',
+                        error_code='INVALID_CREDENTIALS',
+                        error_message='Invalid password provided.',
+                        db_alias=db_alias,
+                    )
+            except Exception as log_err:
+                logger.debug("Failed to record login failure audit: %s", log_err)
+
             if is_locked:
                 return Response(
                     {'error': f'Too many failed login attempts. Account temporarily locked. Try again in {rem} seconds.'},
@@ -652,6 +687,27 @@ class UniversalLoginView(APIView):
             .select_related('role')
             .values_list('role__code', flat=True)
         )
+
+        # Audit logging for successful login
+        try:
+            from apps.tenant_core.audit_engine import UnifiedAuditEngine
+            UnifiedAuditEngine.record_activity(
+                action_code='AUTH.LOGIN_SUCCESS',
+                module='AUTH',
+                entity_type='TenantUser',
+                entity_id=str(user.id),
+                entity_name=f"{user.first_name} {user.last_name}".strip() or user.email,
+                actor_user=user,
+                actor_role=', '.join(active_roles) if active_roles else 'Staff',
+                actor_type='ADMIN' if (getattr(user, 'is_superuser', False) or 'SUPER_ADMIN' in active_roles or 'OWNER' in active_roles) else 'STAFF',
+                request=request,
+                branch=getattr(user, 'home_branch', None),
+                reason='User logged in via verified password',
+                event_description=f"User {user.email} successfully logged in.",
+                db_alias=db_alias,
+            )
+        except Exception as log_err:
+            logger.debug("Failed to record login success audit: %s", log_err)
 
         primary_role = active_roles[0] if active_roles else 'MEMBER'
         default_route = _get_default_route('tenant', active_roles)
@@ -1305,6 +1361,30 @@ class ChangePasswordView(APIView):
         confirm_password = request.data.get('confirm_password', '')
 
         if not user.check_password(current_password):
+            try:
+                auth_type_fail = getattr(user, '_auth_type', None)
+                if auth_type_fail != 'platform':
+                    db_fail = getattr(user, '_state', None) and user._state.db or None
+                    if db_fail and db_fail != 'default':
+                        from apps.tenant_core.audit_engine import UnifiedAuditEngine
+                        UnifiedAuditEngine.record_activity(
+                            action_code='SECURITY.PASSWORD_CHANGE_FAILED',
+                            action_category='SECURITY',
+                            action_verb='change password',
+                            module='SECURITY',
+                            submodule='AUTHENTICATION',
+                            entity_type='TenantUser',
+                            entity_id=str(user.id),
+                            entity_name=getattr(user, 'email', '') or str(user.id),
+                            actor_user=user,
+                            result='FAILURE',
+                            error_code='INVALID_CURRENT_PASSWORD',
+                            error_message='Current password is incorrect.',
+                            request=request,
+                            db_alias=db_fail,
+                        )
+            except Exception:
+                pass
             return Response({'error': 'Current password is incorrect.', 'detail': 'Current password is incorrect.'}, status=status.HTTP_400_BAD_REQUEST)
         if not new_password:
             return Response({'error': 'New password cannot be empty.', 'detail': 'New password cannot be empty.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -1325,6 +1405,26 @@ class ChangePasswordView(APIView):
             from apps.master.services_auth_directory import sync_tenant_user_identity
             tid = getattr(request, 'tenant_id', None) or getattr(user, 'organization_id', None)
             sync_tenant_user_identity(user, tenant_id=tid, db=db)
+            if db != 'default':
+                try:
+                    from apps.tenant_core.audit_engine import UnifiedAuditEngine
+                    UnifiedAuditEngine.record_activity(
+                        action_code='SECURITY.PASSWORD_CHANGED',
+                        action_category='SECURITY',
+                        action_verb='changed password',
+                        module='SECURITY',
+                        submodule='AUTHENTICATION',
+                        entity_type='TenantUser',
+                        entity_id=str(user.id),
+                        entity_name=getattr(user, 'email', '') or str(user.id),
+                        actor_user=user,
+                        result='SUCCESS',
+                        event_description=f"{getattr(user, 'email', 'User')} changed their account password.",
+                        request=request,
+                        db_alias=db,
+                    )
+                except Exception:
+                    pass
 
         return Response({'message': 'Password changed successfully.', 'detail': 'Password changed successfully.'}, status=status.HTTP_200_OK)
 
@@ -1547,9 +1647,16 @@ class LogoutView(APIView):
 
         refresh_token_str = request.data.get('refresh') or request.COOKIES.get('refresh_token')
 
+        user_email = ''
+        user_id = None
+        db_alias = None
+
         if refresh_token_str:
             try:
                 refresh = RefreshToken(refresh_token_str)
+                user_id = refresh.payload.get('user_id')
+                user_email = refresh.payload.get('email') or refresh.payload.get('username') or ''
+                db_alias = refresh.payload.get('db_alias') or refresh.payload.get('tenant_db')
                 refresh.blacklist()
                 logger.debug(
                     'LogoutView: Blacklisted refresh token | correlation_id=%s',
@@ -1561,6 +1668,31 @@ class LogoutView(APIView):
             except Exception as e:
                 # Unexpected error — log but don't fail logout
                 logger.error('LogoutView: Unexpected error blacklisting token: %s', e)
+
+        # Audit logging for logout
+        try:
+            from apps.tenant_core.audit_engine import UnifiedAuditEngine
+            from apps.master.models_tenant import Tenant
+            if not db_alias:
+                default_tenant = Tenant.objects.using('default').filter(status='ACTIVE').first()
+                if default_tenant:
+                    db_alias = f"tenant_{default_tenant.slug}"
+            if db_alias:
+                UnifiedAuditEngine.record_activity(
+                    action_code='AUTH.LOGOUT',
+                    module='AUTH',
+                    entity_type='TenantUser',
+                    entity_id=str(user_id) if user_id else None,
+                    entity_name=user_email or 'User',
+                    actor_email=user_email,
+                    actor_id=str(user_id) if user_id else None,
+                    request=request,
+                    reason='User logged out',
+                    event_description=f"User {user_email or user_id or 'Staff'} logged out.",
+                    db_alias=db_alias,
+                )
+        except Exception as log_err:
+            logger.debug("Failed to record logout audit log: %s", log_err)
 
         resp = Response({'message': 'Logged out successfully.'})
         delete_refresh_cookie(resp, request=request)

@@ -710,6 +710,47 @@ class MembershipLifecycleService:
             except Exception as e:
                 logger.warning(f"Error cancelling bookings during freeze: {e}")
 
+        # Comprehensive Activity & Audit Log
+        try:
+            from .audit_engine import UnifiedAuditEngine
+            member_user = membership.user_profile.user if membership.user_profile else None
+            member_name = f"{member_user.first_name} {member_user.last_name}".strip() if member_user else str(membership.user_profile_id)
+            pkg_name = membership.package.name if membership.package else "Membership"
+            UnifiedAuditEngine.record_activity(
+                action_code='MEMBERSHIP.FROZEN',
+                action_category='MEMBERSHIP',
+                action_verb='FROZEN',
+                module='MEMBERS',
+                submodule='MEMBERSHIPS',
+                entity_type='Membership',
+                entity_id=str(membership.id),
+                entity_name=f"{pkg_name} ({member_name})",
+                actor_user=approved_by_user,
+                actor_type='STAFF' if approved_by_user else 'SYSTEM',
+                branch=membership.home_branch or membership.branch,
+                organization=membership.organization,
+                before_state={'status': old_status, 'end_date': str(old_end)},
+                after_state={'status': membership.status, 'end_date': str(new_end)},
+                field_changes=[
+                    {'field_name': 'status', 'field_label': 'Membership Status', 'old_value': old_status, 'new_value': membership.status},
+                    {'field_name': 'end_date', 'field_label': 'Expiration Date', 'old_value': str(old_end), 'new_value': str(new_end)},
+                    {'field_name': 'freeze_start', 'field_label': 'Freeze Start Date', 'old_value': None, 'new_value': str(freeze_from)},
+                    {'field_name': 'freeze_end', 'field_label': 'Freeze End Date', 'old_value': None, 'new_value': str(freeze_until)},
+                ],
+                reason=reason_text or 'Member requested freeze',
+                event_description=f"Membership '{pkg_name}' for member {member_name} frozen from {freeze_from} to {freeze_until}. End date extended by {freeze_days} days to {new_end}.",
+                metadata={
+                    'freeze_id': str(freeze.id),
+                    'freeze_days': freeze_days,
+                    'total_fee': float(total_fee),
+                    'fee_per_day': float(fee_per_day),
+                    'member_email': member_user.email if member_user else '',
+                },
+                db_alias=alias,
+            )
+        except Exception as log_err:
+            logger.warning(f"Failed to record membership freeze audit: {log_err}")
+
         return freeze
 
     @classmethod
@@ -1067,6 +1108,38 @@ class MembershipLifecycleService:
             reason_text=reason_text or "Membership unfreezed by staff.",
             changed_by_user=approved_by_user,
         )
+
+        # Comprehensive Activity & Audit Log
+        try:
+            from .audit_engine import UnifiedAuditEngine
+            member_user = membership.user_profile.user if membership.user_profile else None
+            member_name = f"{member_user.first_name} {member_user.last_name}".strip() if member_user else str(membership.user_profile_id)
+            pkg_name = membership.package.name if membership.package else "Membership"
+            UnifiedAuditEngine.record_activity(
+                action_code='MEMBERSHIP.UNFROZEN',
+                action_category='MEMBERSHIP',
+                action_verb='UNFROZEN',
+                module='MEMBERS',
+                submodule='MEMBERSHIPS',
+                entity_type='Membership',
+                entity_id=str(membership.id),
+                entity_name=f"{pkg_name} ({member_name})",
+                actor_user=approved_by_user,
+                actor_type='STAFF' if approved_by_user else 'SYSTEM',
+                branch=membership.home_branch or membership.branch,
+                organization=membership.organization,
+                before_state={'status': old_status},
+                after_state={'status': 'ACTIVE'},
+                field_changes=[
+                    {'field_name': 'status', 'field_label': 'Membership Status', 'old_value': old_status, 'new_value': 'ACTIVE'},
+                ],
+                reason=reason_text or 'Staff unfreezed membership',
+                event_description=f"Membership '{pkg_name}' for member {member_name} unfrozen and returned to active status.",
+                db_alias=alias,
+            )
+        except Exception as log_err:
+            logger.warning(f"Failed to record membership unfreeze audit: {log_err}")
+
         return membership
 
     @classmethod
@@ -1245,6 +1318,46 @@ class MembershipLifecycleService:
             reason=f"Validity extended by {days} days to {new_end}. Total fee: ₹{total_fee}.",
         )
 
+        # Comprehensive Activity & Audit Log
+        try:
+            from .audit_engine import UnifiedAuditEngine
+            member_user = membership.user_profile.user if membership.user_profile else None
+            member_name = f"{member_user.first_name} {member_user.last_name}".strip() if member_user else str(membership.user_profile_id)
+            pkg_name = membership.package.name if membership.package else "Membership"
+            UnifiedAuditEngine.record_activity(
+                action_code='MEMBERSHIP.EXTENDED',
+                action_category='MEMBERSHIP',
+                action_verb='EXTENDED',
+                module='MEMBERS',
+                submodule='MEMBERSHIPS',
+                entity_type='Membership',
+                entity_id=str(membership.id),
+                entity_name=f"{pkg_name} ({member_name})",
+                actor_user=approved_by_user,
+                actor_type='STAFF' if approved_by_user else 'SYSTEM',
+                branch=membership.home_branch or membership.branch,
+                organization=membership.organization,
+                before_state={'end_date': str(old_end), 'status': old_status},
+                after_state={'end_date': str(new_end), 'status': membership.status},
+                field_changes=[
+                    {'field_name': 'end_date', 'field_label': 'Expiration Date', 'old_value': str(old_end), 'new_value': str(new_end)},
+                    {'field_name': 'extension_days', 'field_label': 'Extended Days', 'old_value': 0, 'new_value': days},
+                    {'field_name': 'extension_fee', 'field_label': 'Extension Fee', 'old_value': 0, 'new_value': float(total_fee)},
+                ],
+                reason=reason_text or f"Extended by {days} days",
+                event_description=f"Membership '{pkg_name}' for member {member_name} extended by {days} days to {new_end}. Total fee: ₹{total_fee}.",
+                metadata={
+                    'extension_id': str(extension.id),
+                    'days': days,
+                    'total_fee': float(total_fee),
+                    'activation_fee': float(activation_fee),
+                    'was_expired': was_expired,
+                },
+                db_alias=alias,
+            )
+        except Exception as log_err:
+            logger.warning(f"Failed to record membership extension audit: {log_err}")
+
         return membership, extension
 
     @classmethod
@@ -1301,6 +1414,43 @@ class MembershipLifecycleService:
             reason=reason_text or f"Transferred home branch from {from_branch.name if from_branch else 'None'} to {target_branch.name}",
             changed_by_user=actor_user,
         )
+
+        # Comprehensive Activity & Audit Log
+        try:
+            from .audit_engine import UnifiedAuditEngine
+            member_user = membership.user_profile.user if membership.user_profile else None
+            member_name = f"{member_user.first_name} {member_user.last_name}".strip() if member_user else str(membership.user_profile_id)
+            pkg_name = membership.package.name if membership.package else "Membership"
+            UnifiedAuditEngine.record_activity(
+                action_code='MEMBERSHIP.TRANSFERRED',
+                action_category='MEMBERSHIP',
+                action_verb='TRANSFERRED',
+                module='MEMBERS',
+                submodule='MEMBERSHIPS',
+                entity_type='Membership',
+                entity_id=str(membership.id),
+                entity_name=f"{pkg_name} ({member_name})",
+                actor_user=actor_user,
+                actor_type='STAFF' if actor_user else 'SYSTEM',
+                branch=target_branch,
+                organization=membership.organization,
+                before_state={'home_branch': from_branch.name if from_branch else None},
+                after_state={'home_branch': target_branch.name},
+                field_changes=[
+                    {
+                        'field_name': 'home_branch',
+                        'field_label': 'Home Branch',
+                        'old_value': from_branch.name if from_branch else 'None',
+                        'new_value': target_branch.name,
+                    }
+                ],
+                reason=reason_text or f"Transferred home branch to {target_branch.name}",
+                event_description=f"Membership '{pkg_name}' for member {member_name} home branch transferred from {from_branch.name if from_branch else 'None'} to {target_branch.name}.",
+                db_alias=alias,
+            )
+        except Exception as log_err:
+            logger.warning(f"Failed to record branch transfer audit: {log_err}")
+
         return hist
 
     @classmethod
@@ -1367,6 +1517,38 @@ class MembershipLifecycleService:
             reason_text=reason_text or "Membership cancelled by staff.",
             changed_by_user=actor_user,
         )
+
+        # Comprehensive Activity & Audit Log
+        try:
+            from .audit_engine import UnifiedAuditEngine
+            member_user = membership.user_profile.user if membership.user_profile else None
+            member_name = f"{member_user.first_name} {member_user.last_name}".strip() if member_user else str(membership.user_profile_id)
+            pkg_name = membership.package.name if membership.package else "Membership"
+            UnifiedAuditEngine.record_activity(
+                action_code='MEMBERSHIP.CANCELLED',
+                action_category='MEMBERSHIP',
+                action_verb='CANCELLED',
+                module='MEMBERS',
+                submodule='MEMBERSHIPS',
+                entity_type='Membership',
+                entity_id=str(membership.id),
+                entity_name=f"{pkg_name} ({member_name})",
+                actor_user=actor_user,
+                actor_type='STAFF' if actor_user else 'SYSTEM',
+                branch=membership.home_branch or membership.branch,
+                organization=membership.organization,
+                before_state={'status': old_st},
+                after_state={'status': 'CANCELLED'},
+                field_changes=[
+                    {'field_name': 'status', 'field_label': 'Membership Status', 'old_value': old_st, 'new_value': 'CANCELLED'},
+                ],
+                reason=reason_text or 'Staff cancelled membership',
+                event_description=f"Membership '{pkg_name}' for member {member_name} was cancelled.",
+                db_alias=alias,
+            )
+        except Exception as log_err:
+            logger.warning(f"Failed to record membership cancellation audit: {log_err}")
+
         return membership
 
     @classmethod

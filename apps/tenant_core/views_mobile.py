@@ -70,6 +70,7 @@ from .services_bookings import BookingWaitlistAttendanceService, ParqRequiredVal
 from .services_memberships import MembershipLifecycleService
 from .services_discounts import DiscountCouponEngineService
 from .services_crm import CRMLeadService
+from .views_members import format_program_package_name
 
 logger = logging.getLogger(__name__)
 
@@ -810,7 +811,7 @@ class MobileMeView(APIView):
         ) or (
             Membership.objects.using(alias)
             .filter(user_profile=profile, status='ACTIVE', end_date__gte=_me_now)
-            .select_related('package', 'package_version', 'purchase_branch', 'home_branch')
+            .select_related('package', 'package__program', 'program', 'package_version', 'purchase_branch', 'home_branch')
             .order_by('start_date', '-created_at')
             .first()
         )
@@ -823,9 +824,17 @@ class MobileMeView(APIView):
             total_remaining = max(Decimal('0'), total_allocated - total_consumed)
             days_left = max(0, (active_membership.end_date - timezone.now().date()).days)
 
+            _prog = active_membership.program or (active_membership.package.program if active_membership.package else None)
+            _prog_name = _prog.name if _prog else ''
+            _pkg_name = active_membership.package.name if active_membership.package else ''
+            _disp_name = format_program_package_name(_prog_name, _pkg_name)
+
             membership_data = {
                 'membership_id': str(active_membership.id),
-                'package_name': active_membership.package.name,
+                'package_name': _disp_name,
+                'raw_package_name': _pkg_name,
+                'program_name': _prog_name,
+                'display_package_name': _disp_name,
                 'allocated_sessions': float(total_allocated),
                 'consumed_sessions': float(total_consumed),
                 'remaining_sessions': float(total_remaining),
@@ -840,16 +849,23 @@ class MobileMeView(APIView):
         for _m in (Membership.objects.using(alias)
                    .filter(user_profile=profile, status__in=['ACTIVE', 'FROZEN'], end_date__gte=_me_now)
                    .filter(models.Q(start_date__lte=_me_now) | models.Q(start_date__isnull=True))
-                   .select_related('package', 'home_branch')
+                   .select_related('package', 'package__program', 'program', 'home_branch')
                    .order_by('end_date', '-created_at')):
             _ents = _primary_entitlements(_m.entitlements.using(alias).filter(status='ACTIVE'))
             _alloc = sum(e.allocated_units for e in _ents)
             _cons = sum(e.consumed_units for e in _ents)
             _rem = max(Decimal('0'), _alloc - _cons)
             _dl = max(0, (_m.end_date - timezone.now().date()).days) if _m.end_date else 0
+            _p = _m.program or (_m.package.program if _m.package else None)
+            _p_name = _p.name if _p else ''
+            _pk_name = _m.package.name if _m.package else ''
+            _d_name = format_program_package_name(_p_name, _pk_name)
             active_memberships_list.append({
                 'membership_id': str(_m.id),
-                'package_name': _m.package.name,
+                'package_name': _d_name,
+                'raw_package_name': _pk_name,
+                'program_name': _p_name,
+                'display_package_name': _d_name,
                 'allocated_sessions': float(_alloc),
                 'consumed_sessions': float(_cons),
                 'remaining_sessions': float(_rem),
@@ -869,7 +885,10 @@ class MobileMeView(APIView):
             ).exists()
         )
 
-        total_remaining_credits = float(membership_data.get('remaining_sessions', 0.0)) if membership_data else 0.0
+        if active_memberships_list:
+            total_remaining_credits = sum(float(m.get('remaining_sessions', 0.0) or 0.0) for m in active_memberships_list)
+        else:
+            total_remaining_credits = float(membership_data.get('remaining_sessions', 0.0)) if membership_data else 0.0
         active_branch = (
             (active_membership.home_branch or active_membership.purchase_branch)
             if active_membership else None
@@ -1357,11 +1376,14 @@ class MobileScheduleView(APIView):
                     prog = m.program or (m.package.program if m.package else None)
                     if prog and str(prog.id) not in purchased_program_ids:
                         purchased_program_ids.add(str(prog.id))
+                        _p_name = prog.name if prog else ''
+                        _pk_name = m.package.name if m.package else ''
                         purchased_programs.append({
                             'id': str(prog.id),
                             'name': prog.name,
                             'package_id': str(m.package.id) if m.package else '',
-                            'package_name': m.package.name if m.package else '',
+                            'package_name': _pk_name,
+                            'display_package_name': format_program_package_name(_p_name, _pk_name),
                             'membership_id': str(m.id),
                         })
 
@@ -3057,15 +3079,19 @@ class MobilePackagesView(APIView):
             elif session_count == 1:
                 badge = 'DROP-IN'
 
+            _pkg_prog_name = pkg.program.name if pkg.program else ''
+            _pkg_disp_name = format_program_package_name(_pkg_prog_name, pkg.name)
             results.append({
                 'id': str(pkg.id),
                 'package_version_id': str(latest_version.id),
                 'price_id': str(price_obj.id),
                 'name': pkg.name,
+                'display_name': _pkg_disp_name,
+                'display_package_name': _pkg_disp_name,
                 'code': pkg.code,
                 'description': latest_version.description_snapshot or getattr(pkg, 'description', '') or 'All-access Reformer Pilates package.',
                 'program_id': str(pkg.program_id) if pkg.program_id else None,
-                'program_name': pkg.program.name if pkg.program else '',
+                'program_name': _pkg_prog_name,
                 'program_code': pkg.program.code if pkg.program else '',
                 'sessions': 'Unlimited' if is_unlimited else session_count,
                 'session_count': None if is_unlimited else session_count,
@@ -3100,7 +3126,7 @@ class MobileMyCreditsView(APIView):
             .filter(
                 user_profile=profile,
             )
-            .select_related('package')
+            .select_related('package', 'package__program', 'program')
             .prefetch_related('entitlements')
             .order_by('-created_at')
         )
@@ -3124,9 +3150,17 @@ class MobileMyCreditsView(APIView):
             if effective_status == 'ACTIVE' and not is_unlimited:
                 total_remaining_credits += int(remaining)
 
+            _m_prog = m.program or (m.package.program if m.package else None)
+            _m_prog_name = _m_prog.name if _m_prog else ''
+            _m_pkg_name = m.package.name if m.package else ''
+            _m_disp = format_program_package_name(_m_prog_name, _m_pkg_name)
+
             packs.append({
                 'membership_id': str(m.id),
-                'package_name': m.package.name,
+                'package_name': _m_disp,
+                'raw_package_name': _m_pkg_name,
+                'program_name': _m_prog_name,
+                'display_package_name': _m_disp,
                 'status': effective_status,
                 'allocated_sessions': allocated,
                 'consumed_sessions': consumed,
@@ -5240,12 +5274,16 @@ class MobileMembershipActionsView(APIView):
                 t_pct = float(price_obj.tax_percent or 18.0)
                 t_amt = round(b_price * (t_pct / 100.0), 2)
                 tot = round(b_price + t_amt, 2)
+                _rn_prog_name = pkg.program.name if pkg.program else ''
+                _rn_disp = format_program_package_name(_rn_prog_name, pkg.name)
                 renew_options.append({
                     'package_id': str(pkg.id),
                     'package_version_id': str(ver.id),
                     'name': pkg.name,
+                    'display_name': _rn_disp,
+                    'display_package_name': _rn_disp,
                     'program_id': str(pkg.program.id),
-                    'program_name': pkg.program.name,
+                    'program_name': _rn_prog_name,
                     'program_code': pkg.program.code,
                     'duration_days': _get_ver_days(ver),
                     'session_count': _get_ver_sessions(ver),
@@ -5297,6 +5335,7 @@ class MobileMembershipActionsView(APIView):
                 'package_id': str(pkg.id),
                 'package_version_id': str(ver.id),
                 'name': pkg.name,
+                'display_name': format_program_package_name(pkg.program.name if pkg.program else '', pkg.name),
                 'program_id': str(pkg.program.id) if pkg.program else '',
                 'program_name': pkg.program.name if pkg.program else '',
                 'program_code': pkg.program.code if pkg.program else '',
@@ -5312,16 +5351,23 @@ class MobileMembershipActionsView(APIView):
                 'currency': price_obj.currency or 'INR',
             })
 
+        _act_prog = active_m.program or (active_m.package.program if active_m.package else None)
+        _act_prog_name = _act_prog.name if _act_prog else ''
+        _act_pkg_name = active_m.package.name if active_m.package else 'Custom Membership'
+        _act_disp = format_program_package_name(_act_prog_name, _act_pkg_name)
+
         active_membership_data = {
             'id': str(active_m.id),
             'membership_number': active_m.membership_number,
             'status': active_m.status,
             'package_id': str(active_m.package.id) if active_m.package else None,
-            'package_name': active_m.package.name if active_m.package else 'Custom Membership',
+            'package_name': _act_disp,
+            'raw_package_name': _act_pkg_name,
+            'display_package_name': _act_disp,
             'package_version_id': str(active_m.package_version.id) if active_m.package_version else None,
-            'program_id': str(active_m.program.id) if active_m.program else None,
-            'program_name': active_m.program.name if active_m.program else None,
-            'program_code': active_m.program.code if active_m.program else None,
+            'program_id': str(_act_prog.id) if _act_prog else None,
+            'program_name': _act_prog_name or None,
+            'program_code': _act_prog.code if _act_prog else None,
             'branch_id': str(active_m.home_branch.id) if active_m.home_branch else None,
             'branch_name': active_m.home_branch.name if active_m.home_branch else None,
             'start_date': str(active_m.start_date) if active_m.start_date else None,
@@ -6265,6 +6311,30 @@ class MobileDirectTurnstileOpenView(APIView):
         try:
             resp = opener.open(url, timeout=3)
             res_str = resp.read().decode('utf-8', errors='ignore').strip()
+            try:
+                from .audit_engine import UnifiedAuditEngine
+                from .models_users import TenantUser
+                actor_user = getattr(request, 'user', None)
+                UnifiedAuditEngine.record_activity(
+                    action_code='IOT.DIRECT_UNLOCK',
+                    action_category='ACCESS_CONTROL',
+                    action_verb='UNLOCKED',
+                    module='ACCESS_CONTROL',
+                    submodule='TURNSTILE',
+                    entity_type='TurnstileHardware',
+                    entity_id='192.168.1.108',
+                    entity_name='Turnstile Channel 1',
+                    actor_user=actor_user if isinstance(actor_user, TenantUser) else None,
+                    actor_type='MEMBER' if actor_user else 'SYSTEM',
+                    request=request,
+                    result='SUCCESS',
+                    reason='Direct mobile turnstile unlock command',
+                    event_description="Direct turnstile gate unlock command triggered from mobile app.",
+                    source_channel='MOBILE_APP',
+                    metadata={'ip': '192.168.1.108', 'channel': 1},
+                )
+            except Exception:
+                pass
             return Response({"success": True, "detail": "Turnstile gate unlocked!", "result": res_str}, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({"success": False, "error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

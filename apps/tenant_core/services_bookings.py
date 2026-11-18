@@ -2305,6 +2305,39 @@ class BookingWaitlistAttendanceService:
                 changed_at=now
             )
 
+            # Comprehensive Activity & Audit Log
+            try:
+                from .audit_engine import UnifiedAuditEngine
+                member_user = user_profile.user if user_profile else None
+                member_name = f"{user_profile.first_name_snapshot or ''} {user_profile.last_name_snapshot or ''}".strip() or (member_user.email if member_user else 'Member')
+                cls_title = occurrence.class_template.name if (occurrence and occurrence.class_template) else "Class"
+                UnifiedAuditEngine.record_activity(
+                    action_code=f'OPERATIONS.ATTENDANCE_{status}',
+                    action_category='OPERATIONS',
+                    action_verb='CHECKED_IN' if status == 'PRESENT' else status,
+                    module='CLASSES',
+                    submodule='ATTENDANCE',
+                    entity_type='AttendanceRecord',
+                    entity_id=str(record.id),
+                    entity_name=f"{cls_title} ({member_name})",
+                    actor_user=marked_by_user,
+                    actor_type='STAFF' if marked_by_user else 'SYSTEM',
+                    branch=branch,
+                    organization=organization,
+                    before_state={'booking_status': old_booking_status},
+                    after_state={'booking_status': booking.status, 'attendance_status': status, 'method': check_in_method},
+                    reason=f"Attendance recorded as {status} via {check_in_method}",
+                    event_description=f"Attendance recorded as {status} for member {member_name} in '{cls_title}' via {check_in_method}.",
+                    metadata={
+                        'booking_id': str(booking.id),
+                        'occurrence_id': str(occurrence.id) if occurrence else None,
+                        'check_in_method': check_in_method,
+                    },
+                    db_alias=alias,
+                )
+            except Exception as log_err:
+                logger.warning(f"Failed to record attendance audit log: {log_err}")
+
             return record
 
     @classmethod
@@ -2435,6 +2468,46 @@ class BookingWaitlistAttendanceService:
                         status='CONSUMED_EXITED',
                         updated_at=now
                     )
+
+            # Turnstile IoT Activity & Audit Log
+            try:
+                from .audit_engine import UnifiedAuditEngine
+                member_user = user_profile.user if user_profile else None
+                member_name = f"{user_profile.first_name_snapshot or ''} {user_profile.last_name_snapshot or ''}".strip() or (member_user.email if member_user else 'Member')
+                is_denied = effective_event_type == 'DENIED'
+                UnifiedAuditEngine.record_activity(
+                    action_code='IOT.PUNCH_DENIED' if is_denied else f'IOT.PUNCH_{dir_value}',
+                    action_category='ACCESS_CONTROL',
+                    action_verb='DENIED' if is_denied else dir_value,
+                    module='ACCESS_CONTROL',
+                    submodule='TURNSTILE',
+                    entity_type='AccessEvent',
+                    entity_id=str(event.id),
+                    entity_name=f"Turnstile {dir_value} ({member_name})",
+                    actor_type='IOT_DEVICE',
+                    actor_name=device_reference or 'Turnstile Device',
+                    actor_role='Turnstile Reader',
+                    branch=branch,
+                    result='FAILURE' if is_denied else 'SUCCESS',
+                    error_code=effective_reconciliation if is_denied else '',
+                    error_message=f"Access denied: {effective_reconciliation}" if is_denied else '',
+                    reason=f"Turnstile {dir_value} attempt",
+                    event_description=(
+                        f"Turnstile device '{device_reference or 'Hardware Reader'}' DENIED {dir_value} entry for member {member_name}. Reason: {effective_reconciliation}."
+                        if is_denied else
+                        f"Turnstile device '{device_reference or 'Hardware Reader'}' GRANTED {dir_value} punch for member {member_name} at {branch.name if branch else 'Branch'}."
+                    ),
+                    metadata={
+                        'direction': dir_value,
+                        'device_reference': device_reference,
+                        'provider_reference': provider_reference,
+                        'reconciliation_status': effective_reconciliation,
+                    },
+                    source_channel='TURNSTILE_IOT',
+                    db_alias=alias,
+                )
+            except Exception as log_err:
+                logger.warning(f"Failed to record access event audit log: {log_err}")
 
             return event
 

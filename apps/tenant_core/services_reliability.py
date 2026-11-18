@@ -178,7 +178,7 @@ def record_business_audit(
     Creates an immutable business audit event with sanitized before/after state diffs.
     """
     manager = BusinessAuditEvent.objects.using(db_alias) if db_alias else BusinessAuditEvent.objects
-    return manager.create(
+    event = manager.create(
         organization=organization,
         branch=branch,
         actor_type=actor_type,
@@ -199,6 +199,33 @@ def record_business_audit(
         session_id=session_id,
         occurred_at=timezone.now(),
     )
+
+    # Bridge to Canonical ActivityAuditLog for complete unified CRM visibility
+    try:
+        from .audit_engine import UnifiedAuditEngine
+        UnifiedAuditEngine.record_activity(
+            action_code=action_code,
+            module=module,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            actor_user=actor_user,
+            actor_type='STAFF' if actor_type == 'USER' else actor_type,
+            organization=organization,
+            branch=branch,
+            before_state=before_data,
+            after_state=after_data,
+            event_description=event_description or '',
+            metadata=metadata,
+            ip_address=ip_address,
+            user_agent=user_agent or '',
+            request_id=str(request_id) if request_id else '',
+            source_channel=source_channel,
+            db_alias=db_alias,
+        )
+    except Exception as bridge_err:
+        logger.warning(f"Failed to mirror BusinessAuditEvent to ActivityAuditLog: {bridge_err}")
+
+    return event
 
 
 def enqueue_outbox_event(

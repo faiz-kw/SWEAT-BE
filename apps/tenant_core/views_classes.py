@@ -726,8 +726,8 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
         now = timezone.now()
         upcoming_only = (self.request.query_params.get('upcoming_only') or '').strip().lower() == 'true'
 
-        if trainer_id:
-            qs = qs.filter(trainer_assignments__trainer_profile_id=trainer_id)
+        if trainer_id and trainer_id.upper() != 'ALL':
+            qs = qs.filter(trainer_assignments__trainer_profile_id=trainer_id).exclude(trainer_assignments__status__in=['CANCELLED', 'REPLACED'])
 
         if from_date:
             qs = qs.filter(occurrence_date__gte=from_date)
@@ -748,10 +748,16 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
                 occurrence_id=OuterRef('pk'),
                 status='CONFIRMED',
             )
+            any_trainer = ClassOccurrenceTrainer.objects.using(alias).filter(
+                occurrence_id=OuterRef('pk'),
+            ).exclude(status__in=['CANCELLED', 'REPLACED'])
+
             if check_in_param.upper() == 'CHECKED_IN':
                 qs = qs.filter(Exists(confirmed_trainer))
             elif check_in_param.upper() == 'PENDING':
-                qs = qs.filter(~Exists(confirmed_trainer))
+                qs = qs.filter(Exists(any_trainer) & ~Exists(confirmed_trainer))
+            elif check_in_param.upper() in ['NO_TRAINER', 'UNASSIGNED']:
+                qs = qs.filter(~Exists(any_trainer))
 
         if search_param:
             matching_trainer = ClassOccurrenceTrainer.objects.using(alias).filter(

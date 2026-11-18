@@ -486,18 +486,19 @@ class ClassSchedulingService:
             ).first()
             if existing_assignment:
                 existing_assignment.trainer_role = trainer_role
-                existing_assignment.status = 'CONFIRMED'
+                if existing_assignment.status not in ['CONFIRMED', 'ASSIGNED']:
+                    existing_assignment.status = 'ASSIGNED'
                 existing_assignment.assigned_by_user = actor
                 existing_assignment.assigned_at = timezone.now()
                 existing_assignment.save(using=alias)
                 assignment = existing_assignment
             else:
-                # Create assignment
+                # Create new assignment in ASSIGNED (pending check-in) status
                 assignment = ClassOccurrenceTrainer(
                     occurrence=occ,
                     trainer_profile=trainer,
                     trainer_role=trainer_role,
-                    status='CONFIRMED',
+                    status='ASSIGNED',
                     assigned_by_user=actor,
                     assigned_at=timezone.now(),
                 )

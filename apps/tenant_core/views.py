@@ -1726,6 +1726,35 @@ class RoleViewSet(TenantDBMixin, viewsets.ModelViewSet):
                         defaults={'granted': granted}
                     )
 
+            # Audit logging for permissions matrix update
+            try:
+                from .audit_engine import UnifiedAuditEngine
+                actor_user = getattr(request, 'user', None)
+                UnifiedAuditEngine.record_activity(
+                    action_code='ACCESS_CONTROL.PERMISSIONS_UPDATED',
+                    action_category='ACCESS_CONTROL',
+                    action_verb='UPDATED',
+                    module='ACCESS_CONTROL',
+                    submodule='ROLES',
+                    entity_type='Role',
+                    entity_id=str(role.id),
+                    entity_name=role.name,
+                    actor_user=actor_user if isinstance(actor_user, TenantUser) else None,
+                    actor_type='ADMIN',
+                    request=request,
+                    organization=org,
+                    reason='Admin updated role permission matrix',
+                    event_description=f"Role permission matrix updated for '{role.name}'. Updated {len(permissions_data)} permissions, {len(module_access_data)} modules, {len(submodule_access_data)} submodules.",
+                    metadata={
+                        'permissions_count': len(permissions_data),
+                        'modules_count': len(module_access_data),
+                        'submodules_count': len(submodule_access_data),
+                    },
+                    db_alias=db,
+                )
+            except Exception as log_err:
+                logger.warning(f"Failed to record role permissions audit: {log_err}")
+
             # Return refreshed role data
             serializer = self.get_serializer(role)
             return Response(serializer.data, status=status.HTTP_200_OK)
