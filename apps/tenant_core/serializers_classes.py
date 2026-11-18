@@ -1,4 +1,6 @@
 from django.utils import timezone
+import logging
+
 from rest_framework import serializers
 from .models_classes import (
     ClassCategory, ClassTemplate, ClassPrice, ClassBranchAvailability,
@@ -11,6 +13,8 @@ from .models_classes import (
 
 
 from .serializers_catalog import _generate_unique_code
+
+logger = logging.getLogger(__name__)
 
 
 class ClassCategorySerializer(serializers.ModelSerializer):
@@ -423,6 +427,15 @@ class ClassOccurrenceTrainerSerializer(serializers.ModelSerializer):
         return attrs
 
 
+# Booking statuses that occupy a seat, used for the displayed "Booked" count only.
+# NO_SHOW still counts: the member held a seat and never cancelled it.
+# CANCELLED / RESCHEDULED / WAITLISTED are excluded because the seat is released.
+# Capacity enforcement lives in services_bookings and is intentionally not changed.
+SEAT_HOLDING_BOOKING_STATUSES = frozenset({
+    'CONFIRMED', 'RESERVED', 'COMPLETED', 'ATTENDED', 'BOOKED', 'NO_SHOW',
+})
+
+
 class ClassOccurrenceSerializer(serializers.ModelSerializer):
     class_name = serializers.CharField(source='class_template.name', read_only=True)
     description = serializers.CharField(source='class_template.description', read_only=True)
@@ -441,6 +454,8 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
     trainer_checked_in = serializers.SerializerMethodField()
     trainer_check_in_details = serializers.SerializerMethodField()
     booking_count = serializers.SerializerMethodField()
+    member_booking_count = serializers.SerializerMethodField()
+    trial_booking_count = serializers.SerializerMethodField()
     waitlist_count = serializers.SerializerMethodField()
     start_time = serializers.TimeField(write_only=True, required=False)
     end_time = serializers.TimeField(write_only=True, required=False)
@@ -595,13 +610,30 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
         except Exception:
             return {'checked_in': False, 'status': 'UNKNOWN'}
 
+    @staticmethod
+    def _member_seat_count(obj) -> int:
+        """Seat-holding member/class bookings (Booking rows) for this occurrence."""
+        return sum(1 for b in obj.bookings.all() if b.status in SEAT_HOLDING_BOOKING_STATUSES)
+
     def get_booking_count(self, obj):
         if getattr(obj, 'annotated_booking_count', None) is not None:
             return obj.annotated_booking_count
         try:
-            return sum(1 for b in obj.bookings.all() if b.status in ['CONFIRMED', 'RESERVED', 'COMPLETED', 'ATTENDED', 'BOOKED'])
+            member_count = self._member_seat_count(obj)
         except Exception:
             return 0
+        # Trial bookings live in a separate table; the class list view annotates their count.
+        return member_count + self.get_trial_booking_count(obj)
+
+    def get_member_booking_count(self, obj) -> int:
+        try:
+            return self._member_seat_count(obj)
+        except Exception:
+            logger.warning('member_booking_count failed for occurrence %s', getattr(obj, 'pk', None), exc_info=True)
+            return 0
+
+    def get_trial_booking_count(self, obj) -> int:
+        return getattr(obj, 'annotated_trial_count', None) or 0
 
     def get_waitlist_count(self, obj):
         if getattr(obj, 'annotated_waitlist_count', None) is not None:
@@ -642,7 +674,8 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
             'online_provider', 'online_join_url', 'capacity', 'trial_capacity',
             'waitlist_capacity', 'booking_open_at', 'booking_close_at',
             'cancellation_cutoff_at', 'status', 'is_manual', 'is_override',
-            'trainers', 'trainer_checked_in', 'trainer_check_in_details', 'booking_count', 'waitlist_count',
+            'trainers', 'trainer_checked_in', 'trainer_check_in_details', 'booking_count',
+            'member_booking_count', 'trial_booking_count', 'waitlist_count',
             'active_content', 'is_eligible', 'ineligibility_reason', 'ineligibility_code', 'description', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
