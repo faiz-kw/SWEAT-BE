@@ -630,6 +630,23 @@ class BookingViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='cancel')
     def cancel(self, request, pk=None):
         alias = _get_db(request)
+        # Resolve a TRL-xxxx trial reference and guard non-UUID pk so cancel does not 500
+        _pk_str = str(pk or '')
+        try:
+            uuid.UUID(_pk_str); _pk_is_uuid = True
+        except (ValueError, TypeError):
+            _pk_is_uuid = False
+        if not _pk_is_uuid:
+            if _pk_str.upper().startswith('TRL-'):
+                from django.db.models.functions import Cast
+                from django.db.models import TextField
+                _t = TrialBooking.objects.using(alias).annotate(_idt=Cast('id', TextField())).filter(_idt__istartswith=_pk_str.upper()[4:].lower()).first()
+                if _t:
+                    pk = str(_t.id)
+                else:
+                    return Response({'detail': 'Booking not found.'}, status=status.HTTP_404_NOT_FOUND)
+            else:
+                return Response({'detail': 'Booking not found.'}, status=status.HTTP_404_NOT_FOUND)
         try:
             booking = Booking.objects.using(alias).select_related('occurrence__class_template__category__organization', 'branch').get(id=pk)
         except Booking.DoesNotExist:
