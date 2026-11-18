@@ -1330,6 +1330,9 @@ class MobileScheduleView(APIView):
         user_home_ent = None
         user_booking_map = {}
         included_class_ids = None
+        member_home_branch_ids = set()
+        member_has_passport = False
+        member_has_passport_entitlement = False
 
         if user:
             user_profile = _get_or_create_user_profile(user, alias)
@@ -1388,6 +1391,17 @@ class MobileScheduleView(APIView):
                         rule_ids = {str(r.class_template_id) for r in rules if r.class_template_id}
                         if rule_ids:
                             included_class_ids = rule_ids
+
+        # Branch restriction is the ONLY access gate in this system (no package->class rules exist).
+        # Eligibility must consider ALL the member's active packs, not just the primary one.
+        member_home_branch_ids = {str(m.home_branch_id) for m in active_mems if m.home_branch_id}
+        for _m in active_mems:
+            for _e in _m.entitlements.using(alias).filter(status='ACTIVE', entitlement_type__in=['CROSS_BRANCH_SESSION', 'CROSS_BRANCH']):
+                member_has_passport_entitlement = True
+                if _e.is_unlimited or (_e.remaining_units or 0) > 0:
+                    member_has_passport = True
+            if member_has_passport:
+                break
 
         branch_id_param = request.query_params.get('branch_id')
         category_id = request.query_params.get('category_id')
@@ -1672,7 +1686,7 @@ class MobileScheduleView(APIView):
                 cat_credits = getattr(template.category, 'credits', None)
             required_credits = float(cat_credits) if (cat_credits is not None and float(cat_credits) > 0) else 1.0
 
-            is_cross_branch = bool(active_mem and active_mem.home_branch and occ.branch_id != active_mem.home_branch_id)
+            is_cross_branch = bool(active_mem and occ.branch_id and str(occ.branch_id) not in member_home_branch_ids)
             can_raise_ticket = False
             can_purchase_passport = False
             is_included = True
@@ -1690,25 +1704,17 @@ class MobileScheduleView(APIView):
                 else:
                     # Session based membership
                     if is_cross_branch:
-                        if not user_passport_ent or (not user_passport_ent.is_unlimited and (user_passport_ent.allocated_units is None or user_passport_ent.allocated_units <= 0)):
-                            is_included = False
-                            ineligible_reason = "Your package does not include any passport session. Raise a ticket for purchase."
-                            can_raise_ticket = True
-                        elif not user_passport_ent.is_unlimited and (user_passport_ent.remaining_units or 0) <= 0:
-                            home_rem = float(user_home_ent.remaining_units or 0) if (user_home_ent and not user_home_ent.is_unlimited) else (999.0 if (user_home_ent and user_home_ent.is_unlimited) else 0.0)
-                            if home_rem > 0:
-                                is_included = False
-                                ineligible_reason = "All passport sessions have been consumed. You can purchase additional passport sessions to book at this branch."
-                                can_purchase_passport = True
-                            else:
-                                is_included = False
-                                ineligible_reason = "No remaining session credits in your active pack. Please renew or purchase a new pack."
-                        elif user_home_ent and not user_home_ent.is_unlimited and (user_home_ent.remaining_units or 0) <= 0:
-                            is_included = False
-                            ineligible_reason = "No remaining session credits in your active pack. Please renew or purchase a new pack."
-                        else:
+                        if member_has_passport:
                             is_included = True
                             ineligible_reason = None
+                        elif member_has_passport_entitlement:
+                            is_included = False
+                            ineligible_reason = "All passport (cross-branch) sessions have been consumed. Purchase additional passport sessions to book at this branch."
+                            can_purchase_passport = True
+                        else:
+                            is_included = False
+                            ineligible_reason = "This class is at a branch your membership doesn't cover. A cross-branch (passport) session is required."
+                            can_raise_ticket = True
                     else:
                         is_included = (str(template.id) in included_class_ids) if (included_class_ids is not None and template) else True
                         if not is_included and template:
