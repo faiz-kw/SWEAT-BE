@@ -668,6 +668,11 @@ VOICE_CALLING_HOURS_END   = int(os.getenv('VOICE_CALLING_HOURS_END',   '21'))  #
 # Telephony routing: an agent is routable only if their browser sent a presence heartbeat this
 # recently. The WebPhone heartbeat is every 45 s, so 120 s tolerates two missed beats.
 TELEPHONY_BROWSER_LIVENESS_SECONDS = int(os.getenv('TELEPHONY_BROWSER_LIVENESS_SECONDS', '120'))
+# Inbound overflow: number of overflow rings AFTER the primary agent's ring.
+# 3 means the primary rep plus up to 3 overflow reps (4 reps in total), then the call is closed.
+TELEPHONY_MAX_OVERFLOW_ATTEMPTS_AFTER_PRIMARY = int(
+    os.getenv('TELEPHONY_MAX_OVERFLOW_ATTEMPTS_AFTER_PRIMARY', '3')
+)
 META_APP_ID = os.getenv('META_APP_ID', '').strip()
 META_APP_SECRET = os.getenv('META_APP_SECRET', '').strip()
 META_WEBHOOK_VERIFY_TOKEN = os.getenv('META_WEBHOOK_VERIFY_TOKEN', '').strip()

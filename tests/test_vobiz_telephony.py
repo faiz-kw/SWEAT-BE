@@ -9,6 +9,7 @@ Validates:
 - Post-call disposition submission, lead stage advance, and AVAILABLE transition
 """
 
+import html
 import json
 import re
 import uuid
@@ -629,7 +630,8 @@ class VobizTelephonyTests(TestCase):
         """Returns path?query of an absolute URL attribute in the XML (test client needs a path)."""
         match = re.search(rf'{attr}="([^"]+)"', xml)
         assert match, f'{attr} not found in XML: {xml}'
-        parsed = urlparse(match.group(1))
+        # An XML parser unescapes attribute values, so do the same (&amp; -> &).
+        parsed = urlparse(html.unescape(match.group(1)))
         return f'{parsed.path}?{parsed.query}' if parsed.query else parsed.path
 
     def test_agent_bridge_xml_callback_url_points_to_dial_events(self):
@@ -674,7 +676,9 @@ class VobizTelephonyTests(TestCase):
         self.assertEqual(res.status_code, 200)
         xml = res.content.decode()
 
-        self.assertIn(f'action="http://testserver/api/v1/telephony/hangup/?session_id={session.id}"', xml)
+        self.assertIn(
+            f'action="http://testserver/api/v1/telephony/hangup/?session_id={session.id}&amp;event=dial"', xml,
+        )
         self.assertIn(f'callbackUrl="http://testserver/api/v1/telephony/dial-events/?session_id={session.id}"', xml)
         self.assertNotIn('callbackUrl="http://testserver/api/v1/telephony/hangup/', xml)
 
@@ -687,7 +691,9 @@ class VobizTelephonyTests(TestCase):
         self.assertEqual(session.status, 'RINGING')
         self.presence.refresh_from_db()
         self.assertEqual(self.presence.status, 'ON_CALL')
-        self.assertIn(f'action="http://testserver/api/v1/telephony/hangup/?session_id={session.id}"', xml)
+        self.assertIn(
+            f'action="http://testserver/api/v1/telephony/hangup/?session_id={session.id}&amp;event=dial"', xml,
+        )
         self.assertIn(f'callbackUrl="http://testserver/api/v1/telephony/dial-events/?session_id={session.id}"', xml)
         self.assertNotIn('callbackUrl="http://testserver/api/v1/telephony/hangup/', xml)
 

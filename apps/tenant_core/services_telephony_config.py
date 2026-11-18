@@ -10,6 +10,7 @@ with sensible environment-variable fallbacks for developer environments.
 import os
 import logging
 from datetime import datetime, timedelta
+from collections.abc import Iterable
 from typing import Optional, Dict, Any
 
 from django.conf import settings
@@ -189,6 +190,7 @@ class TelephonyConfigService:
         org=None,
         preferred_user=None,
         caller_branch=None,
+        exclude_user_ids: Iterable | None = None,
     ):
         """
         Dynamically selects an available sales representative without ANY hardcoded usernames.
@@ -217,6 +219,8 @@ class TelephonyConfigService:
             .exclude(sip_username__startswith="agent_")
             .exclude(sip_username__icontains="test")
         )
+        if exclude_user_ids:
+            eligible_agents = eligible_agents.exclude(user_id__in=list(exclude_user_ids))
 
         # 1. Preferred user check (must be actively online with a real SIP line)
         if preferred_user:

@@ -13,6 +13,7 @@ import logging
 import urllib.request
 import urllib.error
 from typing import Dict, Any, List, Optional
+from xml.sax.saxutils import quoteattr
 from django.utils import timezone
 from .base import (
     BaseCommunicationAdapter,
@@ -299,11 +300,11 @@ class VobizVoiceAdapter(BaseCommunicationAdapter):
         """
         rec_str = "true" if record else "false"
         sip_target = cls._normalize_sip_uri(agent_sip_uri, registrar_host=registrar_host)
-        callback_attr = f' callbackUrl="{dial_events_url}"' if dial_events_url else ""
+        callback_attr = f' callbackUrl={quoteattr(dial_events_url)}' if dial_events_url else ""
 
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Dial action="{fallback_action_url}"{callback_attr} callerId="{caller_id}" record="{rec_str}" timeout="{timeout}" dialMusic="real">
+  <Dial action={quoteattr(fallback_action_url)}{callback_attr} callerId="{caller_id}" record="{rec_str}" timeout="{timeout}" dialMusic="real">
     <User>{sip_target}</User>
   </Dial>
 </Response>"""
@@ -376,21 +377,25 @@ class VobizVoiceAdapter(BaseCommunicationAdapter):
         caller_id: str,
         complete_action_url: str,
         dial_events_url: str | None = None,
-        whisper_prompt: str = "Please stay on the line while we connect you to our senior consultant.",
+        whisper_prompt: str | None = "Please stay on the line while we connect you to our senior consultant.",
         timeout: int = 20,
         registrar_host: str = '',
     ) -> str:
         """
         Builds VobizXML for the overflow fallback leg when the primary agent is busy or unavailable.
         dial_events_url receives the overflow agent leg's real-time events (answer, connected, hangup).
+        whisper_prompt=None omits the <Speak> (only the first overflow hop whispers).
         """
         sip_target = cls._normalize_sip_uri(secondary_sip_uri, registrar_host=registrar_host)
-        callback_attr = f' callbackUrl="{dial_events_url}"' if dial_events_url else ""
+        callback_attr = f' callbackUrl={quoteattr(dial_events_url)}' if dial_events_url else ""
+        speak = (
+            f'  <Speak voice="WOMAN" language="en-IN">{whisper_prompt}</Speak>\n'
+            if whisper_prompt else ""
+        )
 
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Speak voice="WOMAN" language="en-IN">{whisper_prompt}</Speak>
-  <Dial action="{complete_action_url}"{callback_attr} callerId="{caller_id}" record="true" timeout="{timeout}">
+{speak}  <Dial action={quoteattr(complete_action_url)}{callback_attr} callerId="{caller_id}" record="true" timeout="{timeout}">
     <User>{sip_target}</User>
   </Dial>
 </Response>"""
@@ -414,8 +419,8 @@ class VobizVoiceAdapter(BaseCommunicationAdapter):
         Injects <Record startOnDialAnswer="true"> so the conversation is recorded as soon as customer answers.
         """
         rec_str = "true" if record else "false"
-        dial_action = f' action="{hangup_url}"' if hangup_url else ""
-        action_callback = f' callbackUrl="{dial_events_url}"' if dial_events_url else ""
+        dial_action = f' action={quoteattr(hangup_url)}' if hangup_url else ""
+        action_callback = f' callbackUrl={quoteattr(dial_events_url)}' if dial_events_url else ""
 
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>

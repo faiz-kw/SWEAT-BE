@@ -1400,6 +1400,8 @@ class CallSession(models.Model):
     recording_url = models.URLField(max_length=1000, blank=True, default='')
     recording_storage_key = models.CharField(max_length=500, blank=True, default='')
     hangup_cause = models.CharField(max_length=100, blank=True, default='')
+    # User ids (as strings) of reps already rung for this call. Drives the inbound overflow chain.
+    tried_reps = models.JSONField(default=list, blank=True)
 
     idempotency_key = models.CharField(
         max_length=255,

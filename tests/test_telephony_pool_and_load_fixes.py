@@ -124,8 +124,13 @@ class TelephonyPoolAndLoadFixesTests(TestCase):
         self.assertTrue(c3_upgraded['is_registered_endpoint'])
         self.assertEqual(c3_upgraded['username'], 'sweatagent104201155654570218059')
 
-    def test_click_to_call_rejects_unassigned_agent_with_400(self):
-        """Outbound Click-to-Call rejects unassigned admins instead of routing broken carrier calls."""
+    @patch('apps.tenant_core.views_telephony._is_within_trai_hours', return_value=True)
+    def test_click_to_call_rejects_unassigned_agent_with_400(self, mock_within_hours):
+        """Outbound Click-to-Call rejects unassigned admins instead of routing broken carrier calls.
+
+        The 09:00 to 21:00 IST calling-hours check runs first, so it is pinned to "inside hours"
+        here. Without that the test result depended on the wall clock.
+        """
         TelephonyConfigService.get_agent_webrtc_credentials(self.user1, db_alias='tenant_test')
         TelephonyConfigService.get_agent_webrtc_credentials(self.user2, db_alias='tenant_test')
         TelephonyConfigService.get_agent_webrtc_credentials(self.user3, db_alias='tenant_test')
@@ -157,6 +162,7 @@ class TelephonyPoolAndLoadFixesTests(TestCase):
         self.assertEqual(res.status_code, 400, msg=getattr(res, 'data', None))
         self.assertEqual(res.data.get('code'), 'NO_TELEPHONY_LINE')
         self.assertEqual(CallSession.objects.using('tenant_test').filter(lead=lead).count(), 0)
+        mock_within_hours.assert_called_once()
 
     def test_presence_get_is_readonly_and_unassigned_put_remains_offline(self):
         """GET /presence/ performs zero heartbeat DB writes; PUT /presence/ keeps unassigned agents OFFLINE."""
