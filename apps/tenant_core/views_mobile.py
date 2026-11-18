@@ -2491,7 +2491,8 @@ class MobileMyBookingsView(APIView):
             # Trainer info
             trainer_name = 'SWEAT Trainer'
             if occ:
-                trainer_rec = occ.trainer_assignments.filter(trainer_role='LEAD').first() or occ.trainer_assignments.first()
+                _tas = list(occ.trainer_assignments.all())
+                trainer_rec = next((a for a in _tas if a.trainer_role == 'LEAD'), None) or (_tas[0] if _tas else None)
                 if trainer_rec and trainer_rec.trainer_profile and getattr(trainer_rec.trainer_profile, 'employee_profile', None):
                     emp = trainer_rec.trainer_profile.employee_profile
                     if emp.user_profile and emp.user_profile.user:
