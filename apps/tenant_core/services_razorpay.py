@@ -638,6 +638,34 @@ class RazorpayPaymentFinalizerService:
                 )
                 order.refresh_from_db(using=alias)
 
+            # EXTENSION orders carry no PACKAGE line-item to activate; apply the validity extension here so the
+            # Razorpay WEBHOOK path also shifts end_date (previously only checkout/verify handled it). Idempotent.
+            if order.order_type in ('EXTENSION', 'VALIDITY_EXTENSION'):
+                from .models_memberships import MembershipExtension as _MExt
+                import json as _json
+                _emeta = {}
+                try:
+                    _emeta = _json.loads(order.notes) if order.notes else {}
+                except Exception:
+                    _emeta = {}
+                _emid = _emeta.get('membership_id')
+                _em = Membership.objects.using(alias).filter(id=_emid).first() if _emid else Membership.objects.using(alias).filter(user_profile=order.user_profile).order_by('-created_at').first()
+                _ealready = _MExt.objects.using(alias).filter(reason_text__contains=order.order_number).exists()
+                if _em and not _ealready:
+                    MembershipLifecycleService.extend_membership(
+                        membership=_em, days=int(_emeta.get('days', 30) or 30),
+                        reason_text=f"Validity extension via Razorpay webhook (Order {order.order_number})",
+                        approved_by_user=actor_user, db_alias=alias,
+                    )
+                    _em.refresh_from_db(using=alias)
+                return {
+                    'status': 'PAID', 'order_id': str(order.id), 'order_number': order.order_number,
+                    'order_type': order.order_type, 'extension_applied': bool(_em and not _ealready),
+                    'already_applied': _ealready,
+                    'membership_id': str(_em.id) if _em else None,
+                    'end_date': _em.end_date.isoformat() if (_em and _em.end_date) else None,
+                }
+
             # Activate membership if not active
             membership = existing_membership
             if not membership:
