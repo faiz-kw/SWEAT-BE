@@ -3132,6 +3132,15 @@ class MemberViewSet(viewsets.ViewSet):
         else:
             start_date = today
 
+        # New-purchase coupon (web/CRM) - order-type gated to NEW_MEMBERSHIP
+        purchase_coupon_code = (request.data.get('coupon_code') or '').strip()
+        purchase_discount = Decimal('0.00')
+        if purchase_coupon_code:
+            from .services_discounts import DiscountCouponEngineService as _CPN
+            _cv = _CPN.validate_coupon(code_str=purchase_coupon_code, user_profile=profile, order_subtotal=unit_price, package=package, branch=branch, db_alias=alias, order_type='NEW_MEMBERSHIP')
+            if _cv.get('is_valid'):
+                purchase_discount = Decimal(str(_cv.get('discount_amount') or 0))
+
         with transaction.atomic(using=alias):
             order = CommerceService.create_order(
                 branch=branch,
@@ -3143,7 +3152,7 @@ class MemberViewSet(viewsets.ViewSet):
                     'item_name_snapshot': f"{package.name} (v{package_version.version_number})",
                     'quantity': Decimal('1.00'),
                     'unit_price': unit_price,
-                    'discount_amount': Decimal('0.00'),
+                    'discount_amount': purchase_discount,
                     'tax_percent': Decimal('0.000'),
                 }],
                 user_profile=profile,
