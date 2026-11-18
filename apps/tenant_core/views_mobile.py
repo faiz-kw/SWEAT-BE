@@ -3958,7 +3958,7 @@ class MobileCheckoutVerifyView(APIView):
                     if not m_to_ext:
                         m_to_ext = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
                     if m_to_ext:
-                        membership = MembershipLifecycleService.extend_membership(
+                        membership, _ = MembershipLifecycleService.extend_membership(
                             membership=m_to_ext,
                             days=ext_days,
                             reason_text=f"Self-service validity extension of {ext_days} days (Order {order.order_number})",
