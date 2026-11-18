@@ -9,9 +9,10 @@ with sensible environment-variable fallbacks for developer environments.
 
 import os
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
+from django.conf import settings
 from django.db import models
 from django.utils import timezone
 from config.routers import get_tenant_db_alias
@@ -176,6 +177,12 @@ class TelephonyConfigService:
         return cls.get_vobiz_config(alias)
 
     @classmethod
+    def browser_liveness_cutoff(cls) -> datetime:
+        """Oldest browser heartbeat that still counts as "the agent's browser is open"."""
+        seconds = int(getattr(settings, "TELEPHONY_BROWSER_LIVENESS_SECONDS", 120))
+        return timezone.now() - timedelta(seconds=seconds)
+
+    @classmethod
     def get_available_agent(
         cls,
         db_alias: Optional[str] = None,
@@ -191,14 +198,19 @@ class TelephonyConfigService:
           2. Any available agent belonging to caller's branch.
           3. Any available agent in the organization.
           4. Self-healing auto-recovery: Agents stuck in WRAP_UP > 10 min are auto-freed to AVAILABLE.
+
+        Every step only considers agents whose browser sent a heartbeat recently
+        (``browser_heartbeat_at``). An agent who closed the browser is never selected,
+        even if the database still says AVAILABLE.
         """
         alias = db_alias or get_tenant_db_alias() or "default"
         from apps.tenant_core.models_crm import AgentPresence
 
-        active_window = timezone.now() - timedelta(minutes=8)
+        live_since = cls.browser_liveness_cutoff()
 
         eligible_agents = (
             AgentPresence.objects.using(alias)
+            .filter(browser_heartbeat_at__gte=live_since)
             .exclude(user__status__in=["INACTIVE", "DISABLED", "SUSPENDED", "DEACTIVATED"])
             .exclude(sip_username="")
             .exclude(sip_username__startswith="unassigned_")
@@ -234,24 +246,16 @@ class TelephonyConfigService:
                 logger.info("Telephony dispatch: Selected branch %s rep %s (%s)", caller_branch.name, branch_agent.user.email, branch_agent.sip_username)
                 return branch_agent
 
-        # 3. Any available rep in the organization (excluding test/unassigned users), prioritizing active heartbeats
+        # 3. Any available rep in the organization (excluding test/unassigned users).
+        # eligible_agents already contains only agents with a live browser heartbeat.
         org_filter = {"organization": org} if org else {}
 
-        # First priority: Agents with active heartbeats within the last 8 minutes
         available = eligible_agents.filter(
             status="AVAILABLE",
-            last_heartbeat__gte=active_window,
             **org_filter,
         ).order_by("-last_heartbeat").select_related("user").first()
 
-        # Second priority: Fall back to ANY agent marked AVAILABLE in the organization (even if heartbeat was missed)
-        if not available:
-            available = eligible_agents.filter(
-                status="AVAILABLE",
-                **org_filter,
-            ).order_by("-last_heartbeat").select_related("user").first()
-
-        # Resilient fallback across tenant database if org_filter yielded no results
+        # Resilient fallback across the tenant database if org_filter yielded no results
         if not available:
             available = eligible_agents.filter(
                 status="AVAILABLE",

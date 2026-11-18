@@ -502,10 +502,9 @@ class VobizInboundFallbackWebhookView(APIView):
                 return HttpResponse("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Hangup/></Response>", content_type="application/xml; charset=utf-8")
 
             # Find secondary available rep, prioritizing actively online connected reps
-            active_window = timezone.now() - timedelta(minutes=3)
             secondary_presence = AgentPresence.objects.filter(
                 status='AVAILABLE',
-                last_heartbeat__gte=active_window,
+                browser_heartbeat_at__gte=TelephonyConfigService.browser_liveness_cutoff(),
             ).exclude(user=session.sales_rep if session else None).order_by('-last_heartbeat').first()
 
             vobiz_cfg = TelephonyConfigService.get_vobiz_config()
@@ -1483,8 +1482,10 @@ class AgentPresenceView(APIView):
             presence.status = effective_status
             if effective_status == 'AVAILABLE':
                 presence.active_session = None
-            presence.last_heartbeat = timezone.now()
-            presence.save(update_fields=['status', 'active_session', 'last_heartbeat'])
+            now = timezone.now()
+            presence.last_heartbeat = now
+            presence.browser_heartbeat_at = now
+            presence.save(update_fields=['status', 'active_session', 'last_heartbeat', 'browser_heartbeat_at'])
 
             return Response({
                 'status': presence.status,

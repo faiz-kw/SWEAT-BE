@@ -59,6 +59,7 @@ class VobizTelephonyTests(TestCase):
             user=self.rep,
             sip_username="iqra24030269280035568",
             status="AVAILABLE",
+            browser_heartbeat_at=timezone.now(),
         )
 
         from apps.tenant_core.models_crm import LeadSource
@@ -256,6 +257,7 @@ class VobizTelephonyTests(TestCase):
             sip_username="neha0001",
             status="AVAILABLE",
             last_heartbeat=timezone.now(),
+            browser_heartbeat_at=timezone.now(),
         )
         session = CallSession.objects.create(
             organization=self.org,
@@ -381,6 +383,7 @@ class VobizTelephonyTests(TestCase):
             sip_username="neha0001",
             status="AVAILABLE",
             last_heartbeat=timezone.now(),
+            browser_heartbeat_at=timezone.now(),
         )
 
         res = self.client.post('/api/v1/telephony/inbound/', data={
@@ -584,6 +587,7 @@ class VobizTelephonyTests(TestCase):
             sip_username="neha0001",
             status="AVAILABLE",
             last_heartbeat=timezone.now(),
+            browser_heartbeat_at=timezone.now(),
         )
         session = CallSession.objects.create(
             organization=self.org,

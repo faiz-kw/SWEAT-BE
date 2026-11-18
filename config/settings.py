@@ -665,6 +665,9 @@ VOICE_CALLING_ENABLED = os.getenv('VOICE_CALLING_ENABLED', 'false').lower() in (
 VOICE_CALLING_ENFORCE_HOURS = os.getenv('VOICE_CALLING_ENFORCE_HOURS', 'false' if DEBUG else 'true').lower() in ('true', '1', 't', 'yes')
 VOICE_CALLING_HOURS_START = int(os.getenv('VOICE_CALLING_HOURS_START', '9'))   # 09:00 IST
 VOICE_CALLING_HOURS_END   = int(os.getenv('VOICE_CALLING_HOURS_END',   '21'))  # 21:00 IST
+# Telephony routing: an agent is routable only if their browser sent a presence heartbeat this
+# recently. The WebPhone heartbeat is every 45 s, so 120 s tolerates two missed beats.
+TELEPHONY_BROWSER_LIVENESS_SECONDS = int(os.getenv('TELEPHONY_BROWSER_LIVENESS_SECONDS', '120'))
 META_APP_ID = os.getenv('META_APP_ID', '').strip()
 META_APP_SECRET = os.getenv('META_APP_SECRET', '').strip()
 META_WEBHOOK_VERIFY_TOKEN = os.getenv('META_WEBHOOK_VERIFY_TOKEN', '').strip()

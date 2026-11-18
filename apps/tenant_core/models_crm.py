@@ -1469,6 +1469,9 @@ class AgentPresence(models.Model):
         db_index=True,
     )
     last_heartbeat = models.DateTimeField(auto_now=True)
+    # Set ONLY by the agent's browser heartbeat (PUT /presence/). Deliberately not auto_now:
+    # last_heartbeat is rewritten by server-side saves, so it cannot prove the browser is open.
+    browser_heartbeat_at = models.DateTimeField(null=True, blank=True)
     active_session = models.ForeignKey(
         CallSession,
         on_delete=models.SET_NULL,

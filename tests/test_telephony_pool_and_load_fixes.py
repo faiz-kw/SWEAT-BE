@@ -211,6 +211,9 @@ class TelephonyPoolAndLoadFixesTests(TestCase):
         TelephonyConfigService.get_agent_webrtc_credentials(self.user2, db_alias='tenant_test')
         TelephonyConfigService.get_agent_webrtc_credentials(self.user3, db_alias='tenant_test')
 
+        # Every browser is open, so only the SIP-username exclusion can keep user3 out
+        AgentPresence.objects.using('tenant_test').update(browser_heartbeat_at=timezone.now())
+
         # Even if user3 somehow had AVAILABLE in DB, routing must ignore unassigned_ SIP usernames
         AgentPresence.objects.using('tenant_test').filter(user=self.user3).update(status='AVAILABLE')
         AgentPresence.objects.using('tenant_test').filter(user=self.user2).update(status='OFFLINE')
@@ -283,6 +286,8 @@ class TelephonyPoolAndLoadFixesTests(TestCase):
         """Deactivated staff accounts (status='INACTIVE') are never selected for inbound call routing."""
         TelephonyConfigService.get_agent_webrtc_credentials(self.user1, db_alias='tenant_test')
         TelephonyConfigService.get_agent_webrtc_credentials(self.user2, db_alias='tenant_test')
+        # Both agents have an open browser, so only the INACTIVE status can exclude user1
+        AgentPresence.objects.using('tenant_test').update(browser_heartbeat_at=timezone.now())
 
         self.user1.status = 'INACTIVE'
         self.user1.save(update_fields=['status'])
