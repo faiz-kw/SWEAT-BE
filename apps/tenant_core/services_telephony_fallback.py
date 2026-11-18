@@ -161,7 +161,7 @@ def _claim_next_rep(alias: str, session: CallSession, excluded: list[str]) -> Ag
             return None
         claimed = AgentPresence.objects.using(alias).filter(
             pk=candidate.pk, status='AVAILABLE',
-        ).update(status='ON_CALL', active_session=session)
+        ).update(status='ON_CALL', active_session=session, last_call_assigned_at=timezone.now())
         if claimed:
             return candidate
         skip.add(str(candidate.user_id))

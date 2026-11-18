@@ -1474,6 +1474,9 @@ class AgentPresence(models.Model):
     # Set ONLY by the agent's browser heartbeat (PUT /presence/). Deliberately not auto_now:
     # last_heartbeat is rewritten by server-side saves, so it cannot prove the browser is open.
     browser_heartbeat_at = models.DateTimeField(null=True, blank=True)
+    # When this agent was last handed an inbound call (stamped at claim, not at selection).
+    # Orders round robin: oldest first, NULL (never assigned) first of all.
+    last_call_assigned_at = models.DateTimeField(null=True, blank=True)
     active_session = models.ForeignKey(
         CallSession,
         on_delete=models.SET_NULL,

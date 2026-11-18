@@ -72,9 +72,13 @@ class FallbackChainBase(TestCase):
             organization=self.org, user=user, sip_username=sip, status='AVAILABLE',
             browser_heartbeat_at=timezone.now() - timedelta(seconds=browser_age),
         )
-        # last_heartbeat is auto_now, so stagger it with update() to make the order deterministic.
+        # Routing is round robin on last_call_assigned_at (oldest first), so stamp it explicitly:
+        # a lower stagger means an older stamp and is chosen earlier (A, then B, C, D; primary last).
+        # last_heartbeat is auto_now, so it is also staggered with update().
+        now = timezone.now()
         AgentPresence.objects.filter(pk=presence.pk).update(
-            last_heartbeat=timezone.now() - timedelta(seconds=stagger),
+            last_heartbeat=now - timedelta(seconds=stagger),
+            last_call_assigned_at=now - timedelta(seconds=1000 - stagger),
         )
         return user
 

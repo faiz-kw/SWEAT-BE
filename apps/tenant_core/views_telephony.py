@@ -394,7 +394,8 @@ class VobizInboundWebhookView(APIView):
                 # Mark rep as ON_CALL
                 presence.status = 'ON_CALL'
                 presence.active_session = session
-                presence.save(update_fields=['status', 'active_session', 'last_heartbeat'])
+                presence.last_call_assigned_at = timezone.now()
+                presence.save(update_fields=['status', 'active_session', 'last_heartbeat', 'last_call_assigned_at'])
 
                 member_id_val = str(member_profile.id if member_profile else (caller_user.id if caller_user else '')) if caller_type == 'MEMBER' else None
                 member_number_val = (member_profile.member_number if member_profile else (membership.membership_number if membership else None)) if caller_type == 'MEMBER' else None

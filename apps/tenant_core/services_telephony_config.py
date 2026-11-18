@@ -183,6 +183,11 @@ class TelephonyConfigService:
         seconds = int(getattr(settings, "TELEPHONY_BROWSER_LIVENESS_SECONDS", 120))
         return timezone.now() - timedelta(seconds=seconds)
 
+    @staticmethod
+    def _round_robin_order():
+        """Least recently assigned first. Never-assigned agents go first. ``id`` makes ties stable."""
+        return (models.F("last_call_assigned_at").asc(nulls_first=True), "id")
+
     @classmethod
     def get_available_agent(
         cls,
@@ -197,13 +202,17 @@ class TelephonyConfigService:
 
         Priority Waterfall:
           1. Assigned sales user for the lead/member (if AVAILABLE).
-          2. Any available agent belonging to caller's branch.
-          3. Any available agent in the organization.
+          2. Any available agent belonging to caller's branch (round robin).
+          3. Any available agent in the organization (round robin).
           4. Self-healing auto-recovery: Agents stuck in WRAP_UP > 10 min are auto-freed to AVAILABLE.
 
         Every step only considers agents whose browser sent a heartbeat recently
         (``browser_heartbeat_at``). An agent who closed the browser is never selected,
         even if the database still says AVAILABLE.
+
+        Round robin: steps 2 and 3 order by ``last_call_assigned_at`` (oldest first, NULL first).
+        This method only SELECTS. The caller stamps ``last_call_assigned_at`` when it claims the
+        agent for a call, so non-call callers (lead auto-assignment) never use up a turn.
         """
         alias = db_alias or get_tenant_db_alias() or "default"
         from apps.tenant_core.models_crm import AgentPresence
@@ -245,7 +254,7 @@ class TelephonyConfigService:
             branch_agent = eligible_agents.filter(
                 user__home_branch=caller_branch,
                 status="AVAILABLE",
-            ).order_by("-last_heartbeat").select_related("user").first()
+            ).order_by(*cls._round_robin_order()).select_related("user").first()
             if branch_agent:
                 logger.info("Telephony dispatch: Selected branch %s rep %s (%s)", caller_branch.name, branch_agent.user.email, branch_agent.sip_username)
                 return branch_agent
@@ -257,13 +266,13 @@ class TelephonyConfigService:
         available = eligible_agents.filter(
             status="AVAILABLE",
             **org_filter,
-        ).order_by("-last_heartbeat").select_related("user").first()
+        ).order_by(*cls._round_robin_order()).select_related("user").first()
 
         # Resilient fallback across the tenant database if org_filter yielded no results
         if not available:
             available = eligible_agents.filter(
                 status="AVAILABLE",
-            ).order_by("-last_heartbeat").select_related("user").first()
+            ).order_by(*cls._round_robin_order()).select_related("user").first()
 
         if available:
             logger.info("Telephony dispatch: Selected available rep %s (%s)", available.user.email, available.sip_username)
