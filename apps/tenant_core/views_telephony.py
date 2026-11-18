@@ -263,6 +263,7 @@ class VobizInboundWebhookView(APIView):
                     agent_presence.save(update_fields=['status', 'active_session', 'last_heartbeat'])
 
                 hangup_url = f"{host}/api/v1/telephony/hangup/?session_id={session.id}"
+                dial_events_url = f"{host}/api/v1/telephony/dial-events/?session_id={session.id}"
                 rec_str = "true" if vobiz_cfg.get('record_all_calls', True) else "false"
 
                 logger.info(
@@ -276,7 +277,7 @@ class VobizInboundWebhookView(APIView):
 
                 xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Dial action="{hangup_url}" callbackUrl="{hangup_url}" callerId="{caller_id}" record="{rec_str}">
+  <Dial action="{hangup_url}" callbackUrl="{dial_events_url}" callerId="{caller_id}" record="{rec_str}">
     <Number>{customer_phone}</Number>
   </Dial>
   <Hangup/>
@@ -929,6 +930,7 @@ class AgentAnswerBridgeXmlView(APIView):
             host = _get_webhook_host(request)
             rec_callback_url = f"{host}/api/v1/telephony/recording/?session_id={session.id}"
             hangup_url = f"{host}/api/v1/telephony/hangup/?session_id={session.id}"
+            dial_events_url = f"{host}/api/v1/telephony/dial-events/?session_id={session.id}"
             session_caller_id = session.agent_phone_number if (session.agent_phone_number and str(session.agent_phone_number).startswith('+')) else ''
             caller_id = session_caller_id or vobiz_cfg.get('from_number') or ""
 
@@ -939,6 +941,7 @@ class AgentAnswerBridgeXmlView(APIView):
                 record=bool(vobiz_cfg.get('record_all_calls', True)),
                 recording_callback_url=rec_callback_url,
                 hangup_url=hangup_url,
+                dial_events_url=dial_events_url,
             )
             return HttpResponse(xml, content_type="application/xml; charset=utf-8")
 

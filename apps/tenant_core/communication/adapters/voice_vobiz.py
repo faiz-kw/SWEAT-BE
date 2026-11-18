@@ -287,7 +287,7 @@ class VobizVoiceAdapter(BaseCommunicationAdapter):
         timeout: int = 35,
         record: bool = True,
         recording_callback_url: Optional[str] = None,
-        dial_events_url: Optional[str] = None,
+        dial_events_url: str | None = None,
         registrar_host: str = '',
     ) -> str:
         """
@@ -375,7 +375,7 @@ class VobizVoiceAdapter(BaseCommunicationAdapter):
         secondary_sip_uri: str,
         caller_id: str,
         complete_action_url: str,
-        dial_events_url: Optional[str] = None,
+        dial_events_url: str | None = None,
         whisper_prompt: str = "Please stay on the line while we connect you to our senior consultant.",
         timeout: int = 20,
         registrar_host: str = '',
@@ -404,15 +404,18 @@ class VobizVoiceAdapter(BaseCommunicationAdapter):
         record: bool = True,
         recording_callback_url: Optional[str] = None,
         hangup_url: Optional[str] = None,
+        dial_events_url: str | None = None,
     ) -> str:
         """
         Builds VobizXML for Outbound Click-to-Call.
         Played when the agent answers Vobiz WebPhone: whispers caller info, then dials customer on PSTN.
+        hangup_url is the Dial action (final Dial result). dial_events_url receives the customer
+        leg's real-time events (answer, connected, hangup) and must not point at the hangup webhook.
         Injects <Record startOnDialAnswer="true"> so the conversation is recorded as soon as customer answers.
         """
         rec_str = "true" if record else "false"
         dial_action = f' action="{hangup_url}"' if hangup_url else ""
-        action_callback = f' callbackUrl="{hangup_url}"' if hangup_url else ""
+        action_callback = f' callbackUrl="{dial_events_url}"' if dial_events_url else ""
 
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
