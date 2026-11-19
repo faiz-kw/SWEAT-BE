@@ -583,6 +583,12 @@ def sync_live_legacy_member_to_tenant(primary_uid: int, tenant_alias: str, org_i
 
             order_uuid = uuid.UUID(gen_uuid('order', t_uid))
             order_num = inv_id if inv_id else f"ORD-{t_uid:06d}"
+            # order_number has a UNIQUE constraint, but legacy invoice ids (inv_id) repeat across
+            # transactions. If this number is already held by a DIFFERENT order, make it unique per
+            # transaction so the member sync (incl. attendance/check-ins) no longer fails on a
+            # duplicate-key error (was stranding attendance -> false no-shows).
+            if Order.objects.using(tenant_alias).filter(order_number=order_num).exclude(id=order_uuid).exists():
+                order_num = f"{order_num}-{t_uid}"
             branch_uuid = uuid.UUID(DEFAULT_BRANCH_ID)
 
             is_paid = (t_amountpaid >= tot and tot > Decimal('0.00')) or ('paid' in txn_status or 'success' in txn_status)
