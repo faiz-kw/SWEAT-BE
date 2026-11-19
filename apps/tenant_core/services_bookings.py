@@ -1172,12 +1172,11 @@ class BookingWaitlistAttendanceService:
                             if passport_cfg.get('is_enabled') is False or passport_cfg.get('allow_cross_branch_booking') is False:
                                 raise ValidationError("Cross-branch studio access is currently disabled by administration policy.", code="PASSPORT_DISABLED")
 
-                            from .models_catalog import PackageBranchAvailability
-                            pkg = membership.package_version.package if membership.package_version else membership.package
-                            if pkg:
-                                pba_qs = PackageBranchAvailability.objects.using(alias).filter(package=pkg)
-                                if pba_qs.exists() and not pba_qs.filter(branch=occurrence.branch, status='ENABLED').exists():
-                                    raise ValidationError(f"Membership package does not permit access to '{occurrence.branch.name}'.")
+                            # NOTE: cross-branch access here is authorized by the member's PASSPORT (CROSS_BRANCH)
+                            # entitlement, validated just below. PackageBranchAvailability governs sales/catalog
+                            # availability (which branch a package is sold at), NOT passport usage - so it must not
+                            # block a passport booking (it was stranding 400+ members whose package enables only
+                            # their home branch while granting passport sessions).
 
                             passport_ent = ent_qs.filter(
                                 models.Q(entitlement_type='CROSS_BRANCH_SESSION') | models.Q(entitlement_type='CROSS_BRANCH')
