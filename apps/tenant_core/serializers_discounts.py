@@ -336,6 +336,7 @@ class DiscountEligibilityRuleSerializer(serializers.ModelSerializer):
             'valid_from',
             'valid_until',
             'status',
+            'configuration',
             'created_by_user',
             'conditions',
             'actions',

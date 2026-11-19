@@ -413,6 +413,15 @@ class DiscountEligibilityRuleViewSet(viewsets.ModelViewSet):
         org = getattr(self.request.user, 'organization', None)
         serializer.save(organization=org, created_by_user=self.request.user)
 
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        db = _get_db(request)
+        with transaction.atomic(using=db):
+            DiscountRuleCondition.objects.using(db).filter(discount_eligibility_rule=instance).delete()
+            DiscountRuleAction.objects.using(db).filter(discount_eligibility_rule=instance).delete()
+            instance.delete(using=db)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
     @action(detail=True, methods=['post'], url_path='add-condition')
     def add_condition(self, request, pk=None):
         rule = self.get_object()

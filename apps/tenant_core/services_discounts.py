@@ -479,12 +479,34 @@ class DiscountCouponEngineService:
             matching_offers = []
 
             for rule in rules:
+                # Parse scope metadata from rule.configuration (with fallback to legacy description comment)
+                cfg = getattr(rule, 'configuration', None) or {}
+                scope_branch_ids = [str(x) for x in cfg.get('branch_ids', []) if x]
+                scope_pkg_ids = [str(x) for x in cfg.get('package_ids', []) if x]
+
+                if not scope_branch_ids and not scope_pkg_ids and rule.description and '<!-- SCOPE:' in rule.description:
+                    try:
+                        import json, re
+                        m = re.search(r'<!-- SCOPE:\s*(\{.*?\})\s*-->', rule.description)
+                        if m:
+                            scope_data = json.loads(m.group(1))
+                            scope_branch_ids = [str(x) for x in scope_data.get('branch_ids', []) if x]
+                            scope_pkg_ids = [str(x) for x in scope_data.get('package_ids', []) if x]
+                    except Exception:
+                        pass
+
                 # Branch check
-                if rule.branch and branch and rule.branch_id != branch.id:
+                if scope_branch_ids:
+                    if branch and str(branch.id) not in scope_branch_ids:
+                        continue
+                elif rule.branch and branch and rule.branch_id != branch.id:
                     continue
 
                 # Target package check
-                if rule.target_package and target_package and rule.target_package_id != target_package.id:
+                if scope_pkg_ids:
+                    if target_package and str(target_package.id) not in scope_pkg_ids:
+                        continue
+                elif rule.target_package and target_package and rule.target_package_id != target_package.id:
                     continue
 
                 # Source package check across member active packages
