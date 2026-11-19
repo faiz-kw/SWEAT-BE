@@ -9,9 +9,11 @@ with sensible environment-variable fallbacks for developer environments.
 
 import os
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
+from collections.abc import Iterable
 from typing import Optional, Dict, Any
 
+from django.conf import settings
 from django.db import models
 from django.utils import timezone
 from config.routers import get_tenant_db_alias
@@ -26,6 +28,8 @@ class TelephonyConfigService:
     DEFAULT_WSS_URL = "wss://registrar.vobiz.ai:5063"
     DEFAULT_DID = ""
     DEFAULT_TIMEOUT_SEC = 35
+    # Total tries to claim an agent when another call keeps taking the chosen one first.
+    MAX_CLAIM_ATTEMPTS = 3
 
     @classmethod
     def get_vobiz_config(cls, db_alias: Optional[str] = None) -> Dict[str, Any]:
@@ -176,35 +180,58 @@ class TelephonyConfigService:
         return cls.get_vobiz_config(alias)
 
     @classmethod
+    def browser_liveness_cutoff(cls) -> datetime:
+        """Oldest browser heartbeat that still counts as "the agent's browser is open"."""
+        seconds = int(getattr(settings, "TELEPHONY_BROWSER_LIVENESS_SECONDS", 120))
+        return timezone.now() - timedelta(seconds=seconds)
+
+    @staticmethod
+    def _round_robin_order():
+        """Least recently assigned first. Never-assigned agents go first. ``id`` makes ties stable."""
+        return (models.F("last_call_assigned_at").asc(nulls_first=True), "id")
+
+    @classmethod
     def get_available_agent(
         cls,
         db_alias: Optional[str] = None,
         org=None,
         preferred_user=None,
         caller_branch=None,
+        exclude_user_ids: Iterable | None = None,
     ):
         """
         Dynamically selects an available sales representative without ANY hardcoded usernames.
 
         Priority Waterfall:
           1. Assigned sales user for the lead/member (if AVAILABLE).
-          2. Any available agent belonging to caller's branch.
-          3. Any available agent in the organization.
+          2. Any available agent belonging to caller's branch (round robin).
+          3. Any available agent in the organization (round robin).
           4. Self-healing auto-recovery: Agents stuck in WRAP_UP > 10 min are auto-freed to AVAILABLE.
+
+        Every step only considers agents whose browser sent a heartbeat recently
+        (``browser_heartbeat_at``). An agent who closed the browser is never selected,
+        even if the database still says AVAILABLE.
+
+        Round robin: steps 2 and 3 order by ``last_call_assigned_at`` (oldest first, NULL first).
+        This method only SELECTS. The caller stamps ``last_call_assigned_at`` when it claims the
+        agent for a call, so non-call callers (lead auto-assignment) never use up a turn.
         """
         alias = db_alias or get_tenant_db_alias() or "default"
         from apps.tenant_core.models_crm import AgentPresence
 
-        active_window = timezone.now() - timedelta(minutes=8)
+        live_since = cls.browser_liveness_cutoff()
 
         eligible_agents = (
             AgentPresence.objects.using(alias)
+            .filter(browser_heartbeat_at__gte=live_since)
             .exclude(user__status__in=["INACTIVE", "DISABLED", "SUSPENDED", "DEACTIVATED"])
             .exclude(sip_username="")
             .exclude(sip_username__startswith="unassigned_")
             .exclude(sip_username__startswith="agent_")
             .exclude(sip_username__icontains="test")
         )
+        if exclude_user_ids:
+            eligible_agents = eligible_agents.exclude(user_id__in=list(exclude_user_ids))
 
         # 1. Preferred user check (must be actively online with a real SIP line)
         if preferred_user:
@@ -229,33 +256,25 @@ class TelephonyConfigService:
             branch_agent = eligible_agents.filter(
                 user__home_branch=caller_branch,
                 status="AVAILABLE",
-            ).order_by("-last_heartbeat").select_related("user").first()
+            ).order_by(*cls._round_robin_order()).select_related("user").first()
             if branch_agent:
                 logger.info("Telephony dispatch: Selected branch %s rep %s (%s)", caller_branch.name, branch_agent.user.email, branch_agent.sip_username)
                 return branch_agent
 
-        # 3. Any available rep in the organization (excluding test/unassigned users), prioritizing active heartbeats
+        # 3. Any available rep in the organization (excluding test/unassigned users).
+        # eligible_agents already contains only agents with a live browser heartbeat.
         org_filter = {"organization": org} if org else {}
 
-        # First priority: Agents with active heartbeats within the last 8 minutes
         available = eligible_agents.filter(
             status="AVAILABLE",
-            last_heartbeat__gte=active_window,
             **org_filter,
-        ).order_by("-last_heartbeat").select_related("user").first()
+        ).order_by(*cls._round_robin_order()).select_related("user").first()
 
-        # Second priority: Fall back to ANY agent marked AVAILABLE in the organization (even if heartbeat was missed)
+        # Resilient fallback across the tenant database if org_filter yielded no results
         if not available:
             available = eligible_agents.filter(
                 status="AVAILABLE",
-                **org_filter,
-            ).order_by("-last_heartbeat").select_related("user").first()
-
-        # Resilient fallback across tenant database if org_filter yielded no results
-        if not available:
-            available = eligible_agents.filter(
-                status="AVAILABLE",
-            ).order_by("-last_heartbeat").select_related("user").first()
+            ).order_by(*cls._round_robin_order()).select_related("user").first()
 
         if available:
             logger.info("Telephony dispatch: Selected available rep %s (%s)", available.user.email, available.sip_username)
@@ -285,6 +304,61 @@ class TelephonyConfigService:
             return stale_agent
 
         logger.warning("Telephony dispatch: No sales agents currently available in db %s (all busy, wrap-up, or offline)", alias)
+        return None
+
+    @classmethod
+    def claim_agent_for_session(
+        cls,
+        candidate,
+        session,
+        db_alias: str | None = None,
+        org=None,
+        preferred_user=None,
+        caller_branch=None,
+        exclude_user_ids: Iterable | None = None,
+    ):
+        """
+        Atomically claims ``candidate`` (an AgentPresence from ``get_available_agent``) for ``session``.
+
+        The claim is one conditional UPDATE (AVAILABLE -> ON_CALL), so two calls that picked the same
+        agent cannot both get them: the loser matches zero rows. A loser excludes that agent and
+        selects again, up to ``MAX_CLAIM_ATTEMPTS`` times in total.
+
+        The winner is marked ``ON_CALL`` with ``active_session`` and stamped for round robin
+        (``last_call_assigned_at``). Returns the claimed AgentPresence, or None when every attempt
+        lost. The caller is responsible for ``session.sales_rep``.
+        """
+        alias = db_alias or get_tenant_db_alias() or "default"
+        from apps.tenant_core.models_crm import AgentPresence
+
+        skip = {str(uid) for uid in (exclude_user_ids or [])}
+        for attempt in range(cls.MAX_CLAIM_ATTEMPTS):
+            if candidate is None:
+                return None
+            now = timezone.now()
+            # update() does not run auto_now, so last_heartbeat is set explicitly (as the old save() did).
+            claimed = AgentPresence.objects.using(alias).filter(
+                pk=candidate.pk, status="AVAILABLE",
+            ).update(
+                status="ON_CALL",
+                active_session=session,
+                last_call_assigned_at=now,
+                last_heartbeat=now,
+            )
+            if claimed:
+                return candidate
+            logger.info("Telephony claim: agent %s was taken by another call", candidate.user_id)
+            skip.add(str(candidate.user_id))
+            if attempt == cls.MAX_CLAIM_ATTEMPTS - 1:
+                break
+            candidate = cls.get_available_agent(
+                db_alias=alias,
+                org=org,
+                preferred_user=preferred_user,
+                caller_branch=caller_branch,
+                exclude_user_ids=skip,
+            )
+        logger.warning("Telephony claim: every claim attempt lost the race (excluded=%s)", sorted(skip))
         return None
 
     @classmethod

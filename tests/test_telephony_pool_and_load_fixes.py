@@ -124,8 +124,13 @@ class TelephonyPoolAndLoadFixesTests(TestCase):
         self.assertTrue(c3_upgraded['is_registered_endpoint'])
         self.assertEqual(c3_upgraded['username'], 'sweatagent104201155654570218059')
 
-    def test_click_to_call_rejects_unassigned_agent_with_400(self):
-        """Outbound Click-to-Call rejects unassigned admins instead of routing broken carrier calls."""
+    @patch('apps.tenant_core.views_telephony._is_within_trai_hours', return_value=True)
+    def test_click_to_call_rejects_unassigned_agent_with_400(self, mock_within_hours):
+        """Outbound Click-to-Call rejects unassigned admins instead of routing broken carrier calls.
+
+        The 09:00 to 21:00 IST calling-hours check runs first, so it is pinned to "inside hours"
+        here. Without that the test result depended on the wall clock.
+        """
         TelephonyConfigService.get_agent_webrtc_credentials(self.user1, db_alias='tenant_test')
         TelephonyConfigService.get_agent_webrtc_credentials(self.user2, db_alias='tenant_test')
         TelephonyConfigService.get_agent_webrtc_credentials(self.user3, db_alias='tenant_test')
@@ -157,6 +162,7 @@ class TelephonyPoolAndLoadFixesTests(TestCase):
         self.assertEqual(res.status_code, 400, msg=getattr(res, 'data', None))
         self.assertEqual(res.data.get('code'), 'NO_TELEPHONY_LINE')
         self.assertEqual(CallSession.objects.using('tenant_test').filter(lead=lead).count(), 0)
+        mock_within_hours.assert_called_once()
 
     def test_presence_get_is_readonly_and_unassigned_put_remains_offline(self):
         """GET /presence/ performs zero heartbeat DB writes; PUT /presence/ keeps unassigned agents OFFLINE."""
@@ -210,6 +216,9 @@ class TelephonyPoolAndLoadFixesTests(TestCase):
         TelephonyConfigService.get_agent_webrtc_credentials(self.user1, db_alias='tenant_test')
         TelephonyConfigService.get_agent_webrtc_credentials(self.user2, db_alias='tenant_test')
         TelephonyConfigService.get_agent_webrtc_credentials(self.user3, db_alias='tenant_test')
+
+        # Every browser is open, so only the SIP-username exclusion can keep user3 out
+        AgentPresence.objects.using('tenant_test').update(browser_heartbeat_at=timezone.now())
 
         # Even if user3 somehow had AVAILABLE in DB, routing must ignore unassigned_ SIP usernames
         AgentPresence.objects.using('tenant_test').filter(user=self.user3).update(status='AVAILABLE')
@@ -283,6 +292,8 @@ class TelephonyPoolAndLoadFixesTests(TestCase):
         """Deactivated staff accounts (status='INACTIVE') are never selected for inbound call routing."""
         TelephonyConfigService.get_agent_webrtc_credentials(self.user1, db_alias='tenant_test')
         TelephonyConfigService.get_agent_webrtc_credentials(self.user2, db_alias='tenant_test')
+        # Both agents have an open browser, so only the INACTIVE status can exclude user1
+        AgentPresence.objects.using('tenant_test').update(browser_heartbeat_at=timezone.now())
 
         self.user1.status = 'INACTIVE'
         self.user1.save(update_fields=['status'])
