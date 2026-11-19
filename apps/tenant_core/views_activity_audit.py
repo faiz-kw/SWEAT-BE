@@ -28,6 +28,7 @@ from rest_framework import serializers
 from .models_activity_audit import ActivityAuditLog
 from .models_org import Branch
 from .models_users import TenantUser
+from .models_rbac import Role, RoleAssignment
 from .views import TenantScopeMixin, TenantDBMixin
 from .permissions import TenantRBACPermission
 
@@ -107,6 +108,72 @@ class ActivityAuditLogSerializer(serializers.ModelSerializer):
         if obj.field_changes and isinstance(obj.field_changes, list):
             return len(obj.field_changes)
         return 0
+
+
+# Canonical CRM navigation modules matching the CRM sidebar navigation exactly
+CRM_NAVIGATION_MODULES = [
+    'Dashboard',
+    'CRM & Sales',
+    'Members',
+    'Operations',
+    'Performance',
+    'AI & Intelligence',
+    'Coaching',
+    'Support & Grievance',
+    'Nutrition',
+    'Inventory',
+    'Finance',
+    'Customer Success',
+    'Marketing',
+    'Automation',
+    'Reports',
+    'Community Hub',
+    'Administration',
+]
+
+# Standard Enterprise Action Categories representing the operational nature of activities
+CATEGORY_CANONICAL_MAP = {
+    'COMMERCIAL': 'Commercial & Billing',
+    'COMMERCE': 'Commercial & Billing',
+    'FINANCE': 'Commercial & Billing',
+    'BILLING': 'Commercial & Billing',
+    'OPERATIONAL': 'Operations & Hardware',
+    'OPERATIONS': 'Operations & Hardware',
+    'IOT': 'Operations & Hardware',
+    'SECURITY_POLICY': 'Access & Security',
+    'SECURITY': 'Access & Security',
+    'AUTH': 'Access & Security',
+    'AUTHENTICATION': 'Access & Security',
+    'ACCESS_CONTROL': 'Access & Security',
+    'ACCESS CONTROL': 'Access & Security',
+    'COMMUNICATION': 'Communications & Outreach',
+    'MEMBERSHIP': 'Customer & Membership',
+    'MEMBERSHIPS': 'Customer & Membership',
+    'WORKFORCE': 'Workforce & Staffing',
+    'GENERAL': 'General & System',
+    'SYSTEM': 'General & System',
+}
+
+STANDARD_ACTION_CATEGORIES = [
+    'Access & Security',
+    'Commercial & Billing',
+    'Customer & Membership',
+    'Communications & Outreach',
+    'Operations & Hardware',
+    'Workforce & Staffing',
+    'General & System',
+]
+
+CHANNEL_CANONICAL_MAP = {
+    'ADMIN_PANEL': 'WEB ADMIN',
+    'ADMIN PANEL': 'WEB ADMIN',
+    'WEB': 'WEB ADMIN',
+    'WEB_ADMIN': 'WEB ADMIN',
+    'DESKTOP': 'DESKTOP',
+    'HARDWARE_IOT': 'HARDWARE IOT',
+    'MOBILE_APP': 'MOBILE APP',
+    'WEBHOOK': 'WEBHOOK',
+}
 
 
 class ActivityAuditLogViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ReadOnlyModelViewSet):
@@ -193,48 +260,201 @@ class ActivityAuditLogViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ReadOnly
         # 2. Module & Submodule
         module = params.get('module')
         if module and module.upper() != 'ALL':
-            qs = qs.filter(module__iexact=module)
+            mod_norm = module.strip().upper()
+            if mod_norm in ('ADMINISTRATION', 'ADMIN'):
+                qs = qs.filter(
+                    Q(module__in=['ADMINISTRATION', 'ADMIN', 'CORE', 'USERS', 'ROLES', 'PERMISSIONS', 'SETTINGS', 'ACCESS_CONTROL', 'ORGANIZATION', 'TENANTUSER', 'SECURITY', 'AUTH']) |
+                    Q(action_code__startswith='AUTH') |
+                    Q(action_code__startswith='SECURITY') |
+                    Q(action_code__startswith='ROLE') |
+                    Q(action_code__startswith='USER')
+                )
+            elif mod_norm in ('CRM & SALES', 'CRM', 'SALES'):
+                qs = qs.filter(
+                    Q(module__in=['CRM', 'CRM & SALES', 'SALES', 'LEADS', 'CAMPAIGNS', 'COUPONS', 'DISCOUNT_CAMPAIGNS', 'REWARDS']) |
+                    Q(action_code__startswith='CRM') |
+                    Q(action_code__startswith='LEAD') |
+                    Q(action_code__startswith='DISCOUNT')
+                )
+            elif mod_norm in ('MEMBERS', 'MEMBERSHIPS', 'MEMBERSHIP'):
+                qs = qs.filter(
+                    Q(module__in=['MEMBERS', 'MEMBERSHIPS', 'MEMBERSHIP', 'ATTENDANCE', 'RENEWALS', 'REWARDS']) |
+                    Q(action_code__startswith='MEMBERSHIP') |
+                    Q(action_code__startswith='MEMBER')
+                )
+            elif mod_norm in ('OPERATIONS', 'OPS'):
+                qs = qs.filter(
+                    Q(module__in=['OPERATIONS', 'CLASSES', 'CLASS_OCCURRENCES', 'BOOKINGS', 'MEMBER_ATTENDANCE_STATES', 'TRAINERS', 'PROGRAMS', 'WOD']) |
+                    Q(action_code__startswith='IOT') |
+                    Q(action_code__startswith='BOOKING') |
+                    Q(action_code__startswith='CLASS')
+                )
+            elif mod_norm in ('FINANCE', 'COMMERCE', 'COMMERCIAL'):
+                qs = qs.filter(
+                    Q(module__in=['FINANCE', 'COMMERCE', 'COMMERCIAL', 'INVOICES', 'PAYMENTS', 'REFUNDS']) |
+                    Q(action_code__startswith='COMMERCE') |
+                    Q(action_code__startswith='ORDER') |
+                    Q(action_code__startswith='PAYMENT') |
+                    Q(action_code__startswith='RAZORPAY')
+                )
+            elif mod_norm in ('INVENTORY',):
+                qs = qs.filter(module__in=['INVENTORY', 'STOCK', 'PRODUCTS'])
+            elif mod_norm in ('PERFORMANCE',):
+                qs = qs.filter(module__in=['PERFORMANCE', 'ASSESSMENTS', 'WORKOUTS', 'RECOVERY'])
+            elif mod_norm in ('AI & INTELLIGENCE', 'AI'):
+                qs = qs.filter(module__in=['AI', 'AI & INTELLIGENCE', 'INTELLIGENCE', 'VISION'])
+            elif mod_norm in ('COACHING',):
+                qs = qs.filter(module__in=['COACHING', 'COACH', 'TRAINERS'])
+            elif mod_norm in ('SUPPORT & GRIEVANCE', 'SUPPORT'):
+                qs = qs.filter(module__in=['SUPPORT', 'GRIEVANCE', 'TICKETS'])
+            elif mod_norm in ('NUTRITION',):
+                qs = qs.filter(module__in=['NUTRITION', 'DIET'])
+            elif mod_norm in ('CUSTOMER SUCCESS', 'CS'):
+                qs = qs.filter(module__in=['CS', 'CUSTOMER_SUCCESS', 'CUSTOMER SUCCESS', 'RETENTION'])
+            elif mod_norm in ('MARKETING',):
+                qs = qs.filter(module__in=['MARKETING', 'CAMPAIGNS', 'AUDIENCES'])
+            elif mod_norm in ('AUTOMATION',):
+                qs = qs.filter(module__in=['AUTOMATION', 'WORKFLOWS', 'RULES', 'NOTIFICATIONS'])
+            elif mod_norm in ('REPORTS',):
+                qs = qs.filter(module__in=['REPORTS', 'REPORTING', 'ANALYTICS'])
+            elif mod_norm in ('COMMUNITY HUB', 'COMMUNITY'):
+                qs = qs.filter(module__in=['COMMUNITY', 'COMMUNITY HUB', 'COMMUNITY_HUB'])
+            elif mod_norm in ('DASHBOARD',):
+                qs = qs.filter(module__iexact='DASHBOARD')
+            else:
+                qs = qs.filter(module__iexact=module)
 
         submodule = params.get('submodule')
         if submodule:
             qs = qs.filter(submodule__iexact=submodule)
 
-        # 3. Action Category & Code
+        # 3. Action Category & Code (Canonical Enterprise Operational Classifications)
         category = params.get('category') or params.get('action_category')
         if category and category.upper() != 'ALL':
-            qs = qs.filter(action_category__iexact=category)
+            cat_norm = category.strip().upper()
+            if cat_norm in ('ACCESS & SECURITY', 'SECURITY', 'AUTHENTICATION', 'AUTH', 'ACCESS_CONTROL'):
+                qs = qs.filter(
+                    Q(action_category__in=['ACCESS_CONTROL', 'AUTHENTICATION', 'AUTH', 'SECURITY', 'SECURITY_POLICY', 'Access & Security']) |
+                    Q(action_code__startswith='AUTH') |
+                    Q(action_code__startswith='SECURITY')
+                )
+            elif cat_norm in ('COMMERCIAL & BILLING', 'COMMERCE', 'COMMERCIAL', 'FINANCE', 'BILLING'):
+                qs = qs.filter(
+                    Q(action_category__in=['COMMERCE', 'COMMERCIAL', 'FINANCE', 'BILLING', 'Commercial & Billing']) |
+                    Q(action_code__startswith='COMMERCE') |
+                    Q(action_code__startswith='ORDER') |
+                    Q(action_code__startswith='RAZORPAY')
+                )
+            elif cat_norm in ('CUSTOMER & MEMBERSHIP', 'MEMBERSHIP', 'MEMBERSHIPS'):
+                qs = qs.filter(
+                    Q(action_category__in=['MEMBERSHIP', 'MEMBERSHIPS', 'Customer & Membership']) |
+                    Q(action_code__startswith='MEMBERSHIP')
+                )
+            elif cat_norm in ('COMMUNICATIONS & OUTREACH', 'COMMUNICATION'):
+                qs = qs.filter(
+                    Q(action_category__in=['COMMUNICATION', 'Communications & Outreach']) |
+                    Q(action_code__startswith='COMMUNICATION') |
+                    Q(action_code__startswith='SMS') |
+                    Q(action_code__startswith='WHATSAPP')
+                )
+            elif cat_norm in ('OPERATIONS & HARDWARE', 'OPERATIONS', 'OPERATIONAL', 'IOT'):
+                qs = qs.filter(
+                    Q(action_category__in=['OPERATIONS', 'OPERATIONAL', 'IOT', 'Operations & Hardware']) |
+                    Q(action_code__startswith='IOT')
+                )
+            elif cat_norm in ('WORKFORCE & STAFFING', 'WORKFORCE'):
+                qs = qs.filter(action_category__in=['WORKFORCE', 'Workforce & Staffing'])
+            elif cat_norm in ('GENERAL & SYSTEM', 'GENERAL', 'SYSTEM'):
+                qs = qs.filter(action_category__in=['GENERAL', 'SYSTEM', 'General & System'])
+            else:
+                qs = qs.filter(action_category__iexact=category)
 
         action_code = params.get('action_code')
         if action_code:
             qs = qs.filter(action_code__iexact=action_code)
 
-        # 4. Actor Type & Specific Actor
-        actor_type = params.get('actor_type')
-        if actor_type and actor_type.upper() != 'ALL':
-            qs = qs.filter(actor_type__iexact=actor_type)
+        # 4. Role (Connected to backend Role model; maps performer identity & role assignments)
+        role = params.get('role') or params.get('role_code') or params.get('actor_role') or params.get('actor_type')
+        if role and role.upper() != 'ALL':
+            role_norm = role.strip().upper()
+            if role_norm in ('SYSTEM', 'SYSTEM AUTOMATION & SERVICES'):
+                qs = qs.filter(
+                    Q(actor_type__iexact='SYSTEM') |
+                    Q(actor_role__iexact='SYSTEM') |
+                    Q(actor_role__iexact='GATEWAY')
+                )
+            elif role_norm in ('MEMBER', 'GYM MEMBER'):
+                qs = qs.filter(
+                    Q(actor_type__iexact='MEMBER') |
+                    Q(actor_role__iexact='MEMBER') |
+                    Q(actor_role__iexact='Gym Member')
+                )
+            elif role_norm in ('STAFF', 'STAFF MEMBER'):
+                qs = qs.filter(
+                    Q(actor_type__iexact='STAFF') |
+                    Q(actor_role__icontains='Staff')
+                )
+            else:
+                role_user_ids = list(
+                    RoleAssignment.objects.using(db)
+                    .filter(Q(role__code__iexact=role) | Q(role__name__iexact=role))
+                    .values_list('user_id', flat=True)
+                )
+                role_filter = (
+                    Q(actor_role__iexact=role) |
+                    Q(actor_role__icontains=role) |
+                    Q(actor_type__iexact=role)
+                )
+                if role_norm == 'ORG_ADMIN':
+                    role_filter |= Q(actor_role__icontains='Admin') | Q(actor_type='ADMIN')
+                if role_user_ids:
+                    role_filter |= Q(actor_id__in=[str(uid) for uid in role_user_ids])
+                qs = qs.filter(role_filter)
 
+        # 5. Specific Staff / User Filter (Dynamic from CRM Users & Audit Performers)
         actor_id = params.get('actor_id')
-        if actor_id and actor_id.upper() != 'ALL':
-            qs = qs.filter(actor_id=actor_id)
-
         actor_email = params.get('actor_email')
-        if actor_email and actor_email.upper() != 'ALL':
+        actor_name = params.get('actor_name')
+        if actor_id and actor_id.upper() != 'ALL':
+            if actor_email:
+                qs = qs.filter(Q(actor_id=actor_id) | Q(actor_email__iexact=actor_email))
+            else:
+                qs = qs.filter(actor_id=actor_id)
+        elif actor_email and actor_email.upper() != 'ALL':
             qs = qs.filter(actor_email__icontains=actor_email)
+        elif actor_name and actor_name.upper() != 'ALL':
+            qs = qs.filter(actor_name__icontains=actor_name)
 
         # 5. Result Status (SUCCESS, FAILURE, WARNING)
         result = params.get('result')
         if result and result.upper() != 'ALL':
             qs = qs.filter(result__iexact=result)
 
-        # 6. Branch Filter (within already RBAC-scoped queryset)
+        # 6. Branch Filter (matching selected branch ID or any branch sharing the same name)
         branch_id = params.get('branch_id') or params.get('branch')
         if branch_id and branch_id.upper() != 'ALL':
-            qs = qs.filter(branch_id=branch_id)
+            try:
+                selected_br = Branch.objects.using(db).filter(id=branch_id).first()
+                if selected_br:
+                    matching_ids = list(Branch.objects.using(db).filter(name__iexact=selected_br.name).values_list('id', flat=True))
+                    qs = qs.filter(branch_id__in=matching_ids)
+                else:
+                    qs = qs.filter(branch_id=branch_id)
+            except Exception:
+                qs = qs.filter(branch_id=branch_id)
 
         # 7. Source Channel
         source_channel = params.get('source_channel')
         if source_channel and source_channel.upper() != 'ALL':
-            qs = qs.filter(source_channel__iexact=source_channel)
+            ch_upper = source_channel.upper().replace(' ', '_')
+            if ch_upper in ('WEB_ADMIN', 'ADMIN_PANEL', 'WEB'):
+                qs = qs.filter(source_channel__in=['WEB_ADMIN', 'WEB ADMIN', 'ADMIN_PANEL', 'ADMIN PANEL', 'WEB'])
+            elif ch_upper in ('HARDWARE_IOT',):
+                qs = qs.filter(source_channel__in=['HARDWARE_IOT', 'HARDWARE IOT'])
+            elif ch_upper in ('MOBILE_APP',):
+                qs = qs.filter(source_channel__in=['MOBILE_APP', 'MOBILE APP'])
+            else:
+                qs = qs.filter(source_channel__iexact=source_channel)
 
         # 8. Entity Type & Entity ID
         entity_type = params.get('entity_type')
@@ -273,33 +493,36 @@ class ActivityAuditLogViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ReadOnly
         is_org_wide, allowed_branch_ids = self._get_effective_scope()
         qs = self._get_scoped_queryset(db)
 
-        # Dynamic distinct modules (case-normalized; get_queryset filters via iexact)
-        distinct_modules = sorted(list(set(
-            v.strip().upper()
-            for v in qs.order_by().exclude(module='').values_list('module', flat=True)
-            if v and v.strip()
-        )))
+        # Dynamic distinct modules matching the CRM navigation structure exactly
+        distinct_modules = list(CRM_NAVIGATION_MODULES)
 
-        # Dynamic distinct action categories
-        distinct_categories = sorted(list(set(
-            v.strip().upper()
-            for v in qs.order_by().exclude(action_category='').values_list('action_category', flat=True)
-            if v and v.strip()
-        )))
+        # Standard Enterprise Action Categories representing operational intent
+        distinct_categories = list(STANDARD_ACTION_CATEGORIES)
 
-        # Dynamic distinct actor types
-        distinct_actor_types = sorted(list(set(
-            v.strip().upper()
-            for v in qs.order_by().exclude(actor_type='').values_list('actor_type', flat=True)
-            if v and v.strip()
-        )))
+        # Dynamic distinct Roles from the CRM backend Role model (zero hardcoding)
+        roles = []
+        seen_roles = set()
+        for r in Role.objects.using(db).filter(is_active=True).order_by('name'):
+            code = r.code.strip()
+            if code not in seen_roles:
+                seen_roles.add(code)
+                roles.append({'code': code, 'name': r.name.strip()})
+        if 'SYSTEM' not in seen_roles:
+            roles.append({'code': 'SYSTEM', 'name': 'System Automation & Services'})
 
-        # Dynamic distinct source channels
-        distinct_channels = sorted(list(set(
+        distinct_actor_types = [r['code'] for r in roles]
+
+        # Dynamic distinct source channels (deduplicated through canonical map)
+        raw_channels = set(
             v.strip().upper()
             for v in qs.order_by().exclude(source_channel='').values_list('source_channel', flat=True)
             if v and v.strip()
-        )))
+        )
+        canonical_channels = set()
+        for ch in raw_channels:
+            mapped = CHANNEL_CANONICAL_MAP.get(ch, ch.replace('_', ' '))
+            canonical_channels.add(mapped)
+        distinct_channels = sorted(list(canonical_channels))
 
         # Dynamic distinct results
         distinct_results = sorted(list(set(
@@ -308,39 +531,96 @@ class ActivityAuditLogViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ReadOnly
             if v and v.strip()
         )))
 
-        # Active branches strictly within user's RBAC scope
+        # Distinct branches (deduplicated by normalized name, prioritizing active records)
         branch_qs = Branch.objects.using(db).all()
         if not is_org_wide:
             branch_qs = branch_qs.filter(id__in=allowed_branch_ids) if allowed_branch_ids else branch_qs.none()
-        branches = list(
-            branch_qs.values('id', 'name', 'code', 'status').order_by('name')
-        )
+        seen_branch_names = set()
+        branches = []
+        for b in branch_qs.filter(status='ACTIVE').order_by('name'):
+            norm_name = b.name.strip().lower()
+            if norm_name not in seen_branch_names:
+                seen_branch_names.add(norm_name)
+                branches.append({'id': str(b.id), 'name': b.name.strip(), 'code': b.code, 'status': b.status})
+        for b in branch_qs.order_by('name'):
+            norm_name = b.name.strip().lower()
+            if norm_name not in seen_branch_names:
+                seen_branch_names.add(norm_name)
+                branches.append({'id': str(b.id), 'name': b.name.strip(), 'code': b.code, 'status': b.status})
 
-        # Dynamic active actors (order_by() clears default ordering so PostgreSQL DISTINCT deduplicates accurately)
-        actors_raw = (
-            qs.order_by()
-            .exclude(actor_name='')
-            .values('actor_id', 'actor_name', 'actor_email', 'actor_role', 'actor_type')
-            .distinct()[:100]
+        # Dynamic registered staff & CRM performers (100% backend-driven, ZERO dummy/hardcoded data)
+        # 1. Fetch active registered staff/admins from TenantUser
+        staff_users_qs = (
+            TenantUser.objects.using(db)
+            .filter(user_type__in=['STAFF', 'ADMIN', 'SUPER_ADMIN', 'EMPLOYEE'])
+            .filter(status='ACTIVE')
         )
+        role_map = {}
+        for ra in RoleAssignment.objects.using(db).select_related('role'):
+            role_map[ra.user_id] = ra.role.name
+
         actors = []
-        seen_keys = set()
-        for a in actors_raw:
-            dedup_key = (a.get('actor_id') or a.get('actor_email') or a.get('actor_name') or '').lower()
-            if dedup_key and dedup_key not in seen_keys:
-                seen_keys.add(dedup_key)
-                actors.append(a)
-        actors.sort(key=lambda x: (x.get('actor_name') or '').lower())
+        seen_actors = {}
+        for u in staff_users_qs:
+            first = (u.first_name or '').strip()
+            last = (u.last_name or '').strip()
+            name = f"{first} {last}".strip() or (u.display_name or '').strip() or u.email
+            if not name or (len(name) == 1 and name.isdigit()):
+                continue
+            email = (u.email or '').strip()
+            base_email = email.split('.com')[0] if '.com' in email else email
+            norm_key = (name.lower(), base_email.lower())
+            if norm_key in seen_actors:
+                continue
+            assigned_role = role_map.get(u.id) or u.user_type.title()
+            entry = {
+                'actor_id': str(u.id),
+                'actor_name': name,
+                'actor_email': email,
+                'actor_role': assigned_role,
+                'actor_type': 'ADMIN' if u.user_type in ('ADMIN', 'SUPER_ADMIN') or 'Admin' in assigned_role else 'STAFF',
+            }
+            seen_actors[norm_key] = entry
+            actors.append(entry)
+
+        # 2. Also fetch any system services or actors recorded in ActivityAuditLog
+        system_actors_raw = (
+            qs.order_by()
+            .filter(actor_type__in=['SYSTEM', 'GATEWAY'])
+            .values('actor_id', 'actor_name', 'actor_email', 'actor_role', 'actor_type')
+            .distinct()
+        )
+        for sa in system_actors_raw:
+            name = (sa.get('actor_name') or '').strip() or 'System Automation'
+            norm_key = (name.lower(), '')
+            if norm_key not in seen_actors:
+                entry = {
+                    'actor_id': str(sa.get('actor_id')) if sa.get('actor_id') else None,
+                    'actor_name': name,
+                    'actor_email': sa.get('actor_email') or '',
+                    'actor_role': sa.get('actor_role') or 'System Service',
+                    'actor_type': 'SYSTEM',
+                }
+                seen_actors[norm_key] = entry
+                actors.append(entry)
+
+        # Sort actors: Admins first, then Staff, then System, alphabetically
+        def sort_actor_key(act):
+            t = act.get('actor_type', 'STAFF')
+            prio = 0 if t == 'ADMIN' else (1 if t == 'STAFF' else 2)
+            return (prio, act.get('actor_name', '').lower())
+
+        actors.sort(key=sort_actor_key)
 
         # KPI Summary Counters (strictly within user's RBAC scope)
         total_activities = qs.count()
         security_events = qs.filter(
-            Q(action_category__in=['AUTHENTICATION', 'SECURITY']) |
+            Q(action_category__in=['AUTHENTICATION', 'SECURITY', 'ACCESS_CONTROL', 'Access & Security']) |
             Q(action_code__startswith='AUTH') |
             Q(action_code__startswith='SECURITY')
         ).count()
         commercial_mutations = qs.filter(
-            Q(action_category__in=['COMMERCE', 'COMMERCIAL']) |
+            Q(action_category__in=['COMMERCE', 'COMMERCIAL', 'FINANCE', 'BILLING', 'Commercial & Billing']) |
             Q(action_code__startswith='COMMERCE') |
             Q(action_code__startswith='ORDER') |
             Q(action_code__startswith='RAZORPAY')
@@ -350,6 +630,7 @@ class ActivityAuditLogViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ReadOnly
         return Response({
             'modules': distinct_modules,
             'categories': distinct_categories,
+            'roles': roles,
             'actor_types': distinct_actor_types,
             'source_channels': distinct_channels,
             'results': distinct_results,

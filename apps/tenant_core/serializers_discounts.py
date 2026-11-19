@@ -2,8 +2,12 @@
 apps/tenant_core/serializers_discounts.py — Serializers for Layer 2 Module H: Discounts & Dynamic Offers
 """
 
+import uuid
 from django.utils import timezone
 from rest_framework import serializers
+from apps.tenant_core.context import get_tenant_db_alias
+from .models_catalog import Package, Program
+from .models_org import Branch
 from .models_discounts import (
     DiscountCampaign,
     DiscountCode,
@@ -125,6 +129,143 @@ class DiscountCampaignSerializer(serializers.ModelSerializer):
             return None
         return max(0, obj.usage_limit - obj.redemptions.count())
 
+    def validate_configuration(self, value):
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("Configuration must be a valid JSON object.")
+
+        # Determine tenant DB alias and organization
+        db = get_tenant_db_alias()
+        request = self.context.get('request')
+        org = None
+        if request and hasattr(request, 'user'):
+            org = getattr(request.user, 'organization', None)
+        if not org and self.instance:
+            org = getattr(self.instance, 'organization', None)
+
+        branch_qs = Branch.objects.using(db) if db else Branch.objects.all()
+        program_qs = Program.objects.using(db) if db else Program.objects.all()
+        package_qs = Package.objects.using(db) if db else Package.objects.all()
+
+        if org:
+            branch_qs = branch_qs.filter(organization=org)
+            program_qs = program_qs.filter(organization=org)
+            package_qs = package_qs.filter(organization=org)
+
+        # 1. Validate branch_ids / branch_id
+        branch_ids = value.get('branch_ids')
+        if branch_ids is not None:
+            if not isinstance(branch_ids, list):
+                raise serializers.ValidationError("branch_ids must be a list of branch UUIDs.")
+            cleaned_branch_ids = [str(b).strip() for b in branch_ids if str(b).strip()]
+            if cleaned_branch_ids:
+                for bid in cleaned_branch_ids:
+                    try:
+                        uuid.UUID(str(bid))
+                    except (ValueError, TypeError):
+                        raise serializers.ValidationError(f"Invalid branch ID format: '{bid}'.")
+
+                existing_branch_ids = set(
+                    str(x) for x in branch_qs.filter(id__in=cleaned_branch_ids, status='ACTIVE').values_list('id', flat=True)
+                )
+                invalid_branches = [bid for bid in cleaned_branch_ids if bid not in existing_branch_ids]
+                if invalid_branches:
+                    raise serializers.ValidationError(f"Branch(es) not found or inactive: {', '.join(invalid_branches)}.")
+
+                value['branch_ids'] = cleaned_branch_ids
+                if not value.get('branch_id'):
+                    value['branch_id'] = cleaned_branch_ids[0]
+            else:
+                value['branch_ids'] = []
+        elif value.get('branch_id'):
+            bid = str(value['branch_id']).strip()
+            try:
+                uuid.UUID(bid)
+            except (ValueError, TypeError):
+                raise serializers.ValidationError(f"Invalid branch ID format: '{bid}'.")
+            if not branch_qs.filter(id=bid, status='ACTIVE').exists():
+                raise serializers.ValidationError(f"Branch '{bid}' not found or inactive.")
+            value['branch_ids'] = [bid]
+
+        # 2. Validate program_ids
+        program_ids = value.get('program_ids')
+        cleaned_prog_ids = []
+        if program_ids is not None:
+            if not isinstance(program_ids, list):
+                raise serializers.ValidationError("program_ids must be a list of program UUIDs.")
+            cleaned_prog_ids = [str(p).strip() for p in program_ids if str(p).strip()]
+            if cleaned_prog_ids:
+                for pid in cleaned_prog_ids:
+                    try:
+                        uuid.UUID(str(pid))
+                    except (ValueError, TypeError):
+                        raise serializers.ValidationError(f"Invalid program ID format: '{pid}'.")
+
+                existing_prog_ids = set(
+                    str(x) for x in program_qs.filter(id__in=cleaned_prog_ids, status='ACTIVE').values_list('id', flat=True)
+                )
+                invalid_progs = [pid for pid in cleaned_prog_ids if pid not in existing_prog_ids]
+                if invalid_progs:
+                    raise serializers.ValidationError(f"Program(s) not found or inactive: {', '.join(invalid_progs)}.")
+
+                value['program_ids'] = cleaned_prog_ids
+            else:
+                value['program_ids'] = []
+
+        # 3. Validate package_ids / package_id
+        package_ids = value.get('package_ids')
+        cleaned_pkg_ids = []
+        if package_ids is not None:
+            if not isinstance(package_ids, list):
+                raise serializers.ValidationError("package_ids must be a list of package UUIDs.")
+            cleaned_pkg_ids = [str(p).strip() for p in package_ids if str(p).strip()]
+            if cleaned_pkg_ids:
+                for pkg_id in cleaned_pkg_ids:
+                    try:
+                        uuid.UUID(str(pkg_id))
+                    except (ValueError, TypeError):
+                        raise serializers.ValidationError(f"Invalid package ID format: '{pkg_id}'.")
+
+                active_pkgs = list(package_qs.filter(id__in=cleaned_pkg_ids, status='ACTIVE').values('id', 'name', 'program_id'))
+                existing_pkg_map = {str(p['id']): p for p in active_pkgs}
+
+                invalid_pkgs = [pkg_id for pkg_id in cleaned_pkg_ids if pkg_id not in existing_pkg_map]
+                if invalid_pkgs:
+                    raise serializers.ValidationError(f"Package(s) not found or inactive: {', '.join(invalid_pkgs)}.")
+
+                if cleaned_prog_ids:
+                    selected_prog_set = set(cleaned_prog_ids)
+                    mismatched = [
+                        existing_pkg_map[pkg_id]['name']
+                        for pkg_id in cleaned_pkg_ids
+                        if str(existing_pkg_map[pkg_id]['program_id']) not in selected_prog_set
+                    ]
+                    if mismatched:
+                        raise serializers.ValidationError(
+                            f"The following package(s) do not belong to the selected programs: {', '.join(mismatched)}."
+                        )
+
+                value['package_ids'] = cleaned_pkg_ids
+                if not value.get('package_id'):
+                    value['package_id'] = cleaned_pkg_ids[0]
+            else:
+                value['package_ids'] = []
+        elif value.get('package_id'):
+            pkg_id = str(value['package_id']).strip()
+            try:
+                uuid.UUID(pkg_id)
+            except (ValueError, TypeError):
+                raise serializers.ValidationError(f"Invalid package ID format: '{pkg_id}'.")
+            pkg = package_qs.filter(id=pkg_id, status='ACTIVE').first()
+            if not pkg:
+                raise serializers.ValidationError(f"Package '{pkg_id}' not found or inactive.")
+            if cleaned_prog_ids and str(pkg.program_id) not in set(cleaned_prog_ids):
+                raise serializers.ValidationError(f"Package '{pkg.name}' does not belong to the selected programs.")
+            value['package_ids'] = [pkg_id]
+
+        return value
+
 
 class DiscountRuleConditionSerializer(serializers.ModelSerializer):
     class Meta:
@@ -202,6 +343,21 @@ class DiscountEligibilityRuleSerializer(serializers.ModelSerializer):
             'updated_at',
         ]
         read_only_fields = ['id', 'organization', 'created_by_user', 'created_at', 'updated_at']
+
+    def validate(self, attrs):
+        branch = attrs.get('branch')
+        if branch and getattr(branch, 'status', None) and branch.status != 'ACTIVE':
+            raise serializers.ValidationError({"branch": f"Branch '{branch.name}' is inactive."})
+
+        source_package = attrs.get('source_package')
+        if source_package and getattr(source_package, 'status', None) and source_package.status != 'ACTIVE':
+            raise serializers.ValidationError({"source_package": f"Source package '{source_package.name}' is inactive."})
+
+        target_package = attrs.get('target_package')
+        if target_package and getattr(target_package, 'status', None) and target_package.status != 'ACTIVE':
+            raise serializers.ValidationError({"target_package": f"Target package '{target_package.name}' is inactive."})
+
+        return attrs
 
 
 class DiscountRedemptionSerializer(serializers.ModelSerializer):

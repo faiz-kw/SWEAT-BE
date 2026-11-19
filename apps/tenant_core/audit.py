@@ -379,10 +379,8 @@ def _execute_emit_audit_event(
     # 7. Bridge to Canonical ActivityAuditLog for complete unified CRM visibility
     try:
         from .audit_engine import UnifiedAuditEngine
-        mod = 'ACCESS_CONTROL' if 'ROLE' in final_resource_type.upper() or 'PERMISSION' in final_resource_type.upper() else (
-            'SETTINGS' if 'SETTING' in final_resource_type.upper() or 'BRANCH' in final_resource_type.upper() else (
-                'MEMBERS' if 'USER' in final_resource_type.upper() else 'GENERAL'
-            )
+        mod = 'ADMINISTRATION' if any(kw in final_resource_type.upper() for kw in ['ROLE', 'PERMISSION', 'BRANCH', 'LOCATION', 'ORGANIZATION', 'SETTING', 'TENANTUSER', 'SECURITY']) else (
+            'MEMBERS' if 'MEMBER' in final_resource_type.upper() else 'GENERAL'
         )
         action_code = final_action if '.' in final_action else f"{final_resource_type.upper()}.{final_action.upper()}"
         UnifiedAuditEngine.record_activity(
