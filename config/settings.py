@@ -673,6 +673,11 @@ TELEPHONY_BROWSER_LIVENESS_SECONDS = int(os.getenv('TELEPHONY_BROWSER_LIVENESS_S
 TELEPHONY_MAX_OVERFLOW_ATTEMPTS_AFTER_PRIMARY = int(
     os.getenv('TELEPHONY_MAX_OVERFLOW_ATTEMPTS_AFTER_PRIMARY', '3')
 )
+# Longest call a presence heartbeat will treat as still live. Past this, an open session no longer keeps
+# an agent ON_CALL: with no sweeper, a lost hangup webhook would otherwise strand the agent forever.
+TELEPHONY_MAX_CALL_DURATION_MINUTES = int(os.getenv('TELEPHONY_MAX_CALL_DURATION_MINUTES', '120'))
+# Temporary, for the heartbeat-cadence experiment: log the writer (user and tab) of each heartbeat.
+TELEPHONY_HEARTBEAT_TRACE = os.getenv('TELEPHONY_HEARTBEAT_TRACE', 'false').lower() in ('true', '1', 'yes')
 META_APP_ID = os.getenv('META_APP_ID', '').strip()
 META_APP_SECRET = os.getenv('META_APP_SECRET', '').strip()
 META_WEBHOOK_VERIFY_TOKEN = os.getenv('META_WEBHOOK_VERIFY_TOKEN', '').strip()

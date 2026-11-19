@@ -52,6 +52,7 @@ from apps.tenant_core.models_memberships import Membership
 from apps.tenant_core.communication.adapters.voice_vobiz import VobizVoiceAdapter
 from apps.tenant_core.services_voice_calling import VoiceCallingService
 from apps.tenant_core.services_telephony_config import TelephonyConfigService
+from apps.tenant_core.services_telephony_presence import sanitize_tab_id, status_after_heartbeat
 from apps.tenant_core.services_telephony_fallback import (
     DIAL_RESULT_EVENT,
     HANGUP_XML,
@@ -1330,6 +1331,8 @@ class AgentPresenceView(APIView):
         new_status = request.data.get('status', 'AVAILABLE').upper()
         if new_status not in ('AVAILABLE', 'WRAP_UP', 'OFFLINE'):
             return Response({'error': 'Invalid status.'}, status=status.HTTP_400_BAD_REQUEST)
+        # A heartbeat is a pure liveness ping carrying no status (see services_telephony_presence).
+        is_heartbeat = request.data.get('heartbeat') is True
 
         uid_hex = request.user.id.hex[:12] if hasattr(request.user.id, 'hex') else str(request.user.id)[:12]
         unassigned_sip = f"unassigned_{uid_hex}"
@@ -1357,14 +1360,26 @@ class AgentPresenceView(APIView):
 
             # Unassigned accounts without a dedicated Vobiz line must remain OFFLINE
             # so they are never selected for inbound call dispatch.
-            effective_status = new_status if is_registered else 'OFFLINE'
+            now = timezone.now()
+            previous_status = presence.status
+            if is_heartbeat:
+                # Pure liveness ping: any `status` in the body is ignored, the server decides.
+                effective_status = status_after_heartbeat(presence, is_registered=is_registered, now=now)
+            else:
+                # Explicit change from the agent or the close-tab beacon (including OFFLINE): always honoured.
+                effective_status = new_status if is_registered else 'OFFLINE'
             presence.status = effective_status
             if effective_status == 'AVAILABLE':
                 presence.active_session = None
-            now = timezone.now()
             presence.last_heartbeat = now
             presence.browser_heartbeat_at = now
             presence.save(update_fields=['status', 'active_session', 'last_heartbeat', 'browser_heartbeat_at'])
+
+            if is_heartbeat and getattr(settings, 'TELEPHONY_HEARTBEAT_TRACE', False):
+                logger.info(
+                    "presence heartbeat user=%s tab=%s status=%s->%s",
+                    request.user.id, sanitize_tab_id(request.data.get('tab_id')), previous_status, effective_status,
+                )
 
             return Response({
                 'status': presence.status,
