@@ -511,3 +511,114 @@ class DynamicPhonePrivacyRBACTestCase(TestCase):
         req_allowed = self._make_request(self.org_admin_user)
         unsanitized = sanitize_meta_field_data(req_allowed, dict_payload)
         self.assertEqual(unsanitized['mobile_number'], '+919988776655')
+
+    # ------------------------------------------------------------------
+    # 7. Telephony Privacy & Server-Side Click-to-Call by lead_id
+    # ------------------------------------------------------------------
+    def test_10_telephony_missed_calls_and_inbound_poll_respect_dynamic_permission(self):
+        from unittest.mock import patch
+        from contextlib import nullcontext
+        from rest_framework.test import APIRequestFactory, force_authenticate
+        from apps.tenant_core.models_crm import CallSession
+        from apps.tenant_core.views_telephony import (
+            ActiveInboundCallPollView,
+            MissedCallsQueueView,
+        )
+
+        CallSession.objects.create(
+            organization=self.org,
+            lead=self.lead,
+            sales_rep=self.sales_user,
+            branch=self.branch,
+            provider='VOBIZ',
+            direction='INBOUND',
+            call_mode='HUMAN_MANUAL',
+            status='RINGING',
+            user_phone_number=self.RAW_LEAD_PHONE,
+            started_at=timezone.now(),
+        )
+
+        api_rf = APIRequestFactory()
+        with patch('apps.tenant_core.views_telephony.resolve_telephony_tenant_context', return_value=nullcontext()):
+            # 1. Sales Rep WITHOUT permission -> sees ******7890
+            req_denied = api_rf.get('/api/v1/tenant/crm/telephony/missed-calls/')
+            self.sales_user._db_alias = self.DB_ALIAS
+            req_denied._tenant_db_alias = self.DB_ALIAS
+            force_authenticate(req_denied, user=self.sales_user)
+            missed_resp = MissedCallsQueueView.as_view()(req_denied)
+            self.assertEqual(missed_resp.status_code, 200)
+            self.assertEqual(missed_resp.data['missed_calls'][0]['user_phone_number'], self.MASKED_LEAD_PHONE)
+            self.assertEqual(missed_resp.data['missed_calls'][0]['masked_phone'], self.MASKED_LEAD_PHONE)
+
+            poll_req = api_rf.get('/api/v1/tenant/crm/telephony/active/')
+            poll_req._tenant_db_alias = self.DB_ALIAS
+            force_authenticate(poll_req, user=self.sales_user)
+            poll_resp = ActiveInboundCallPollView.as_view()(poll_req)
+            self.assertEqual(poll_resp.status_code, 200)
+            self.assertTrue(poll_resp.data['active'])
+            self.assertEqual(poll_resp.data['caller_phone'], self.MASKED_LEAD_PHONE)
+
+            # 2. Grant permission -> immediately sees full phone number
+            self._set_role_phone_permission(self.role_sales, granted=True)
+            req_granted = api_rf.get('/api/v1/tenant/crm/telephony/missed-calls/')
+            req_granted._tenant_db_alias = self.DB_ALIAS
+            force_authenticate(req_granted, user=self.sales_user)
+            missed_resp2 = MissedCallsQueueView.as_view()(req_granted)
+            self.assertEqual(missed_resp2.data['missed_calls'][0]['user_phone_number'], self.RAW_LEAD_PHONE)
+
+    def test_11_click_to_call_by_lead_id_and_disposition_with_masked_phone(self):
+        from unittest.mock import MagicMock, patch
+        from contextlib import nullcontext
+        from rest_framework.test import APIRequestFactory, force_authenticate
+        from apps.tenant_core.models_crm import AgentPresence, CallSession
+        from apps.tenant_core.views_telephony import CallDispositionView, ClickToCallView
+
+        AgentPresence.objects.create(
+            organization=self.org,
+            user=self.sales_user,
+            sip_username='sweat_rep_101',
+            status='AVAILABLE',
+        )
+
+        api_rf = APIRequestFactory()
+        mock_result = MagicMock(success=True, provider_message_id='vobiz-uuid-999')
+
+        with patch('apps.tenant_core.views_telephony.resolve_telephony_tenant_context', return_value=nullcontext()), \
+             patch('apps.tenant_core.views_telephony._is_within_trai_hours', return_value=True), \
+             patch('apps.tenant_core.views_telephony.VobizVoiceAdapter.initiate_click_to_call', return_value=mock_result) as mock_dial:
+
+            # Sales Rep without phone visibility calls using ONLY lead_id
+            req = api_rf.post('/api/v1/tenant/crm/telephony/click-to-call/', {'lead_id': str(self.lead.id)}, format='json')
+            self.sales_user._db_alias = self.DB_ALIAS
+            req._tenant_db_alias = self.DB_ALIAS
+            force_authenticate(req, user=self.sales_user)
+            resp = ClickToCallView.as_view()(req)
+
+            self.assertEqual(resp.status_code, 200)
+            # Server dialed the real phone privately while returning masked_phone to restricted rep
+            mock_dial.assert_called_once()
+            self.assertEqual(mock_dial.call_args.kwargs['customer_phone'], self.RAW_LEAD_PHONE)
+            self.assertEqual(resp.data['masked_phone'], self.MASKED_LEAD_PHONE)
+
+            # Submit call disposition with masked caller_phone -> never overwrites real phone on CallSession
+            session_id = resp.data['call_session_id']
+            disp_req = api_rf.post(
+                '/api/v1/tenant/crm/telephony/disposition/',
+                {
+                    'session_id': session_id,
+                    'lead_id': str(self.lead.id),
+                    'caller_phone': self.MASKED_LEAD_PHONE,
+                    'disposition': 'INTERESTED',
+                    'disposition_notes': 'Wants morning stretch slot',
+                },
+                format='json',
+            )
+            disp_req._tenant_db_alias = self.DB_ALIAS
+            force_authenticate(disp_req, user=self.sales_user)
+            disp_resp = CallDispositionView.as_view()(disp_req)
+            self.assertEqual(disp_resp.status_code, 200)
+
+            cs = CallSession.objects.get(id=session_id)
+            self.assertEqual(cs.user_phone_number, self.RAW_LEAD_PHONE)
+            self.assertEqual(cs.disposition, 'INTERESTED')
+            self.assertEqual(cs.lead_id, self.lead.id)

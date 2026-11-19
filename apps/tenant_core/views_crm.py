@@ -4604,3 +4604,127 @@ class InAppNotificationViewSet(viewsets.ModelViewSet):
         count = qs.update(is_read=True, read_at=now)
         return Response({'marked_read': count})
 
+
+class LeadTransferViewSet(viewsets.ViewSet):
+    """
+    ViewSet for bulk lead and pipeline transfers, RM offboarding reassignments, and audit history.
+    """
+    permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
+    required_module = 'crm'
+    required_submodule = 'leads'
+    required_permission = 'crm.leads.transfer'
+    permission_action_map = {
+        'source_reps': 'crm.leads.transfer',
+        'preview': 'crm.leads.transfer',
+        'execute': 'crm.leads.transfer',
+        'rollback': 'crm.leads.transfer',
+        'history': 'crm.leads.transfer',
+    }
+
+    @action(detail=False, methods=['get'], url_path='source-reps')
+    def source_reps(self, request):
+        alias = _get_db(request)
+        org = _get_org(request)
+        if not org:
+            return Response({'error': 'Organization context missing'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from .services_lead_transfer import get_transfer_source_reps
+        source_reps = get_transfer_source_reps(org, db_alias=alias)
+        return Response({'source_reps': source_reps})
+
+    @action(detail=False, methods=['post'], url_path='preview')
+    def preview(self, request):
+        alias = _get_db(request)
+        org = _get_org(request)
+        if not org:
+            return Response({'error': 'Organization context missing'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from .services_lead_transfer import preview_transfer
+        data = request.data or {}
+        preview_data = preview_transfer(
+            organization=org,
+            source_user_id=data.get('source_user_id'),
+            lead_ids=data.get('lead_ids'),
+            is_all_matching=data.get('is_all_matching', False),
+            branch_id=data.get('branch_id'),
+            stage_filter=data.get('stage_filter'),
+            include_converted=data.get('include_converted', True),
+            include_lost=data.get('include_lost', True),
+            db_alias=alias,
+        )
+        return Response(preview_data)
+
+    @action(detail=False, methods=['post'], url_path='execute')
+    def execute(self, request):
+        alias = _get_db(request)
+        org = _get_org(request)
+        if not org:
+            return Response({'error': 'Organization context missing'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from .services_lead_transfer import execute_transfer
+        data = request.data or {}
+        try:
+            result = execute_transfer(
+                organization=org,
+                actor_user=request.user,
+                source_user_id=data.get('source_user_id'),
+                lead_ids=data.get('lead_ids'),
+                is_all_matching=data.get('is_all_matching', False),
+                target_user_ids=data.get('target_user_ids', []),
+                transfer_mode=data.get('transfer_mode', 'ROUND_ROBIN'),
+                custom_weights=data.get('custom_weights'),
+                branch_id=data.get('branch_id'),
+                stage_filter=data.get('stage_filter'),
+                include_converted=data.get('include_converted', True),
+                include_lost=data.get('include_lost', True),
+                stop_auto_assign=data.get('stop_auto_assign', True),
+                auto_switch_meta=data.get('auto_switch_meta', True),
+                reason=data.get('reason', ''),
+                db_alias=alias,
+            )
+            return Response(result, status=status.HTTP_200_OK)
+        except ValidationError as e:
+            return Response({'error': e.message_dict if hasattr(e, 'message_dict') else str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.exception("Failed to execute lead transfer")
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['post'], url_path='rollback')
+    def rollback(self, request):
+        alias = _get_db(request)
+        org = _get_org(request)
+        if not org:
+            return Response({'error': 'Organization context missing'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from .services_lead_transfer import rollback_transfer
+        batch_id = request.data.get('batch_id')
+        if not batch_id:
+            return Response({'error': 'batch_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            result = rollback_transfer(
+                organization=org,
+                batch_id=batch_id,
+                actor_user=request.user,
+                db_alias=alias,
+            )
+            return Response(result, status=status.HTTP_200_OK)
+        except ValidationError as e:
+            return Response({'error': e.message_dict if hasattr(e, 'message_dict') else str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.exception("Failed to rollback lead transfer")
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['get'], url_path='history')
+    def history(self, request):
+        alias = _get_db(request)
+        org = _get_org(request)
+        if not org:
+            return Response({'error': 'Organization context missing'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from .services_lead_transfer import get_transfer_history
+        limit = int(request.query_params.get('limit', 50))
+        history_data = get_transfer_history(org, db_alias=alias, limit=limit)
+        return Response({'history': history_data})
+
+

@@ -83,6 +83,7 @@ from .views_crm import (
     CRMCampaignPerformanceViewSet,
     CRMDashboardViewSet,
     InAppNotificationViewSet,
+    LeadTransferViewSet,
 )
 from .views_automation import (
     AutomationWorkflowViewSet,
@@ -304,6 +305,7 @@ router.register(r'crm/stage-automation-rules', CRMStageAutomationRuleViewSet, ba
 router.register(r'crm/trial-reminder-policy', CRMTrialReminderPolicyViewSet, basename='crm-trial-reminder-policy')
 router.register(r'crm/attention-policy', CRMAttentionPolicyViewSet, basename='crm-attention-policy')
 router.register(r'crm/agent-assignment-config', CRMAgentAssignmentConfigViewSet, basename='crm-agent-assignment-config')
+router.register(r'crm/lead-transfers', LeadTransferViewSet, basename='crm-lead-transfer')
 router.register(r'crm/channels', CRMCommunicationChannelsViewSet, basename='crm-channel')
 router.register(r'crm/whatsapp-policy', WhatsAppAutomationPolicyViewSet, basename='crm-whatsapp-policy')
 router.register(r'crm/communications', CommunicationMessageViewSet, basename='crm-communication')

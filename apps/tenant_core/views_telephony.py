@@ -406,7 +406,14 @@ class VobizInboundWebhookView(APIView):
                     status_label = "NEW_CALLER"
                     branch_name = "General"
 
-                masked_phone = f"+91-XXXXX-{caller_phone[-4:]}" if len(caller_phone) >= 4 else "+91-XXXXX-XXXX"
+                from .security_utils import mask_phone_if_restricted, mask_phone_number
+                masked_phone = mask_phone_number(caller_phone) or "******XXXX"
+                rep_visible_phone = mask_phone_if_restricted(
+                    None,
+                    caller_phone,
+                    user=target_rep,
+                    db_alias=get_tenant_db_alias() or 'default',
+                )
                 screen_pop_payload = {
                     'session_id': str(session.id),
                     'call_uuid': call_uuid,
@@ -414,8 +421,8 @@ class VobizInboundWebhookView(APIView):
                     'member_id': member_id_val,
                     'member_number': member_number_val,
                     'lead_id': lead_id_val,
-                    'caller_phone': caller_phone,
-                    'masked_phone': masked_phone,
+                    'caller_phone': rep_visible_phone,
+                    'masked_phone': rep_visible_phone,
                     'lead_name': display_name,
                     'branch': branch_name,
                     'status': status_label,
@@ -524,7 +531,8 @@ class VobizInboundFallbackWebhookView(APIView):
                 # Push screen-pop to secondary rep
                 lead = session.lead if session else None
                 caller_phone = session.user_phone_number if session else "Unknown"
-                masked_phone = f"+91-XXXXX-{caller_phone[-4:]}" if len(caller_phone) >= 4 else "+91-XXXXX-XXXX"
+                from .security_utils import mask_phone_number
+                masked_phone = mask_phone_number(caller_phone) or "******XXXX"
                 push_agent_telephony_event(str(secondary_user.id), 'INCOMING_CALL_POPUP', {
                     'session_id': str(session.id) if session else '',
                     'call_uuid': call_uuid,
@@ -813,85 +821,132 @@ class ClickToCallView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
-        user = request.user
-        lead_id = request.data.get('lead_id')
-        if not lead_id:
-            return Response({'error': 'lead_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        with resolve_telephony_tenant_context():
+            from .security_utils import mask_phone_if_restricted
+            user = request.user
+            lead_id = request.data.get('lead_id')
+            member_id = request.data.get('member_id')
+            source_session_id = request.data.get('session_id')
+            if not lead_id and not member_id and not source_session_id:
+                return Response(
+                    {'error': 'lead_id, member_id, or session_id is required.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
-        # 1. Enforce TRAI Outbound Calling Hours (09:00 - 21:00 IST)
-        if not _is_within_trai_hours():
-            return Response({
-                'error': 'Outbound calls are only permitted between 9:00 AM and 9:00 PM IST per TRAI regulations.',
-                'code': 'OUTSIDE_CALLING_HOURS',
-            }, status=status.HTTP_400_BAD_REQUEST)
+            # 1. Enforce TRAI Outbound Calling Hours (09:00 - 21:00 IST)
+            if not _is_within_trai_hours():
+                return Response({
+                    'error': 'Outbound calls are only permitted between 9:00 AM and 9:00 PM IST per TRAI regulations.',
+                    'code': 'OUTSIDE_CALLING_HOURS',
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-        lead = Lead.objects.filter(id=lead_id).first()
-        if not lead or not lead.phone_normalized:
-            return Response({'error': 'Lead not found or has no phone number.'}, status=status.HTTP_404_NOT_FOUND)
+            lead = None
+            target_phone = ''
+            target_org = getattr(user, 'organization', None)
+            target_branch = getattr(user, 'home_branch', None)
 
-        # 2. Resolve Agent Presence & SIP Endpoint — strictly require the agent's own registered line
-        presence = AgentPresence.objects.filter(user=user).first()
-        if (
-            not presence
-            or not presence.sip_username
-            or presence.sip_username.startswith(('unassigned_', 'agent_'))
-        ):
-            return Response(
-                {
-                    'error': 'No dedicated Vobiz softphone line available for this account. Outbound manual calling requires a registered line.',
-                    'code': 'NO_TELEPHONY_LINE',
-                },
-                status=status.HTTP_400_BAD_REQUEST,
+            if lead_id:
+                lead = Lead.objects.filter(id=lead_id).select_related('organization', 'branch').first()
+                if not lead:
+                    return Response({'error': 'Lead not found.'}, status=status.HTTP_404_NOT_FOUND)
+                if getattr(lead, 'do_not_contact', False):
+                    return Response(
+                        {'error': 'This lead is marked Do Not Contact and cannot be called.', 'code': 'DO_NOT_CONTACT'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                target_phone = (lead.phone_normalized or '').strip()
+                target_org = lead.organization or target_org
+                target_branch = lead.branch or target_branch
+            elif member_id:
+                profile = UserProfile.objects.filter(id=member_id).select_related('user', 'preferred_branch').first()
+                if not profile or not profile.user:
+                    return Response({'error': 'Member not found.'}, status=status.HTTP_404_NOT_FOUND)
+                target_phone = (getattr(profile.user, 'phone', '') or '').strip()
+                target_org = getattr(profile.user, 'organization', None) or target_org
+                target_branch = profile.preferred_branch or getattr(profile.user, 'home_branch', None) or target_branch
+            elif source_session_id:
+                prev_session = CallSession.objects.filter(id=source_session_id).select_related('lead', 'organization', 'branch').first()
+                if not prev_session:
+                    return Response({'error': 'Call session not found.'}, status=status.HTTP_404_NOT_FOUND)
+                lead = prev_session.lead
+                if lead and getattr(lead, 'do_not_contact', False):
+                    return Response(
+                        {'error': 'This lead is marked Do Not Contact and cannot be called.', 'code': 'DO_NOT_CONTACT'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                target_phone = (prev_session.user_phone_number or (lead.phone_normalized if lead else '') or '').strip()
+                target_org = prev_session.organization or (lead.organization if lead else None) or target_org
+                target_branch = prev_session.branch or (lead.branch if lead else None) or target_branch
+
+            if not target_phone:
+                return Response({'error': 'No phone number available for this contact.'}, status=status.HTTP_404_NOT_FOUND)
+
+            if not target_org:
+                target_org = Organization.objects.filter(status='ACTIVE').first()
+
+            # 2. Resolve Agent Presence & SIP Endpoint — strictly require the agent's own registered line
+            presence = AgentPresence.objects.filter(user=user).first()
+            if (
+                not presence
+                or not presence.sip_username
+                or presence.sip_username.startswith(('unassigned_', 'agent_'))
+            ):
+                return Response(
+                    {
+                        'error': 'No dedicated Vobiz softphone line available for this account. Outbound manual calling requires a registered line.',
+                        'code': 'NO_TELEPHONY_LINE',
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # 3. Create CallSession record
+            session = CallSession.objects.create(
+                organization=target_org,
+                lead=lead,
+                sales_rep=user,
+                branch=target_branch,
+                provider='VOBIZ',
+                direction='OUTBOUND',
+                call_mode='HUMAN_MANUAL',
+                status='INITIATED',
+                user_phone_number=target_phone,
+                agent_phone_number=presence.sip_username,
+                started_at=timezone.now(),
             )
 
-        # 3. Create CallSession record
-        session = CallSession.objects.create(
-            organization=lead.organization,
-            lead=lead,
-            sales_rep=user,
-            branch=lead.branch,
-            provider='VOBIZ',
-            direction='OUTBOUND',
-            call_mode='HUMAN_MANUAL',
-            status='INITIATED',
-            user_phone_number=lead.phone_normalized,
-            agent_phone_number=presence.sip_username,
-            started_at=timezone.now(),
-        )
+            vobiz_cfg = TelephonyConfigService.get_vobiz_config()
+            host = _get_webhook_host(request)
+            answer_url = f"{host}/api/v1/telephony/agent-answer-bridge/?session_id={session.id}"
+            hangup_url = f"{host}/api/v1/telephony/hangup/?session_id={session.id}"
+            registrar_host = vobiz_cfg.get('registrar_host') or 'registrar.vobiz.ai'
+            agent_sip_uri = f"sip:{presence.sip_username}@{registrar_host}"
 
-        vobiz_cfg = TelephonyConfigService.get_vobiz_config()
-        host = _get_webhook_host(request)
-        answer_url = f"{host}/api/v1/telephony/agent-answer-bridge/?session_id={session.id}"
-        hangup_url = f"{host}/api/v1/telephony/hangup/?session_id={session.id}"
-        registrar_host = vobiz_cfg.get('registrar_host') or 'registrar.vobiz.ai'
-        agent_sip_uri = f"sip:{presence.sip_username}@{registrar_host}"
+            # 4. Dispatch via VobizVoiceAdapter using dynamic tenant configuration
+            adapter = VobizVoiceAdapter(configuration=vobiz_cfg)
+            result = adapter.initiate_click_to_call(
+                agent_sip_uri=agent_sip_uri,
+                customer_phone=target_phone,
+                answer_url=answer_url,
+                hangup_url=hangup_url,
+                timeout=int(vobiz_cfg.get('ring_timeout_sec') or 35),
+            )
 
-        # 4. Dispatch via VobizVoiceAdapter using dynamic tenant configuration
-        adapter = VobizVoiceAdapter(configuration=vobiz_cfg)
-        result = adapter.initiate_click_to_call(
-            agent_sip_uri=agent_sip_uri,
-            customer_phone=lead.phone_normalized,
-            answer_url=answer_url,
-            hangup_url=hangup_url,
-            timeout=int(vobiz_cfg.get('ring_timeout_sec') or 35),
-        )
+            if result.success and result.provider_message_id:
+                session.provider_attempt_id = result.provider_message_id
+                session.status = 'RINGING'
+                session.save(update_fields=['provider_attempt_id', 'status'])
+                presence.status = 'ON_CALL'
+                presence.active_session = session
+                presence.save(update_fields=['status', 'active_session'])
 
-        if result.success and result.provider_message_id:
-            session.provider_attempt_id = result.provider_message_id
-            session.status = 'RINGING'
-            session.save(update_fields=['provider_attempt_id', 'status'])
-            presence.status = 'ON_CALL'
-            presence.active_session = session
-            presence.save(update_fields=['status', 'active_session'])
-
-        masked_phone = f"+91-XXXXX-{lead.phone_normalized[-4:]}" if len(lead.phone_normalized) >= 4 else "+91-XXXXX-XXXX"
-        return Response({
-            'call_session_id': str(session.id),
-            'status': session.status,
-            'message': 'Dialing customer via Vobiz WebPhone.',
-            'agent_sip': agent_sip_uri,
-            'masked_phone': masked_phone,
-        }, status=status.HTTP_200_OK)
+            display_phone = mask_phone_if_restricted(request, target_phone)
+            return Response({
+                'call_session_id': str(session.id),
+                'status': session.status,
+                'message': 'Dialing customer via Vobiz WebPhone.',
+                'agent_sip': agent_sip_uri,
+                'masked_phone': display_phone,
+            }, status=status.HTTP_200_OK)
 
 
 @method_decorator(csrf_exempt, name='dispatch')
@@ -976,21 +1031,31 @@ class CallDispositionView(APIView):
                     created_at__gte=timezone.now() - timedelta(minutes=15)
                 ).order_by('-created_at').first()
 
-            caller_phone = str(request.data.get('caller_phone', '')).strip()
+            from .security_utils import is_masked_phone
+            raw_caller_phone = str(request.data.get('caller_phone', '')).strip()
+            caller_phone = '' if is_masked_phone(raw_caller_phone) else raw_caller_phone
+            req_lead_id = request.data.get('lead_id')
+            resolved_lead = None
+            if req_lead_id:
+                try:
+                    resolved_lead = Lead.objects.filter(id=req_lead_id).first()
+                except Exception:
+                    resolved_lead = None
 
             if not session:
                 # Ensure the call session is captured so the agent's logged work is NEVER lost
-                org = getattr(user, 'organization', None) or Organization.objects.first()
-                branch = getattr(user, 'home_branch', None) or Branch.objects.filter(organization=org).first()
+                org = (resolved_lead.organization if resolved_lead else None) or getattr(user, 'organization', None) or Organization.objects.first()
+                branch = (resolved_lead.branch if resolved_lead else None) or getattr(user, 'home_branch', None) or Branch.objects.filter(organization=org).first()
                 session = CallSession.objects.create(
                     organization=org,
+                    lead=resolved_lead,
                     sales_rep=user if getattr(user, 'is_authenticated', False) else None,
                     branch=branch,
                     provider='VOBIZ',
                     direction=request.data.get('direction', 'OUTBOUND'),
                     call_mode='HUMAN_MANUAL',
                     status='COMPLETED',
-                    user_phone_number=caller_phone,
+                    user_phone_number=caller_phone or (resolved_lead.phone_normalized if resolved_lead else ''),
                     duration_seconds=float(request.data.get('duration_seconds', 0.0) or 0.0),
                     disposition=disposition,
                     disposition_notes=notes,
@@ -1001,9 +1066,14 @@ class CallDispositionView(APIView):
             session.disposition = disposition
             session.disposition_notes = notes
             session.disposition_submitted_at = timezone.now()
-            if not session.user_phone_number and caller_phone:
-                session.user_phone_number = caller_phone
-            session.save(update_fields=['disposition', 'disposition_notes', 'disposition_submitted_at', 'user_phone_number'])
+            update_fields = ['disposition', 'disposition_notes', 'disposition_submitted_at']
+            if not session.lead and resolved_lead:
+                session.lead = resolved_lead
+                update_fields.append('lead')
+            if not session.user_phone_number and (caller_phone or (resolved_lead and resolved_lead.phone_normalized)):
+                session.user_phone_number = caller_phone or resolved_lead.phone_normalized
+                update_fields.append('user_phone_number')
+            session.save(update_fields=update_fields)
 
             # Match or auto-create Lead if session has no lead (never auto-create if phone belongs to an existing Member)
             lead = session.lead
@@ -1342,16 +1412,17 @@ class MissedCallsQueueView(APIView):
                 disposition_submitted_at__isnull=True
             ).select_related('lead', 'sales_rep', 'lead__branch').order_by('-created_at')[:50]
 
+            from .security_utils import mask_phone_if_restricted
             results = []
             for s in missed:
                 lead = s.lead
                 phone = s.user_phone_number or ""
-                masked_phone = f"+91-XXXXX-{phone[-4:]}" if len(phone) >= 4 else "+91-XXXXX-XXXX"
+                display_phone = mask_phone_if_restricted(request, phone)
                 lead_data = {
                     'id': str(lead.id),
                     'first_name': lead.first_name,
                     'last_name': lead.last_name or '',
-                    'masked_phone': masked_phone,
+                    'masked_phone': display_phone,
                     'branch_name': lead.branch.name if lead.branch else "General",
                     'status': lead.current_status,
                 } if lead else None
@@ -1361,8 +1432,8 @@ class MissedCallsQueueView(APIView):
                     'session_id': str(s.id),
                     'started_at': s.started_at.isoformat() if s.started_at else s.created_at.isoformat(),
                     'called_at': s.created_at.isoformat(),
-                    'user_phone_number': phone,
-                    'masked_phone': masked_phone,
+                    'user_phone_number': display_phone,
+                    'masked_phone': display_phone,
                     'status': s.status,
                     'direction': s.direction,
                     'sales_rep_name': f"{s.sales_rep.first_name} {s.sales_rep.last_name or ''}".strip() if s.sales_rep else "Unassigned",
@@ -1546,7 +1617,8 @@ class ActiveInboundCallPollView(APIView):
                     status_label = f"LEAD · {lead.current_status}"
                     branch_name = lead.branch.name if lead.branch else "General"
 
-        masked_phone = f"+91-XXXXX-{caller_phone[-4:]}" if len(caller_phone) >= 4 else "+91-XXXXX-XXXX"
+        from .security_utils import mask_phone_if_restricted
+        display_phone = mask_phone_if_restricted(request, caller_phone)
         return Response({
             'active': True,
             'session_id': str(session.id),
@@ -1555,8 +1627,8 @@ class ActiveInboundCallPollView(APIView):
             'member_id': member_id_val,
             'member_number': member_number_val,
             'lead_id': lead_id_val,
-            'caller_phone': caller_phone,
-            'masked_phone': masked_phone,
+            'caller_phone': display_phone,
+            'masked_phone': display_phone,
             'lead_name': display_name,
             'branch': branch_name,
             'status': status_label,
@@ -2032,9 +2104,10 @@ class TelephonyAnalyticsView(APIView):
             recent_calls_page = recent_qs.order_by('-created_at')[offset : offset + page_size]
 
             recent_calls = []
+            from .security_utils import mask_phone_if_restricted
             for cs in recent_calls_page:
                 p = cs.user_phone_number or ''
-                masked_phone = f"+91-XXXXX-{p[-4:]}" if len(p) >= 4 else (p or "+91-XXXXX-XXXX")
+                masked_phone = mask_phone_if_restricted(request, p) if p else '******XXXX'
                 rep_name = f"{cs.sales_rep.first_name} {cs.sales_rep.last_name}".strip() if cs.sales_rep else "Automated / Pool"
                 lead_name = f"{cs.lead.first_name} {cs.lead.last_name}".strip() if cs.lead else None
                 lead_id_val = str(cs.lead_id) if cs.lead_id else None
@@ -2239,6 +2312,7 @@ class TelephonyExportView(APIView):
                 'Disposition Notes', 'Recording Available'
             ])
 
+            from .security_utils import mask_phone_if_restricted
             for cs in qs.order_by('-created_at'):
                 dur = int(cs.duration_seconds or 0)
                 dur_fmt = f"{dur // 60}m {dur % 60}s"
@@ -2251,7 +2325,7 @@ class TelephonyExportView(APIView):
                     str(cs.id),
                     time_str,
                     lead_name,
-                    cs.user_phone_number or '',
+                    mask_phone_if_restricted(request, cs.user_phone_number or ''),
                     rep_name,
                     cs.direction,
                     cs.status,
