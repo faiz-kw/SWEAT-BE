@@ -819,6 +819,22 @@ class ClickToCallView(APIView):
                 timeout=int(vobiz_cfg.get('ring_timeout_sec') or 35),
             )
 
+            if not result.success:
+                logger.warning(
+                    "ClickToCall failed: user=%s session=%s code=%s error=%s",
+                    getattr(user, 'email', user), session.id, result.error_code, result.error_message,
+                )
+                session.status = 'FAILED'
+                session.save(update_fields=['status'])
+                return Response(
+                    {
+                        'error': result.error_message or 'Vobiz could not start the call.',
+                        'code': result.error_code or 'VOBIZ_ERROR',
+                        'call_session_id': str(session.id),
+                    },
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
+
             if result.success and result.provider_message_id:
                 session.provider_attempt_id = result.provider_message_id
                 session.status = 'RINGING'
