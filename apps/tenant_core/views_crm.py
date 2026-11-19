@@ -582,12 +582,12 @@ class LeadViewSet(viewsets.ModelViewSet):
             elif bucket == 'DUE_TODAY':
                 qs = qs.filter(followup_tasks__status='PENDING', followup_tasks__due_at__date=today).distinct()
             elif bucket == 'OVERDUE':
-                qs = qs.filter(Q(followup_tasks__status='PENDING', followup_tasks__due_at__date__lt=today) | Q(sla_status='BREACHED')).distinct()
+                qs = qs.filter(Q(followup_tasks__status='PENDING', followup_tasks__due_at__date__lt=today) | Q(response_sla_status='BREACHED')).distinct()
             else:
                 qs = qs.filter(
                     Q(current_status='NEW_LEAD') |
                     Q(followup_tasks__status='PENDING', followup_tasks__due_at__date__lte=today) |
-                    Q(sla_status='BREACHED')
+                    Q(response_sla_status='BREACHED')
                 ).distinct()
         else:
             assigned_to_me = self.request.query_params.get('assigned_to_me')
@@ -926,11 +926,11 @@ class LeadViewSet(viewsets.ModelViewSet):
 
                 my_day_new = my_day_base.filter(current_status='NEW_LEAD').count()
                 my_day_due = my_day_base.filter(followup_tasks__status='PENDING', followup_tasks__due_at__date=today).distinct().count()
-                my_day_over = my_day_base.filter(Q(followup_tasks__status='PENDING', followup_tasks__due_at__date__lt=today) | Q(sla_status='BREACHED')).distinct().count()
+                my_day_over = my_day_base.filter(Q(followup_tasks__status='PENDING', followup_tasks__due_at__date__lt=today) | Q(response_sla_status='BREACHED')).distinct().count()
                 my_day_tot = my_day_base.filter(
                     Q(current_status='NEW_LEAD') |
                     Q(followup_tasks__status='PENDING', followup_tasks__due_at__date__lte=today) |
-                    Q(sla_status='BREACHED')
+                    Q(response_sla_status='BREACHED')
                 ).distinct().count()
 
                 my_day_metrics = {

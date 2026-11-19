@@ -1400,6 +1400,8 @@ class CallSession(models.Model):
     recording_url = models.URLField(max_length=1000, blank=True, default='')
     recording_storage_key = models.CharField(max_length=500, blank=True, default='')
     hangup_cause = models.CharField(max_length=100, blank=True, default='')
+    # User ids (as strings) of reps already rung for this call. Drives the inbound overflow chain.
+    tried_reps = models.JSONField(default=list, blank=True)
 
     idempotency_key = models.CharField(
         max_length=255,
@@ -1469,6 +1471,12 @@ class AgentPresence(models.Model):
         db_index=True,
     )
     last_heartbeat = models.DateTimeField(auto_now=True)
+    # Set ONLY by the agent's browser heartbeat (PUT /presence/). Deliberately not auto_now:
+    # last_heartbeat is rewritten by server-side saves, so it cannot prove the browser is open.
+    browser_heartbeat_at = models.DateTimeField(null=True, blank=True)
+    # When this agent was last handed an inbound call (stamped at claim, not at selection).
+    # Orders round robin: oldest first, NULL (never assigned) first of all.
+    last_call_assigned_at = models.DateTimeField(null=True, blank=True)
     active_session = models.ForeignKey(
         CallSession,
         on_delete=models.SET_NULL,

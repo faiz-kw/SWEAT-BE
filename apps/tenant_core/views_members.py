@@ -2332,6 +2332,20 @@ class MemberViewSet(viewsets.ViewSet):
         alias = _get_db(request)
         org = _get_org(request)
         qs = self.get_member_queryset(alias, org)
+        # Trainer branch scoping: a plain Trainer sees only members of their home branch;
+        # admins / managers / front-desk / super-admin are NEVER restricted here.
+        # (Client-360 can still look up any individual member across branches.)
+        _roles = {str(r).upper() for r in (get_user_role_codes(request) or set())}
+        if ('TRAINER' in _roles) and not (_roles & {'ORG_ADMIN', 'SUPER_ADMIN', 'BRANCH_MANAGER', 'FINANCE_ADMIN', 'FRONT_DESK'}):
+            _tb = getattr(request.user, 'home_branch_id', None)
+            if _tb:
+                qs = qs.filter(
+                    Q(preferred_branch_id=_tb)
+                    | Q(memberships__home_branch_id=_tb)
+                    | Q(memberships__purchase_branch_id=_tb)
+                ).distinct()
+            else:
+                qs = qs.none()
         today = timezone.now().date()
 
         # Branch / Location filter: current / home member branch

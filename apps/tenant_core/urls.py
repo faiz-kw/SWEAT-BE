@@ -38,6 +38,7 @@ from .views_privacy import (
 from .views_integrations import TenantIntegrationViewSet
 from .views_security_policy import SecurityPolicyView
 from . import views_telephony
+from . import views_telephony_dial_events
 from . import views_public_trial
 from . import views_pos
 from .views_audit_outbox import (
@@ -419,6 +420,7 @@ urlpatterns = [
     # Vobiz & Sales CRM Telephony Routes
     path('telephony/inbound/', views_telephony.VobizInboundWebhookView.as_view(), name='telephony-inbound'),
     path('telephony/dial-fallback/', views_telephony.VobizInboundFallbackWebhookView.as_view(), name='telephony-dial-fallback'),
+    path('telephony/dial-events/', views_telephony_dial_events.VobizDialEventView.as_view(), name='telephony-dial-events'),
     path('telephony/hangup/', views_telephony.VobizHangupWebhookView.as_view(), name='telephony-hangup'),
     path('telephony/recording/', views_telephony.VobizRecordingWebhookView.as_view(), name='telephony-recording'),
     path('telephony/agent-answer-bridge/', views_telephony.AgentAnswerBridgeXmlView.as_view(), name='telephony-agent-answer-bridge'),

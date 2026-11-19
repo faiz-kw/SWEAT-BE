@@ -17,6 +17,7 @@ import json
 import time
 import logging
 import zoneinfo
+from xml.sax.saxutils import quoteattr
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
@@ -24,6 +25,7 @@ import asyncio
 import redis
 import redis.asyncio as aioredis
 from django.conf import settings
+from django.core.serializers.json import DjangoJSONEncoder
 from django.db import connections, transaction
 from django.http import HttpResponse, StreamingHttpResponse
 from django.views import View
@@ -50,8 +52,19 @@ from apps.tenant_core.models_memberships import Membership
 from apps.tenant_core.communication.adapters.voice_vobiz import VobizVoiceAdapter
 from apps.tenant_core.services_voice_calling import VoiceCallingService
 from apps.tenant_core.services_telephony_config import TelephonyConfigService
+from apps.tenant_core.services_telephony_presence import sanitize_tab_id, status_after_heartbeat
+from apps.tenant_core.services_telephony_fallback import (
+    DIAL_RESULT_EVENT,
+    HANGUP_XML,
+    apply_hangup,
+    handle_dial_fallback,
+    parse_attempt,
+)
 
 logger = logging.getLogger(__name__)
+
+# Vobiz expects a webhook answer within 3 s; warn well before that.
+SLOW_CALLBACK_MS = 2000
 
 @contextmanager
 def resolve_telephony_tenant_context():
@@ -145,7 +158,7 @@ def push_agent_telephony_event(user_id: str, event_type: str, payload: dict, ten
     try:
         redis_url = getattr(settings, 'REDIS_URL', 'redis://localhost:6379/0')
         r = redis.from_url(redis_url, socket_timeout=1.0, socket_connect_timeout=1.0)
-        r.publish(channel, json.dumps(evt))
+        r.publish(channel, json.dumps(evt, cls=DjangoJSONEncoder))
         logger.info("Published telephony event '%s' to channel '%s'", event_type, channel)
     except Exception as e:
         logger.error("Failed to publish telephony event '%s' to Redis (%s): %s", event_type, channel, e)
@@ -261,7 +274,8 @@ class VobizInboundWebhookView(APIView):
                     agent_presence.last_heartbeat = timezone.now()
                     agent_presence.save(update_fields=['status', 'active_session', 'last_heartbeat'])
 
-                hangup_url = f"{host}/api/v1/telephony/hangup/?session_id={session.id}"
+                hangup_url = f"{host}/api/v1/telephony/hangup/?session_id={session.id}&event={DIAL_RESULT_EVENT}"
+                dial_events_url = f"{host}/api/v1/telephony/dial-events/?session_id={session.id}"
                 rec_str = "true" if vobiz_cfg.get('record_all_calls', True) else "false"
 
                 logger.info(
@@ -275,7 +289,7 @@ class VobizInboundWebhookView(APIView):
 
                 xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Dial action="{hangup_url}" callbackUrl="{hangup_url}" callerId="{caller_id}" record="{rec_str}">
+  <Dial action={quoteattr(hangup_url)} callbackUrl="{dial_events_url}" callerId="{caller_id}" record="{rec_str}">
     <Number>{customer_phone}</Number>
   </Dial>
   <Hangup/>
@@ -377,11 +391,23 @@ class VobizInboundWebhookView(APIView):
                 session.status = 'RINGING'
                 session.save(update_fields=['lead', 'sales_rep', 'status'])
 
+            if presence:
+                # Claim the rep atomically (AVAILABLE -> ON_CALL). If a simultaneous call took them
+                # first, claim_agent_for_session selects another rep; None means nobody is left.
+                presence = TelephonyConfigService.claim_agent_for_session(
+                    presence,
+                    session,
+                    org=org,
+                    preferred_user=assigned_rep,
+                    caller_branch=caller_branch,
+                )
+                target_rep = presence.user if presence else assigned_rep
+                if session.sales_rep_id != (target_rep.id if target_rep else None):
+                    session.sales_rep = target_rep
+                    session.save(update_fields=['sales_rep'])
+
             if presence and target_rep:
-                # Mark rep as ON_CALL
-                presence.status = 'ON_CALL'
-                presence.active_session = session
-                presence.save(update_fields=['status', 'active_session', 'last_heartbeat'])
+                # The rep is already ON_CALL with this session (claimed above).
 
                 member_id_val = str(member_profile.id if member_profile else (caller_user.id if caller_user else '')) if caller_type == 'MEMBER' else None
                 member_number_val = (member_profile.member_number if member_profile else (membership.membership_number if membership else None)) if caller_type == 'MEMBER' else None
@@ -434,9 +460,9 @@ class VobizInboundWebhookView(APIView):
 
                 # Build VobizXML — dial agent's registered SIP endpoint
                 host = _get_webhook_host(request)
-                fallback_url = f"{host}/api/v1/telephony/dial-fallback/?session_id={session.id}"
+                fallback_url = f"{host}/api/v1/telephony/dial-fallback/?session_id={session.id}&attempt=0"
                 rec_callback_url = f"{host}/api/v1/telephony/recording/?session_id={session.id}"
-                hangup_url = f"{host}/api/v1/telephony/hangup/?session_id={session.id}"
+                dial_events_url = f"{host}/api/v1/telephony/dial-events/?session_id={session.id}"
                 did_caller_id = did_number if did_number.startswith('+') else vobiz_cfg['from_number']
                 agent_sip = f"sip:{presence.sip_username}@{vobiz_cfg['registrar_host']}"
                 caller_display_id = did_caller_id
@@ -447,7 +473,7 @@ class VobizInboundWebhookView(APIView):
                     timeout=max(35, int(vobiz_cfg.get('ring_timeout_sec') or 35)),
                     record=vobiz_cfg['record_all_calls'],
                     recording_callback_url=rec_callback_url,
-                    hangup_url=hangup_url,
+                    dial_events_url=dial_events_url,
                 )
                 logger.info("Generated Inbound Dial XML:\n%s", xml)
                 return HttpResponse(xml, content_type="application/xml; charset=utf-8")
@@ -484,115 +510,29 @@ class VobizInboundFallbackWebhookView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
+        started = time.monotonic()
         with resolve_telephony_tenant_context():
-            session_id = request.GET.get('session_id') or request.data.get('session_id')
-            dial_status = request.data.get('DialStatus') or request.POST.get('DialStatus', 'no-answer')
-            call_uuid = request.data.get('CallUUID') or request.POST.get('CallUUID', '')
-
-            session = CallSession.objects.filter(id=session_id).first() if session_id else None
-            if not session:
-                session = CallSession.objects.filter(provider_attempt_id=call_uuid).first()
-
-            org = session.organization if session else Organization.objects.first()
-
-            # If primary call completed successfully, return Hangup Response
-            if dial_status.lower() in ('completed', 'answered'):
-                if session and session.status != 'COMPLETED':
-                    duration_val = float(request.data.get('DialBLegDuration') or request.POST.get('DialBLegDuration') or request.data.get('Duration') or 0.0)
-                    session.duration_seconds = duration_val
-                    session.bill_duration_seconds = VobizVoiceAdapter.calculate_billable_duration(duration_val)
-                    session.status = 'COMPLETED'
-                    session.ended_at = timezone.now()
-                    session.save(update_fields=['duration_seconds', 'bill_duration_seconds', 'status', 'ended_at'])
-                return HttpResponse("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Hangup/></Response>", content_type="application/xml; charset=utf-8")
-
-            # Find secondary available rep, prioritizing actively online connected reps
-            active_window = timezone.now() - timedelta(minutes=3)
-            secondary_presence = AgentPresence.objects.filter(
-                status='AVAILABLE',
-                last_heartbeat__gte=active_window,
-            ).exclude(user=session.sales_rep if session else None).order_by('-last_heartbeat').first()
-
-            vobiz_cfg = TelephonyConfigService.get_vobiz_config()
-            host = _get_webhook_host(request)
-            session_caller_id = session.agent_phone_number if (session and session.agent_phone_number and str(session.agent_phone_number).startswith('+')) else ''
-            caller_id = session_caller_id or vobiz_cfg.get('from_number') or ""
-
-            if secondary_presence:
-                secondary_user = secondary_presence.user
-                secondary_presence.status = 'ON_CALL'
-                secondary_presence.active_session = session
-                secondary_presence.save(update_fields=['status', 'active_session', 'last_heartbeat'])
-
-                if session:
-                    session.sales_rep = secondary_user
-                    session.save(update_fields=['sales_rep'])
-
-                # Push screen-pop to secondary rep
-                lead = session.lead if session else None
-                caller_phone = session.user_phone_number if session else "Unknown"
-                from .security_utils import mask_phone_number
-                masked_phone = mask_phone_number(caller_phone) or "******XXXX"
-                push_agent_telephony_event(str(secondary_user.id), 'INCOMING_CALL_POPUP', {
-                    'session_id': str(session.id) if session else '',
-                    'call_uuid': call_uuid,
-                    'lead_id': lead.id if lead else None,
-                    'lead_name': f"{lead.first_name} {lead.last_name or ''}".strip() if lead else "Member Call (Overflow)",
-                    'masked_phone': masked_phone,
-                    'branch': lead.branch.name if (lead and lead.branch) else "General",
-                    'status': lead.current_status if lead else "OVERFLOW",
-                })
-
-                complete_url = f"{host}/api/v1/telephony/hangup/"
-                registrar_host = vobiz_cfg.get('registrar_host') or 'registrar.vobiz.ai'
-                agent_sip = f"sip:{secondary_presence.sip_username}@{registrar_host}"
-                xml = VobizVoiceAdapter.build_fallback_overflow_xml(
-                    secondary_sip_uri=agent_sip,
-                    caller_id=caller_id,
-                    complete_action_url=complete_url,
-                    whisper_prompt="Please stay on the line while we connect you to our senior consultant.",
-                    timeout=int(vobiz_cfg.get('ring_timeout_sec') or 20),
-                    registrar_host=registrar_host,
-                )
-                return HttpResponse(xml, content_type="application/xml; charset=utf-8")
-
-            # If no secondary rep available either: play polite message and log missed call
-            if session:
-                session.status = 'NO_ANSWER'
-                session.save(update_fields=['status'])
-                # Always reset the agent to AVAILABLE so next call is not blocked
-                if session.sales_rep:
-                    AgentPresence.objects.filter(user=session.sales_rep).update(
-                        status='AVAILABLE',
-                        active_session=None,
-                    )
-                # Log to Lead timeline if caller was a lead
-                if session.lead:
-                    LeadActivity.objects.create(
-                        lead=session.lead,
-                        activity_type='CALL',
-                        outcome='MISSED',
-                        notes=f"Missed inbound call from {session.user_phone_number}. No reps were available to answer.",
-                        external_reference=str(session.id),
-                    )
-                # Write CallSession activity note for timeline
-                session.disposition_notes = f"MISSED: Inbound call from {session.user_phone_number}. No reps were available to answer."
-                session.save(update_fields=['disposition_notes'])
-
-                # Broadcast MISSED_CALL to reps so the Missed Calls Desk updates in real-time
-                for pres in AgentPresence.objects.filter(organization=org):
-                    push_agent_telephony_event(str(pres.user_id), 'MISSED_CALL', {
-                        'session_id': str(session.id),
-                        'call_uuid': call_uuid,
-                        'caller_phone': session.user_phone_number,
-                    })
-
-            xml = """<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Speak voice="WOMAN" language="en-IN">All consultants are currently assisting members. We have scheduled an immediate callback for you. Thank you for calling SWEAT.</Speak>
-  <Hangup/>
-</Response>"""
-            return HttpResponse(xml, content_type="application/xml; charset=utf-8")
+            data = request.data
+            outcome = handle_dial_fallback(
+                alias=get_tenant_db_alias() or 'default',
+                session_id=request.GET.get('session_id') or data.get('session_id'),
+                call_uuid=data.get('CallUUID') or request.POST.get('CallUUID', ''),
+                dial_status=data.get('DialStatus') or request.POST.get('DialStatus', 'no-answer'),
+                attempt=parse_attempt(request.GET.get('attempt')),
+                host=_get_webhook_host(request),
+            )
+            handled_ms = int((time.monotonic() - started) * 1000)
+            # Events are published after the DB lock is released, inside the tenant context
+            # so the Redis channel names resolve to the right tenant.
+            for user_id, event_type, payload in outcome.events:
+                push_agent_telephony_event(user_id, event_type, payload)
+            total_ms = int((time.monotonic() - started) * 1000)
+            log = logger.warning if total_ms > SLOW_CALLBACK_MS else logger.info
+            log(
+                "telephony.dial_fallback elapsed_ms=%d handled_ms=%d events=%d",
+                total_ms, handled_ms, len(outcome.events),
+            )
+            return HttpResponse(outcome.xml, content_type="application/xml; charset=utf-8")
 
 
 # ============================================================================
@@ -612,9 +552,15 @@ class VobizHangupWebhookView(APIView):
     def post(self, request):
         with resolve_telephony_tenant_context():
             data = request.data if isinstance(request.data, dict) else {}
+            # event=dial marks the Dial `action` URL (result of the Dial verb). Without it the hit
+            # is Vobiz's call-level hangup.
+            is_dial_result = request.GET.get('event') == DIAL_RESULT_EVENT
             call_uuid = data.get('CallUUID') or data.get('call_uuid') or request.POST.get('CallUUID', '')
             call_status = data.get('CallStatus') or request.POST.get('CallStatus', 'completed')
+            dial_status = str(data.get('DialStatus') or request.POST.get('DialStatus') or call_status).lower()
             duration_raw = float(data.get('Duration') or request.POST.get('Duration', 0.0))
+            if is_dial_result and not duration_raw:
+                duration_raw = float(data.get('DialBLegDuration') or request.POST.get('DialBLegDuration', 0.0))
             recording_url = (
                 data.get('RecordUrl')
                 or data.get('record_url')
@@ -627,92 +573,34 @@ class VobizHangupWebhookView(APIView):
             )
             hangup_cause = data.get('HangupCause') or request.POST.get('HangupCause', 'NORMAL_CLEARING')
 
-            logger.info("Vobiz Hangup Webhook: UUID=%s Duration=%ss Status=%s", call_uuid, duration_raw, call_status)
+            logger.info(
+                "Vobiz Hangup Webhook: UUID=%s Duration=%ss Status=%s dial_result=%s",
+                call_uuid, duration_raw, call_status, is_dial_result,
+            )
 
-            session = CallSession.objects.filter(provider_attempt_id=call_uuid).first()
-            if not session:
-                session_id = request.GET.get('session_id')
-                if session_id:
-                    session = CallSession.objects.filter(id=session_id).first()
+            outcome = apply_hangup(
+                alias=get_tenant_db_alias() or 'default',
+                session_id=request.GET.get('session_id'),
+                call_uuid=call_uuid,
+                duration_raw=duration_raw,
+                recording_url=recording_url,
+                hangup_cause=hangup_cause,
+                dial_result=is_dial_result,
+                dial_status=dial_status,
+            )
+            for user_id, event_type, payload in outcome.events:
+                push_agent_telephony_event(user_id, event_type, payload)
 
-            if session:
-                bill_duration = VobizVoiceAdapter.calculate_billable_duration(duration_raw)
-                is_meaningful = (duration_raw >= 30.0)
-
-                session.duration_seconds = duration_raw
-                session.bill_duration_seconds = bill_duration
-                session.is_meaningful = is_meaningful
-                session.recording_url = recording_url
-                session.hangup_cause = hangup_cause
-                session.status = 'COMPLETED' if duration_raw > 0 else 'NO_ANSWER'
-                session.ended_at = timezone.now()
-                session.save(update_fields=[
-                    'duration_seconds',
-                    'bill_duration_seconds',
-                    'is_meaningful',
-                    'recording_url',
-                    'hangup_cause',
-                    'status',
-                    'ended_at',
-                ])
-
-                # Trigger Celery background archival to private storage
-                if recording_url:
-                    try:
-                        from apps.tenant_core.tasks_recordings import archive_vobiz_recording_task
-                        archive_vobiz_recording_task.delay(str(session.id), recording_url)
-                    except Exception as task_err:
-                        logger.info("Celery task dispatch skipped or running in sync mode: %s", task_err)
-
-                # Update rep presence based on whether the call actually connected
-                if session.sales_rep:
-                    rep_id = str(session.sales_rep.id)
-                    if duration_raw > 0:
-                        # If disposition was ALREADY submitted by agent from the browser WebRTC phone:
-                        if session.disposition:
-                            logger.info("Call %s already disposed as %s. Setting rep to AVAILABLE and skipping duplicate CALL_ENDED broadcast.", session.id, session.disposition)
-                            AgentPresence.objects.filter(user=session.sales_rep).update(
-                                status='AVAILABLE',
-                                active_session=None,
-                            )
-                        else:
-                            # Connected call: place in WRAP_UP for post-call notes & disposition
-                            AgentPresence.objects.filter(user=session.sales_rep).update(
-                                status='WRAP_UP',
-                                active_session=session,
-                            )
-                            push_agent_telephony_event(rep_id, 'CALL_ENDED', {
-                                'session_id': str(session.id),
-                                'call_uuid': call_uuid,
-                                'duration_seconds': int(duration_raw),
-                                'bill_duration_seconds': bill_duration,
-                                'is_meaningful': is_meaningful,
-                                'direction': session.direction,
-                                'caller_phone': session.user_phone_number or '',
-                                'lead_id': session.lead.id if session.lead else None,
-                                'lead_name': f"{session.lead.first_name} {session.lead.last_name or ''}".strip() if session.lead else (session.user_phone_number or "Customer"),
-                                'recording_url': recording_url,
-                            })
-                    else:
-                        # Unanswered / cancelled call: instantly return to AVAILABLE
-                        AgentPresence.objects.filter(user=session.sales_rep).update(
-                            status='AVAILABLE',
-                            active_session=None,
-                        )
-                        # Only push MISSED_CALL notification for real INBOUND calls, never for agent's own outbound calls!
-                        if session.direction == 'INBOUND':
-                            push_agent_telephony_event(rep_id, 'MISSED_CALL', {
-                                'session_id': str(session.id),
-                                'call_uuid': call_uuid,
-                                'caller_phone': session.user_phone_number,
-                            })
+            # Trigger Celery background archival to private storage
+            if outcome.archive_recording_url:
+                try:
+                    from apps.tenant_core.tasks_recordings import archive_vobiz_recording_task
+                    archive_vobiz_recording_task.delay(outcome.archive_session_id, outcome.archive_recording_url)
+                except Exception as task_err:
+                    logger.info("Celery task dispatch skipped or running in sync mode: %s", task_err)
 
             # Return valid VobizXML rather than JSON to avoid 8012 Invalid Action XML carrier errors
-            xml_resp = """<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Hangup/>
-</Response>"""
-            return HttpResponse(xml_resp, content_type="application/xml; charset=utf-8")
+            return HttpResponse(HANGUP_XML, content_type="application/xml; charset=utf-8")
 
 
 
@@ -974,7 +862,8 @@ class AgentAnswerBridgeXmlView(APIView):
             vobiz_cfg = TelephonyConfigService.get_vobiz_config()
             host = _get_webhook_host(request)
             rec_callback_url = f"{host}/api/v1/telephony/recording/?session_id={session.id}"
-            hangup_url = f"{host}/api/v1/telephony/hangup/?session_id={session.id}"
+            hangup_url = f"{host}/api/v1/telephony/hangup/?session_id={session.id}&event={DIAL_RESULT_EVENT}"
+            dial_events_url = f"{host}/api/v1/telephony/dial-events/?session_id={session.id}"
             session_caller_id = session.agent_phone_number if (session.agent_phone_number and str(session.agent_phone_number).startswith('+')) else ''
             caller_id = session_caller_id or vobiz_cfg.get('from_number') or ""
 
@@ -985,6 +874,7 @@ class AgentAnswerBridgeXmlView(APIView):
                 record=bool(vobiz_cfg.get('record_all_calls', True)),
                 recording_callback_url=rec_callback_url,
                 hangup_url=hangup_url,
+                dial_events_url=dial_events_url,
             )
             return HttpResponse(xml, content_type="application/xml; charset=utf-8")
 
@@ -1511,6 +1401,8 @@ class AgentPresenceView(APIView):
         new_status = request.data.get('status', 'AVAILABLE').upper()
         if new_status not in ('AVAILABLE', 'WRAP_UP', 'OFFLINE'):
             return Response({'error': 'Invalid status.'}, status=status.HTTP_400_BAD_REQUEST)
+        # A heartbeat is a pure liveness ping carrying no status (see services_telephony_presence).
+        is_heartbeat = request.data.get('heartbeat') is True
 
         uid_hex = request.user.id.hex[:12] if hasattr(request.user.id, 'hex') else str(request.user.id)[:12]
         unassigned_sip = f"unassigned_{uid_hex}"
@@ -1538,12 +1430,26 @@ class AgentPresenceView(APIView):
 
             # Unassigned accounts without a dedicated Vobiz line must remain OFFLINE
             # so they are never selected for inbound call dispatch.
-            effective_status = new_status if is_registered else 'OFFLINE'
+            now = timezone.now()
+            previous_status = presence.status
+            if is_heartbeat:
+                # Pure liveness ping: any `status` in the body is ignored, the server decides.
+                effective_status = status_after_heartbeat(presence, is_registered=is_registered, now=now)
+            else:
+                # Explicit change from the agent or the close-tab beacon (including OFFLINE): always honoured.
+                effective_status = new_status if is_registered else 'OFFLINE'
             presence.status = effective_status
             if effective_status == 'AVAILABLE':
                 presence.active_session = None
-            presence.last_heartbeat = timezone.now()
-            presence.save(update_fields=['status', 'active_session', 'last_heartbeat'])
+            presence.last_heartbeat = now
+            presence.browser_heartbeat_at = now
+            presence.save(update_fields=['status', 'active_session', 'last_heartbeat', 'browser_heartbeat_at'])
+
+            if is_heartbeat and getattr(settings, 'TELEPHONY_HEARTBEAT_TRACE', False):
+                logger.info(
+                    "presence heartbeat user=%s tab=%s status=%s->%s",
+                    request.user.id, sanitize_tab_id(request.data.get('tab_id')), previous_status, effective_status,
+                )
 
             return Response({
                 'status': presence.status,
