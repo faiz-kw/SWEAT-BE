@@ -390,12 +390,23 @@ class VobizInboundWebhookView(APIView):
                 session.status = 'RINGING'
                 session.save(update_fields=['lead', 'sales_rep', 'status'])
 
+            if presence:
+                # Claim the rep atomically (AVAILABLE -> ON_CALL). If a simultaneous call took them
+                # first, claim_agent_for_session selects another rep; None means nobody is left.
+                presence = TelephonyConfigService.claim_agent_for_session(
+                    presence,
+                    session,
+                    org=org,
+                    preferred_user=assigned_rep,
+                    caller_branch=caller_branch,
+                )
+                target_rep = presence.user if presence else assigned_rep
+                if session.sales_rep_id != (target_rep.id if target_rep else None):
+                    session.sales_rep = target_rep
+                    session.save(update_fields=['sales_rep'])
+
             if presence and target_rep:
-                # Mark rep as ON_CALL
-                presence.status = 'ON_CALL'
-                presence.active_session = session
-                presence.last_call_assigned_at = timezone.now()
-                presence.save(update_fields=['status', 'active_session', 'last_heartbeat', 'last_call_assigned_at'])
+                # The rep is already ON_CALL with this session (claimed above).
 
                 member_id_val = str(member_profile.id if member_profile else (caller_user.id if caller_user else '')) if caller_type == 'MEMBER' else None
                 member_number_val = (member_profile.member_number if member_profile else (membership.membership_number if membership else None)) if caller_type == 'MEMBER' else None

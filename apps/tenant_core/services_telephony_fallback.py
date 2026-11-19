@@ -32,7 +32,6 @@ from apps.tenant_core.services_telephony_config import TelephonyConfigService
 logger = logging.getLogger(__name__)
 
 DIAL_RESULT_EVENT = 'dial'
-MAX_CLAIM_RETRIES = 3
 FIRST_OVERFLOW_WHISPER = "Please stay on the line while we connect you to our senior consultant."
 
 _XML_HEAD = '<?xml version="1.0" encoding="UTF-8"?>'
@@ -149,23 +148,16 @@ def _overflow_xml(session: CallSession, presence: AgentPresence, host: str, next
 
 def _claim_next_rep(alias: str, session: CallSession, excluded: list[str]) -> AgentPresence | None:
     """
-    Picks the next live, AVAILABLE rep not already tried, then claims them with a conditional
-    UPDATE (AVAILABLE -> ON_CALL). If another call won the race, exclude that rep and re-select.
+    Picks the next live, AVAILABLE rep not already tried, then claims them atomically
+    (AVAILABLE -> ON_CALL). If another call won the race, the shared helper selects again.
     """
-    skip = set(excluded)
-    for _ in range(MAX_CLAIM_RETRIES):
-        candidate = TelephonyConfigService.get_available_agent(
-            db_alias=alias, org=session.organization, exclude_user_ids=skip,
-        )
-        if candidate is None:
-            return None
-        claimed = AgentPresence.objects.using(alias).filter(
-            pk=candidate.pk, status='AVAILABLE',
-        ).update(status='ON_CALL', active_session=session, last_call_assigned_at=timezone.now())
-        if claimed:
-            return candidate
-        skip.add(str(candidate.user_id))
-    return None
+    org = session.organization
+    candidate = TelephonyConfigService.get_available_agent(
+        db_alias=alias, org=org, exclude_user_ids=excluded,
+    )
+    return TelephonyConfigService.claim_agent_for_session(
+        candidate, session, db_alias=alias, org=org, exclude_user_ids=excluded,
+    )
 
 
 def _popup_event(session: CallSession, call_uuid: str, user_id: str) -> Event:

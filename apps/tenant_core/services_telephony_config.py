@@ -28,6 +28,8 @@ class TelephonyConfigService:
     DEFAULT_WSS_URL = "wss://registrar.vobiz.ai:5063"
     DEFAULT_DID = ""
     DEFAULT_TIMEOUT_SEC = 35
+    # Total tries to claim an agent when another call keeps taking the chosen one first.
+    MAX_CLAIM_ATTEMPTS = 3
 
     @classmethod
     def get_vobiz_config(cls, db_alias: Optional[str] = None) -> Dict[str, Any]:
@@ -302,6 +304,61 @@ class TelephonyConfigService:
             return stale_agent
 
         logger.warning("Telephony dispatch: No sales agents currently available in db %s (all busy, wrap-up, or offline)", alias)
+        return None
+
+    @classmethod
+    def claim_agent_for_session(
+        cls,
+        candidate,
+        session,
+        db_alias: str | None = None,
+        org=None,
+        preferred_user=None,
+        caller_branch=None,
+        exclude_user_ids: Iterable | None = None,
+    ):
+        """
+        Atomically claims ``candidate`` (an AgentPresence from ``get_available_agent``) for ``session``.
+
+        The claim is one conditional UPDATE (AVAILABLE -> ON_CALL), so two calls that picked the same
+        agent cannot both get them: the loser matches zero rows. A loser excludes that agent and
+        selects again, up to ``MAX_CLAIM_ATTEMPTS`` times in total.
+
+        The winner is marked ``ON_CALL`` with ``active_session`` and stamped for round robin
+        (``last_call_assigned_at``). Returns the claimed AgentPresence, or None when every attempt
+        lost. The caller is responsible for ``session.sales_rep``.
+        """
+        alias = db_alias or get_tenant_db_alias() or "default"
+        from apps.tenant_core.models_crm import AgentPresence
+
+        skip = {str(uid) for uid in (exclude_user_ids or [])}
+        for attempt in range(cls.MAX_CLAIM_ATTEMPTS):
+            if candidate is None:
+                return None
+            now = timezone.now()
+            # update() does not run auto_now, so last_heartbeat is set explicitly (as the old save() did).
+            claimed = AgentPresence.objects.using(alias).filter(
+                pk=candidate.pk, status="AVAILABLE",
+            ).update(
+                status="ON_CALL",
+                active_session=session,
+                last_call_assigned_at=now,
+                last_heartbeat=now,
+            )
+            if claimed:
+                return candidate
+            logger.info("Telephony claim: agent %s was taken by another call", candidate.user_id)
+            skip.add(str(candidate.user_id))
+            if attempt == cls.MAX_CLAIM_ATTEMPTS - 1:
+                break
+            candidate = cls.get_available_agent(
+                db_alias=alias,
+                org=org,
+                preferred_user=preferred_user,
+                caller_branch=caller_branch,
+                exclude_user_ids=skip,
+            )
+        logger.warning("Telephony claim: every claim attempt lost the race (excluded=%s)", sorted(skip))
         return None
 
     @classmethod
