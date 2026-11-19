@@ -36,6 +36,7 @@ from apps.tenant_core.models import (
     AccessEvent,
 )
 from apps.tenant_core.services_bookings import BookingWaitlistAttendanceService
+from apps.tenant_core.services_booking_policy import BookingPolicyService
 
 
 class Layer2Phase9BookingAttendanceTests(TestCase):
@@ -425,3 +426,51 @@ class Layer2Phase9BookingAttendanceTests(TestCase):
         booking.refresh_from_db()
         self.assertEqual(booking.status, 'COMPLETED')
         self.assertTrue(AttendanceRecord.objects.filter(booking=booking, check_in_method='ACCESS_DEVICE').exists())
+
+    def test_07_dynamic_booking_policy_and_cooling_off_reset(self):
+        # 1. Save dynamic booking policy with custom limits at organization level
+        policy = BookingPolicyService.save_policy(
+            organization=self.org,
+            policy_data={
+                'max_upcoming_bookings': 10,
+                'advance_booking_days_max': 14,
+                'no_show_restriction_threshold': 3,
+                'no_show_cooling_off_days': 5,
+                'restricted_max_advance_bookings': 1,
+            },
+            branch=None,
+            db_alias='tenant_test'
+        )
+        self.assertEqual(policy.max_upcoming_bookings, 10)
+        self.assertEqual(policy.no_show_cooling_off_days, 5)
+
+        # 2. Verify active AttendancePolicySet was synchronized
+        self.att_policy.refresh_from_db()
+        self.assertEqual(self.att_policy.normal_max_advance_bookings, 10)
+        self.assertEqual(self.att_policy.restricted_max_advance_bookings, 1)
+        self.assertEqual(self.att_policy.restriction_threshold, 3)
+        self.assertEqual(self.att_policy.restriction_duration_days, 5)
+
+        # 3. Simulate member under restriction with cooling-off expired (6 days ago vs 5 days cooling off)
+        member_att_state, _ = MemberAttendanceState.objects.get_or_create(
+            user_profile=self.member_profile,
+            defaults={'attendance_policy_set': self.att_policy, 'booking_mode': 'NORMAL'}
+        )
+        member_att_state.attendance_policy_set = self.att_policy
+        member_att_state.booking_mode = 'SINGLE_BOOKING'
+        member_att_state.current_max_advance_bookings = 1
+        member_att_state.consecutive_no_show_count = 3
+        member_att_state.restriction_started_at = timezone.now() - timedelta(days=6)
+        member_att_state.save()
+
+        # can_member_book should detect cooling off expired, auto-restore to NORMAL mode
+        can_book, reason = BookingWaitlistAttendanceService.can_member_book(
+            self.member_profile,
+            self.org,
+            occurrence=self.occurrence
+        )
+        self.assertTrue(can_book)
+        member_att_state.refresh_from_db()
+        self.assertEqual(member_att_state.booking_mode, 'NORMAL')
+        self.assertEqual(member_att_state.current_max_advance_bookings, 10)
+        self.assertEqual(member_att_state.consecutive_no_show_count, 0)

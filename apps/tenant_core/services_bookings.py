@@ -246,16 +246,53 @@ class BookingWaitlistAttendanceService:
         ).first()
 
         if member_state and member_state.booking_mode == 'SINGLE_BOOKING':
-            active_advance = Booking.objects.using(alias).filter(
-                user_profile=user_profile,
-                status__in=['CONFIRMED', 'RESERVED'],
-                occurrence__start_at__gt=timezone.now()
-            ).count()
-            if active_advance >= member_state.current_max_advance_bookings:
-                return (
-                    False,
-                    f"Booking restricted due to previous no-shows. Maximum active advance bookings allowed: {member_state.current_max_advance_bookings}."
+            # Dynamic Cooling-Off Expiration Check
+            branch = occurrence.branch if occurrence else None
+            from .services_booking_policy import BookingPolicyService
+            effective_bp = BookingPolicyService.get_effective_policy(organization, branch=branch, db_alias=alias)
+            cooling_days = int(
+                effective_bp.get('no_show_cooling_off_days')
+                or getattr(attendance_policy, 'restriction_duration_days', 7)
+                or 7
+            )
+            now = timezone.now()
+
+            # If cooling-off window has elapsed, auto-restore member to NORMAL mode
+            if member_state.restriction_started_at and now > (member_state.restriction_started_at + timedelta(days=cooling_days)):
+                member_state.booking_mode = 'NORMAL'
+                member_state.consecutive_no_show_count = 0
+                normal_max = int(
+                    effective_bp.get('max_upcoming_bookings')
+                    or getattr(attendance_policy, 'normal_max_advance_bookings', 7)
+                    or 7
                 )
+                member_state.current_max_advance_bookings = normal_max
+                member_state.save(using=alias, update_fields=['booking_mode', 'consecutive_no_show_count', 'current_max_advance_bookings', 'updated_at'])
+
+                try:
+                    AttendancePolicyEvent.objects.using(alias).create(
+                        user_profile=user_profile,
+                        attendance_policy_set=attendance_policy,
+                        event_type='POLICY_RESET',
+                        new_booking_mode='NORMAL',
+                        reason=f"No-show restriction cooling-off period ({cooling_days} days) completed; auto-restored to NORMAL",
+                        triggered_by_type='SYSTEM',
+                        created_at=now
+                    )
+                except Exception as log_e:
+                    logger.warning("Failed to log cooling-off reset event: %s", log_e)
+            else:
+                active_advance = Booking.objects.using(alias).filter(
+                    user_profile=user_profile,
+                    status__in=['CONFIRMED', 'RESERVED'],
+                    occurrence__start_at__gt=now
+                ).count()
+                max_allowed = member_state.current_max_advance_bookings or int(effective_bp.get('restricted_max_advance_bookings', 1))
+                if active_advance >= max_allowed:
+                    return (
+                        False,
+                        f"Booking restricted due to previous no-shows. Maximum active advance bookings allowed: {max_allowed}."
+                    )
 
         return True, ""
 
@@ -915,13 +952,22 @@ class BookingWaitlistAttendanceService:
                 if not can_book:
                     raise ValidationError(restriction_reason)
 
-            # 4. Check Booking Policy via canonical hierarchy
+            # 4. Resolve Configurable Booking Policy & Hierarchy
+            from .services_booking_policy import BookingPolicyService
+            effective_bp = BookingPolicyService.get_effective_policy(organization, branch=branch, db_alias=alias)
             booking_policy = cls.resolve_booking_policy(occurrence, db_alias=alias)
 
-            if booking_policy and not is_staff_override:
+            if not is_staff_override:
                 now = timezone.now()
-                # Check max upcoming bookings (allows up to 7 advance sessions)
-                max_upcoming = max(int(getattr(booking_policy, 'max_upcoming_bookings', 7) or 7), 7)
+                # Check max upcoming bookings dynamically (respects configured UI value, e.g. 10)
+                configured_max = effective_bp.get('max_upcoming_bookings')
+                if configured_max:
+                    max_upcoming = int(configured_max)
+                elif booking_policy and booking_policy.max_upcoming_bookings:
+                    max_upcoming = int(booking_policy.max_upcoming_bookings)
+                else:
+                    max_upcoming = 7
+
                 upcoming_count = Booking.objects.using(alias).filter(
                     user_profile=user_profile,
                     status__in=['CONFIRMED', 'RESERVED'],
@@ -930,42 +976,41 @@ class BookingWaitlistAttendanceService:
                 if upcoming_count >= max_upcoming:
                     raise ValidationError(f"Maximum upcoming bookings ({max_upcoming}) exceeded.")
 
-                # Check booking window
-                diff_minutes = int((occurrence.start_at - now).total_seconds() / 60)
-                if booking_policy.booking_open_minutes_before and diff_minutes > booking_policy.booking_open_minutes_before:
-                    raise ValidationError("Booking window has not opened yet for this class occurrence.")
-                if booking_policy.booking_close_minutes_before and diff_minutes < booking_policy.booking_close_minutes_before:
-                    raise ValidationError("Booking window has closed for this class occurrence.")
+                # Check booking window from policy hierarchy if configured
+                if booking_policy:
+                    diff_minutes = int((occurrence.start_at - now).total_seconds() / 60)
+                    if booking_policy.booking_open_minutes_before and diff_minutes > booking_policy.booking_open_minutes_before:
+                        raise ValidationError("Booking window has not opened yet for this class occurrence.")
+                    if booking_policy.booking_close_minutes_before and diff_minutes < booking_policy.booking_close_minutes_before:
+                        raise ValidationError("Booking window has closed for this class occurrence.")
 
-                # Check trial allowed
-                if booking_type == 'TRIAL':
-                    if not booking_policy.allow_trial:
-                        raise ValidationError("Trial bookings are not permitted by organization policy.")
-                    if booking_policy.max_trial_bookings:
-                        trials_used = Booking.objects.using(alias).filter(
-                            user_profile=user_profile,
-                            booking_type='TRIAL'
-                        ).count()
-                        if trials_used >= booking_policy.max_trial_bookings:
-                            raise ValidationError(f"Maximum trial bookings ({booking_policy.max_trial_bookings}) exceeded.")
+                    # Check trial allowed
+                    if booking_type == 'TRIAL':
+                        if not booking_policy.allow_trial:
+                            raise ValidationError("Trial bookings are not permitted by organization policy.")
+                        if booking_policy.max_trial_bookings:
+                            trials_used = Booking.objects.using(alias).filter(
+                                user_profile=user_profile,
+                                booking_type='TRIAL'
+                            ).count()
+                            if trials_used >= booking_policy.max_trial_bookings:
+                                raise ValidationError(f"Maximum trial bookings ({booking_policy.max_trial_bookings}) exceeded.")
 
-            # 4b. Check Configurable BookingPolicyService for booking types & advance limits
-            from .services_booking_policy import BookingPolicyService
-            effective_bp = BookingPolicyService.get_effective_policy(organization, branch=branch, db_alias=alias)
-            allowed_types = effective_bp.get('allowed_booking_types')
-            if allowed_types:
-                # Normalize types: A member booking an occurrence/class is permitted under 'CLASS' or 'MEMBER'
-                normalized_type = 'CLASS' if booking_type in ['CLASS', 'MEMBER'] else booking_type
-                normalized_allowed = {'CLASS' if t in ['CLASS', 'MEMBER'] else t for t in allowed_types}
-                if normalized_type not in normalized_allowed:
-                    raise ValidationError(f"Booking type '{booking_type}' is not permitted by current booking policy.")
+                # Check permitted booking types
+                allowed_types = effective_bp.get('allowed_booking_types')
+                if allowed_types:
+                    # Normalize types: A member booking an occurrence/class is permitted under 'CLASS' or 'MEMBER'
+                    normalized_type = 'CLASS' if booking_type in ['CLASS', 'MEMBER'] else booking_type
+                    normalized_allowed = {'CLASS' if t in ['CLASS', 'MEMBER'] else t for t in allowed_types}
+                    if normalized_type not in normalized_allowed:
+                        raise ValidationError(f"Booking type '{booking_type}' is not permitted by current booking policy.")
 
-            # Check advance booking window limit (up to 7 days ahead; staff/admin bypasses)
-            adv_days_max = effective_bp.get('advance_booking_days_max') or 7
-            if not is_staff_override and adv_days_max and occurrence.occurrence_date:
-                max_allowed_date = timezone.now().date() + timedelta(days=int(adv_days_max))
-                if occurrence.occurrence_date > max_allowed_date:
-                    raise ValidationError(f"Advance bookings beyond {adv_days_max} days are not permitted.")
+                # Check advance booking window limit dynamically from effective_bp (e.g. 14 days)
+                adv_days_max = effective_bp.get('advance_booking_days_max') or 14
+                if adv_days_max and occurrence.occurrence_date:
+                    max_allowed_date = timezone.now().date() + timedelta(days=int(adv_days_max))
+                    if occurrence.occurrence_date > max_allowed_date:
+                        raise ValidationError(f"Advance bookings beyond {adv_days_max} days are not permitted.")
 
             # 5. Member validation & Package Class Access
             units_to_consume = Decimal('1.00')

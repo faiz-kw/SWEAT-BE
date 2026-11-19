@@ -60,6 +60,11 @@ DEFAULT_BOOKING_POLICY: Dict[str, Any] = {
     'max_upcoming_bookings': 7,
     'advance_booking_days_max': 7,
 
+    # 5b. Attendance Discipline & No-Show Restriction Rules
+    'no_show_restriction_threshold': 2,
+    'no_show_cooling_off_days': 7,
+    'restricted_max_advance_bookings': 1,
+
     # 6. Turnstile QR Access Configuration
     'qr_activation_minutes_before_class': 20,
 
@@ -183,6 +188,9 @@ class BookingPolicyService:
                 'require_active_membership',
                 'max_upcoming_bookings',
                 'advance_booking_days_max',
+                'no_show_restriction_threshold',
+                'no_show_cooling_off_days',
+                'restricted_max_advance_bookings',
                 'qr_activation_minutes_before_class',
                 'notify_unpaid_auto_cancellation',
                 'notify_unconfirmed_auto_cancellation',
@@ -222,6 +230,28 @@ class BookingPolicyService:
                     o_settings.save(using=alias, update_fields=['booking_cancellation_window_hours', 'late_cancellation_fee', 'booking_config', 'updated_at'])
             except Exception as e:
                 logger.warning("Failed syncing governance settings mirror: %s", e)
+
+            # Synchronize active AttendancePolicySet so discipline rules stay 100% in sync with web config
+            try:
+                from .models_bookings import AttendancePolicySet
+                att_qs = AttendancePolicySet.objects.using(alias).filter(organization=organization, status='ACTIVE')
+                if branch:
+                    att_qs = att_qs.filter(branch=branch)
+                for aps in att_qs:
+                    aps.normal_max_advance_bookings = int(cfg.max_upcoming_bookings or 7)
+                    aps.restricted_max_advance_bookings = int(cfg.restricted_max_advance_bookings or 1)
+                    aps.restriction_threshold = int(cfg.no_show_restriction_threshold or 2)
+                    aps.restriction_duration_days = int(cfg.no_show_cooling_off_days or 7)
+                    aps.updated_at = timezone.now()
+                    aps.save(using=alias, update_fields=[
+                        'normal_max_advance_bookings',
+                        'restricted_max_advance_bookings',
+                        'restriction_threshold',
+                        'restriction_duration_days',
+                        'updated_at'
+                    ])
+            except Exception as e:
+                logger.warning("Failed syncing active AttendancePolicySet with booking config: %s", e)
 
             # Record business audit
             target_desc = f"Branch '{branch.name}'" if branch else f"Tenant '{organization.name}'"
@@ -283,7 +313,7 @@ class BookingPolicyService:
                     minutes = policy.get('auto_cancel_unpaid_minutes', 15)
                     return True, 'AUTO_CANCELLED_UNPAID', f"Auto-cancelled: Payment not completed within {minutes} minutes."
 
-        # 2. Evaluate Unconfirmed Auto-Cancellation (T-60 mins before session or creation fallback)
+        # 2. Evaluate Unconfirmed Auto-Cancellation (time limit from booking creation or before session start)
         if policy.get('auto_cancel_unconfirmed_enabled', True):
             confirmation_status = getattr(booking, 'confirmation_status', 'CONFIRMED')
             is_unconfirmed = (confirmation_status in ['PENDING', 'RESCHEDULE_REQUESTED']) or (booking.status == 'RESERVED')
@@ -292,12 +322,12 @@ class BookingPolicyService:
                     getattr(booking, 'occurrence', None).start_at if getattr(booking, 'occurrence', None) else None
                 )
                 minutes = int(policy.get('auto_cancel_unconfirmed_minutes', 60))
-                if start_time:
-                    unconfirmed_deadline = start_time - timedelta(minutes=minutes)
-                else:
-                    unconfirmed_deadline = created_time + timedelta(minutes=minutes)
+                creation_deadline = created_time + timedelta(minutes=minutes)
+                session_deadline = (start_time - timedelta(minutes=minutes)) if start_time else None
 
-                if current_time >= unconfirmed_deadline:
+                if current_time >= creation_deadline:
+                    return True, 'AUTO_CANCELLED_UNCONFIRMED', f"Auto-cancelled: Booking not confirmed within {minutes} minutes of reservation."
+                elif session_deadline and current_time >= session_deadline:
                     return True, 'AUTO_CANCELLED_UNCONFIRMED', f"Auto-cancelled: Booking not confirmed {minutes} minutes before session."
 
         return False, None, None

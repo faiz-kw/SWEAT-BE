@@ -163,6 +163,10 @@ class AttendancePolicySet(models.Model):
     normal_max_advance_bookings = models.IntegerField(default=7)
     restricted_max_advance_bookings = models.IntegerField(default=1)
     restriction_threshold = models.IntegerField(default=2)
+    restriction_duration_days = models.IntegerField(
+        default=7,
+        help_text="Cooling-off window in days before no-show restriction automatically expires"
+    )
     reset_on_successful_attendance = models.BooleanField(default=True)
     no_show_mark_after_minutes = models.IntegerField(default=0)
     status = models.CharField(
@@ -549,6 +553,20 @@ class BookingPolicyConfig(models.Model):
     advance_booking_days_max = models.IntegerField(
         default=14,
         help_text="Maximum days in advance a member is allowed to book"
+    )
+
+    # 5b. Attendance Discipline & No-Show Restriction Rules
+    no_show_restriction_threshold = models.IntegerField(
+        default=2,
+        help_text="Consecutive no-shows before advance booking is restricted"
+    )
+    no_show_cooling_off_days = models.IntegerField(
+        default=7,
+        help_text="Cooling-off window in days before no-show restriction automatically expires"
+    )
+    restricted_max_advance_bookings = models.IntegerField(
+        default=1,
+        help_text="Maximum advance bookings permitted while restricted"
     )
 
     # 6. Turnstile QR Access Configuration
