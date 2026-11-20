@@ -4,7 +4,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('tenant_core', '0086_agentpresence_last_call_assigned_at'),
+        ('tenant_core', '0085_attendancepolicyset_restriction_duration_days_and_more'),
     ]
 
     operations = [

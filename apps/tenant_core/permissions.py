@@ -294,6 +294,32 @@ class TenantRBACPermission(permissions.BasePermission):
 
             raise PermissionDenied(reason)
 
+        # Strict Lead Visibility: Non-supervisors cannot view or modify leads assigned to other users
+        if hasattr(obj, 'assigned_sales_user_id') and obj.assigned_sales_user_id:
+            from apps.tenant_core.security_utils import get_user_role_codes
+            user_roles = get_user_role_codes(request)
+            is_supervisor = (
+                getattr(request.user, 'is_superuser', False)
+                or any(r in ('ORG_ADMIN', 'SUPER_ADMIN', 'TENANT_ADMIN', 'BRANCH_MANAGER', 'SALES_MANAGER') for r in user_roles)
+            )
+            if not is_supervisor:
+                try:
+                    from apps.tenant_core.models_users import TenantUser
+                    db = getattr(request, '_tenant_db_alias', None) or 'default'
+                    emp_prof = getattr(getattr(request.user, 'profile', None), 'employee_profile', None)
+                    if emp_prof and TenantUser.objects.using(db).filter(profile__employee_profile__reporting_manager=emp_prof).exists():
+                        is_supervisor = True
+                except Exception:
+                    pass
+
+            # Allow if user is either the assigned sales user OR the assigned trainer user
+            is_assigned_user = (
+                obj.assigned_sales_user_id == request.user.id
+                or getattr(obj, 'assigned_trainer_user_id', None) == request.user.id
+            )
+            if not is_supervisor and not is_assigned_user:
+                raise PermissionDenied('You do not have permission to view or access leads assigned to other team members.')
+
         return True
 
 

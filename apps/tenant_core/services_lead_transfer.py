@@ -374,6 +374,21 @@ def execute_transfer(
     if not ordered_target_ids:
         raise ValidationError({'target_user_ids': 'Selected recipients are not eligible or active.'})
 
+    # Validate eligibility of each recipient against CRM setup policies (allowed_role_codes, excluded_user_ids, availability)
+    from .services_lead_assignment import LeadAssignmentEligibilityService
+    target_branch = Branch.objects.using(alias).filter(id=branch_id, organization=organization).first() if (branch_id and branch_id != 'ALL') else None
+    for target_user in target_users:
+        is_valid, validation_err = LeadAssignmentEligibilityService.validate_assignee_eligibility(
+            organization=organization,
+            user=target_user,
+            branch=target_branch,
+            db_alias=alias,
+        )
+        if not is_valid:
+            raise ValidationError({
+                'target_user_ids': f"Recipient '{get_user_display_name(target_user)}' is not eligible for lead assignment: {validation_err}"
+            })
+
     source_user = None
     source_user_name = ''
     if source_user_id:

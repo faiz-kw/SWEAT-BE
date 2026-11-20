@@ -326,18 +326,40 @@ class TenantUserSerializer(serializers.ModelSerializer):
 
     def get_role(self, obj):
         try:
-            for ra in self._get_role_assignments(obj):
-                if ra.is_active and ra.role:
-                    return ra.role.code
+            role_hierarchy = {
+                'SUPER_ADMIN': 100,
+                'ORG_ADMIN': 90,
+                'BRANCH_MANAGER': 80,
+                'FINANCE_ADMIN': 70,
+                'SALES_REP': 60,
+                'FRONT_DESK': 50,
+                'TRAINER': 40,
+                'MEMBER': 10,
+            }
+            active_ras = [ra for ra in self._get_role_assignments(obj) if ra.is_active and ra.role]
+            if active_ras:
+                best_ra = max(active_ras, key=lambda ra: role_hierarchy.get(ra.role.code, 0))
+                return best_ra.role.code
         except Exception:
             pass
         return 'STAFF'
 
     def get_role_name(self, obj):
         try:
-            for ra in self._get_role_assignments(obj):
-                if ra.is_active and ra.role:
-                    return ra.role.name
+            role_hierarchy = {
+                'SUPER_ADMIN': 100,
+                'ORG_ADMIN': 90,
+                'BRANCH_MANAGER': 80,
+                'FINANCE_ADMIN': 70,
+                'SALES_REP': 60,
+                'FRONT_DESK': 50,
+                'TRAINER': 40,
+                'MEMBER': 10,
+            }
+            active_ras = [ra for ra in self._get_role_assignments(obj) if ra.is_active and ra.role]
+            if active_ras:
+                best_ra = max(active_ras, key=lambda ra: role_hierarchy.get(ra.role.code, 0))
+                return best_ra.role.name
         except Exception:
             pass
         return 'Staff Member'

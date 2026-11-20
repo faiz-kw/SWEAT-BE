@@ -532,6 +532,31 @@ class LeadViewSet(viewsets.ModelViewSet):
             qs = qs.filter(Q(branch_id__in=permitted_branches) | Q(assigned_sales_user=self.request.user) | Q(branch_id__isnull=True))
         # --- FIX: INCLUDE ORGANIZATION-WIDE LEADS IN BRANCH SCOPE END ---
 
+        # Enforce role-based lead visibility:
+        # Supervisors (Org Admins, Super Admins, Branch Managers, Sales Managers, or Reporting Managers) can view branch/org leads.
+        # Staff/Sales/HR reps without supervisor roles can ONLY view leads assigned to them.
+        from apps.tenant_core.security_utils import get_user_role_codes
+        user_roles = get_user_role_codes(self.request)
+        is_lead_supervisor = (
+            getattr(self.request.user, 'is_superuser', False)
+            or any(r in ('ORG_ADMIN', 'SUPER_ADMIN', 'TENANT_ADMIN', 'BRANCH_MANAGER', 'SALES_MANAGER') for r in user_roles)
+        )
+        if not is_lead_supervisor:
+            try:
+                emp_prof = getattr(getattr(self.request.user, 'profile', None), 'employee_profile', None)
+                if emp_prof and TenantUser.objects.using(alias).filter(profile__employee_profile__reporting_manager=emp_prof).exists():
+                    is_lead_supervisor = True
+            except Exception:
+                pass
+
+        if not is_lead_supervisor:
+            unassigned_filter = self.request.query_params.get('unassigned')
+            is_unassigned_query = unassigned_filter and str(unassigned_filter).lower() in ('true', '1')
+            if is_unassigned_query:
+                qs = qs.filter(assigned_sales_user__isnull=True)
+            else:
+                qs = qs.filter(Q(assigned_sales_user=self.request.user) | Q(assigned_trainer_user=self.request.user))
+
         status_val = self.request.query_params.get('current_status')
         if status_val and status_val not in ('all', 'ALL'):
             if status_val == 'TRIAL_BOOKED':

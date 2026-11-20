@@ -1505,6 +1505,8 @@ class LeadTransferBatch(models.Model):
         ('SINGLE', 'Single Representative'),
         ('ROUND_ROBIN', 'Round Robin Distribution'),
         ('LEAST_BUSY', 'Least Busy Auto-Balance'),
+        ('INDIVIDUAL', 'Individual Reassignment'),
+        ('TAKEOVER', 'Representative Takeover'),
     ]
     STATUS_CHOICES = [
         ('COMPLETED', 'Completed'),

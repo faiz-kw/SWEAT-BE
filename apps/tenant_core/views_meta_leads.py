@@ -24,6 +24,7 @@ from .models_meta_leads import MetaLeadMapping, MetaLeadImport, MetaConnection, 
 from .models_org import Branch
 from .models_crm import LeadSource, Lead, SalesFollowupTask, CRMAgentAssignmentConfig
 from .models_users import TenantUser
+from .models_rbac import Role, RoleAssignment
 from .permissions import RequireActiveTenantAndOrg, TenantRBACPermission
 from .services_meta_leads import (
     require_tenant_alias,
@@ -57,7 +58,10 @@ class MappingSerializer(serializers.ModelSerializer):
     branch = serializers.UUIDField(allow_null=True, required=False)
     fallback_branch = serializers.UUIDField(allow_null=True, required=False)
     lead_source = serializers.UUIDField()
+    assigned_role = serializers.UUIDField(allow_null=True, required=False)
+    assigned_role_name = serializers.CharField(read_only=True, required=False)
     assigned_sales_user = serializers.UUIDField(allow_null=True, required=False)
+    assigned_sales_users = serializers.ListField(child=serializers.UUIDField(), required=False, allow_empty=True)
     expected_version = serializers.IntegerField(write_only=True, required=False, min_value=1)
     page_name = serializers.CharField(read_only=True, required=False)
 
@@ -66,9 +70,9 @@ class MappingSerializer(serializers.ModelSerializer):
         fields = ['id', 'page_id', 'page_name', 'form_id', 'name', 'is_active', 'version', 'expected_version',
                   'field_mappings', 'field_defaults', 'branch_mode', 'branch', 'branch_field', 'branch_answers',
                   'unmatched_branch_policy', 'fallback_branch', 'lead_source', 'initial_stage', 'repeat_policy',
-                  'assignment_mode', 'assigned_sales_user', 'create_followup_task', 'followup_task_type',
-                  'followup_due_hours', 'updated_at']
-        read_only_fields = ['id', 'page_name', 'version', 'updated_at']
+                  'assignment_mode', 'assigned_role', 'assigned_role_name', 'assigned_sales_user', 'assigned_sales_users',
+                  'create_followup_task', 'followup_task_type', 'followup_due_hours', 'updated_at']
+        read_only_fields = ['id', 'page_name', 'assigned_role_name', 'version', 'updated_at']
         validators = []
 
     def validate_page_id(self, value):
@@ -84,9 +88,9 @@ class MappingSerializer(serializers.ModelSerializer):
         return val
 
     def to_representation(self, instance):
-        fields_to_read = [k for k in self.Meta.fields if k not in ('expected_version', 'page_name')]
+        fields_to_read = [k for k in self.Meta.fields if k not in ('expected_version', 'page_name', 'assigned_role_name')]
         data_dict = {
-            key: getattr(instance, key + '_id' if key in ('branch', 'fallback_branch', 'lead_source', 'assigned_sales_user') else key)
+            key: getattr(instance, key + '_id' if key in ('branch', 'fallback_branch', 'lead_source', 'assigned_role', 'assigned_sales_user') else key)
             for key in fields_to_read
         }
         result = super().to_representation(data_dict)
@@ -102,6 +106,21 @@ class MappingSerializer(serializers.ModelSerializer):
             except Exception:
                 pass
         result['page_name'] = page_name
+
+        assigned_role_name = None
+        if alias and getattr(instance, 'assigned_role_id', None):
+            try:
+                r_obj = Role.objects.using(alias).filter(id=instance.assigned_role_id).first()
+                if r_obj:
+                    assigned_role_name = r_obj.name
+            except Exception:
+                pass
+        result['assigned_role_name'] = assigned_role_name
+
+        sales_users = getattr(instance, 'assigned_sales_users', None) or []
+        if not sales_users and getattr(instance, 'assigned_sales_user_id', None):
+            sales_users = [str(instance.assigned_sales_user_id)]
+        result['assigned_sales_users'] = [str(uid) for uid in sales_users]
         return result
 
     def validate(self, attrs):
@@ -110,7 +129,7 @@ class MappingSerializer(serializers.ModelSerializer):
             if key in attrs:
                 return attrs[key]
             if self.instance:
-                return getattr(self.instance, key + '_id' if key in ('branch', 'fallback_branch', 'lead_source', 'assigned_sales_user') else key)
+                return getattr(self.instance, key + '_id' if key in ('branch', 'fallback_branch', 'lead_source', 'assigned_role', 'assigned_sales_user') else key)
             return default
         if self.instance and attrs.get('expected_version') != self.instance.version:
             raise serializers.ValidationError({'expected_version': 'Settings changed or version is missing. Reload and save again.'})
@@ -215,15 +234,47 @@ class MappingSerializer(serializers.ModelSerializer):
 
         assignment_mode = value('assignment_mode', 'TENANT_POLICY')
         if assignment_mode == 'SPECIFIC_USER':
-            user_id = value('assigned_sales_user')
-            if not user_id:
-                raise serializers.ValidationError({'assigned_sales_user': 'Select the designated sales representative.'})
-            staff = TenantUser.objects.using(alias).filter(id=user_id, organization=org, status='ACTIVE', is_login_allowed=True).first()
-            if not staff:
-                raise serializers.ValidationError({'assigned_sales_user': 'Designated sales representative must be an active staff member in this organisation.'})
-            attrs['assigned_sales_user'] = staff
+            role_id = value('assigned_role')
+            if role_id:
+                try:
+                    role_uuid = uuid.UUID(str(role_id))
+                    role_obj = Role.objects.using(alias).filter(id=role_uuid, organization=org, is_active=True).first()
+                    if not role_obj:
+                        raise serializers.ValidationError({'assigned_role': 'Selected role does not exist or is inactive.'})
+                    attrs['assigned_role'] = role_obj
+                except (ValueError, TypeError):
+                    raise serializers.ValidationError({'assigned_role': 'Invalid role identifier.'})
+            else:
+                attrs['assigned_role'] = None
+
+            raw_users = value('assigned_sales_users') or []
+            if isinstance(raw_users, (list, tuple)):
+                user_ids = [str(u).strip() for u in raw_users if str(u).strip()]
+            else:
+                user_ids = []
+
+            single_user = value('assigned_sales_user')
+            if not user_ids and single_user:
+                user_ids = [str(single_user).strip()]
+
+            if not user_ids:
+                raise serializers.ValidationError({'assigned_sales_users': 'Select at least one designated team member.'})
+
+            valid_users_qs = TenantUser.objects.using(alias).filter(
+                id__in=user_ids, organization=org, status='ACTIVE', is_login_allowed=True
+            )
+            valid_user_map = {str(u.id): u for u in valid_users_qs}
+            missing_users = [u for u in user_ids if u not in valid_user_map]
+            if missing_users:
+                raise serializers.ValidationError({'assigned_sales_users': f'Selected team member(s) not found or inactive: {", ".join(missing_users)}'})
+
+            attrs['assigned_sales_users'] = user_ids
+            # Set assigned_sales_user to the first valid user for backward compatibility
+            attrs['assigned_sales_user'] = valid_user_map[user_ids[0]]
         else:
+            attrs['assigned_role'] = None
             attrs['assigned_sales_user'] = None
+            attrs['assigned_sales_users'] = []
 
         initial_stage = value('initial_stage', 'NEW_LEAD')
         valid_stages = {s[0] for s in Lead.STATUSES}
@@ -1750,11 +1801,34 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
             'allow_unassigned_fallback': config.allow_unassigned_fallback if config else True,
             'require_branch_match': config.require_branch_match if config else True,
         }
+        active_roles = list(Role.objects.using(self.alias).filter(
+            organization=self.organization, is_active=True
+        ).exclude(code__in=['MEMBER', 'LEAD']).order_by('name').values('id', 'name', 'code', 'scope'))
+
         eligible_users = list(TenantUser.objects.using(self.alias).filter(
             organization=self.organization, status='ACTIVE', is_login_allowed=True
         ).order_by('first_name', 'last_name').values('id', 'first_name', 'last_name', 'email'))
+
+        user_ids = [u['id'] for u in eligible_users]
+        role_assignments = list(RoleAssignment.objects.using(self.alias).filter(
+            organization=self.organization, user_id__in=user_ids, is_active=True, status='ACTIVE'
+        ).select_related('role'))
+
+        user_roles_map = {}
+        for ra in role_assignments:
+            if ra.role and ra.role.is_active and ra.role.code not in ('MEMBER', 'LEAD'):
+                user_roles_map.setdefault(str(ra.user_id), []).append({
+                    'id': str(ra.role.id),
+                    'code': ra.role.code,
+                    'name': ra.role.name,
+                })
+
         for u in eligible_users:
+            u['id'] = str(u['id'])
             u['name'] = f"{u['first_name']} {u['last_name']}".strip() or u['email']
+            u_roles = user_roles_map.get(str(u['id']), [])
+            u['roles'] = u_roles
+            u['role_ids'] = [r['id'] for r in u_roles]
 
         conns = list(MetaConnection.objects.using(self.alias).filter(
             organization=self.organization
@@ -1829,6 +1903,7 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
             'assignment_modes': [{'value': k, 'label': v} for k, v in MetaLeadMapping.ASSIGNMENT_MODES],
             'task_types': [{'value': k, 'label': v} for k, v in SalesFollowupTask.TASK_TYPES],
             'branches': list(Branch.objects.using(self.alias).filter(organization=self.organization, status='ACTIVE').values('id', 'name', 'code')),
+            'roles': active_roles,
             'lead_sources': list(LeadSource.objects.using(self.alias).filter(organization=self.organization, source_type='META', status='ACTIVE').values('id', 'name')),
             'eligible_users': eligible_users,
             'tenant_assignment_policy': policy_summary,

@@ -118,7 +118,9 @@ def process_simulation(organization, event_id, actor_user=None):
             event.mapping_snapshot.update(
                 branch_id=str(mapping.branch_id) if mapping.branch_id else None,
                 fallback_branch_id=str(mapping.fallback_branch_id) if getattr(mapping, 'fallback_branch_id', None) else None,
+                assigned_role_id=str(mapping.assigned_role_id) if getattr(mapping, 'assigned_role_id', None) else None,
                 assigned_sales_user_id=str(mapping.assigned_sales_user_id) if getattr(mapping, 'assigned_sales_user_id', None) else None,
+                assigned_sales_users=getattr(mapping, 'assigned_sales_users', []) or [],
                 lead_source_id=str(mapping.lead_source_id))
             try:
                 # Nested savepoint rolls back every CRM write on failure while retaining the receipt.
@@ -395,7 +397,9 @@ def process_live_import(organization, event_id, actor_user=None, graph_client=No
         event.mapping_snapshot.update(
             branch_id=str(mapping.branch_id) if mapping.branch_id else None,
             fallback_branch_id=str(mapping.fallback_branch_id) if getattr(mapping, 'fallback_branch_id', None) else None,
+            assigned_role_id=str(mapping.assigned_role_id) if getattr(mapping, 'assigned_role_id', None) else None,
             assigned_sales_user_id=str(mapping.assigned_sales_user_id) if getattr(mapping, 'assigned_sales_user_id', None) else None,
+            assigned_sales_users=getattr(mapping, 'assigned_sales_users', []) or [],
             lead_source_id=str(mapping.lead_source_id))
 
         # 4. Ingest into CRM within isolated savepoint
@@ -588,10 +592,32 @@ def _apply_mapping(event, mapping, alias, actor_user, is_live: bool = False):
                 raise ValueError(f'Mapped answer for {key} exceeds CRM field length of {maximum}.')
     # --- FIX: EXTRACT VOICE CONSENT AND RESOLVE INTERESTED PROGRAM END ---
 
-    # Assigned sales user preference
+    # Assigned sales user / team member preference
     assigned_sales_user = None
-    if getattr(mapping, 'assignment_mode', 'TENANT_POLICY') == 'SPECIFIC_USER' and getattr(mapping, 'assigned_sales_user_id', None):
-        assigned_sales_user = mapping.assigned_sales_user
+    if getattr(mapping, 'assignment_mode', 'TENANT_POLICY') == 'SPECIFIC_USER':
+        raw_users = getattr(mapping, 'assigned_sales_users', None) or []
+        if isinstance(raw_users, list) and len(raw_users) > 1:
+            active_candidates = list(TenantUser.objects.using(alias).filter(
+                id__in=raw_users,
+                organization=event.organization,
+                status='ACTIVE',
+                is_login_allowed=True,
+            ).order_by('first_name', 'last_name', 'id'))
+            if active_candidates:
+                import_count = MetaLeadImport.objects.using(alias).filter(
+                    organization=event.organization,
+                    form_id=event.form_id,
+                    status='IMPORTED',
+                ).count()
+                assigned_sales_user = active_candidates[import_count % len(active_candidates)]
+            elif getattr(mapping, 'assigned_sales_user_id', None):
+                assigned_sales_user = mapping.assigned_sales_user
+        elif getattr(mapping, 'assigned_sales_user_id', None):
+            assigned_sales_user = mapping.assigned_sales_user
+        elif isinstance(raw_users, list) and len(raw_users) == 1:
+            assigned_sales_user = TenantUser.objects.using(alias).filter(
+                id=raw_users[0], organization=event.organization, status='ACTIVE', is_login_allowed=True
+            ).first()
 
     # Resolve human-readable Facebook Page name and structured Q&A answers for zero-data-loss timeline logging
     page_name = None

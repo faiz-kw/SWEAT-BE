@@ -28,7 +28,7 @@ from config.routers import set_tenant_db_alias
 from apps.tenant_core.models_org import Organization, Branch, Location
 from apps.tenant_core.models_users import TenantUser
 from apps.tenant_core.models_workforce import UserProfile
-from apps.tenant_core.models_rbac import Role, RoleAssignment, Permission, RolePermissionSetItem
+from apps.tenant_core.models_rbac import Role, RoleAssignment, Permission, RolePermissionSet, RolePermissionSetItem
 from apps.tenant_core.models_crm import (
     Lead,
     LeadSource,
@@ -185,6 +185,29 @@ class LeadTransferEngineTestCase(TestCase):
         self.target_b._auth_type = 'tenant'
         self.target_b.save(using=DB)
         UserProfile.objects.using(DB).create(user=self.target_b)
+
+        # Configure Sales Role for eligible target reps
+        sales_role, _ = Role.objects.using(DB).get_or_create(
+            organization=self.org,
+            code='SALES_REP',
+            defaults={'name': 'Sales Representative', 'is_active': True, 'status': 'ACTIVE'},
+        )
+        RoleAssignment.objects.using(DB).create(
+            user=self.target_a,
+            organization=self.org,
+            role=sales_role,
+            branch=self.branch1,
+            status='ACTIVE',
+            is_active=True,
+        )
+        RoleAssignment.objects.using(DB).create(
+            user=self.target_b,
+            organization=self.org,
+            role=sales_role,
+            branch=self.branch2,
+            status='ACTIVE',
+            is_active=True,
+        )
 
     def _create_lead(self, assigned_user=None, status='NEW_LEAD', branch=None):
         return Lead.objects.using(DB).create(
