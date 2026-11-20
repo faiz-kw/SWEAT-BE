@@ -3388,13 +3388,13 @@ class MobileDiscountCouponsView(APIView):
                 continue
             _cfg = camp.configuration if isinstance(camp.configuration, dict) else {}
             if req_package_id:
-                _apid = str(c.package_id) if c.package_id else _cfg.get('package_id')
-                _apids = _cfg.get('package_ids') if isinstance(_cfg.get('package_ids'), list) else None
-                if _apid:
-                    if str(_apid) != str(req_package_id):
-                        continue
-                elif _apids:
-                    if str(req_package_id) not in [str(x) for x in _apids]:
+                _code_pkg_id = str(c.package_id) if c.package_id else None
+                _cfg_pkg_ids = [str(x) for x in _cfg.get('package_ids', []) if x] if isinstance(_cfg.get('package_ids'), list) else []
+                _cfg_single_pkg_id = str(_cfg.get('package_id')) if (_cfg.get('package_id') and not _cfg_pkg_ids) else None
+                _allowed_pkgs = [_code_pkg_id] if _code_pkg_id else (_cfg_pkg_ids if _cfg_pkg_ids else ([_cfg_single_pkg_id] if _cfg_single_pkg_id else []))
+
+                if _allowed_pkgs:
+                    if str(req_package_id) not in _allowed_pkgs:
                         continue
                 elif isinstance(_cfg.get('program_ids'), list) and _cfg.get('program_ids'):
                     if not req_program_id or str(req_program_id) not in [str(x) for x in _cfg['program_ids']]:
@@ -4093,6 +4093,59 @@ class MobileCheckoutVerifyView(APIView):
                             )
                     except Exception as conv_crm_err:
                         logger.warning("Could not sync CRM lead conversion for %s: %s", user.email, conv_crm_err)
+
+                # 4. Record coupon redemption if coupon was applied
+                applied_c_code = meta.get('coupon_code')
+                if applied_c_code and order.discount_amount and order.discount_amount > Decimal('0.00'):
+                    try:
+                        from .models_discounts import DiscountCode, DiscountRedemption
+                        d_code_obj = (
+                            DiscountCode.objects.using(alias)
+                            .filter(code__iexact=str(applied_c_code).strip())
+                            .select_related('campaign')
+                            .first()
+                        )
+                        if d_code_obj and not DiscountRedemption.objects.using(alias).filter(order=order).exists():
+                            DiscountRedemption.objects.using(alias).create(
+                                discount_code=d_code_obj,
+                                campaign=d_code_obj.campaign,
+                                order=order,
+                                user_profile=profile,
+                                discount_amount=order.discount_amount,
+                                eligibility_snapshot={
+                                    'code': d_code_obj.code,
+                                    'campaign_name': d_code_obj.campaign.name,
+                                    'discount_type': d_code_obj.campaign.discount_type,
+                                    'discount_value': str(d_code_obj.campaign.discount_value),
+                                    'order_type': order.order_type,
+                                    'action_type': action_type,
+                                },
+                                redeemed_at=timezone.now(),
+                            )
+                    except Exception as red_err:
+                        logger.warning("Could not record DiscountRedemption for order %s: %s", order.order_number, red_err)
+
+                # 5. Generate authoritative MemberInvoice snapshot
+                try:
+                    from .models_commerce import MemberInvoice
+                    if not MemberInvoice.objects.using(alias).filter(order=order).exists():
+                        inv_num = f"INV-{timezone.now().strftime('%Y%m')}-{uuid.uuid4().hex[:6].upper()}"
+                        MemberInvoice.objects.using(alias).create(
+                            invoice_number=inv_num,
+                            order=order,
+                            user_profile=profile,
+                            branch=order.branch,
+                            subtotal=order.subtotal,
+                            discount_amount=order.discount_amount,
+                            reward_amount=order.reward_amount,
+                            tax_amount=order.tax_amount,
+                            total_amount=order.total_amount,
+                            currency=order.currency,
+                            status='PAID',
+                            issued_at=timezone.now(),
+                        )
+                except Exception as inv_err:
+                    logger.warning("Could not generate MemberInvoice for order %s: %s", order.order_number, inv_err)
         except Exception as exc:
             logger.exception("Failed to verify and process checkout for order %s: %s", order.order_number, exc)
             return Response(
@@ -4148,7 +4201,7 @@ class MobileOrdersView(APIView):
             Order.objects.using(alias)
             .filter(user_profile=profile)
             .select_related('branch')
-            .prefetch_related('items__package')
+            .prefetch_related('items__package', 'discount_redemptions__discount_code', 'invoices')
             .order_by('-created_at')
         )
         data = []
@@ -4166,6 +4219,20 @@ class MobileOrdersView(APIView):
                     'tax_amount': str(it.tax_amount),
                     'total_amount': str(it.total_amount),
                 })
+
+            coupon_code_val = None
+            first_redemption = o.discount_redemptions.all().first()
+            if first_redemption and first_redemption.discount_code:
+                coupon_code_val = first_redemption.discount_code.code
+            elif o.notes:
+                try:
+                    meta_notes = json.loads(o.notes)
+                    coupon_code_val = meta_notes.get('coupon_code')
+                except Exception:
+                    pass
+
+            first_inv = o.invoices.all().first()
+
             data.append({
                 'id': str(o.id),
                 'order_number': o.order_number,
@@ -4173,6 +4240,8 @@ class MobileOrdersView(APIView):
                 'status': o.status,
                 'subtotal': str(o.subtotal),
                 'discount_amount': str(o.discount_amount),
+                'coupon_code': coupon_code_val,
+                'invoice_number': first_inv.invoice_number if first_inv else None,
                 'tax_amount': str(o.tax_amount),
                 'total_amount': str(o.total_amount),
                 'currency': o.currency,
@@ -5655,6 +5724,7 @@ class MobileMembershipRenewView(APIView):
             'package_version_id': str(ver.id),
             'parq_decision': parq_decision,
             'parq_submission_id': parq_submission_id,
+            'coupon_code': renew_coupon_code if renew_coupon_code else None,
         }
 
         with transaction.atomic(using=alias):
@@ -5872,6 +5942,7 @@ class MobileMembershipUpgradeView(APIView):
             'parq_decision': parq_decision,
             'parq_submission_id': parq_submission_id,
             'reason': reason,
+            'coupon_code': upg_coupon_code if upg_coupon_code else None,
         }
 
         with transaction.atomic(using=alias):
@@ -6679,3 +6750,55 @@ class MobileTicketsView(APIView):
             'status': ticket.status,
             'created_at': ticket.created_at.isoformat(),
         }, status=status.HTTP_201_CREATED)
+
+
+class MobilePricingQuoteView(APIView):
+    """
+    GET / POST /api/v1/mobile/pricing/quote/ and /api/v1/tenant/pricing/quote/
+    Unified Canonical Quotation Brain powered by UnifiedPricingService.
+    Pure read-only calculation of catalog price, coupon discount, statutory GST, and final payable.
+    """
+    permission_classes = [AllowAny]
+
+    def _execute_quote(self, request, params):
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            alias = getattr(getattr(request, 'user', None), '_state', None)
+            alias = getattr(alias, 'db', None) or get_tenant_db_alias() or 'default'
+
+        profile_id = params.get('user_profile_id')
+        if not profile_id and request.user and getattr(request.user, 'is_authenticated', False):
+            p = UserProfile.objects.using(alias).filter(user=request.user).values_list('id', flat=True).first()
+            if p:
+                profile_id = str(p)
+
+        from .services_pricing import UnifiedPricingService
+
+        try:
+            quote = UnifiedPricingService.calculate_quote(
+                order_type=params.get('order_type', 'NEW_MEMBERSHIP'),
+                package_id=params.get('package_id'),
+                package_version_id=params.get('package_version_id'),
+                branch_id=params.get('branch_id'),
+                user_profile_id=profile_id,
+                lead_id=params.get('lead_id'),
+                current_membership_id=params.get('current_membership_id'),
+                coupon_code=params.get('coupon_code'),
+                db_alias=alias,
+            )
+            return Response(quote, status=status.HTTP_200_OK)
+        except ValidationError as e:
+            detail_msg = e.detail if hasattr(e, 'detail') else str(e)
+            if isinstance(detail_msg, list):
+                detail_msg = str(detail_msg[0])
+            return Response({'error': str(detail_msg)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.exception("Quotation error in MobilePricingQuoteView")
+            return Response({'error': str(e) or 'Failed to calculate quotation.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    def get(self, request):
+        return self._execute_quote(request, request.query_params)
+
+    def post(self, request):
+        return self._execute_quote(request, request.data)
+

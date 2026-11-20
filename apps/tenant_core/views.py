@@ -834,8 +834,8 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
         from .models_workforce import EmployeeProfile
         from .models_memberships import Membership
 
-        # Fast direct staff filter using indexed user_type and relationships
-        qs = qs.filter(user_type='STAFF').select_related(
+        # Fast direct staff filter: include staff and trainers while strictly excluding customer members and leads
+        qs = qs.exclude(user_type__in=['MEMBER', 'LEAD']).select_related(
             'organization', 'home_branch', 'home_branch__location', 'profile'
         )
 

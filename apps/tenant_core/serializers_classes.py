@@ -257,6 +257,8 @@ class ClassScheduleRuleSerializer(serializers.ModelSerializer):
         valid_from = attrs.get('valid_from') or (self.instance.valid_from if self.instance else None)
         valid_until = attrs.get('valid_until') if 'valid_until' in attrs else (self.instance.valid_until if self.instance else None)
 
+        target_status = attrs.get('status') or (self.instance.status if self.instance else 'ACTIVE')
+
         if not attrs.get('recurrence_type'):
             attrs['recurrence_type'] = 'WEEKLY'
         if not attrs.get('delivery_mode'):
@@ -270,67 +272,70 @@ class ClassScheduleRuleSerializer(serializers.ModelSerializer):
         if valid_from and valid_until and valid_until < valid_from:
             raise serializers.ValidationError({"valid_until": "Valid until date must be on or after valid from date."})
 
-        if valid_until and valid_until < timezone.now().date():
-            raise serializers.ValidationError({"valid_until": "Recurring schedule period cannot be entirely in the past."})
+        # Operational validations only apply when the rule is ACTIVE.
+        # Deactivating an inactive or past rule must never be blocked.
+        if target_status == 'ACTIVE':
+            if valid_until and valid_until < timezone.now().date():
+                raise serializers.ValidationError({"valid_until": "Recurring schedule period cannot be entirely in the past."})
 
-        if branch:
-            if getattr(branch, 'status', None) and branch.status != 'ACTIVE':
-                raise serializers.ValidationError({"branch": f"Branch '{branch.name}' is not ACTIVE."})
+            if branch:
+                if getattr(branch, 'status', None) and branch.status != 'ACTIVE':
+                    raise serializers.ValidationError({"branch": f"Branch '{branch.name}' is not ACTIVE."})
 
-            class_template = attrs.get('class_template') or getattr(self.instance, 'class_template', None)
-            if class_template and class_template.program:
-                from .models_catalog import ProgramBranchAvailability
-                from .context import get_tenant_db_alias
-                chk_alias = get_tenant_db_alias() or 'default'
-                if hasattr(branch, '_state') and branch._state.db:
-                    chk_alias = branch._state.db
-                if class_template.program.status != 'ACTIVE':
-                    raise serializers.ValidationError({
-                        "branch": f"Cannot schedule class '{class_template.name}' because its program '{class_template.program.name}' is not ACTIVE."
-                    })
-                is_pba_active = ProgramBranchAvailability.objects.using(chk_alias).filter(
-                    program=class_template.program,
-                    branch=branch,
-                    is_active=True
-                ).exists()
-                if not is_pba_active:
-                    raise serializers.ValidationError({
-                        "branch": f"Cannot schedule class '{class_template.name}' at '{branch.name}' because its program '{class_template.program.name}' is not active at this branch."
-                    })
-
-            # Check branch working hours
-            from .models_govern import BranchWorkingHours, BranchOperatingException
-            from .context import get_tenant_db_alias
-            alias = get_tenant_db_alias() or 'default'
-            day_names = {1: 'Monday', 2: 'Tuesday', 3: 'Wednesday', 4: 'Thursday', 5: 'Friday', 6: 'Saturday', 7: 'Sunday'}
-            for dow in (days_of_week or []):
-                wh = BranchWorkingHours.objects.using(alias).filter(branch=branch, day_of_week=dow).first()
-                if wh:
-                    d_name = day_names.get(dow, f'Day {dow}')
-                    if not wh.is_open:
-                        raise serializers.ValidationError({"branch": f"Branch '{branch.name}' is closed on {d_name}."})
-                    if not wh.is_24_hours:
-                        if wh.open_time and start_time and start_time < wh.open_time:
-                            raise serializers.ValidationError(
-                                {"start_time": f"Class start time ({start_time.strftime('%H:%M')}) is before branch opening time ({wh.open_time.strftime('%H:%M')}) on {d_name}."}
-                            )
-                        if wh.close_time and end_time and end_time > wh.close_time:
-                            raise serializers.ValidationError(
-                                {"end_time": f"Class end time ({end_time.strftime('%H:%M')}) is after branch closing time ({wh.close_time.strftime('%H:%M')}) on {d_name}."}
-                            )
-
-            # Check holiday exceptions when valid_from is single date or short range
-            if valid_from:
-                end_check = valid_until or valid_from
-                # If exact single day rule falls on a closed holiday
-                if valid_from == end_check:
-                    holiday = BranchOperatingException.objects.using(alias).filter(
-                        branch=branch, exception_date=valid_from, is_closed=True
-                    ).first()
-                    if holiday:
+                class_template = attrs.get('class_template') or getattr(self.instance, 'class_template', None)
+                if class_template and class_template.program:
+                    from .models_catalog import ProgramBranchAvailability
+                    from .context import get_tenant_db_alias
+                    chk_alias = get_tenant_db_alias() or 'default'
+                    if hasattr(branch, '_state') and branch._state.db:
+                        chk_alias = branch._state.db
+                    if class_template.program.status != 'ACTIVE':
                         raise serializers.ValidationError({
-                            "valid_from": f"Branch '{branch.name}' is closed on {valid_from} ({holiday.reason or 'Holiday/Maintenance'})."
+                            "branch": f"Cannot schedule class '{class_template.name}' because its program '{class_template.program.name}' is not ACTIVE."
                         })
+                    is_pba_active = ProgramBranchAvailability.objects.using(chk_alias).filter(
+                        program=class_template.program,
+                        branch=branch,
+                        is_active=True
+                    ).exists()
+                    if not is_pba_active:
+                        raise serializers.ValidationError({
+                            "branch": f"Cannot schedule class '{class_template.name}' at '{branch.name}' because its program '{class_template.program.name}' is not active at this branch."
+                        })
+
+                # Check branch working hours
+                from .models_govern import BranchWorkingHours, BranchOperatingException
+                from .context import get_tenant_db_alias
+                alias = get_tenant_db_alias() or 'default'
+                day_names = {1: 'Monday', 2: 'Tuesday', 3: 'Wednesday', 4: 'Thursday', 5: 'Friday', 6: 'Saturday', 7: 'Sunday'}
+                for dow in (days_of_week or []):
+                    wh = BranchWorkingHours.objects.using(alias).filter(branch=branch, day_of_week=dow).first()
+                    if wh:
+                        d_name = day_names.get(dow, f'Day {dow}')
+                        if not wh.is_open:
+                            raise serializers.ValidationError({"branch": f"Branch '{branch.name}' is closed on {d_name}."})
+                        if not wh.is_24_hours:
+                            if wh.open_time and start_time and start_time < wh.open_time:
+                                raise serializers.ValidationError(
+                                    {"start_time": f"Class start time ({start_time.strftime('%H:%M')}) is before branch opening time ({wh.open_time.strftime('%H:%M')}) on {d_name}."}
+                                )
+                            if wh.close_time and end_time and end_time > wh.close_time:
+                                raise serializers.ValidationError(
+                                    {"end_time": f"Class end time ({end_time.strftime('%H:%M')}) is after branch closing time ({wh.close_time.strftime('%H:%M')}) on {d_name}."}
+                                )
+
+                # Check holiday exceptions when valid_from is single date or short range
+                if valid_from:
+                    end_check = valid_until or valid_from
+                    # If exact single day rule falls on a closed holiday
+                    if valid_from == end_check:
+                        holiday = BranchOperatingException.objects.using(alias).filter(
+                            branch=branch, exception_date=valid_from, is_closed=True
+                        ).first()
+                        if holiday:
+                            raise serializers.ValidationError({
+                                "valid_from": f"Branch '{branch.name}' is closed on {valid_from} ({holiday.reason or 'Holiday/Maintenance'})."
+                            })
 
         return attrs
 

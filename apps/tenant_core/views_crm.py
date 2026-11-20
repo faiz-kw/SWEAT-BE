@@ -25,7 +25,7 @@ Endpoints:
 
 import logging
 from decimal import Decimal
-from rest_framework import viewsets, filters, status
+from rest_framework import viewsets, filters, status, serializers
 from rest_framework.decorators import action
 from rest_framework.response import Response
 import re
@@ -187,6 +187,7 @@ def get_user_effective_branch_ids(user, db_alias: str = 'default') -> Optional[S
 
 class LeadSourceViewSet(viewsets.ModelViewSet):
     serializer_class = LeadSourceSerializer
+    pagination_class = None
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
     required_module = 'crm'
     required_submodule = 'leads'
@@ -746,21 +747,25 @@ class LeadViewSet(viewsets.ModelViewSet):
             extra_fields['assignment_mode'] = assignment_mode
 
         is_staff_manual = hasattr(self.request, 'user') and getattr(self.request.user, 'is_authenticated', False) and hasattr(self.request.user, 'organization_id')
-        lead = CRMLeadService.create_lead(
-            organization=org,
-            first_name=serializer.validated_data.get('first_name'),
-            last_name=serializer.validated_data.get('last_name'),
-            phone=serializer.validated_data.get('phone_normalized'),
-            email=serializer.validated_data.get('email_normalized'),
-            branch=branch,
-            lead_source=lead_source or serializer.validated_data.get('lead_source'),
-            assigned_sales_user=assigned_sales_user if assignment_mode != 'AUTO' else None,
-            actor_user=self.request.user if is_staff_manual else None,
-            extra_fields=extra_fields,
-            attribution_data=serializer.validated_data.get('attribution'),
-            block_if_duplicate=is_staff_manual,
-            db_alias=alias,
-        )
+        try:
+            lead = CRMLeadService.create_lead(
+                organization=org,
+                first_name=serializer.validated_data.get('first_name'),
+                last_name=serializer.validated_data.get('last_name'),
+                phone=serializer.validated_data.get('phone_normalized'),
+                email=serializer.validated_data.get('email_normalized'),
+                branch=branch,
+                lead_source=lead_source or serializer.validated_data.get('lead_source'),
+                assigned_sales_user=assigned_sales_user if assignment_mode != 'AUTO' else None,
+                actor_user=self.request.user if is_staff_manual else None,
+                extra_fields=extra_fields,
+                attribution_data=serializer.validated_data.get('attribution'),
+                block_if_duplicate=is_staff_manual,
+                db_alias=alias,
+            )
+        except ValidationError as ve:
+            msg = ve.message if hasattr(ve, 'message') else str(ve.messages[0] if hasattr(ve, 'messages') else ve)
+            raise serializers.ValidationError({'detail': msg})
         serializer.instance = lead
 
         # Check if caller requested automated AI call trigger, provided voice consent,

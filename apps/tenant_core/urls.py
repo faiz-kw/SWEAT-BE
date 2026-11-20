@@ -41,6 +41,7 @@ from . import views_telephony
 from . import views_telephony_dial_events
 from . import views_public_trial
 from . import views_pos
+from . import views_mobile
 from .views_audit_outbox import (
     BusinessAuditEventViewSet,
     IdempotencyRecordViewSet,
@@ -450,7 +451,8 @@ urlpatterns = [
     path('pos/status/<str:external_ref_id>/', views_pos.POSPaymentStatusView.as_view(), name='pos-payment-status'),
     path('pos/cancel/<str:external_ref_id>/', views_pos.CancelPOSPaymentView.as_view(), name='pos-cancel-payment'),
 
-    
+    # Unified Quotation Engine
+    path('pricing/quote/', views_mobile.MobilePricingQuoteView.as_view(), name='tenant-pricing-quote'),
 
     path('invoice/order/<uuid:order_id>/', WebOrderInvoiceView.as_view(), name='web-order-invoice'),
     path('invoice/<uuid:invoice_id>/', WebInvoiceRenderView.as_view(), name='web-invoice-render'),

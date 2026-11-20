@@ -4597,6 +4597,17 @@ class MemberViewSet(viewsets.ViewSet):
         if not branch and org:
             branch = Branch.objects.using(alias).filter(organization=org).first()
 
+        # Rejoin coupon (web/CRM) - order-type gated to RENEWAL or NEW_MEMBERSHIP
+        rejoin_coupon_code = (request.data.get('coupon_code') or '').strip()
+        rejoin_discount = Decimal('0.00')
+        if rejoin_coupon_code:
+            from .services_discounts import DiscountCouponEngineService as _CPN
+            _cv = _CPN.validate_coupon(code_str=rejoin_coupon_code, user_profile=profile, order_subtotal=unit_price, package=package, branch=branch, db_alias=alias, order_type='RENEWAL')
+            if not _cv.get('is_valid'):
+                _cv = _CPN.validate_coupon(code_str=rejoin_coupon_code, user_profile=profile, order_subtotal=unit_price, package=package, branch=branch, db_alias=alias, order_type='NEW_MEMBERSHIP')
+            if _cv.get('is_valid'):
+                rejoin_discount = Decimal(str(_cv.get('discount_amount') or 0))
+
         with transaction.atomic(using=alias):
             old_status = profile.member_status
             profile.member_status = 'ACTIVE'
@@ -4615,14 +4626,14 @@ class MemberViewSet(viewsets.ViewSet):
                     'item_name_snapshot': f"{package.name} (v{package_version.version_number})",
                     'quantity': Decimal('1.00'),
                     'unit_price': unit_price,
-                    'discount_amount': Decimal('0.00'),
+                    'discount_amount': rejoin_discount,
                     'tax_percent': Decimal('0.000'),
                 }],
                 user_profile=profile,
                 order_type='REJOIN',
                 source='FRONT_DESK',
                 currency='INR',
-                notes=reason,
+                notes=f"{reason} | Coupon: {rejoin_coupon_code}" if rejoin_coupon_code else reason,
                 created_by=request.user,
                 db_alias=alias,
             )

@@ -199,9 +199,9 @@ class ClassCategoryViewSet(viewsets.ModelViewSet):
         alias = _get_db(self.request)
         org = _get_org(self.request)
         qs = ClassCategory.objects.using(alias).filter(organization=org)
-        status_filter = self.request.query_params.get('status')
-        if status_filter:
-            qs = qs.filter(status=status_filter)
+        status_filter = (self.request.query_params.get('status') or '').strip()
+        if status_filter and status_filter.upper() != 'ALL':
+            qs = qs.filter(status__iexact=status_filter)
         return qs.order_by('display_order')
 
     def perform_create(self, serializer):
@@ -252,9 +252,9 @@ class ClassTemplateViewSet(viewsets.ModelViewSet):
         category_id = self.request.query_params.get('category_id')
         if category_id:
             qs = qs.filter(category_id=category_id)
-        status_filter = self.request.query_params.get('status')
-        if status_filter:
-            qs = qs.filter(status=status_filter)
+        status_filter = (self.request.query_params.get('status') or '').strip()
+        if status_filter and status_filter.upper() != 'ALL':
+            qs = qs.filter(status__iexact=status_filter)
         return qs.order_by('name')
 
     def _save_branch_capacities(self, instance, branch_capacities, alias):
