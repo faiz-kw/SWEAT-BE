@@ -306,34 +306,48 @@ class DiscountCouponEngineService:
         and unavailable metrics fail-closed behavior. Zero mock/fallback metrics.
         """
         alias = db_alias or (getattr(user_profile, '_state', None) and user_profile._state.db) or get_current_tenant_db_alias() or 'default'
-        from .models_memberships import Membership, MembershipEntitlement
+        from .models_memberships import Membership, MembershipEntitlement, MembershipFreeze
 
-        active_memberships = list(
+        today = timezone.now().date()
+
+        all_user_memberships = list(
             Membership.objects.using(alias)
-            .filter(user_profile=user_profile, status='ACTIVE')
+            .filter(user_profile=user_profile)
             .select_related('package', 'package_version', 'home_branch', 'purchase_branch')
             .order_by('-created_at')
         )
+
+        active_freeze_mem_ids = set(MembershipFreeze.objects.using(alias).filter(
+            membership__user_profile=user_profile,
+            status='ACTIVE',
+            freeze_from__lte=today,
+            freeze_until__gte=today
+        ).values_list('membership_id', flat=True))
+
+        def _derive_op_status(m):
+            if not m:
+                return 'INACTIVE'
+            if m.id in active_freeze_mem_ids or m.status == 'FROZEN':
+                return 'FROZEN'
+            if m.status == 'ACTIVE' and m.end_date and m.end_date < today:
+                return 'EXPIRED'
+            return m.status
+
+        # Truly active, unexpired, non-frozen memberships
+        active_memberships = [
+            m for m in all_user_memberships
+            if m.status == 'ACTIVE'
+            and (m.end_date is None or m.end_date >= today)
+            and m.id not in active_freeze_mem_ids
+        ]
+
         active_membership = None
         if membership_id:
-            active_membership = next((m for m in active_memberships if str(m.id) == str(membership_id)), None)
-            if not active_membership:
-                active_membership = (
-                    Membership.objects.using(alias)
-                    .filter(user_profile=user_profile, id=membership_id)
-                    .select_related('package', 'package_version', 'home_branch', 'purchase_branch')
-                    .first()
-                )
+            active_membership = next((m for m in all_user_memberships if str(m.id) == str(membership_id)), None)
         if not active_membership and active_memberships:
             active_membership = active_memberships[0]
-        if not active_membership:
-            active_membership = (
-                Membership.objects.using(alias)
-                .filter(user_profile=user_profile)
-                .select_related('package', 'package_version', 'home_branch', 'purchase_branch')
-                .order_by('-created_at')
-                .first()
-            )
+        if not active_membership and all_user_memberships:
+            active_membership = all_user_memberships[0]
 
         all_memberships_summary = [
             {
@@ -341,19 +355,21 @@ class DiscountCouponEngineService:
                 'membership_number': m.membership_number,
                 'package_name': m.package.name,
                 'package_id': str(m.package_id),
-                'status': m.status,
+                'status': _derive_op_status(m),
             }
-            for m in active_memberships
+            for m in (active_memberships if active_memberships else all_user_memberships)
         ]
 
         active_package_ids = [str(m.package_id) for m in active_memberships]
+        if not active_package_ids and active_membership and active_membership.package_id:
+            active_package_ids = [str(active_membership.package_id)]
 
         if not active_membership:
             return {
                 'has_membership': False,
                 'membership_id': None,
                 'membership_number': None,
-                'membership_status': None,
+                'membership_status': 'INACTIVE',
                 'current_package_id': None,
                 'current_package_name': None,
                 'current_package_version_id': None,
@@ -373,9 +389,11 @@ class DiscountCouponEngineService:
                 'all_memberships': all_memberships_summary,
             }
 
-        today = timezone.now().date()
-        package_age_days = max(0, (today - active_membership.start_date).days)
-        remaining_days = max(0, (active_membership.end_date - today).days)
+        membership_op_status = _derive_op_status(active_membership)
+        package_age_days = max(0, (today - active_membership.start_date).days) if active_membership.start_date else None
+        remaining_days = max(0, (active_membership.end_date - today).days) if active_membership.end_date else 0
+        if membership_op_status == 'EXPIRED':
+            remaining_days = 0
         branch = active_membership.home_branch or active_membership.purchase_branch
 
         entitlements = list(MembershipEntitlement.objects.using(alias).filter(membership=active_membership))
@@ -423,14 +441,14 @@ class DiscountCouponEngineService:
             'has_membership': True,
             'membership_id': str(active_membership.id),
             'membership_number': active_membership.membership_number,
-            'membership_status': active_membership.status,
+            'membership_status': membership_op_status,
             'current_package_id': str(active_membership.package_id),
             'current_package_name': active_membership.package.name,
             'current_package_version_id': str(active_membership.package_version_id),
             'branch_id': str(branch.id) if branch else None,
             'branch_name': branch.name if branch else None,
-            'start_date': str(active_membership.start_date),
-            'end_date': str(active_membership.end_date),
+            'start_date': str(active_membership.start_date) if active_membership.start_date else None,
+            'end_date': str(active_membership.end_date) if active_membership.end_date else None,
             'package_age_days': package_age_days,
             'remaining_days': remaining_days,
             'sessions_allocated': sessions_allocated,
