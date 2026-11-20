@@ -2454,7 +2454,18 @@ class MemberViewSet(viewsets.ViewSet):
             elif st == 'CANCELLED':
                 qs = qs.filter(memberships__status='CANCELLED')
             elif st == 'INACTIVE':
-                qs = qs.filter(Q(member_status='INACTIVE') | Q(user__status='INACTIVE'))
+                act_ids = _get_active_profile_ids()
+                frozen_ids = set(Membership.objects.using(alias).filter(
+                    Q(status='FROZEN') | Q(id__in=active_freeze_mem_ids)
+                ).values_list('user_profile_id', flat=True))
+                exp_profile_ids = set(Membership.objects.using(alias).filter(
+                    Q(status='EXPIRED') | (Q(status='ACTIVE') & Q(end_date__lt=today))
+                ).values_list('user_profile_id', flat=True))
+                has_active_or_expired = act_ids | frozen_ids | exp_profile_ids
+
+                qs = qs.filter(
+                    Q(member_status='INACTIVE') | Q(user__status='INACTIVE') | ~Q(id__in=has_active_or_expired)
+                )
             else:
                 qs = qs.filter(Q(member_status__iexact=status_param) | Q(memberships__status__iexact=status_param))
 

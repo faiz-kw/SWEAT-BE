@@ -365,26 +365,47 @@ class DiscountCouponEngineService:
             active_package_ids = [str(active_membership.package_id)]
 
         if not active_membership:
+            # Fallback to resolve member's branch from profile, user, or organization default
+            user = user_profile.user
+            branch = (
+                user_profile.preferred_branch
+                or (getattr(user, 'home_branch', None) if user else None)
+            )
+            if not branch and user:
+                from .models import UserBranch
+                ub = UserBranch.objects.using(alias).filter(user=user, is_active=True).select_related('branch').first()
+                if ub and ub.branch:
+                    branch = ub.branch
+            if not branch and user and getattr(user, 'organization_id', None):
+                from .models import Branch
+                branch = Branch.objects.using(alias).filter(organization_id=user.organization_id, status='ACTIVE').first()
+
+            account_start = user_profile.joining_date or (user_profile.created_at.date() if user_profile.created_at else None) or (user.created_at.date() if user and user.created_at else None)
+            account_age_days = max(0, (today - account_start).days) if account_start else 0
+            mem_num = user_profile.member_number or f"MEM-{str(user_profile.id)[:8].upper()}"
+            branch_name = branch.name if branch else 'Main Branch'
+            branch_id = str(branch.id) if branch else None
+
             return {
                 'has_membership': False,
                 'membership_id': None,
-                'membership_number': None,
+                'membership_number': mem_num,
                 'membership_status': 'INACTIVE',
                 'current_package_id': None,
-                'current_package_name': None,
+                'current_package_name': 'None (No active package)',
                 'current_package_version_id': None,
-                'branch_id': None,
-                'branch_name': None,
-                'start_date': None,
+                'branch_id': branch_id,
+                'branch_name': branch_name,
+                'start_date': str(account_start) if account_start else None,
                 'end_date': None,
-                'package_age_days': None,
-                'remaining_days': None,
-                'sessions_allocated': None,
-                'sessions_consumed': None,
-                'sessions_remaining': None,
-                'usage_percentage': None,
+                'package_age_days': account_age_days,
+                'remaining_days': 0,
+                'sessions_allocated': 0.0,
+                'sessions_consumed': 0.0,
+                'sessions_remaining': 0.0,
+                'usage_percentage': 0.0,
                 'is_unlimited': False,
-                'metrics_available': False,
+                'metrics_available': True,
                 'active_package_ids': [],
                 'all_memberships': all_memberships_summary,
             }
