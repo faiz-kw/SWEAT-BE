@@ -113,42 +113,61 @@ class DiscountCouponEngineService:
 
         # Branch scope
         camp_cfg = campaign.configuration if isinstance(campaign.configuration, dict) else {}
-        allowed_branch_id = str(discount_code.branch_id) if discount_code.branch_id else camp_cfg.get('branch_id')
-        allowed_branch_ids = camp_cfg.get('branch_ids') if isinstance(camp_cfg.get('branch_ids'), list) else None
-        if allowed_branch_id:
-            if not branch or str(branch.id) != str(allowed_branch_id):
-                branch_label = discount_code.branch.name if discount_code.branch else (Branch.objects.using(alias).filter(id=allowed_branch_id).values_list('name', flat=True).first() or 'the designated branch')
-                return {'is_valid': False, 'reason': f"Coupon is only valid at {branch_label}.", 'reason_code': 'BRANCH_NOT_ELIGIBLE'}
-        elif allowed_branch_ids:
-            if not branch or str(branch.id) not in [str(x) for x in allowed_branch_ids]:
+        code_branch_id = str(discount_code.branch_id) if discount_code.branch_id else None
+        camp_branch_ids = [str(x) for x in camp_cfg.get('branch_ids', []) if x] if isinstance(camp_cfg.get('branch_ids'), list) else []
+        camp_single_branch_id = str(camp_cfg.get('branch_id')) if (camp_cfg.get('branch_id') and not camp_branch_ids) else None
+
+        allowed_branch_ids = [code_branch_id] if code_branch_id else (camp_branch_ids if camp_branch_ids else ([camp_single_branch_id] if camp_single_branch_id else []))
+
+        if allowed_branch_ids:
+            allowed_branch_set = set(allowed_branch_ids)
+            if branch and str(branch.id) not in allowed_branch_set:
+                if len(allowed_branch_ids) == 1:
+                    branch_label = discount_code.branch.name if discount_code.branch else (Branch.objects.using(alias).filter(id=allowed_branch_ids[0]).values_list('name', flat=True).first() or 'the designated branch')
+                    return {'is_valid': False, 'reason': f"Coupon is only valid at {branch_label}.", 'reason_code': 'BRANCH_NOT_ELIGIBLE'}
+                else:
+                    return {'is_valid': False, 'reason': 'Coupon is not valid at this branch.', 'reason_code': 'BRANCH_NOT_ELIGIBLE'}
+            elif not branch and order is not None and str(order.branch_id) not in allowed_branch_set:
                 return {'is_valid': False, 'reason': 'Coupon is not valid at this branch.', 'reason_code': 'BRANCH_NOT_ELIGIBLE'}
 
         # Package scope
-        allowed_package_id = str(discount_code.package_id) if discount_code.package_id else camp_cfg.get('package_id')
-        allowed_package_ids = camp_cfg.get('package_ids') if isinstance(camp_cfg.get('package_ids'), list) else None
-        if allowed_package_id:
+        # Priority 1: Explicit package lock on the DiscountCode itself
+        # Priority 2: Multi-package scope on Campaign configuration ('package_ids')
+        # Priority 3: Single-package scope on Campaign configuration ('package_id')
+        code_pkg_id = str(discount_code.package_id) if discount_code.package_id else None
+        camp_pkg_ids = [str(x) for x in camp_cfg.get('package_ids', []) if x] if isinstance(camp_cfg.get('package_ids'), list) else []
+        camp_single_pkg_id = str(camp_cfg.get('package_id')) if (camp_cfg.get('package_id') and not camp_pkg_ids) else None
+
+        allowed_package_ids = [code_pkg_id] if code_pkg_id else (camp_pkg_ids if camp_pkg_ids else ([camp_single_pkg_id] if camp_single_pkg_id else []))
+
+        if allowed_package_ids:
+            allowed_package_set = set(allowed_package_ids)
             pkg_eligible = False
-            if package and str(package.id) == str(allowed_package_id):
+            if package and str(package.id) in allowed_package_set:
                 pkg_eligible = True
             elif order is not None:
                 order_pkg_ids = list(order.items.using(alias).filter(package_id__isnull=False).values_list('package_id', flat=True))
-                if any(str(p) == str(allowed_package_id) for p in order_pkg_ids):
+                if any(str(p) in allowed_package_set for p in order_pkg_ids):
                     pkg_eligible = True
+
             if not pkg_eligible:
-                pkg_label = discount_code.package.name if discount_code.package else (Package.objects.using(alias).filter(id=allowed_package_id).values_list('name', flat=True).first() or 'the designated package')
-                return {'is_valid': False, 'reason': f"Coupon is only valid for package '{pkg_label}'.", 'reason_code': 'PACKAGE_NOT_ELIGIBLE'}
-        elif allowed_package_ids:
-            allowed_set = {str(x) for x in allowed_package_ids}
-            opids = []
-            if package:
-                opids.append(str(package.id))
-            if order is not None:
-                opids += [str(p) for p in order.items.using(alias).filter(package_id__isnull=False).values_list('package_id', flat=True)]
-            if not any(pid in allowed_set for pid in opids):
-                return {'is_valid': False, 'reason': 'Coupon is not valid for this package.', 'reason_code': 'PACKAGE_NOT_ELIGIBLE'}
+                if not package and order is None:
+                    if len(allowed_package_ids) == 1:
+                        pkg_label = discount_code.package.name if discount_code.package else (Package.objects.using(alias).filter(id=allowed_package_ids[0]).values_list('name', flat=True).first() or 'the designated package')
+                        return {'is_valid': False, 'reason': f"Coupon requires selecting target package '{pkg_label}'.", 'reason_code': 'PACKAGE_NOT_ELIGIBLE'}
+                    else:
+                        return {'is_valid': False, 'reason': f"Coupon is restricted to {len(allowed_package_ids)} specific packages. Please select one of the eligible packages under 'Target Package'.", 'reason_code': 'PACKAGE_NOT_ELIGIBLE'}
+                elif package:
+                    if len(allowed_package_ids) == 1:
+                        pkg_label = discount_code.package.name if discount_code.package else (Package.objects.using(alias).filter(id=allowed_package_ids[0]).values_list('name', flat=True).first() or 'the designated package')
+                        return {'is_valid': False, 'reason': f"Coupon is only valid for package '{pkg_label}'.", 'reason_code': 'PACKAGE_NOT_ELIGIBLE'}
+                    else:
+                        return {'is_valid': False, 'reason': f"Coupon is not valid for package '{package.name}'. It is only applicable to the {len(allowed_package_ids)} configured packages.", 'reason_code': 'PACKAGE_NOT_ELIGIBLE'}
+                else:
+                    return {'is_valid': False, 'reason': 'Coupon is not valid for the packages in this order.', 'reason_code': 'PACKAGE_NOT_ELIGIBLE'}
 
         # Program scope - a configured program_ids list (covers a whole program's packages)
-        allowed_program_ids = camp_cfg.get('program_ids') if isinstance(camp_cfg.get('program_ids'), list) else None
+        allowed_program_ids = [str(x) for x in camp_cfg.get('program_ids', []) if x] if isinstance(camp_cfg.get('program_ids'), list) else []
         if allowed_program_ids:
             prog_set = set()
             if package is not None and getattr(package, 'program_id', None):
@@ -157,8 +176,9 @@ class DiscountCouponEngineService:
                 for _it in order.items.using(alias).filter(package__isnull=False).select_related('package'):
                     if getattr(_it, 'package', None) and getattr(_it.package, 'program_id', None):
                         prog_set.add(str(_it.package.program_id))
-            if not (prog_set & {str(x) for x in allowed_program_ids}):
-                return {'is_valid': False, 'reason': 'Coupon is not valid for this program.', 'reason_code': 'PROGRAM_NOT_ELIGIBLE'}
+            if package is not None or order is not None:
+                if not (prog_set & set(allowed_program_ids)):
+                    return {'is_valid': False, 'reason': 'Coupon is not valid for this program.', 'reason_code': 'PROGRAM_NOT_ELIGIBLE'}
 
         # User lock - restrict a coupon to specific member(s) via configuration['allowed_user_ids']
         allowed_user_ids = camp_cfg.get('allowed_user_ids') if isinstance(camp_cfg.get('allowed_user_ids'), list) else None
@@ -483,8 +503,9 @@ class DiscountCouponEngineService:
                 cfg = getattr(rule, 'configuration', None) or {}
                 scope_branch_ids = [str(x) for x in cfg.get('branch_ids', []) if x]
                 scope_pkg_ids = [str(x) for x in cfg.get('package_ids', []) if x]
+                scope_prog_ids = [str(x) for x in cfg.get('program_ids', []) if x]
 
-                if not scope_branch_ids and not scope_pkg_ids and rule.description and '<!-- SCOPE:' in rule.description:
+                if not scope_branch_ids and not scope_pkg_ids and not scope_prog_ids and rule.description and '<!-- SCOPE:' in rule.description:
                     try:
                         import json, re
                         m = re.search(r'<!-- SCOPE:\s*(\{.*?\})\s*-->', rule.description)
@@ -492,6 +513,7 @@ class DiscountCouponEngineService:
                             scope_data = json.loads(m.group(1))
                             scope_branch_ids = [str(x) for x in scope_data.get('branch_ids', []) if x]
                             scope_pkg_ids = [str(x) for x in scope_data.get('package_ids', []) if x]
+                            scope_prog_ids = [str(x) for x in scope_data.get('program_ids', []) if x]
                     except Exception:
                         pass
 
@@ -501,6 +523,13 @@ class DiscountCouponEngineService:
                         continue
                 elif rule.branch and branch and rule.branch_id != branch.id:
                     continue
+
+                # Program check
+                if scope_prog_ids:
+                    if target_package:
+                        pkg_prog_id = str(getattr(target_package, 'program_id', None) or '')
+                        if not pkg_prog_id or pkg_prog_id not in scope_prog_ids:
+                            continue
 
                 # Target package check
                 if scope_pkg_ids:
@@ -529,17 +558,34 @@ class DiscountCouponEngineService:
                     is_qualified = True
 
                 if is_qualified:
-                    actions = list(rule.actions.all())
+                    actions = list(rule.actions.select_related('discount_campaign', 'discount_code').all())
                     for act in actions:
+                        camp = act.discount_campaign
+                        code_obj = act.discount_code
+                        code_str = code_obj.code if code_obj else (
+                            camp.codes.filter(status='ACTIVE').values_list('code', flat=True).first() if camp else None
+                        )
+                        pct = act.discount_percentage if act.discount_percentage else (
+                            camp.discount_value if (camp and camp.discount_type == 'PERCENTAGE') else None
+                        )
+                        amt = act.discount_amount if act.discount_amount else (
+                            camp.discount_value if (camp and camp.discount_type == 'FIXED') else None
+                        )
+                        max_d = act.maximum_discount if act.maximum_discount else (
+                            camp.max_discount if camp else None
+                        )
                         matching_offers.append({
                             'rule_id': str(rule.id),
                             'rule_name': rule.name,
                             'rule_type': rule.rule_type,
                             'action_type': act.action_type,
                             'message': act.message or rule.description or rule.name,
-                            'discount_percentage': str(act.discount_percentage) if act.discount_percentage else None,
-                            'discount_amount': str(act.discount_amount) if act.discount_amount else None,
-                            'maximum_discount': str(act.maximum_discount) if act.maximum_discount else None,
+                            'campaign_id': str(camp.id) if camp else None,
+                            'campaign_name': camp.name if camp else None,
+                            'coupon_code': code_str,
+                            'discount_percentage': str(pct) if pct else None,
+                            'discount_amount': str(amt) if amt else None,
+                            'maximum_discount': str(max_d) if max_d else None,
                             'auto_apply': act.auto_apply,
                             'priority': rule.priority,
                         })
