@@ -294,17 +294,15 @@ class ClassScheduleRuleSerializer(serializers.ModelSerializer):
                         raise serializers.ValidationError({
                             "branch": f"Cannot schedule class '{class_template.name}' because its program '{class_template.program.name}' is not ACTIVE."
                         })
-                    is_pba_active = ProgramBranchAvailability.objects.using(chk_alias).filter(
-                        program=class_template.program,
-                        branch=branch,
-                        is_active=True
-                    ).exists()
-                    if not is_pba_active:
-                        raise serializers.ValidationError({
-                            "branch": f"Cannot schedule class '{class_template.name}' at '{branch.name}' because its program '{class_template.program.name}' is not active at this branch."
-                        })
+                    pba_qs = ProgramBranchAvailability.objects.using(chk_alias).filter(program=class_template.program)
+                    if pba_qs.exists():
+                        is_pba_active = pba_qs.filter(branch=branch, is_active=True).exists()
+                        if not is_pba_active:
+                            raise serializers.ValidationError({
+                                "branch": f"Cannot schedule class '{class_template.name}' at '{branch.name}' because its program '{class_template.program.name}' is not active at this branch."
+                            })
 
-                # Check branch working hours
+                # Check branch working hours (including split-shift support)
                 from .models_govern import BranchWorkingHours, BranchOperatingException
                 from .context import get_tenant_db_alias
                 alias = get_tenant_db_alias() or 'default'
@@ -316,14 +314,54 @@ class ClassScheduleRuleSerializer(serializers.ModelSerializer):
                         if not wh.is_open:
                             raise serializers.ValidationError({"branch": f"Branch '{branch.name}' is closed on {d_name}."})
                         if not wh.is_24_hours:
-                            if wh.open_time and start_time and start_time < wh.open_time:
-                                raise serializers.ValidationError(
-                                    {"start_time": f"Class start time ({start_time.strftime('%H:%M')}) is before branch opening time ({wh.open_time.strftime('%H:%M')}) on {d_name}."}
+                            fits_s1 = bool(wh.open_time and wh.close_time and start_time >= wh.open_time and end_time <= wh.close_time)
+                            fits_s2 = bool(
+                                getattr(wh, 'has_split_shift', False) and
+                                getattr(wh, 'open_time_2', None) and
+                                getattr(wh, 'close_time_2', None) and
+                                start_time >= wh.open_time_2 and
+                                end_time <= wh.close_time_2
+                            )
+                            if getattr(wh, 'has_split_shift', False) and getattr(wh, 'open_time_2', None) and getattr(wh, 'close_time_2', None):
+                                if not (fits_s1 or fits_s2):
+                                    raise serializers.ValidationError({
+                                        "start_time": (
+                                            f"Class ({start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}) falls outside branch operating shifts "
+                                            f"({wh.open_time.strftime('%H:%M')}–{wh.close_time.strftime('%H:%M')} & "
+                                            f"{wh.open_time_2.strftime('%H:%M')}–{wh.close_time_2.strftime('%H:%M')}) on {d_name}."
+                                        )
+                                    })
+                            else:
+                                if wh.open_time and start_time and start_time < wh.open_time:
+                                    raise serializers.ValidationError(
+                                        {"start_time": f"Class start time ({start_time.strftime('%H:%M')}) is before branch opening time ({wh.open_time.strftime('%H:%M')}) on {d_name}."}
+                                    )
+                                if wh.close_time and end_time and end_time > wh.close_time:
+                                    raise serializers.ValidationError(
+                                        {"end_time": f"Class end time ({end_time.strftime('%H:%M')}) is after branch closing time ({wh.close_time.strftime('%H:%M')}) on {d_name}."}
+                                    )
+
+                # Prevent duplicate active recurring rule for the same template, branch, time, and overlapping days
+                if not self.instance and branch and class_template and start_time and end_time and target_status == 'ACTIVE':
+                    existing_rules = ClassScheduleRule.objects.using(alias).filter(
+                        branch=branch,
+                        class_template=class_template,
+                        start_time=start_time,
+                        end_time=end_time,
+                        status='ACTIVE',
+                    )
+                    target_days = set(days_of_week or [])
+                    for er in existing_rules:
+                        er_days = set(er.days_of_week or [])
+                        common_days = target_days.intersection(er_days)
+                        if common_days:
+                            common_names = [day_names.get(d, f"Day {d}") for d in sorted(common_days)]
+                            raise serializers.ValidationError({
+                                "start_time": (
+                                    f"An active recurring rule for '{class_template.name}' at '{branch.name}' already exists "
+                                    f"from {start_time.strftime('%H:%M')} to {end_time.strftime('%H:%M')} on {', '.join(common_names)}."
                                 )
-                            if wh.close_time and end_time and end_time > wh.close_time:
-                                raise serializers.ValidationError(
-                                    {"end_time": f"Class end time ({end_time.strftime('%H:%M')}) is after branch closing time ({wh.close_time.strftime('%H:%M')}) on {d_name}."}
-                                )
+                            })
 
                 # Check holiday exceptions when valid_from is single date or short range
                 if valid_from:
@@ -782,6 +820,8 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
             occ_date = start_at.date()
 
         if tpl:
+            if not self.instance and getattr(tpl, 'status', 'ACTIVE') != 'ACTIVE':
+                raise serializers.ValidationError({"class_template": "Cannot schedule an occurrence for an inactive or non-active class template."})
             branch_avail = None
             if branch:
                 from .models_classes import ClassBranchAvailability

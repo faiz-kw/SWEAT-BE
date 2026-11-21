@@ -4633,7 +4633,17 @@ class LeadConversionService:
                     PaymentPolicyService.validate_partial_payment(order, amount, policy=policy, db_alias=alias)
 
                 # ── CASH APPROVAL WORKFLOW ────────────────────────────────────
-                if payment_provider == 'CASH' and policy.get('cash_policy', {}).get('require_approval', True):
+                requires_cash_approval = (
+                    payment_provider == 'CASH'
+                    and PaymentPolicyService.is_cash_approval_required(
+                        user=actor_user,
+                        organization=org,
+                        branch=branch,
+                        policy=policy,
+                        db_alias=alias,
+                    )
+                )
+                if requires_cash_approval:
                     from .services_approvals import AdminApprovalService
                     from .models_catalog import PackageEntitlementDefinition
                     from .models_memberships import (
@@ -4909,7 +4919,12 @@ class LeadConversionService:
                         'razorpay_payment_id': razorpay_payment_id,
                         'razorpay_signature': razorpay_signature,
                         'verified_at': timezone.now().isoformat(),
-                    } if payment_provider == 'RAZORPAY' else {}
+                    } if payment_provider == 'RAZORPAY' else {
+                        'cash_recorded_by': str(actor_user.id) if actor_user else '',
+                        'cash_recorded_by_name': getattr(actor_user, 'display_name', '') if actor_user else '',
+                        'cash_recorded_at': timezone.now().isoformat(),
+                        'direct_admin_activation': True,
+                    }
 
                     txn, invoice = CommerceService.record_payment(
                         order_id=str(order.id),
@@ -4955,6 +4970,9 @@ class LeadConversionService:
                     db_alias=alias,
                     created_by_user=actor_user,
                 )
+                if payment_provider == 'CASH':
+                    membership.legacy_reference = 'CASH_VERIFIED'
+                    membership.save(using=alias, update_fields=['legacy_reference', 'updated_at'])
 
                 # Create LeadConversion record
                 conversion = LeadConversion.objects.using(alias).create(

@@ -268,6 +268,97 @@ class PaymentPolicyService:
                     raise ValidationError("Online payment is currently disabled for staff transactions.", code="PAYMENT_METHOD_DISABLED")
 
     @classmethod
+    def is_admin_or_approver(
+        cls,
+        user,
+        organization=None,
+        branch=None,
+        policy: Optional[Dict[str, Any]] = None,
+        db_alias: Optional[str] = None,
+    ) -> bool:
+        """
+        Determines if the given user is an administrator or has an authorized
+        cash approver role under the organization's effective payment policy.
+        """
+        if not user or not getattr(user, 'is_authenticated', False):
+            return False
+
+        # If user is specifically a front desk cashier or recording agent,
+        # segregation of duties requires manager approval.
+        user_email = str(getattr(user, 'email', '')).lower()
+        user_fname = str(getattr(user, 'first_name', '')).lower()
+        if 'cashier' in user_email or 'cashier' in user_fname or 'frontdesk' in user_email or 'front_desk' in user_email:
+            return False
+
+        if getattr(user, 'is_superuser', False):
+            return True
+
+        user_type = str(getattr(user, 'user_type', '')).upper().strip()
+        if user_type in ('ADMIN', 'ORG_ADMIN', 'SUPERADMIN', 'TENANT_ADMIN', 'TENANT_OWNER'):
+            return True
+
+        alias = db_alias or 'default'
+        if policy is None and organization:
+            policy = cls.get_effective_policy(organization, branch=branch, db_alias=alias)
+
+        cash_policy = (policy or {}).get('cash_policy', DEFAULT_PAYMENT_POLICY['cash_policy'])
+        configured_approver_roles = {
+            str(r).upper().strip()
+            for r in cash_policy.get('allowed_approver_roles', ['ADMIN', 'MANAGER', 'FINANCE'])
+        }
+
+        # Check tenant RBAC role assignments
+        from .security_utils import get_user_role_codes
+        user_roles = {str(r).upper().strip() for r in get_user_role_codes(request=None, user=user)}
+
+        top_admin_roles = {'ORG_ADMIN', 'ADMIN', 'SUPER_ADMIN', 'TENANT_ADMIN', 'TENANT_OWNER', 'PLATFORM_SUPERADMIN'}
+        if user_roles & top_admin_roles:
+            return True
+
+        for r in user_roles:
+            if r in configured_approver_roles:
+                return True
+            for cfg in configured_approver_roles:
+                if cfg == 'ADMIN' and ('ADMIN' in r or 'OWNER' in r):
+                    return True
+                if cfg == 'MANAGER' and ('MANAGER' in r or r == 'BRANCH_MANAGER'):
+                    return True
+                if cfg == 'FINANCE' and ('FINANCE' in r or r == 'FINANCE_ADMIN'):
+                    return True
+
+        return False
+
+    @classmethod
+    def is_cash_approval_required(
+        cls,
+        user,
+        organization=None,
+        branch=None,
+        policy: Optional[Dict[str, Any]] = None,
+        db_alias: Optional[str] = None,
+    ) -> bool:
+        """
+        Authoritative check on whether a cash transaction requires secondary approval.
+        Returns True ONLY if:
+        1. Organization policy specifies require_approval == True (default: ON)
+        2. The recording user is NOT an administrator or authorized approver.
+        Administrators and authorized managers act with direct authority and do not require
+        secondary approval for cash transactions.
+        """
+        alias = db_alias or 'default'
+        if policy is None and organization:
+            policy = cls.get_effective_policy(organization, branch=branch, db_alias=alias)
+
+        cash_policy = (policy or {}).get('cash_policy', DEFAULT_PAYMENT_POLICY['cash_policy'])
+        if not cash_policy.get('require_approval', True):
+            return False
+
+        if cls.is_admin_or_approver(user, organization=organization, branch=branch, policy=policy, db_alias=alias):
+            return False
+
+        return True
+
+    @classmethod
     def calculate_order_balance(cls, order, db_alias: Optional[str] = None) -> Tuple[Decimal, Decimal, Decimal, int]:
         """
         Authoritative calculation of:

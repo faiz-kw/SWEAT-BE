@@ -3368,15 +3368,20 @@ class MobileDiscountCouponsView(APIView):
         req_member_id = request.query_params.get('member_id') or request.query_params.get('user_profile_id') or request.query_params.get('user_id')
 
         # Authoritative member profile and lifecycle state resolution
-        profile = None
-        if req_member_id:
-            profile = UserProfile.objects.using(alias).filter(
-                models.Q(id=req_member_id) | models.Q(user_id=req_member_id)
-            ).first()
-        if not profile and request.user and request.user.is_authenticated:
-            profile = UserProfile.objects.using(alias).filter(user=request.user).first()
+        profile = DiscountCouponEngineService.resolve_authoritative_member_profile(
+            req_member_id, request_user=request.user, db_alias=alias
+        )
 
-        member_lifecycle = DiscountCouponEngineService.get_member_lifecycle_state(profile, alias) if profile else None
+        member_lifecycle = None
+        if profile:
+            member_lifecycle = DiscountCouponEngineService.get_member_lifecycle_state(profile, alias)
+        elif req_order_type in ('NEW_MEMBERSHIP', 'NEW_PACKAGE', 'LEAD_CONVERSION', 'CONVERT_LEAD'):
+            member_lifecycle = 'NEW'
+        elif req_member_id:
+            from .models_crm import Lead as _LeadRef
+            if _LeadRef.objects.using(alias).filter(id=req_member_id).exists():
+                member_lifecycle = 'NEW'
+
         req_program_id = None
         if req_package_id:
             from .models_catalog import Package as _PkgRef
@@ -3412,13 +3417,18 @@ class MobileDiscountCouponsView(APIView):
                 _cfg_pkg_ids = [str(x) for x in _cfg.get('package_ids', []) if x] if isinstance(_cfg.get('package_ids'), list) else []
                 _cfg_single_pkg_id = str(_cfg.get('package_id')) if (_cfg.get('package_id') and not _cfg_pkg_ids) else None
                 _allowed_pkgs = [_code_pkg_id] if _code_pkg_id else (_cfg_pkg_ids if _cfg_pkg_ids else ([_cfg_single_pkg_id] if _cfg_single_pkg_id else []))
+                _cfg_program_ids = [str(x) for x in _cfg.get('program_ids', []) if x] if isinstance(_cfg.get('program_ids'), list) else []
 
-                if _allowed_pkgs:
-                    if str(req_package_id) not in _allowed_pkgs:
-                        continue
-                elif isinstance(_cfg.get('program_ids'), list) and _cfg.get('program_ids'):
-                    if not req_program_id or str(req_program_id) not in [str(x) for x in _cfg['program_ids']]:
-                        continue
+                pkg_matches = False
+                if _allowed_pkgs and str(req_package_id) in _allowed_pkgs:
+                    pkg_matches = True
+                elif _cfg_program_ids and req_program_id and str(req_program_id) in _cfg_program_ids:
+                    pkg_matches = True
+                elif not _allowed_pkgs and not _cfg_program_ids:
+                    pkg_matches = True
+
+                if not pkg_matches:
+                    continue
             if req_branch_id:
                 _code_branch_id = str(c.branch_id) if c.branch_id else None
                 _cfg_branch_ids = [str(x) for x in _cfg.get('branch_ids', []) if x] if isinstance(_cfg.get('branch_ids'), list) else []
@@ -3484,13 +3494,9 @@ class MobileValidateCouponView(APIView):
             return Response({'is_valid': False, 'detail': 'Promo code is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
         member_id = request.data.get('member_id') or request.data.get('user_profile_id') or request.data.get('user_id')
-        profile = None
-        if member_id:
-            profile = UserProfile.objects.using(alias).filter(
-                models.Q(id=member_id) | models.Q(user_id=member_id)
-            ).first()
-        if not profile and request.user and request.user.is_authenticated:
-            profile = UserProfile.objects.using(alias).filter(user=request.user).first()
+        profile = DiscountCouponEngineService.resolve_authoritative_member_profile(
+            member_id, request_user=request.user, db_alias=alias
+        )
 
         pkg = Package.objects.using(alias).filter(id=package_id).first() if package_id else None
 

@@ -248,6 +248,12 @@ class TenantDBMixin:
                             status='INACTIVE', is_active=False, is_primary=False
                         )
             else:
+                clear_home = (
+                    data.get('clear_home_branch') is True
+                    or ('home_branch' in data and not data.get('home_branch'))
+                    or ('primary_branch_id' in data and not data.get('primary_branch_id'))
+                    or (str(branch_id).lower() in ('all', 'none', 'null', ''))
+                )
                 if br_obj:
                     instance.home_branch = br_obj
                     instance.save(using=db, update_fields=['home_branch'])
@@ -260,9 +266,13 @@ class TenantDBMixin:
                         RoleAssignment.objects.using(db).filter(
                             user=instance, is_active=True, role__scope='BRANCH', branch_id=old_branch_id,
                         ).update(branch=br_obj, scope_type='BRANCH')
+                elif clear_home and ('home_branch' in data or 'primary_branch_id' in data or 'clear_home_branch' in data):
+                    instance.home_branch = None
+                    instance.save(using=db, update_fields=['home_branch'])
+                    UserBranch.objects.using(db).filter(user=instance).update(status='INACTIVE', is_active=False, is_primary=False)
 
                 existing_role = role_obj and RoleAssignment.objects.using(db).filter(user=instance, role=role_obj, is_active=True).exists()
-                if role_obj and (br_obj or not existing_role):
+                if role_obj and (br_obj or not existing_role or clear_home):
                     RoleAssignment.objects.using(db).filter(user=instance, is_active=True).update(is_active=False, status='INACTIVE')
                     assigned_branch = instance.home_branch if role_obj.scope == 'BRANCH' else None
                     RoleAssignment.objects.using(db).create(
@@ -1036,7 +1046,7 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
 
             branch_id = data.get('home_branch') or data.get('primary_branch_id') or data.get('branch_id') or data.get('branch')
             br_obj = None
-            if branch_id:
+            if branch_id and str(branch_id).lower() not in ('all', 'none', 'null', ''):
                 try:
                     br_obj = Branch.objects.using(db).filter(id=uuid.UUID(str(branch_id))).first()
                 except (ValueError, TypeError, AttributeError):
@@ -1071,6 +1081,12 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
                 except Exception as sync_e:
                     logger.warning("Failed to sync updated username for %s: %s", instance.email, sync_e)
 
+            clear_home = (
+                data.get('clear_home_branch') is True
+                or ('home_branch' in data and not data.get('home_branch'))
+                or ('primary_branch_id' in data and not data.get('primary_branch_id'))
+                or (str(branch_id).lower() in ('all', 'none', 'null', ''))
+            )
             if br_obj:
                 instance.home_branch = br_obj
                 instance.save(using=db, update_fields=['home_branch'])
@@ -1084,9 +1100,13 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
                     RoleAssignment.objects.using(db).filter(
                         user=instance, is_active=True, role__scope='BRANCH', branch_id=old_branch_id,
                     ).update(branch=br_obj, scope_type='BRANCH')
+            elif clear_home and ('home_branch' in data or 'primary_branch_id' in data or 'clear_home_branch' in data):
+                instance.home_branch = None
+                instance.save(using=db, update_fields=['home_branch'])
+                UserBranch.objects.using(db).filter(user=instance, scope_type='HOME').update(status='INACTIVE', is_active=False, is_primary=False)
 
             existing_role = role_obj and RoleAssignment.objects.using(db).filter(user=instance, role=role_obj, is_active=True).exists()
-            if role_obj and branch_access is None and (br_obj or not existing_role):
+            if role_obj and branch_access is None and (br_obj or not existing_role or clear_home):
                 RoleAssignment.objects.using(db).filter(user=instance, is_active=True).update(is_active=False, status='INACTIVE')
                 assigned_branch = instance.home_branch if role_obj.scope == 'BRANCH' else None
                 ra = RoleAssignment.objects.using(db).filter(
@@ -1119,6 +1139,24 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
                     assignment.status = 'ACTIVE' if enabled else 'INACTIVE'
                     assignment.scope_type = 'BRANCH'
                     assignment.save(using=db)
+
+                    is_pri = (branch_obj == br_obj or branch_obj.id == instance.home_branch_id) if enabled else False
+                    if enabled:
+                        UserBranch.objects.using(db).update_or_create(
+                            user=instance,
+                            branch=branch_obj,
+                            defaults={
+                                'is_primary': is_pri,
+                                'scope_type': 'HOME' if is_pri else 'ADDITIONAL',
+                                'relationship_type': 'PRIMARY' if is_pri else 'SECONDARY',
+                                'status': 'ACTIVE',
+                                'is_active': True,
+                            }
+                        )
+                    else:
+                        UserBranch.objects.using(db).filter(user=instance, branch=branch_obj).update(
+                            status='INACTIVE', is_active=False, is_primary=False
+                        )
 
             # Update department if provided
             dept_id = data.get('department_id') or data.get('department')

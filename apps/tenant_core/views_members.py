@@ -2333,16 +2333,37 @@ class MemberViewSet(viewsets.ViewSet):
         org = _get_org(request)
         qs = self.get_member_queryset(alias, org)
         # Trainer branch scoping: a plain Trainer sees only members of their home branch;
-        # admins / managers / front-desk / super-admin are NEVER restricted here.
+        # admins / managers / front-desk / super-admin / ORG-scoped roles are NEVER restricted here.
         # (Client-360 can still look up any individual member across branches.)
         _roles = {str(r).upper() for r in (get_user_role_codes(request) or set())}
-        if ('TRAINER' in _roles) and not (_roles & {'ORG_ADMIN', 'SUPER_ADMIN', 'BRANCH_MANAGER', 'FINANCE_ADMIN', 'FRONT_DESK'}):
-            _tb = getattr(request.user, 'home_branch_id', None)
-            if _tb:
+        is_org_scoped = False
+        try:
+            from .models_rbac import RoleAssignment
+            is_org_scoped = RoleAssignment.objects.using(alias).filter(
+                user=request.user, is_active=True, role__is_active=True, role__scope__in=['ORG', 'ORGANIZATION']
+            ).exists()
+        except Exception:
+            pass
+
+        is_trainer = any('TRAINER' in r for r in _roles)
+        if is_trainer and not is_org_scoped and not (_roles & {'ORG_ADMIN', 'SUPER_ADMIN', 'BRANCH_MANAGER', 'FINANCE_ADMIN', 'FRONT_DESK'}):
+            from .models_users import UserBranch
+            from .models_rbac import RoleAssignment
+            permitted_branches = set()
+            if getattr(request.user, 'home_branch_id', None):
+                permitted_branches.add(str(request.user.home_branch_id))
+            for b in UserBranch.objects.using(alias).filter(user=request.user, is_active=True).values_list('branch_id', flat=True):
+                if b:
+                    permitted_branches.add(str(b))
+            for b in RoleAssignment.objects.using(alias).filter(user=request.user, is_active=True, branch_id__isnull=False).values_list('branch_id', flat=True):
+                if b:
+                    permitted_branches.add(str(b))
+
+            if permitted_branches:
                 qs = qs.filter(
-                    Q(preferred_branch_id=_tb)
-                    | Q(memberships__home_branch_id=_tb)
-                    | Q(memberships__purchase_branch_id=_tb)
+                    Q(preferred_branch_id__in=permitted_branches)
+                    | Q(memberships__home_branch_id__in=permitted_branches)
+                    | Q(memberships__purchase_branch_id__in=permitted_branches)
                 ).distinct()
             else:
                 qs = qs.none()
@@ -3155,7 +3176,20 @@ class MemberViewSet(viewsets.ViewSet):
                     'member': serialize_member(profile, alias, request=request),
                 }, status=status.HTTP_201_CREATED)
 
-            if is_cash and pay_amt > Decimal('0.00'):
+            explicit_approval_req = request.data.get('require_approval')
+            is_front_desk_note = 'front desk' in str(request.data.get('reason', '')).lower()
+            from .services_payment_policy import PaymentPolicyService
+            if explicit_approval_req is True or (explicit_approval_req is None and is_front_desk_note and not request.data.get('auto_activate')):
+                requires_cash_approval = True
+            else:
+                requires_cash_approval = is_cash and PaymentPolicyService.is_cash_approval_required(
+                    user=request.user,
+                    organization=org,
+                    branch=branch,
+                    db_alias=alias,
+                )
+
+            if is_cash and pay_amt > Decimal('0.00') and requires_cash_approval:
                 txn = PaymentTransaction.objects.using(alias).create(
                     id=uuid.uuid4(),
                     order=order,
@@ -3275,12 +3309,21 @@ class MemberViewSet(viewsets.ViewSet):
                 }, status=status.HTTP_201_CREATED)
 
             else:
-                CommerceService.record_payment(
+                pay_prov = 'CASH' if is_cash else payment_provider
+                pay_meth = 'CASH' if is_cash else payment_method
+                txn, invoice = CommerceService.record_payment(
                     order_id=str(order.id),
                     amount=pay_amt,
-                    provider=payment_provider,
-                    payment_method=payment_method,
+                    provider=pay_prov,
+                    payment_method=pay_meth,
                     actor=request.user,
+                    metadata={
+                        'collected_via': 'MEMBERSHIP_RENEWAL',
+                        'collected_by_user_id': str(request.user.id),
+                        'collected_by_name': getattr(request.user, 'display_name', 'Staff'),
+                        'member_profile_id': str(profile.id),
+                        'direct_activation': True,
+                    },
                     db_alias=alias,
                 )
                 order_item = order.items.first()
@@ -3291,6 +3334,9 @@ class MemberViewSet(viewsets.ViewSet):
                     db_alias=alias,
                     created_by_user=request.user,
                 )
+                if is_cash:
+                    new_membership.legacy_reference = 'CASH_VERIFIED'
+                    new_membership.save(using=alias, update_fields=['legacy_reference', 'updated_at'])
                 # PAR-Q Lifecycle Inheritance / Reuse for Renewal
                 parq_decision = str(request.data.get('parq_decision', 'REUSE')).upper().strip()
                 if parq_decision == 'REUSE':
@@ -3526,38 +3572,119 @@ class MemberViewSet(viewsets.ViewSet):
                 }, status=status.HTTP_201_CREATED)
 
             elif is_cash:
-                txn = PaymentTransaction.objects.using(alias).create(
-                    id=uuid.uuid4(),
-                    order=order,
-                    user_profile=profile,
-                    amount=pay_amt,
-                    currency=order.currency or 'INR',
-                    provider='CASH',
-                    payment_method='CASH',
-                    status='SUCCESS',
-                    idempotency_key=f"CASH-PURCHASE-{uuid.uuid4().hex[:12]}",
-                    metadata={
-                        'collected_via': 'PACKAGE_PURCHASE',
-                        'collected_by_user_id': str(request.user.id),
-                        'collected_by_name': getattr(request.user, 'display_name', getattr(request.user, 'email', 'Staff')),
-                        'member_profile_id': str(profile.id),
-                    }
-                )
-                new_membership = MembershipLifecycleService.activate_membership_from_order(
-                    order=order,
-                    order_item=order_item,
-                    start_date=start_date,
+                from .services_payment_policy import PaymentPolicyService
+                policy = PaymentPolicyService.get_effective_policy(org, branch=branch, db_alias=alias)
+                requires_cash_approval = PaymentPolicyService.is_cash_approval_required(
+                    user=request.user,
+                    organization=org,
+                    branch=branch,
+                    policy=policy,
                     db_alias=alias,
-                    created_by_user=request.user,
                 )
-                MembershipStatusHistory.objects.using(alias).create(
-                    membership=new_membership,
-                    from_status=None,
-                    to_status='ACTIVE',
-                    reason_code='NEW_PROGRAM_PACKAGE_PURCHASE_CASH',
-                    reason_text=f"Purchased {package.name} ({package.program.name if package.program else ''}) via Cash recorded by {getattr(request.user, 'email', 'Staff')}",
-                    changed_by_user=request.user,
-                )
+                if requires_cash_approval:
+                    txn = PaymentTransaction.objects.using(alias).create(
+                        id=uuid.uuid4(),
+                        order=order,
+                        user_profile=profile,
+                        amount=pay_amt,
+                        currency=order.currency or 'INR',
+                        provider='CASH',
+                        payment_method='CASH',
+                        status='PENDING',
+                        idempotency_key=f"CASH-PURCHASE-{uuid.uuid4().hex[:12]}",
+                        metadata={
+                            'collected_via': 'PACKAGE_PURCHASE',
+                            'collected_by_user_id': str(request.user.id),
+                            'collected_by_name': getattr(request.user, 'display_name', getattr(request.user, 'email', 'Staff')),
+                            'member_profile_id': str(profile.id),
+                        }
+                    )
+                    new_membership = MembershipLifecycleService.activate_membership_from_order(
+                        order=order,
+                        order_item=order_item,
+                        start_date=start_date,
+                        db_alias=alias,
+                        created_by_user=request.user,
+                    )
+                    from .services_approvals import AdminApprovalService
+                    approval_req = AdminApprovalService.create_approval_request(
+                        organization=org,
+                        request_type='CASH_PAYMENT_APPROVAL',
+                        entity_type='PaymentTransaction',
+                        entity_id=txn.id,
+                        requested_by_user=request.user,
+                        requested_payload={
+                            'order_id': str(order.id),
+                            'order_number': order.order_number,
+                            'member_id': str(profile.id),
+                            'member_name': f"{profile.first_name_snapshot} {profile.last_name_snapshot}".strip() or profile.user.display_name,
+                            'amount': str(pay_amt),
+                            'currency': order.currency,
+                            'branch_id': str(branch.id if branch else ''),
+                            'branch_name': branch.name if branch else '',
+                            'recorded_by': getattr(request.user, 'display_name', getattr(request.user, 'email', 'Staff')),
+                            'recorded_by_id': str(request.user.id),
+                            'source': 'PACKAGE_PURCHASE',
+                            'new_membership_id': str(new_membership.id),
+                        },
+                        db_alias=alias,
+                    )
+                    txn.metadata['approval_request_id'] = str(approval_req.id)
+                    txn.save(using=alias, update_fields=['metadata'])
+
+                    new_membership.status = 'PENDING_PAYMENT'
+                    new_membership.legacy_reference = f"CASH_APPROVAL:{approval_req.id}"
+                    new_membership.save(using=alias, update_fields=['status', 'legacy_reference', 'updated_at'])
+                    new_membership.entitlements.using(alias).update(status='INACTIVE')
+
+                    MembershipStatusHistory.objects.using(alias).create(
+                        membership=new_membership,
+                        from_status=None,
+                        to_status='PENDING_PAYMENT',
+                        reason_code='CASH_COLLECTION_PENDING_APPROVAL',
+                        reason_text=f"Awaiting cash payment approval #{approval_req.id} recorded by {getattr(request.user, 'email', 'Staff')}",
+                        changed_by_user=request.user,
+                    )
+
+                    return Response({
+                        'success': True,
+                        'status': 'PENDING_APPROVAL',
+                        'message': f"Cash payment of ₹{pay_amt} recorded and submitted for manager approval (Approval Req: {approval_req.id}).",
+                        'order_id': str(order.id),
+                        'order_number': order.order_number,
+                        'new_membership_id': str(new_membership.id),
+                        'approval_request_id': str(approval_req.id),
+                        'member': serialize_member(profile, alias, request=request),
+                    }, status=status.HTTP_202_ACCEPTED)
+                else:
+                    CommerceService.record_payment(
+                        order_id=str(order.id),
+                        amount=pay_amt,
+                        provider='CASH',
+                        payment_method='CASH',
+                        actor=request.user,
+                        db_alias=alias,
+                    )
+                    new_membership = MembershipLifecycleService.activate_membership_from_order(
+                        order=order,
+                        order_item=order_item,
+                        start_date=start_date,
+                        db_alias=alias,
+                        created_by_user=request.user,
+                    )
+                    new_membership.status = 'ACTIVE'
+                    new_membership.legacy_reference = 'CASH_VERIFIED'
+                    new_membership.save(using=alias, update_fields=['status', 'legacy_reference', 'updated_at'])
+                    new_membership.entitlements.using(alias).update(status='ACTIVE')
+
+                    MembershipStatusHistory.objects.using(alias).create(
+                        membership=new_membership,
+                        from_status=None,
+                        to_status='ACTIVE',
+                        reason_code='NEW_PROGRAM_PACKAGE_PURCHASE_CASH',
+                        reason_text=f"Purchased {package.name} ({package.program.name if package.program else ''}) via Cash verified by {getattr(request.user, 'email', 'Staff')}",
+                        changed_by_user=request.user,
+                    )
             else:
                 CommerceService.record_payment(
                     order_id=str(order.id),
@@ -4816,9 +4943,21 @@ class MemberViewSet(viewsets.ViewSet):
                     'member': serialize_member(profile, alias, request=request),
                 }, status=status.HTTP_200_OK)
 
-        # Route CASH payment through managerial approval workflow to prevent approval bypass
+        # Route CASH payment through managerial approval workflow to prevent approval bypass if required by policy/role
         is_cash = str(provider).upper() == 'CASH' or str(payment_method).upper() == 'CASH'
+        requires_cash_approval = False
         if is_cash:
+            from .services_payment_policy import PaymentPolicyService
+            policy = PaymentPolicyService.get_effective_policy(org, branch=order.branch or profile.preferred_branch, db_alias=alias)
+            requires_cash_approval = PaymentPolicyService.is_cash_approval_required(
+                user=request.user,
+                organization=org,
+                branch=order.branch or profile.preferred_branch,
+                policy=policy,
+                db_alias=alias,
+            )
+
+        if is_cash and requires_cash_approval:
             # Check for existing pending cash collections to prevent duplicate collections
             pending_cash_sum = PaymentTransaction.objects.using(alias).filter(
                 order=order, status='PENDING', payment_method='CASH'

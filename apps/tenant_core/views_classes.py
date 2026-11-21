@@ -511,116 +511,156 @@ class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
     def create(self, request, *args, **kwargs):
         alias = _get_db(request)
         branches = request.data.get('branches')
+        if not branches and request.data.get('branch'):
+            branches = [request.data.get('branch')]
+        elif not isinstance(branches, list) or len(branches) == 0:
+            branches = [request.data.get('branch')] if request.data.get('branch') else []
+
+        if not branches:
+            return Response({'branch': 'Please select at least one branch.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        raw_time_slots = request.data.get('time_slots')
+        if not isinstance(raw_time_slots, list) or len(raw_time_slots) == 0:
+            if request.data.get('start_time') and request.data.get('end_time'):
+                raw_time_slots = [{
+                    'start_time': request.data.get('start_time'),
+                    'end_time': request.data.get('end_time')
+                }]
+            else:
+                return Response({'time_slots': 'Please configure at least one valid time slot.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Intra-request validation for time slots
+        validated_slots = []
+        seen_slots = set()
+        for idx, slot in enumerate(raw_time_slots, start=1):
+            st = str(slot.get('start_time') or '').strip()
+            et = str(slot.get('end_time') or '').strip()
+            if not st or not et:
+                return Response({'time_slots': f"Slot #{idx} is missing start time or end time."}, status=status.HTTP_400_BAD_REQUEST)
+            if et <= st:
+                return Response({'time_slots': f"Slot #{idx} ({st} – {et}): End time must be strictly greater than start time."}, status=status.HTTP_400_BAD_REQUEST)
+            key = (st[:5], et[:5])
+            if key in seen_slots:
+                return Response({'time_slots': f"Duplicate time slot ({key[0]} – {key[1]}) found in submission."}, status=status.HTTP_400_BAD_REQUEST)
+            seen_slots.add(key)
+            validated_slots.append({'start_time': st, 'end_time': et})
+
         auto_generate = request.data.get('generate_slots', True)
         gen_from = request.data.get('generate_from_date') or request.data.get('valid_from')
         gen_to = request.data.get('generate_to_date') or request.data.get('valid_until')
 
-        # Multi-branch batch creation
-        if isinstance(branches, list) and len(branches) > 0:
-            if not gen_to and gen_from:
-                try:
-                    from_d = date.fromisoformat(str(gen_from))
-                    gen_to = (from_d + timedelta(days=30)).isoformat()
-                except Exception:
-                    pass
+        if not gen_to and gen_from:
+            try:
+                from_d = date.fromisoformat(str(gen_from))
+                gen_to = (from_d + timedelta(days=30)).isoformat()
+            except Exception:
+                pass
 
-            created_rules = []
-            total_occurrences_count = 0
+        created_rules = []
+        total_occurrences_count = 0
+        duplicate_rules = []
+        partial_errors = []
 
-            with transaction.atomic(using=alias):
-                for branch_id in branches:
+        with transaction.atomic(using=alias):
+            for branch_id in branches:
+                for s in validated_slots:
+                    sid = transaction.savepoint(using=alias)
                     data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
                     data['branch'] = branch_id
+                    data['start_time'] = s['start_time']
+                    data['end_time'] = s['end_time']
                     data.pop('branches', None)
+                    data.pop('time_slots', None)
                     data.pop('generate_slots', None)
                     data.pop('generate_from_date', None)
                     data.pop('generate_to_date', None)
 
                     serializer = self.get_serializer(data=data)
-                    serializer.is_valid(raise_exception=True)
-                    rule = serializer.save()
+                    if not serializer.is_valid():
+                        transaction.savepoint_rollback(sid, using=alias)
+                        err_dict = serializer.errors
+                        err_msg = '; '.join([f"{k}: {v[0] if isinstance(v, list) else v}" for k, v in err_dict.items()])
+                        if 'already exists' in err_msg.lower():
+                            duplicate_rules.append(err_msg)
+                        else:
+                            partial_errors.append(f"Branch {branch_id} ({s['start_time']}–{s['end_time']}): {err_msg}")
+                        continue
 
-                    record_business_audit(
-                        organization=rule.branch.organization,
-                        branch=rule.branch,
-                        module='classes',
-                        action_code='SCHEDULE_RULE_CREATED',
-                        entity_type='ClassScheduleRule',
-                        entity_id=rule.id,
-                        actor_user=request.user,
-                        event_description=f"Created recurring schedule rule for {rule.class_template.name} at {rule.branch.name}",
-                        after_data={
-                            'template_name': rule.class_template.name,
-                            'branch_name': rule.branch.name,
-                            'days': rule.days_of_week,
-                            'time_window': f"{rule.start_time.strftime('%H:%M')} – {rule.end_time.strftime('%H:%M')}",
-                            'status': rule.status,
-                        },
-                        db_alias=alias,
-                    )
-                    created_rules.append(rule)
+                    try:
+                        rule = serializer.save()
+                        record_business_audit(
+                            organization=rule.branch.organization,
+                            branch=rule.branch,
+                            module='classes',
+                            action_code='SCHEDULE_RULE_CREATED',
+                            entity_type='ClassScheduleRule',
+                            entity_id=rule.id,
+                            actor_user=request.user,
+                            event_description=f"Created recurring schedule rule for {rule.class_template.name} at {rule.branch.name} ({s['start_time']}–{s['end_time']})",
+                            after_data={
+                                'template_name': rule.class_template.name,
+                                'branch_name': rule.branch.name,
+                                'days': rule.days_of_week,
+                                'time_window': f"{s['start_time']} – {s['end_time']}",
+                                'status': rule.status,
+                            },
+                            db_alias=alias,
+                        )
+                        created_rules.append(rule)
 
-                    if auto_generate and gen_from and gen_to:
-                        try:
-                            from_d = date.fromisoformat(str(gen_from))
-                            to_d = date.fromisoformat(str(gen_to))
-                            occs = ClassSchedulingService.generate_occurrences_from_rule(
-                                rule=rule,
-                                from_date=from_d,
-                                to_date=to_d,
-                                actor=request.user,
-                                db_alias=alias,
-                            )
-                            total_occurrences_count += len(occs)
-                        except Exception as exc:
-                            logger.warning(f"Failed to generate occurrences for rule {rule.id}: {exc}")
+                        if auto_generate and gen_from and gen_to:
+                            try:
+                                from_d = date.fromisoformat(str(gen_from))
+                                to_d = date.fromisoformat(str(gen_to))
+                                occs = ClassSchedulingService.generate_occurrences_from_rule(
+                                    rule=rule,
+                                    from_date=from_d,
+                                    to_date=to_d,
+                                    actor=request.user,
+                                    db_alias=alias,
+                                )
+                                total_occurrences_count += len(occs)
+                            except Exception as exc:
+                                logger.warning(f"Failed to generate occurrences for rule {rule.id}: {exc}")
 
-            serialized = self.get_serializer(created_rules, many=True).data
+                        transaction.savepoint_commit(sid, using=alias)
+                    except Exception as exc:
+                        transaction.savepoint_rollback(sid, using=alias)
+                        partial_errors.append(f"Branch {branch_id} ({s['start_time']}–{s['end_time']}): {str(exc)}")
+
+        total_attempts = len(branches) * len(validated_slots)
+        if not created_rules:
+            if duplicate_rules and len(duplicate_rules) == total_attempts:
+                return Response({
+                    'error': f"All requested recurring rules already exist: {duplicate_rules[0]}"
+                }, status=status.HTTP_400_BAD_REQUEST)
+            if partial_errors:
+                return Response({
+                    'error': ' | '.join(partial_errors)
+                }, status=status.HTTP_400_BAD_REQUEST)
             return Response({
-                'rules': serialized,
-                'count': len(created_rules),
-                'occurrences_generated': total_occurrences_count,
-            }, status=status.HTTP_201_CREATED)
+                'error': 'Failed to create recurring schedule rules. Please check operating hours and availability.'
+            }, status=status.HTTP_400_BAD_REQUEST)
 
-        # Single branch creation
-        data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
-        data.pop('branches', None)
-        data.pop('generate_slots', None)
-        data.pop('generate_from_date', None)
-        data.pop('generate_to_date', None)
+        serialized = self.get_serializer(created_rules, many=True).data
+        message = f"Successfully created {len(created_rules)} recurring schedule rule(s) across {len(branches)} branch(es)"
+        if total_occurrences_count > 0:
+            message += f" and generated {total_occurrences_count} class slot(s)."
+        else:
+            message += "."
+        if duplicate_rules:
+            message += f" Note: {len(duplicate_rules)} duplicate rule(s) already existed and were skipped."
+        if partial_errors:
+            message += f" Warning: {len(partial_errors)} slot(s) were skipped due to branch schedule conflicts."
 
-        serializer = self.get_serializer(data=data)
-        serializer.is_valid(raise_exception=True)
-        self.perform_create(serializer)
-        rule = serializer.instance
-
-        total_occurrences_count = 0
-        if auto_generate and gen_from:
-            if not gen_to:
-                try:
-                    from_d = date.fromisoformat(str(gen_from))
-                    gen_to = (from_d + timedelta(days=30)).isoformat()
-                except Exception:
-                    pass
-            if gen_to:
-                try:
-                    from_d = date.fromisoformat(str(gen_from))
-                    to_d = date.fromisoformat(str(gen_to))
-                    occs = ClassSchedulingService.generate_occurrences_from_rule(
-                        rule=rule,
-                        from_date=from_d,
-                        to_date=to_d,
-                        actor=request.user,
-                        db_alias=alias,
-                    )
-                    total_occurrences_count = len(occs)
-                except Exception as exc:
-                    logger.warning(f"Failed to generate occurrences for rule {rule.id}: {exc}")
-
-        resp_data = serializer.data
-        resp_data['occurrences_generated'] = total_occurrences_count
-        headers = self.get_success_headers(serializer.data)
-        return Response(resp_data, status=status.HTTP_201_CREATED, headers=headers)
+        return Response({
+            'rules': serialized,
+            'count': len(created_rules),
+            'occurrences_generated': total_occurrences_count,
+            'duplicates_skipped': len(duplicate_rules),
+            'partial_errors': partial_errors,
+            'message': message,
+        }, status=status.HTTP_201_CREATED)
 
     def perform_create(self, serializer):
         rule = serializer.save()

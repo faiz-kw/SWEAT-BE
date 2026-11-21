@@ -317,47 +317,61 @@ class AdminApprovalService:
             order.status = 'PARTIALLY_PAID'
             order.save(using=alias)
 
-        # Release full entitlements if membership was provisional
+        # Release full entitlements if membership was provisional or pending approval
         from .models_memberships import Membership, MembershipEntitlementLedger, MembershipStatusHistory
         from .models_catalog import PackageEntitlementDefinition
         membership = Membership.objects.using(alias).filter(source_order=order).first()
-        if membership and membership.legacy_reference and 'PROVISIONAL_CASH' in membership.legacy_reference:
-            ent_defs = {
-                str(ed.id): ed
-                for ed in PackageEntitlementDefinition.objects.using(alias).filter(package_version=membership.package_version)
-            }
-            for ent in membership.entitlements.using(alias).all():
-                ed = ent.source_definition or ent_defs.get(str(ent.source_definition_id))
-                if ed:
-                    full_units = ed.allocated_units
-                    current_alloc = ent.allocated_units or Decimal('0.00')
-                    remaining_units = (full_units - current_alloc) if full_units else Decimal('0.00')
-                    ent.allocated_units = full_units
-                    ent.is_unlimited = ed.is_unlimited
-                    ent.status = 'ACTIVE'
-                    ent.save(using=alias, update_fields=['allocated_units', 'is_unlimited', 'status', 'updated_at'])
-                    if remaining_units > Decimal('0.00'):
-                        alloc_log_units = remaining_units if not ed.is_unlimited else Decimal('999999.00')
-                        MembershipEntitlementLedger.objects.using(alias).create(
-                            membership_entitlement=ent,
-                            transaction_type='ALLOCATION',
-                            units=alloc_log_units,
-                            reason_code='CASH_APPROVAL_ENTITLEMENT_RELEASE',
-                            reason_text="Full package entitlement released upon cash payment approval",
-                            balance_after=ent.remaining_units or Decimal('999999.00'),
-                            created_by_user=action_record.approver_user,
-                        )
-            membership.legacy_reference = 'CASH_APPROVED'
-            membership.status = 'ACTIVE'
-            membership.save(using=alias, update_fields=['legacy_reference', 'status', 'updated_at'])
-            MembershipStatusHistory.objects.using(alias).create(
-                membership=membership,
-                from_status='ACTIVE',
-                to_status='ACTIVE',
-                reason_code='CASH_PAYMENT_APPROVED',
-                reason_text="Provisional restrictions cleared upon cash payment approval",
-                changed_by_user=action_record.approver_user,
-            )
+        if membership:
+            if membership.legacy_reference and 'PROVISIONAL_CASH' in membership.legacy_reference:
+                ent_defs = {
+                    str(ed.id): ed
+                    for ed in PackageEntitlementDefinition.objects.using(alias).filter(package_version=membership.package_version)
+                }
+                for ent in membership.entitlements.using(alias).all():
+                    ed = ent.source_definition or ent_defs.get(str(ent.source_definition_id))
+                    if ed:
+                        full_units = ed.allocated_units
+                        current_alloc = ent.allocated_units or Decimal('0.00')
+                        remaining_units = (full_units - current_alloc) if full_units else Decimal('0.00')
+                        ent.allocated_units = full_units
+                        ent.is_unlimited = ed.is_unlimited
+                        ent.status = 'ACTIVE'
+                        ent.save(using=alias, update_fields=['allocated_units', 'is_unlimited', 'status', 'updated_at'])
+                        if remaining_units > Decimal('0.00'):
+                            alloc_log_units = remaining_units if not ed.is_unlimited else Decimal('999999.00')
+                            MembershipEntitlementLedger.objects.using(alias).create(
+                                membership_entitlement=ent,
+                                transaction_type='ALLOCATION',
+                                units=alloc_log_units,
+                                reason_code='CASH_APPROVAL_ENTITLEMENT_RELEASE',
+                                reason_text="Full package entitlement released upon cash payment approval",
+                                balance_after=ent.remaining_units or Decimal('999999.00'),
+                                created_by_user=action_record.approver_user,
+                            )
+                membership.legacy_reference = 'CASH_APPROVED'
+                membership.status = 'ACTIVE'
+                membership.save(using=alias, update_fields=['legacy_reference', 'status', 'updated_at'])
+                MembershipStatusHistory.objects.using(alias).create(
+                    membership=membership,
+                    from_status='ACTIVE',
+                    to_status='ACTIVE',
+                    reason_code='CASH_PAYMENT_APPROVED',
+                    reason_text="Provisional restrictions cleared upon cash payment approval",
+                    changed_by_user=action_record.approver_user,
+                )
+            elif membership.status == 'PENDING_PAYMENT' or (membership.legacy_reference and 'CASH_APPROVAL' in membership.legacy_reference):
+                membership.status = 'ACTIVE'
+                membership.legacy_reference = 'CASH_APPROVED'
+                membership.save(using=alias, update_fields=['legacy_reference', 'status', 'updated_at'])
+                membership.entitlements.using(alias).update(status='ACTIVE')
+                MembershipStatusHistory.objects.using(alias).create(
+                    membership=membership,
+                    from_status='PENDING_PAYMENT',
+                    to_status='ACTIVE',
+                    reason_code='CASH_PAYMENT_APPROVED',
+                    reason_text="Membership activated upon cash payment approval",
+                    changed_by_user=action_record.approver_user,
+                )
 
         # Check membership activation policy
         should_activate = PaymentPolicyService.should_activate_membership(order, total_paid, db_alias=alias)

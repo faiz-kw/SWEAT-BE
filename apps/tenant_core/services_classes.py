@@ -133,15 +133,13 @@ class ClassSchedulingService:
             if class_template.program.status != 'ACTIVE':
                 raise ValidationError(f"Cannot schedule class '{class_template.name}' because its program '{class_template.program.name}' is not ACTIVE.")
             from .models_catalog import ProgramBranchAvailability
-            is_pba_active = ProgramBranchAvailability.objects.using(alias).filter(
-                program=class_template.program,
-                branch=branch,
-                is_active=True
-            ).exists()
-            if not is_pba_active:
-                raise ValidationError(f"Cannot schedule class '{class_template.name}' at '{branch.name}' because its program '{class_template.program.name}' is not active at this branch.")
+            pba_qs = ProgramBranchAvailability.objects.using(alias).filter(program=class_template.program)
+            if pba_qs.exists():
+                is_pba_active = pba_qs.filter(branch=branch, is_active=True).exists()
+                if not is_pba_active:
+                    raise ValidationError(f"Cannot schedule class '{class_template.name}' at '{branch.name}' because its program '{class_template.program.name}' is not active at this branch.")
 
-        # Rule 11: Validate against branch weekly working hours
+        # Rule 11: Validate against branch weekly working hours (including split shifts)
         day_names = {1: 'Monday', 2: 'Tuesday', 3: 'Wednesday', 4: 'Thursday', 5: 'Friday', 6: 'Saturday', 7: 'Sunday'}
         for dow in (days_of_week or []):
             wh = BranchWorkingHours.objects.using(alias).filter(branch=branch, day_of_week=dow).first()
@@ -150,14 +148,30 @@ class ClassSchedulingService:
                 if not wh.is_open:
                     raise ValidationError(f"Branch '{branch.name}' is closed on {d_name}.")
                 if not wh.is_24_hours:
-                    if wh.open_time and start_time < wh.open_time:
-                        raise ValidationError(
-                            f"Class start time {start_time.strftime('%H:%M')} is before branch opening time {wh.open_time.strftime('%H:%M')} on {d_name}."
-                        )
-                    if wh.close_time and end_time > wh.close_time:
-                        raise ValidationError(
-                            f"Class end time {end_time.strftime('%H:%M')} is after branch closing time {wh.close_time.strftime('%H:%M')} on {d_name}."
-                        )
+                    fits_s1 = bool(wh.open_time and wh.close_time and start_time >= wh.open_time and end_time <= wh.close_time)
+                    fits_s2 = bool(
+                        getattr(wh, 'has_split_shift', False) and
+                        getattr(wh, 'open_time_2', None) and
+                        getattr(wh, 'close_time_2', None) and
+                        start_time >= wh.open_time_2 and
+                        end_time <= wh.close_time_2
+                    )
+                    if getattr(wh, 'has_split_shift', False) and getattr(wh, 'open_time_2', None) and getattr(wh, 'close_time_2', None):
+                        if not (fits_s1 or fits_s2):
+                            raise ValidationError(
+                                f"Class time ({start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}) falls outside branch operating shifts "
+                                f"({wh.open_time.strftime('%H:%M')}–{wh.close_time.strftime('%H:%M')} & "
+                                f"{wh.open_time_2.strftime('%H:%M')}–{wh.close_time_2.strftime('%H:%M')}) on {d_name}."
+                            )
+                    else:
+                        if wh.open_time and start_time < wh.open_time:
+                            raise ValidationError(
+                                f"Class start time {start_time.strftime('%H:%M')} is before branch opening time {wh.open_time.strftime('%H:%M')} on {d_name}."
+                            )
+                        if wh.close_time and end_time > wh.close_time:
+                            raise ValidationError(
+                                f"Class end time {end_time.strftime('%H:%M')} is after branch closing time {wh.close_time.strftime('%H:%M')} on {d_name}."
+                            )
 
         rule = ClassScheduleRule(
             class_template=class_template,
@@ -242,12 +256,25 @@ class ClassSchedulingService:
                     continue
 
                 if eff.get('is_open') and not eff.get('is_24_hours'):
-                    if eff.get('open_time') and rule.start_time < eff['open_time']:
-                        curr += timedelta(days=1)
-                        continue
-                    if eff.get('close_time') and rule.end_time > eff['close_time']:
-                        curr += timedelta(days=1)
-                        continue
+                    fits_shift_1 = bool(eff.get('open_time') and eff.get('close_time') and rule.start_time >= eff['open_time'] and rule.end_time <= eff['close_time'])
+                    fits_shift_2 = bool(
+                        eff.get('has_split_shift') and
+                        eff.get('open_time_2') and
+                        eff.get('close_time_2') and
+                        rule.start_time >= eff['open_time_2'] and
+                        rule.end_time <= eff['close_time_2']
+                    )
+                    if eff.get('has_split_shift') and eff.get('open_time_2') and eff.get('close_time_2'):
+                        if not (fits_shift_1 or fits_shift_2):
+                            curr += timedelta(days=1)
+                            continue
+                    else:
+                        if eff.get('open_time') and rule.start_time < eff['open_time']:
+                            curr += timedelta(days=1)
+                            continue
+                        if eff.get('close_time') and rule.end_time > eff['close_time']:
+                            curr += timedelta(days=1)
+                            continue
 
                 # Construct timestamps localized to branch timezone then stored as UTC
                 tz_name = getattr(rule.branch, 'timezone', None) or 'Asia/Kolkata'
@@ -266,7 +293,14 @@ class ClassSchedulingService:
                     branch=rule.branch,
                     class_template=rule.class_template,
                     start_at=start_dt,
-                ).exists()
+                ).exclude(status__in=['CANCELLED', 'DEACTIVATED']).exists()
+
+                if not exists and rule.class_template.program_id:
+                    exists = ClassOccurrence.objects.using(alias).filter(
+                        branch=rule.branch,
+                        class_template__program_id=rule.class_template.program_id,
+                        start_at=start_dt,
+                    ).exclude(status__in=['CANCELLED', 'DEACTIVATED']).exists()
 
                 if not exists:
                     occ = ClassOccurrence(

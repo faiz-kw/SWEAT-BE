@@ -801,7 +801,12 @@ class PaymentTransactionViewSet(viewsets.ReadOnlyModelViewSet):
         for idx, g in enumerate(channel_groups):
             method_label = (g.get('payment_method') or 'Cash').strip()
             agent_email = g.get('order__sold_by_user__email')
-            agent_name = f"{agent_email} ({method_label})" if agent_email else f"Front Desk — {method_label}"
+            fallback_name = None
+            if not agent_email:
+                first_matching_txn = qs.filter(payment_method=g.get('payment_method')).first()
+                if first_matching_txn and isinstance(first_matching_txn.metadata, dict):
+                    fallback_name = first_matching_txn.metadata.get('recorded_by_name') or first_matching_txn.metadata.get('cash_recorded_by_name')
+            agent_name = f"{agent_email} ({method_label})" if agent_email else (fallback_name or f"Front Desk — {method_label}")
             agent_collections.append({
                 'agent_id': str(g.get('order__sold_by_user__id') or f"channel-{idx}"),
                 'agent_name': agent_name,

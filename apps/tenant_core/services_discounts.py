@@ -121,6 +121,67 @@ class DiscountCouponEngineService:
     }
 
     @classmethod
+    def resolve_authoritative_member_profile(
+        cls,
+        member_identifier: Optional[str],
+        request_user=None,
+        db_alias: Optional[str] = None
+    ) -> Optional[UserProfile]:
+        """
+        Authoritative resolver for a genuine customer member profile.
+        Supports lookup across:
+        1. UserProfile UUID
+        2. TenantUser UUID (user_id)
+        3. Member number (e.g. MEM-12345)
+        4. Membership UUID (membership_id / contract_id) -> user_profile
+        5. Membership member_id -> user_profile
+        6. End-user customer fallback (excludes staff/admin accounts from being treated as purchasing customer)
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        if not member_identifier and request_user and getattr(request_user, 'is_authenticated', False):
+            # Only fall back to request.user if the user is a genuine customer/member, NOT a staff/admin user
+            user_type = str(getattr(request_user, 'user_type', '')).upper()
+            is_staff = getattr(request_user, 'is_staff', False) or user_type in ('STAFF', 'ADMIN', 'MANAGER', 'OWNER', 'COACH', 'TRAINER')
+            if not is_staff and user_type in ('MEMBER', 'CUSTOMER'):
+                return UserProfile.objects.using(alias).filter(user=request_user).first()
+            return None
+
+        if not member_identifier:
+            return None
+
+        ident = str(member_identifier).strip()
+        try:
+            # 1. Direct UserProfile ID
+            p = UserProfile.objects.using(alias).filter(id=ident).first()
+            if p:
+                return p
+
+            # 2. TenantUser ID (user_id)
+            p = UserProfile.objects.using(alias).filter(user_id=ident).first()
+            if p:
+                return p
+
+            # 3. Member number
+            p = UserProfile.objects.using(alias).filter(member_number=ident).first()
+            if p:
+                return p
+
+            # 4. Membership ID -> user_profile
+            from .models_memberships import Membership
+            mem = Membership.objects.using(alias).filter(id=ident).select_related('user_profile').first()
+            if mem and mem.user_profile:
+                return mem.user_profile
+
+            # 5. Membership membership_number -> user_profile
+            mem = Membership.objects.using(alias).filter(membership_number=ident).select_related('user_profile').first()
+            if mem and mem.user_profile:
+                return mem.user_profile
+        except Exception as e:
+            logger.debug("Error in resolve_authoritative_member_profile for '%s': %s", ident, e)
+
+        return None
+
+    @classmethod
     def get_member_lifecycle_state(cls, user_profile: Optional[UserProfile], db_alias: Optional[str] = None) -> str:
         """
         Determines authoritative member lifecycle state:
@@ -206,9 +267,16 @@ class DiscountCouponEngineService:
         if not code_clean:
             return {'is_valid': False, 'reason': 'Coupon code is required.', 'reason_code': 'REQUIRED'}
 
+        # Prioritize active codes belonging to currently active campaigns
         discount_code = DiscountCode.objects.using(alias).select_related('campaign', 'branch', 'package').filter(
-            code__iexact=code_clean
+            code__iexact=code_clean,
+            status='ACTIVE',
+            campaign__status='ACTIVE'
         ).order_by('-created_at').first()
+        if not discount_code:
+            discount_code = DiscountCode.objects.using(alias).select_related('campaign', 'branch', 'package').filter(
+                code__iexact=code_clean
+            ).order_by('-created_at').first()
         if not discount_code:
             return {'is_valid': False, 'reason': f"Coupon code '{code_str}' is invalid or does not exist.", 'reason_code': 'NOT_FOUND'}
 
@@ -265,25 +333,37 @@ class DiscountCouponEngineService:
             elif not branch and order is not None and str(order.branch_id) not in allowed_branch_set:
                 return {'is_valid': False, 'reason': 'Coupon is not valid at this branch.', 'reason_code': 'BRANCH_NOT_ELIGIBLE'}
 
-        # Package scope
+        # Package and Program scope (Dynamic & configurable)
         # Priority 1: Explicit package lock on the DiscountCode itself
         # Priority 2: Multi-package scope on Campaign configuration ('package_ids')
         # Priority 3: Single-package scope on Campaign configuration ('package_id')
+        # Priority 4: Whole-program scope on Campaign configuration ('program_ids')
         code_pkg_id = str(discount_code.package_id) if discount_code.package_id else None
         camp_pkg_ids = [str(x) for x in camp_cfg.get('package_ids', []) if x] if isinstance(camp_cfg.get('package_ids'), list) else []
         camp_single_pkg_id = str(camp_cfg.get('package_id')) if (camp_cfg.get('package_id') and not camp_pkg_ids) else None
-
         allowed_package_ids = [code_pkg_id] if code_pkg_id else (camp_pkg_ids if camp_pkg_ids else ([camp_single_pkg_id] if camp_single_pkg_id else []))
+        allowed_program_ids = [str(x) for x in camp_cfg.get('program_ids', []) if x] if isinstance(camp_cfg.get('program_ids'), list) else []
 
-        if allowed_package_ids:
+        if allowed_package_ids or allowed_program_ids:
             allowed_package_set = set(allowed_package_ids)
+            allowed_program_set = set(allowed_program_ids)
             pkg_eligible = False
-            if package and str(package.id) in allowed_package_set:
-                pkg_eligible = True
+
+            if package:
+                if str(package.id) in allowed_package_set:
+                    pkg_eligible = True
+                elif allowed_program_set and getattr(package, 'program_id', None) and str(package.program_id) in allowed_program_set:
+                    pkg_eligible = True
             elif order is not None:
                 order_pkg_ids = list(order.items.using(alias).filter(package_id__isnull=False).values_list('package_id', flat=True))
                 if any(str(p) in allowed_package_set for p in order_pkg_ids):
                     pkg_eligible = True
+                elif allowed_program_set:
+                    for _it in order.items.using(alias).filter(package__isnull=False).select_related('package'):
+                        if getattr(_it, 'package', None) and getattr(_it.package, 'program_id', None):
+                            if str(_it.package.program_id) in allowed_program_set:
+                                pkg_eligible = True
+                                break
 
             if not pkg_eligible:
                 if not package and order is None:
@@ -291,29 +371,17 @@ class DiscountCouponEngineService:
                         pkg_label = discount_code.package.name if discount_code.package else (Package.objects.using(alias).filter(id=allowed_package_ids[0]).values_list('name', flat=True).first() or 'the designated package')
                         return {'is_valid': False, 'reason': f"Coupon requires selecting target package '{pkg_label}'.", 'reason_code': 'PACKAGE_NOT_ELIGIBLE'}
                     else:
-                        return {'is_valid': False, 'reason': f"Coupon is restricted to {len(allowed_package_ids)} specific packages. Please select one of the eligible packages under 'Target Package'.", 'reason_code': 'PACKAGE_NOT_ELIGIBLE'}
+                        return {'is_valid': False, 'reason': f"Coupon is restricted to specific packages or programs. Please select an eligible package under 'Target Package'.", 'reason_code': 'PACKAGE_NOT_ELIGIBLE'}
                 elif package:
-                    if len(allowed_package_ids) == 1:
+                    if allowed_program_set and not allowed_package_set:
+                        return {'is_valid': False, 'reason': 'Coupon is not valid for this program.', 'reason_code': 'PROGRAM_NOT_ELIGIBLE'}
+                    elif len(allowed_package_ids) == 1:
                         pkg_label = discount_code.package.name if discount_code.package else (Package.objects.using(alias).filter(id=allowed_package_ids[0]).values_list('name', flat=True).first() or 'the designated package')
                         return {'is_valid': False, 'reason': f"Coupon is only valid for package '{pkg_label}'.", 'reason_code': 'PACKAGE_NOT_ELIGIBLE'}
                     else:
-                        return {'is_valid': False, 'reason': f"Coupon is not valid for package '{package.name}'. It is only applicable to the {len(allowed_package_ids)} configured packages.", 'reason_code': 'PACKAGE_NOT_ELIGIBLE'}
+                        return {'is_valid': False, 'reason': f"Coupon is not valid for package '{package.name}'. It is only applicable to the configured packages or programs.", 'reason_code': 'PACKAGE_NOT_ELIGIBLE'}
                 else:
                     return {'is_valid': False, 'reason': 'Coupon is not valid for the packages in this order.', 'reason_code': 'PACKAGE_NOT_ELIGIBLE'}
-
-        # Program scope - a configured program_ids list (covers a whole program's packages)
-        allowed_program_ids = [str(x) for x in camp_cfg.get('program_ids', []) if x] if isinstance(camp_cfg.get('program_ids'), list) else []
-        if allowed_program_ids:
-            prog_set = set()
-            if package is not None and getattr(package, 'program_id', None):
-                prog_set.add(str(package.program_id))
-            if order is not None:
-                for _it in order.items.using(alias).filter(package__isnull=False).select_related('package'):
-                    if getattr(_it, 'package', None) and getattr(_it.package, 'program_id', None):
-                        prog_set.add(str(_it.package.program_id))
-            if package is not None or order is not None:
-                if not (prog_set & set(allowed_program_ids)):
-                    return {'is_valid': False, 'reason': 'Coupon is not valid for this program.', 'reason_code': 'PROGRAM_NOT_ELIGIBLE'}
 
         # User lock - restrict a coupon to specific member(s) via configuration['allowed_user_ids']
         allowed_user_ids = camp_cfg.get('allowed_user_ids') if isinstance(camp_cfg.get('allowed_user_ids'), list) else None
