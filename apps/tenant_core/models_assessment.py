@@ -16,6 +16,7 @@ mobility, balance and strength, then personalize training, nutrition targets, an
 
 import uuid
 import secrets
+from datetime import timedelta
 from decimal import Decimal
 from django.db import models
 from django.utils import timezone
@@ -29,6 +30,14 @@ from .models_memberships import Membership, MembershipEntitlement
 def _generate_session_code():
     """Generates a friendly 6-digit numeric pairing code for studio screen casting."""
     return str(secrets.randbelow(900000) + 100000)
+
+
+PAIRING_CODE_TTL = timedelta(hours=4)
+
+
+def _default_pairing_code_expiry():
+    """Expiry for a new pairing code; the code stops working after this time."""
+    return timezone.now() + PAIRING_CODE_TTL
 
 
 class MemberAssessment(models.Model):
@@ -239,6 +248,8 @@ class MemberAssessment(models.Model):
 
     # Studio Screen Pairing
     pairing_code = models.CharField(max_length=10, default=_generate_session_code)
+    pairing_code_expires_at = models.DateTimeField(default=_default_pairing_code_expiry)
+    pairing_code_used_at = models.DateTimeField(null=True, blank=True)
     display_screen_connected = models.BooleanField(default=False)
 
     created_at = models.DateTimeField(default=timezone.now)

@@ -124,10 +124,11 @@ urlpatterns = [
     path('api/redoc/', SpectacularRedocView.as_view(url_name='schema'), name='redoc'),
 ]
 
-from django.conf import settings
-from django.views.static import serve
 from django.urls import re_path
+from apps.tenant_core.views_media import ProtectedMediaView
 
+# Uploaded media is no longer served by the public django.views.static.serve route.
+# ProtectedMediaView requires a short-lived signed URL or an authenticated user with access.
 urlpatterns += [
-    re_path(r'^media/(?P<path>.*)$', serve, {'document_root': settings.MEDIA_ROOT}),
+    re_path(r'^media/(?P<path>.*)$', ProtectedMediaView.as_view(), name='protected-media'),
 ]

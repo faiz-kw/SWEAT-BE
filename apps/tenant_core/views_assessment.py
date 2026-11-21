@@ -8,7 +8,7 @@ Endpoints:
 4. PATCH /api/v1/tenant/assessments/<id>/         — Saves vitals, movement tests, and coach notes
 5. POST /api/v1/tenant/assessments/<id>/capture/  — Uploads baseline photos + computes CV posture metrics
 6. POST /api/v1/tenant/assessments/<id>/approve-and-send/ — Coach approval gate (unlocks display screen)
-7. GET  /api/v1/tenant/assessments/pair/          — Connects Studio TV Display Screen (mirror mode)
+7. POST /api/v1/tenant/assessments/pair/          — Connects Studio TV Display Screen (mirror mode)
 """
 
 import uuid
@@ -18,6 +18,8 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from rest_framework.throttling import SimpleRateThrottle
+from django.utils import timezone
 
 from config.routers import set_tenant_db_alias, get_tenant_db_alias
 from .models_assessment import MemberAssessment
@@ -26,6 +28,7 @@ from .models_users import TenantUser
 from .models_crm import UserProfile, Lead
 from .models_catalog import Package
 from .services_assessment import AssessmentEngineService
+from .services_media import build_signed_media_url
 from .services_reliability import record_business_audit
 
 
@@ -68,7 +71,8 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
         alias, org = _resolve_db_and_org(self.request)
         qs = MemberAssessment.objects.using(alias).filter(organization=org)
         if hasattr(self.request.user, 'user_type') and self.request.user.user_type == 'MEMBER':
-            qs = qs.filter(user_profile__user=self.request.user)
+            # Members see only their own assessments, and only after the coach has approved them.
+            qs = qs.filter(user_profile__user=self.request.user, status='APPROVED')
         return qs.order_by('-created_at')
 
     def create(self, request, *args, **kwargs):
@@ -453,8 +457,8 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
             'capability_matrix': instance.capability_matrix,
 
             # Photos & Posture Score
-            'photo_front_url': instance.photo_front.url if instance.photo_front else instance.photo_front_url,
-            'photo_side_url': instance.photo_side.url if instance.photo_side else instance.photo_side_url,
+            'photo_front_url': build_signed_media_url(instance.photo_front.name) if instance.photo_front else instance.photo_front_url,
+            'photo_side_url': build_signed_media_url(instance.photo_side.name) if instance.photo_side else instance.photo_side_url,
             'metrics': {
                 'posture_score': float(instance.posture_score),
                 'shoulder_tilt_degrees': float(instance.shoulder_tilt_degrees or 0),
@@ -484,81 +488,113 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
         }
 
 
+class PairingRedeemThrottle(SimpleRateThrottle):
+    """Limits pairing-code guesses per client address (applies to anonymous and signed-in callers)."""
+    scope = 'assessment_pairing'
+    rate = '10/minute'
+
+    def get_cache_key(self, request, view):
+        return self.cache_format % {'scope': self.scope, 'ident': self.get_ident(request)}
+
+
 class StudioScreenPairingView(APIView):
     """
-    GET /api/v1/tenant/assessments/pair/?code=123456
+    POST /api/v1/tenant/assessments/pair/   body: {"code": "123456"}
     Pairing endpoint for the Studio TV Screen Mirror.
-    If the assessment is not yet approved, keeps the screen in locked standby / framing mode.
-    Once approved by the coach, unlocks the full visual transformation & roadmap reveal.
-    """
-    permission_classes = [AllowAny]
 
-    def get(self, request):
-        code = request.query_params.get('code')
+    - A code works only until `pairing_code_expires_at` and only for one reveal.
+    - While the assessment is not approved, the screen gets a locked standby response and the
+      code stays valid.
+    - When the assessment is approved, the code is consumed and the approved summary is returned
+      once. Vitals and prescriptions are never included.
+    """
+    # Public by design: the studio TV has no login. Guarded by the expiring single-use code and
+    # the per-address throttle below.
+    permission_classes = [AllowAny]
+    throttle_classes = [PairingRedeemThrottle]
+
+    def post(self, request):
+        code = str(request.data.get('code') or '').strip()
         if not code:
             return Response({'error': 'Pairing code is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
         alias, org = _resolve_db_and_org(request)
-        assessment = MemberAssessment.objects.using(alias).filter(pairing_code=code.strip()).first()
+        now = timezone.now()
+        assessment = (
+            MemberAssessment.objects.using(alias)
+            .filter(
+                organization=org,
+                pairing_code=code,
+                pairing_code_used_at__isnull=True,
+                pairing_code_expires_at__gt=now,
+            )
+            .order_by('-created_at')
+            .first()
+        )
         if not assessment:
             return Response({'error': 'Invalid or expired pairing code.'}, status=status.HTTP_404_NOT_FOUND)
 
-        assessment.display_screen_connected = True
-        assessment.save(using=alias, update_fields=['display_screen_connected'])
+        if not assessment.display_screen_connected:
+            MemberAssessment.objects.using(alias).filter(pk=assessment.pk).update(display_screen_connected=True)
 
-        is_approved = (assessment.status == 'APPROVED')
+        if assessment.status != 'APPROVED':
+            return Response({
+                'id': str(assessment.id),
+                'status': assessment.status,
+                'member_name': assessment.member_name,
+                'is_approved': False,
+                'connected': True,
+            }, status=status.HTTP_200_OK)
 
-        response_data = {
+        # Consume the code atomically so two screens cannot both receive the approved summary.
+        consumed = (
+            MemberAssessment.objects.using(alias)
+            .filter(pk=assessment.pk, pairing_code_used_at__isnull=True)
+            .update(pairing_code_used_at=now)
+        )
+        if not consumed:
+            return Response({'error': 'Invalid or expired pairing code.'}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response(self._approved_summary(assessment), status=status.HTTP_200_OK)
+
+    @staticmethod
+    def _approved_summary(assessment: MemberAssessment) -> dict:
+        """Presentation data for the studio screen. Excludes vitals and prescriptions."""
+        rec_pkg = assessment.recommended_package
+        rec_price = None
+        rec_sessions = None
+        if rec_pkg:
+            ver = assessment.recommended_package_version or rec_pkg.get_active_version()
+            if ver:
+                p = ver.prices.filter(status='ACTIVE').first()
+                if p:
+                    rec_price = float(p.total_price)
+                for e in ver.entitlement_definitions.filter(status='ACTIVE'):
+                    if e.entitlement_type in ['HOME_BRANCH_SESSION', 'CLASS_SESSION', 'PERSONAL_TRAINING_SESSION', 'OPEN_ACCESS']:
+                        rec_sessions = 365 if e.is_unlimited else int(e.allocated_units or 0)
+
+        return {
             'id': str(assessment.id),
             'status': assessment.status,
             'member_name': assessment.member_name,
-            'is_approved': is_approved,
+            'is_approved': True,
             'connected': True,
+            'target_goal': assessment.get_target_goal_display(),
+            'stated_goal_outcome': assessment.stated_goal_outcome,
+            'timeline_weeks': assessment.target_timeline_weeks,
+            'timeline_months': assessment.target_timeline_months,
+            'posture_score': float(assessment.posture_score),
+            'shoulder_tilt_degrees': float(assessment.shoulder_tilt_degrees or 0),
+            'capability_matrix': assessment.capability_matrix,
+            'recommended_package': {
+                'name': rec_pkg.name if rec_pkg else 'Tailored Studio Plan',
+                'session_units': rec_sessions or 72,
+                'price': rec_price or 0,
+                'reason': assessment.recommendation_reason,
+            },
+            'milestones': {
+                'month_1': assessment.month_1_image_url,
+                'month_2': assessment.month_2_image_url,
+                'month_3': assessment.month_3_image_url,
+            },
         }
-
-        # If approved, reveal the full presentation to the studio screen
-        if is_approved:
-            rec_pkg = assessment.recommended_package
-            rec_price = None
-            rec_sessions = None
-            if rec_pkg:
-                ver = assessment.recommended_package_version or rec_pkg.get_active_version()
-                if ver:
-                    p = ver.prices.filter(status='ACTIVE').first()
-                    if p:
-                        rec_price = float(p.total_price)
-                    for e in ver.entitlement_definitions.filter(status='ACTIVE'):
-                        if e.entitlement_type in ['HOME_BRANCH_SESSION', 'CLASS_SESSION', 'PERSONAL_TRAINING_SESSION', 'OPEN_ACCESS']:
-                            rec_sessions = 365 if e.is_unlimited else int(e.allocated_units or 0)
-
-            response_data.update({
-                'target_goal': assessment.get_target_goal_display(),
-                'stated_goal_outcome': assessment.stated_goal_outcome,
-                'timeline_weeks': assessment.target_timeline_weeks,
-                'timeline_months': assessment.target_timeline_months,
-                'posture_score': float(assessment.posture_score),
-                'shoulder_tilt_degrees': float(assessment.shoulder_tilt_degrees or 0),
-                'vitals': {
-                    'bmi': float(assessment.calculated_bmi) if assessment.calculated_bmi else None,
-                    'rmr_kcal': assessment.bmr_rmr_kcal,
-                    'tdee_kcal': assessment.tdee_kcal,
-                    'daily_calorie_target': assessment.daily_calorie_target,
-                    'macros': assessment.nutrition_macros,
-                },
-                'capability_matrix': assessment.capability_matrix,
-                'recommended_package': {
-                    'name': rec_pkg.name if rec_pkg else 'Tailored Studio Plan',
-                    'session_units': rec_sessions or 72,
-                    'price': rec_price or 0,
-                    'reason': assessment.recommendation_reason,
-                },
-                'workout_prescription': assessment.workout_prescription,
-                'diet_prescription': assessment.diet_prescription,
-                'milestones': {
-                    'month_1': assessment.month_1_image_url,
-                    'month_2': assessment.month_2_image_url,
-                    'month_3': assessment.month_3_image_url,
-                },
-            })
-
-        return Response(response_data, status=status.HTTP_200_OK)
