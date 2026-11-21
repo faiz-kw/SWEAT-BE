@@ -553,38 +553,48 @@ class TenantUserSerializer(serializers.ModelSerializer):
             import uuid
             from .models_workforce import UserProfile, EmployeeProfile
             db_alias = getattr(getattr(instance, '_state', None), 'db', None) or 'default'
-            user_profile, _ = UserProfile.objects.using(db_alias).get_or_create(
-                user=instance,
-                defaults={'first_name_snapshot': instance.first_name, 'last_name_snapshot': instance.last_name}
-            )
-            mgr_emp = None
-            if reports_to_param and str(reports_to_param).strip() and str(reports_to_param).strip().lower() not in ('none', 'unassigned', ''):
-                try:
-                    mgr_user = TenantUser.objects.using(db_alias).filter(id=uuid.UUID(str(reports_to_param))).first()
-                    if mgr_user:
-                        mgr_prof, _ = UserProfile.objects.using(db_alias).get_or_create(
-                            user=mgr_user,
-                            defaults={'first_name_snapshot': mgr_user.first_name, 'last_name_snapshot': mgr_user.last_name}
-                        )
-                        mgr_emp, _ = EmployeeProfile.objects.using(db_alias).get_or_create(
-                            user_profile=mgr_prof,
-                            organization=instance.organization,
-                            defaults={'employee_code': f"EMP-{mgr_user.id.hex[:6].upper()}"}
-                        )
-                except Exception:
-                    mgr_emp = None
+            try:
+                user_profile, _ = UserProfile.objects.using(db_alias).get_or_create(
+                    user=instance,
+                    defaults={'first_name_snapshot': instance.first_name, 'last_name_snapshot': instance.last_name}
+                )
+                mgr_emp = None
+                if reports_to_param and str(reports_to_param).strip() and str(reports_to_param).strip().lower() not in ('none', 'unassigned', ''):
+                    try:
+                        mgr_user = TenantUser.objects.using(db_alias).filter(id=uuid.UUID(str(reports_to_param))).first()
+                        if mgr_user:
+                            mgr_prof, _ = UserProfile.objects.using(db_alias).get_or_create(
+                                user=mgr_user,
+                                defaults={'first_name_snapshot': mgr_user.first_name, 'last_name_snapshot': mgr_user.last_name}
+                            )
+                            mgr_emp = EmployeeProfile.objects.using(db_alias).filter(user_profile=mgr_prof).first()
+                            if not mgr_emp and instance.organization:
+                                base_code = f"EMP-{mgr_user.id.hex[:6].upper()}"
+                                mgr_emp = EmployeeProfile.objects.using(db_alias).create(
+                                    user_profile=mgr_prof,
+                                    organization=instance.organization,
+                                    employee_code=base_code
+                                )
+                    except Exception as ex_mgr:
+                        logger.warning("Could not resolve manager employee profile: %s", ex_mgr)
+                        mgr_emp = None
 
-            emp_profile, _ = EmployeeProfile.objects.using(db_alias).get_or_create(
-                user_profile=user_profile,
-                organization=instance.organization,
-                defaults={
-                    'employee_code': f"EMP-{instance.id.hex[:6].upper()}",
-                    'reporting_manager': mgr_emp,
-                }
-            )
-            if emp_profile.reporting_manager != mgr_emp:
-                emp_profile.reporting_manager = mgr_emp
-                emp_profile.save(using=db_alias, update_fields=['reporting_manager'])
+                emp_profile = EmployeeProfile.objects.using(db_alias).filter(user_profile=user_profile).first()
+                if not emp_profile:
+                    if instance.organization:
+                        base_code = f"EMP-{instance.id.hex[:6].upper()}"
+                        emp_profile = EmployeeProfile.objects.using(db_alias).create(
+                            user_profile=user_profile,
+                            organization=instance.organization,
+                            employee_code=base_code,
+                            reporting_manager=mgr_emp,
+                        )
+                else:
+                    if emp_profile.reporting_manager != mgr_emp:
+                        emp_profile.reporting_manager = mgr_emp
+                        emp_profile.save(using=db_alias, update_fields=['reporting_manager'])
+            except Exception as ex_ep:
+                logger.warning("Could not sync employee profile for user %s: %s", instance.id, ex_ep)
 
         return super().update(instance, validated_data)
 

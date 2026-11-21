@@ -1,4 +1,5 @@
 from django.utils import timezone
+from django.core.exceptions import ObjectDoesNotExist
 import logging
 
 from rest_framework import serializers
@@ -342,7 +343,7 @@ class ClassScheduleRuleSerializer(serializers.ModelSerializer):
 
 class ClassOccurrenceTrainerSerializer(serializers.ModelSerializer):
     trainer_name = serializers.SerializerMethodField()
-    trainer_code = serializers.CharField(source='trainer_profile.trainer_code', read_only=True)
+    trainer_code = serializers.SerializerMethodField()
 
     class Meta:
         model = ClassOccurrenceTrainer
@@ -352,29 +353,43 @@ class ClassOccurrenceTrainerSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'assigned_at', 'created_at']
 
+    def get_trainer_code(self, obj):
+        try:
+            tp = obj.trainer_profile
+            return tp.trainer_code if tp else ''
+        except (ObjectDoesNotExist, AttributeError):
+            return ''
+        except Exception:
+            return ''
+
     def get_trainer_name(self, obj):
-        tp = getattr(obj, 'trainer_profile', None)
-        if not tp:
+        try:
+            tp = obj.trainer_profile
+            if not tp:
+                return 'Trainer'
+            emp = getattr(tp, 'employee_profile', None)
+            up = getattr(emp, 'user_profile', None) if emp else None
+            if up:
+                first = getattr(up, 'first_name_snapshot', '') or ''
+                last = getattr(up, 'last_name_snapshot', '') or ''
+                full = f"{first} {last}".strip()
+                if full and full.lower() not in ['sweat', 'sweat demo', 'demo']:
+                    return full
+                u = getattr(up, 'user', None)
+                if u:
+                    u_full = getattr(u, 'full_name', '') or ''
+                    if u_full and u_full.lower() not in ['sweat', 'sweat demo', 'demo']:
+                        return u_full
+                    u_name = f"{getattr(u, 'first_name', '')} {getattr(u, 'last_name', '')}".strip()
+                    if u_name and u_name.lower() not in ['sweat', 'sweat demo', 'demo']:
+                        return u_name
+                if full:
+                    return f"{full} ({tp.trainer_code})"
+            return tp.trainer_code or 'Trainer'
+        except (ObjectDoesNotExist, AttributeError):
             return 'Trainer'
-        emp = getattr(tp, 'employee_profile', None)
-        up = getattr(emp, 'user_profile', None) if emp else None
-        if up:
-            first = getattr(up, 'first_name_snapshot', '') or ''
-            last = getattr(up, 'last_name_snapshot', '') or ''
-            full = f"{first} {last}".strip()
-            if full and full.lower() not in ['sweat', 'sweat demo', 'demo']:
-                return full
-            u = getattr(up, 'user', None)
-            if u:
-                u_full = getattr(u, 'full_name', '') or ''
-                if u_full and u_full.lower() not in ['sweat', 'sweat demo', 'demo']:
-                    return u_full
-                u_name = f"{getattr(u, 'first_name', '')} {getattr(u, 'last_name', '')}".strip()
-                if u_name and u_name.lower() not in ['sweat', 'sweat demo', 'demo']:
-                    return u_name
-            if full:
-                return f"{full} ({tp.trainer_code})"
-        return tp.trainer_code or 'Trainer'
+        except Exception:
+            return 'Trainer'
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
@@ -416,7 +431,7 @@ class ClassOccurrenceTrainerSerializer(serializers.ModelSerializer):
             )
             if self.instance and self.instance.pk:
                 conflicts = conflicts.exclude(pk=self.instance.pk)
-            conflicts = conflicts.exclude(occurrence=occ)
+            conflicts = conflicts.exclude(occurrence=occ).exclude(occurrence__status__in=['CANCELLED', 'DEACTIVATED'])
 
             if conflicts.exists():
                 c = conflicts.select_related('occurrence__branch', 'occurrence__class_template').first()
@@ -454,7 +469,23 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
     branch_longitude = serializers.DecimalField(source='branch.longitude', max_digits=10, decimal_places=7, read_only=True)
     branch_geofence_radius_meters = serializers.IntegerField(source='branch.geofence_radius_meters', read_only=True)
     branch_geofence_enforcement = serializers.CharField(source='branch.geofence_enforcement', read_only=True)
-    trainers = ClassOccurrenceTrainerSerializer(source='trainer_assignments', many=True, read_only=True)
+    trainers = serializers.SerializerMethodField()
+
+    def get_trainers(self, obj):
+        if obj.status in ('CANCELLED', 'DEACTIVATED'):
+            return []
+        assignments = []
+        try:
+            for a in obj.trainer_assignments.all():
+                if a.status in ['ASSIGNED', 'CONFIRMED']:
+                    try:
+                        if a.trainer_profile:
+                            assignments.append(a)
+                    except (ObjectDoesNotExist, AttributeError):
+                        continue
+        except Exception:
+            pass
+        return ClassOccurrenceTrainerSerializer(assignments, many=True, context=self.context).data
     active_content = serializers.SerializerMethodField()
     trainer_checked_in = serializers.SerializerMethodField()
     trainer_check_in_details = serializers.SerializerMethodField()
@@ -537,7 +568,11 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
         lead_t = next((t.get('trainer_name') for t in trainers_list if t.get('trainer_name') and t.get('trainer_name') != 'Trainer'), None)
         if not lead_t and trainers_list:
             lead_t = trainers_list[0].get('trainer_name')
-        ret['trainer_name'] = lead_t or getattr(instance, 'lead_trainer_snapshot', None) or 'Unassigned'
+        if instance.status in ('CANCELLED', 'DEACTIVATED'):
+            ret['trainer_name'] = 'Unassigned'
+            ret['trainers'] = []
+        else:
+            ret['trainer_name'] = lead_t or getattr(instance, 'lead_trainer_snapshot', None) or 'Unassigned'
 
         if ret.get('online_join_url') == '__NONE__' or getattr(instance, 'online_provider', None) == 'NO_VIDEO':
             ret['online_join_url'] = ''
@@ -578,30 +613,56 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
             return False
 
     def get_trainer_check_in_details(self, obj):
+        if obj.status in ('CANCELLED', 'DEACTIVATED'):
+            return {
+                'checked_in': False,
+                'trainer_name': None,
+                'status': 'UNASSIGNED',
+            }
         try:
-            confirmed = next((t for t in obj.trainer_assignments.all() if t.status == 'CONFIRMED'), None)
+            valid_trainers = []
+            try:
+                for t in obj.trainer_assignments.all():
+                    if t.status in ['ASSIGNED', 'CONFIRMED']:
+                        try:
+                            if t.trainer_profile:
+                                valid_trainers.append(t)
+                        except (ObjectDoesNotExist, AttributeError):
+                            continue
+            except Exception:
+                valid_trainers = []
+
+            confirmed = next((t for t in valid_trainers if t.status == 'CONFIRMED'), None)
             if confirmed:
                 t_name = None
-                if confirmed.trainer_profile and getattr(confirmed.trainer_profile, 'employee_profile', None):
-                    up = getattr(confirmed.trainer_profile.employee_profile, 'user_profile', None)
-                    if up and getattr(up, 'user', None):
-                        t_name = up.user.full_name or up.user.email
-                if not t_name and confirmed.trainer_profile:
-                    t_name = confirmed.trainer_profile.trainer_code
+                try:
+                    tp = confirmed.trainer_profile
+                    if tp and getattr(tp, 'employee_profile', None):
+                        up = getattr(tp.employee_profile, 'user_profile', None)
+                        if up and getattr(up, 'user', None):
+                            t_name = up.user.full_name or up.user.email
+                    if not t_name and tp:
+                        t_name = tp.trainer_code
+                except (ObjectDoesNotExist, AttributeError):
+                    pass
                 return {
                     'checked_in': True,
                     'trainer_name': t_name or 'Trainer',
                     'status': 'CONFIRMED',
                 }
-            assigned = next((t for t in obj.trainer_assignments.all() if t.status in ['ASSIGNED', 'CONFIRMED']), None)
+            assigned = next((t for t in valid_trainers if t.status in ['ASSIGNED', 'CONFIRMED']), None)
             if assigned:
                 t_name = None
-                if assigned.trainer_profile and getattr(assigned.trainer_profile, 'employee_profile', None):
-                    up = getattr(assigned.trainer_profile.employee_profile, 'user_profile', None)
-                    if up and getattr(up, 'user', None):
-                        t_name = up.user.full_name or up.user.email
-                if not t_name and assigned.trainer_profile:
-                    t_name = assigned.trainer_profile.trainer_code
+                try:
+                    tp = assigned.trainer_profile
+                    if tp and getattr(tp, 'employee_profile', None):
+                        up = getattr(tp.employee_profile, 'user_profile', None)
+                        if up and getattr(up, 'user', None):
+                            t_name = up.user.full_name or up.user.email
+                    if not t_name and tp:
+                        t_name = tp.trainer_code
+                except (ObjectDoesNotExist, AttributeError):
+                    pass
                 return {
                     'checked_in': False,
                     'trainer_name': t_name or 'Trainer',

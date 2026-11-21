@@ -2141,6 +2141,7 @@ class LeadViewSet(viewsets.ModelViewSet):
         package_version_id = request.data.get('package_version_id')
         branch_id = request.data.get('branch_id')
         coupon_code = request.data.get('coupon_code')
+        order_type = request.data.get('order_type') or request.query_params.get('order_type') or 'NEW_MEMBERSHIP'
 
         if not package_version_id:
             return Response(
@@ -2168,6 +2169,7 @@ class LeadViewSet(viewsets.ModelViewSet):
                 branch_id=str(branch_id),
                 coupon_code=coupon_code,
                 channel=channel,
+                order_type=order_type,
                 db_alias=alias,
             )
             return Response(quote)
@@ -2200,6 +2202,7 @@ class LeadViewSet(viewsets.ModelViewSet):
         package_version_id = request.data.get('package_version_id')
         branch_id = request.data.get('branch_id')
         coupon_code = request.data.get('coupon_code')
+        order_type = request.data.get('order_type') or request.query_params.get('order_type') or 'NEW_MEMBERSHIP'
 
         if not package_version_id or not branch_id:
             return Response(

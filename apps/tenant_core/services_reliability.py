@@ -177,6 +177,25 @@ def record_business_audit(
     """
     Creates an immutable business audit event with sanitized before/after state diffs.
     """
+    # If actor_user is not a TenantUser instance (e.g. PlatformUser/SuperAdmin), resolve or fallback safely
+    if actor_user is not None and getattr(actor_user, '__class__', None).__name__ != 'TenantUser':
+        resolved_tenant_user = None
+        try:
+            from .models_users import TenantUser
+            from django.db.models import Q
+            alias = db_alias or 'default'
+            actor_email = getattr(actor_user, 'email', None)
+            actor_id = getattr(actor_user, 'id', None)
+            resolved_tenant_user = TenantUser.objects.using(alias).filter(
+                Q(id=actor_id) | (Q(email__iexact=actor_email) if actor_email else Q(pk__isnull=True))
+            ).first()
+        except Exception:
+            resolved_tenant_user = None
+        if not metadata:
+            metadata = {}
+        metadata['raw_actor'] = str(actor_user)
+        actor_user = resolved_tenant_user
+
     manager = BusinessAuditEvent.objects.using(db_alias) if db_alias else BusinessAuditEvent.objects
     event = manager.create(
         organization=organization,

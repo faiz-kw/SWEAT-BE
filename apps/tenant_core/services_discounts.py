@@ -21,7 +21,7 @@ Capabilities:
 
 import logging
 from decimal import Decimal
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 from django.db import transaction
 from django.utils import timezone
 from django.core.exceptions import ValidationError
@@ -50,12 +50,147 @@ class DiscountCouponEngineService:
     High performance, deterministic discount evaluation and coupon redemption engine.
     """
 
+    # Dynamic transaction/order type semantic families for multi-platform compatibility
+    ORDER_TYPE_FAMILIES = {
+        'NEW_MEMBERSHIP': {
+            'NEW_MEMBERSHIP', 'NEW_PACKAGE', 'NEW', 'LEAD_CONVERSION',
+            'FIRST_PURCHASE', 'ENROLLMENT', 'SIGNUP', 'PURCHASE', 'NEW_SALE', 'PACKAGE_PURCHASE'
+        },
+        'NEW_PACKAGE': {
+            'NEW_PACKAGE', 'NEW_MEMBERSHIP', 'NEW', 'LEAD_CONVERSION',
+            'FIRST_PURCHASE', 'ENROLLMENT', 'SIGNUP', 'PURCHASE', 'NEW_SALE', 'PACKAGE_PURCHASE'
+        },
+        'PACKAGE_PURCHASE': {
+            'PACKAGE_PURCHASE', 'NEW_PACKAGE', 'NEW_MEMBERSHIP', 'NEW', 'LEAD_CONVERSION',
+            'FIRST_PURCHASE', 'ENROLLMENT', 'SIGNUP', 'PURCHASE', 'NEW_SALE'
+        },
+        'RENEWAL': {
+            'RENEWAL', 'RENEW', 'MEMBERSHIP_RENEWAL', 'PACKAGE_RENEWAL'
+        },
+        'UPGRADE': {
+            'UPGRADE', 'TIER_UPGRADE', 'MEMBERSHIP_UPGRADE'
+        },
+        'REJOIN': {
+            'REJOIN', 'WINBACK', 'REACTIVATION'
+        },
+        'ADDON': {
+            'ADDON', 'TOPUP', 'SESSION_PACK', 'EXTRA_SESSIONS'
+        },
+    }
+
+    @classmethod
+    def matches_order_type(cls, candidate_order_type: Optional[str], allowed_order_types: Optional[List[str]]) -> bool:
+        """
+        Dynamically checks whether candidate_order_type satisfies allowed_order_types.
+        Enterprise-grade dynamic resolution:
+        1. If allowed_order_types is unconfigured / empty / None / contains 'ALL', '*', 'ANY', returns True.
+        2. Exact case-insensitive match -> True.
+        3. Semantic alias expansion across transaction families (e.g., NEW_MEMBERSHIP, LEAD_CONVERSION, NEW_PACKAGE).
+        """
+        if not allowed_order_types:
+            return True
+        clean_allowed = [str(x).strip().upper() for x in allowed_order_types if x]
+        if not clean_allowed or any(x in ('ALL', '*', 'ANY', 'UNIVERSAL') for x in clean_allowed):
+            return True
+
+        cand = str(candidate_order_type or '').strip().upper()
+        if not cand:
+            return False
+
+        if cand in clean_allowed:
+            return True
+
+        # Semantic family alias expansion
+        cand_synonyms = set(cls.ORDER_TYPE_FAMILIES.get(cand, {cand}))
+        cand_synonyms.add(cand)
+
+        allowed_synonyms = set()
+        for a in clean_allowed:
+            allowed_synonyms.add(a)
+            allowed_synonyms.update(cls.ORDER_TYPE_FAMILIES.get(a, set()))
+
+        return bool(cand_synonyms & allowed_synonyms)
+
+    # Dynamic member lifecycle state semantic families
+    MEMBER_TYPE_FAMILIES = {
+        'NEW': {'NEW', 'PROSPECT', 'LEAD', 'FIRST_TIME', 'NEW_MEMBER'},
+        'EXPIRED': {'EXPIRED', 'INACTIVE', 'CHURNED', 'LAPSED', 'WINBACK', 'REJOIN', 'FORMER'},
+        'ACTIVE': {'ACTIVE', 'CURRENT', 'EXISTING_ACTIVE', 'MEMBER'},
+        'EXISTING': {'ACTIVE', 'CURRENT', 'EXPIRED', 'INACTIVE', 'CHURNED', 'LAPSED', 'WINBACK', 'REJOIN', 'FORMER'},
+        'NEW_OR_EXPIRED': {'NEW', 'PROSPECT', 'LEAD', 'FIRST_TIME', 'NEW_MEMBER', 'EXPIRED', 'INACTIVE', 'CHURNED', 'LAPSED', 'WINBACK', 'REJOIN', 'FORMER'},
+    }
+
+    @classmethod
+    def get_member_lifecycle_state(cls, user_profile: Optional[UserProfile], db_alias: Optional[str] = None) -> str:
+        """
+        Determines authoritative member lifecycle state:
+        - 'NEW': First-time user / lead with zero past memberships.
+        - 'ACTIVE': Has at least 1 currently active, valid, unexpired membership.
+        - 'EXPIRED': Has prior membership(s), but all are expired, cancelled, or inactive.
+        """
+        if not user_profile:
+            return 'NEW'
+        alias = db_alias or (getattr(user_profile, '_state', None) and user_profile._state.db) or get_current_tenant_db_alias() or 'default'
+        from .models_memberships import Membership
+        today = timezone.now().date()
+        mems = list(Membership.objects.using(alias).filter(user_profile=user_profile))
+        if not mems:
+            return 'NEW'
+        has_active = any(
+            m.status == 'ACTIVE' and (m.end_date is None or m.end_date >= today)
+            for m in mems
+        )
+        return 'ACTIVE' if has_active else 'EXPIRED'
+
+    @classmethod
+    def matches_member_type(cls, candidate_state: Optional[str], allowed_member_types: Optional[Union[str, List[str]]]) -> bool:
+        """
+        Dynamically checks whether candidate_state satisfies allowed_member_types.
+        Supports:
+        - Unrestricted / None / empty / 'ALL' / '*' -> True
+        - Single string or list of allowed member types
+        - Semantic family alias expansion (NEW, EXPIRED, ACTIVE, NEW_OR_EXPIRED)
+        """
+        if not allowed_member_types:
+            return True
+        if isinstance(allowed_member_types, str):
+            allowed_list = [allowed_member_types]
+        else:
+            allowed_list = [str(x) for x in allowed_member_types if x]
+        clean_allowed = [x.strip().upper() for x in allowed_list if x]
+        if not clean_allowed or any(x in ('ALL', '*', 'ANY', 'UNIVERSAL') for x in clean_allowed):
+            return True
+
+        cand = str(candidate_state or 'NEW').strip().upper()
+
+        if cand in clean_allowed:
+            return True
+
+        allowed_synonyms = set()
+        for a in clean_allowed:
+            allowed_synonyms.add(a)
+            allowed_synonyms.update(cls.MEMBER_TYPE_FAMILIES.get(a, set()))
+
+        if 'NEW_OR_EXPIRED' in allowed_synonyms:
+            if cand in ('NEW', 'EXPIRED'):
+                return True
+            if cand == 'ACTIVE':
+                return False
+
+        if 'ACTIVE' in allowed_synonyms and 'NEW' not in allowed_synonyms and 'EXPIRED' not in allowed_synonyms:
+            return cand == 'ACTIVE'
+
+        cand_synonyms = set(cls.MEMBER_TYPE_FAMILIES.get(cand, {cand}))
+        cand_synonyms.add(cand)
+
+        return bool(cand_synonyms & allowed_synonyms)
+
     @classmethod
     def validate_coupon(
         cls,
         code_str: str,
-        user_profile: UserProfile,
-        order_subtotal: Decimal,
+        user_profile: Optional[UserProfile] = None,
+        order_subtotal: Optional[Union[Decimal, float, str]] = None,
         branch: Optional[Branch] = None,
         package: Optional[Package] = None,
         db_alias: Optional[str] = None,
@@ -187,23 +322,44 @@ class DiscountCouponEngineService:
             if not uid or uid not in [str(x) for x in allowed_user_ids]:
                 return {'is_valid': False, 'reason': 'This coupon is not available for your account.', 'reason_code': 'USER_NOT_ELIGIBLE'}
 
-        # Order-type gate (RENEWAL-only / NEW-only / UPGRADE-only via configuration['order_types'])
+        # Order-type gate (Dynamic & configurable across ALL platforms)
         allowed_order_types = camp_cfg.get('order_types') if isinstance(camp_cfg.get('order_types'), list) else None
         if allowed_order_types:
-            otype = (str(order_type).upper() if order_type else (str(getattr(order, 'order_type', '') or '').upper() if order is not None else ''))
-            if not otype or otype not in [str(x).upper() for x in allowed_order_types]:
-                return {'is_valid': False, 'reason': 'This coupon is not valid for this transaction type.', 'reason_code': 'ORDER_TYPE_NOT_ELIGIBLE'}
+            otype = None
+            if order_type:
+                otype = str(order_type).strip().upper()
+            elif order is not None and getattr(order, 'order_type', None):
+                otype = str(order.order_type).strip().upper()
+            elif user_profile is not None:
+                member_state = cls.get_member_lifecycle_state(user_profile, alias)
+                if member_state == 'ACTIVE':
+                    otype = 'RENEWAL'
+                elif member_state == 'EXPIRED':
+                    otype = 'REJOIN'
+                else:
+                    otype = 'NEW_MEMBERSHIP'
+            else:
+                otype = 'NEW_MEMBERSHIP'
 
-        # Member-type gate (NEW = first-time only / EXISTING = must already have a membership)
-        member_type = camp_cfg.get('member_type')
-        if member_type and user_profile is not None:
-            from .models_memberships import Membership as _Mem
-            has_prior = _Mem.objects.using(alias).filter(user_profile=user_profile).exclude(status='CANCELLED').exists()
-            mt = str(member_type).upper()
-            if mt == 'NEW' and has_prior:
-                return {'is_valid': False, 'reason': 'This offer is only for first-time members.', 'reason_code': 'MEMBER_TYPE_NOT_ELIGIBLE'}
-            if mt == 'EXISTING' and not has_prior:
-                return {'is_valid': False, 'reason': 'This offer is only for existing members.', 'reason_code': 'MEMBER_TYPE_NOT_ELIGIBLE'}
+            if not cls.matches_order_type(otype, allowed_order_types):
+                return {
+                    'is_valid': False,
+                    'reason': 'This coupon is not valid for this transaction type.',
+                    'reason_code': 'ORDER_TYPE_NOT_ELIGIBLE',
+                }
+
+        # Member lifecycle gate (NEW, ACTIVE, EXPIRED/INACTIVE/REJOIN, NEW_OR_EXPIRED)
+        allowed_member_types = camp_cfg.get('allowed_member_types') or camp_cfg.get('member_type')
+        if allowed_member_types:
+            member_state = cls.get_member_lifecycle_state(user_profile, alias)
+            if not cls.matches_member_type(member_state, allowed_member_types):
+                if member_state == 'ACTIVE':
+                    reason = 'This offer is only for new members or rejoining expired members; you currently have an active membership.'
+                elif member_state == 'EXPIRED':
+                    reason = 'This offer is only for active members.'
+                else:
+                    reason = 'This offer is not eligible for your current membership status.'
+                return {'is_valid': False, 'reason': reason, 'reason_code': 'MEMBER_TYPE_NOT_ELIGIBLE'}
 
         # Minimum order amount & Authoritative Subtotal calculation
         if order is not None and order.items.using(alias).exists():
@@ -246,6 +402,7 @@ class DiscountCouponEngineService:
             'is_valid': True,
             'code_id': str(discount_code.id),
             'code': discount_code.code,
+            'coupon_code': discount_code.code,
             'campaign_id': str(campaign.id),
             'campaign_name': campaign.name,
             'discount_type': campaign.discount_type,

@@ -1006,7 +1006,7 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
                 if role_obj is None:
                     raise ValidationError({'role_id': 'Select a valid role.'})
 
-            if role_obj and instance.organization_id != role_obj.organization_id:
+            if role_obj and role_obj.organization_id and instance.organization_id != role_obj.organization_id:
                 instance.organization = role_obj.organization
                 instance.save(using=db, update_fields=['organization'])
 
@@ -1089,12 +1089,21 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
             if role_obj and branch_access is None and (br_obj or not existing_role):
                 RoleAssignment.objects.using(db).filter(user=instance, is_active=True).update(is_active=False, status='INACTIVE')
                 assigned_branch = instance.home_branch if role_obj.scope == 'BRANCH' else None
-                RoleAssignment.objects.using(db).create(
-                    organization=instance.organization, user=instance, role=role_obj,
-                    branch=assigned_branch,
-                    scope_type='BRANCH' if assigned_branch else 'ORGANIZATION',
-                    status='ACTIVE', is_active=True,
-                )
+                ra = RoleAssignment.objects.using(db).filter(
+                    organization=instance.organization, user=instance, role=role_obj, branch=assigned_branch,
+                ).first()
+                if ra:
+                    ra.status = 'ACTIVE'
+                    ra.is_active = True
+                    ra.scope_type = 'BRANCH' if assigned_branch else 'ORGANIZATION'
+                    ra.save(using=db, update_fields=['status', 'is_active', 'scope_type', 'updated_at'])
+                else:
+                    RoleAssignment.objects.using(db).create(
+                        organization=instance.organization, user=instance, role=role_obj,
+                        branch=assigned_branch,
+                        scope_type='BRANCH' if assigned_branch else 'ORGANIZATION',
+                        status='ACTIVE', is_active=True,
+                    )
 
             if branch_access is not None:
                 for branch_obj, enabled in resolved_access:

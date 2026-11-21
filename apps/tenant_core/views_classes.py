@@ -311,12 +311,36 @@ class ClassTemplateViewSet(viewsets.ModelViewSet):
         )
 
     def perform_update(self, serializer):
+        old_status = serializer.instance.status if serializer.instance else None
         instance = serializer.save()
         alias = _get_db(self.request)
         org = _get_org(self.request)
         branch_capacities = self.request.data.get('branch_capacities')
         if branch_capacities is not None:
             self._save_branch_capacities(instance, branch_capacities, alias)
+
+        # If class template is deactivated, cancel all future sessions and release assigned trainers immediately
+        if instance.status != 'ACTIVE' and old_status == 'ACTIVE':
+            future_occs = list(
+                ClassOccurrence.objects.using(alias).filter(
+                    class_template=instance,
+                    start_at__gte=timezone.now(),
+                    status__in=['SCHEDULED', 'OPEN'],
+                )
+            )
+            if future_occs:
+                occ_ids = [o.id for o in future_occs]
+                ClassOccurrence.objects.using(alias).filter(id__in=occ_ids).update(
+                    status='CANCELLED',
+                    updated_at=timezone.now()
+                )
+                ClassSchedulingService.release_trainers_for_occurrences(
+                    occurrence_ids=occ_ids,
+                    reason=f"Class template '{instance.name}' deactivated",
+                    actor=self.request.user,
+                    db_alias=alias,
+                )
+
         record_business_audit(
             organization=org,
             module='classes',
@@ -621,8 +645,32 @@ class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
         )
 
     def perform_update(self, serializer):
+        old_status = serializer.instance.status if serializer.instance else None
         rule = serializer.save()
         alias = _get_db(self.request)
+
+        # If schedule rule is deactivated, cancel all future sessions and release assigned trainers immediately
+        if rule.status != 'ACTIVE' and old_status == 'ACTIVE':
+            future_occs = list(
+                ClassOccurrence.objects.using(alias).filter(
+                    schedule_rule=rule,
+                    start_at__gte=timezone.now(),
+                    status__in=['SCHEDULED', 'OPEN'],
+                )
+            )
+            if future_occs:
+                occ_ids = [o.id for o in future_occs]
+                ClassOccurrence.objects.using(alias).filter(id__in=occ_ids).update(
+                    status='CANCELLED',
+                    updated_at=timezone.now()
+                )
+                ClassSchedulingService.release_trainers_for_occurrences(
+                    occurrence_ids=occ_ids,
+                    reason=f"Recurring schedule rule '{rule}' deactivated",
+                    actor=self.request.user,
+                    db_alias=alias,
+                )
+
         record_business_audit(
             organization=rule.branch.organization,
             branch=rule.branch,
@@ -911,6 +959,19 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             db_alias=alias,
         )
 
+    def perform_update(self, serializer):
+        old_status = serializer.instance.status if serializer.instance else None
+        instance = serializer.save()
+        new_status = instance.status
+        alias = _get_db(self.request)
+        if new_status in ('CANCELLED', 'DEACTIVATED') and old_status not in ('CANCELLED', 'DEACTIVATED'):
+            ClassSchedulingService.release_trainers_for_occurrences(
+                occurrence_ids=[instance.id],
+                reason=f"Class slot updated to {new_status}",
+                actor=self.request.user,
+                db_alias=alias,
+            )
+
     @action(detail=True, methods=['post'], url_path='assign-trainer')
     def assign_trainer(self, request, pk=None):
         alias = _get_db(request)
@@ -939,8 +1000,7 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
         alias = _get_db(request)
         trainer_profile_id = request.data.get('trainer_profile_id')
         assignment_id = request.data.get('assignment_id')
-        if not trainer_profile_id and not assignment_id:
-            return Response({'error': 'trainer_profile_id or assignment_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+        unassign_all = request.data.get('unassign_all', False)
 
         from .models_classes import ClassOccurrenceTrainer
         qs = ClassOccurrenceTrainer.objects.using(alias).filter(occurrence_id=pk)
@@ -948,9 +1008,12 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             qs = qs.filter(id=assignment_id)
         elif trainer_profile_id:
             qs = qs.filter(trainer_profile_id=trainer_profile_id)
+        elif not unassign_all:
+            # Default to clearing active assignments for this occurrence if not specific
+            pass
 
         deleted_count, _ = qs.delete()
-        if deleted_count == 0:
+        if deleted_count == 0 and not unassign_all and (assignment_id or trainer_profile_id):
             return Response({'error': 'Trainer assignment not found for this occurrence.'}, status=status.HTTP_404_NOT_FOUND)
 
         from .services_classes import record_business_audit
@@ -1811,6 +1874,23 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
         start_time_str = instance.start_at.strftime('%H:%M') if instance.start_at else ''
         end_time_str = instance.end_at.strftime('%H:%M') if instance.end_at else ''
 
+        active_trainers = list(
+            ClassOccurrenceTrainer.objects.using(alias).filter(
+                occurrence=instance,
+                status__in=['ASSIGNED', 'CONFIRMED'],
+            ).select_related('trainer_profile', 'trainer_profile__employee_profile__user_profile')
+        )
+        assigned_trainers_preview = []
+        for at in active_trainers:
+            t_name = ClassOccurrenceTrainerSerializer(at).get_trainer_name(at)
+            assigned_trainers_preview.append({
+                'id': str(at.id),
+                'trainer_id': str(at.trainer_profile_id),
+                'trainer_name': t_name,
+                'trainer_code': getattr(at.trainer_profile, 'trainer_code', ''),
+                'role': at.trainer_role,
+            })
+
         return Response({
             'occurrence_id': str(instance.id),
             'class_name': instance.class_template.name if instance.class_template else 'Class Session',
@@ -1824,6 +1904,7 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             'waitlist_count': waitlist_count,
             'is_recurring': bool(instance.schedule_rule_id),
             'affected_bookings': affected_list,
+            'assigned_trainers': assigned_trainers_preview,
         }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'], url_path='cancel')
@@ -1858,12 +1939,20 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             )
 
         with transaction.atomic(using=alias):
-            # 1. Update occurrence status
+            # 1. Immediately release any assigned trainers so they are free for other classes and appointments
+            released_trainers_count = ClassSchedulingService.release_trainers_for_occurrences(
+                occurrence_ids=[instance.id],
+                reason=f"Class session {target_status.lower()}: {reason or 'Cancelled by admin'}",
+                actor=request.user,
+                db_alias=alias,
+            )
+
+            # 2. Update occurrence status
             old_status = instance.status
             instance.status = target_status
             instance.save(using=alias, update_fields=['status', 'updated_at'])
 
-            # 2. Query and process all active bookings
+            # 3. Query and process all active bookings
             active_bookings = list(
                 Booking.objects.using(alias).filter(
                     occurrence=instance,
@@ -1948,6 +2037,7 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
                         'reason': reason,
                         'cancelled_bookings_count': cancelled_bookings_count,
                         'notifications_sent_count': notifications_sent_count,
+                        'released_trainers_count': released_trainers_count,
                     },
                     db_alias=alias,
                 )
@@ -1959,6 +2049,7 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             'cancelled_bookings_count': cancelled_bookings_count,
             'notifications_sent_count': notifications_sent_count,
             'credits_restored_count': credits_restored_count,
+            'released_trainers_count': released_trainers_count,
         }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'], url_path='restore')

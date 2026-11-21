@@ -3362,7 +3362,21 @@ class MobileDiscountCouponsView(APIView):
 
         now = timezone.now()
         req_package_id = request.query_params.get('package_id')
+        req_branch_id = request.query_params.get('branch_id')
+        req_subtotal = request.query_params.get('subtotal')
         req_order_type = (request.query_params.get('order_type') or '').strip().upper() or None
+        req_member_id = request.query_params.get('member_id') or request.query_params.get('user_profile_id') or request.query_params.get('user_id')
+
+        # Authoritative member profile and lifecycle state resolution
+        profile = None
+        if req_member_id:
+            profile = UserProfile.objects.using(alias).filter(
+                models.Q(id=req_member_id) | models.Q(user_id=req_member_id)
+            ).first()
+        if not profile and request.user and request.user.is_authenticated:
+            profile = UserProfile.objects.using(alias).filter(user=request.user).first()
+
+        member_lifecycle = DiscountCouponEngineService.get_member_lifecycle_state(profile, alias) if profile else None
         req_program_id = None
         if req_package_id:
             from .models_catalog import Package as _PkgRef
@@ -3386,6 +3400,12 @@ class MobileDiscountCouponsView(APIView):
             camp = c.campaign
             if isinstance(camp.configuration, dict) and camp.configuration.get('hidden'):
                 continue
+            if not camp.is_currently_valid():
+                continue
+            if camp.usage_limit:
+                redemption_count = getattr(camp, 'redemptions', None)
+                if redemption_count and redemption_count.count() >= camp.usage_limit:
+                    continue
             _cfg = camp.configuration if isinstance(camp.configuration, dict) else {}
             if req_package_id:
                 _code_pkg_id = str(c.package_id) if c.package_id else None
@@ -3399,9 +3419,35 @@ class MobileDiscountCouponsView(APIView):
                 elif isinstance(_cfg.get('program_ids'), list) and _cfg.get('program_ids'):
                     if not req_program_id or str(req_program_id) not in [str(x) for x in _cfg['program_ids']]:
                         continue
+            if req_branch_id:
+                _code_branch_id = str(c.branch_id) if c.branch_id else None
+                _cfg_branch_ids = [str(x) for x in _cfg.get('branch_ids', []) if x] if isinstance(_cfg.get('branch_ids'), list) else []
+                _cfg_single_branch_id = str(_cfg.get('branch_id')) if (_cfg.get('branch_id') and not _cfg_branch_ids) else None
+                _allowed_branches = [_code_branch_id] if _code_branch_id else (_cfg_branch_ids if _cfg_branch_ids else ([_cfg_single_branch_id] if _cfg_single_branch_id else []))
+                if _allowed_branches and str(req_branch_id) not in _allowed_branches:
+                    continue
+            if req_subtotal:
+                try:
+                    subtotal_val = float(req_subtotal)
+                    if camp.minimum_order_amount and subtotal_val < float(camp.minimum_order_amount):
+                        continue
+                except (ValueError, TypeError):
+                    pass
             if req_order_type:
                 _aots = _cfg.get('order_types') if isinstance(_cfg.get('order_types'), list) else None
-                if _aots and req_order_type not in [str(x).upper() for x in _aots]:
+                if _aots and not DiscountCouponEngineService.matches_order_type(req_order_type, _aots):
+                    continue
+
+            # Member lifecycle / status filtering
+            _amt = _cfg.get('allowed_member_types') or _cfg.get('member_type')
+            if _amt and member_lifecycle:
+                if not DiscountCouponEngineService.matches_member_type(member_lifecycle, _amt):
+                    continue
+
+            # User-lock filtering (allowed_user_ids)
+            _auids = _cfg.get('allowed_user_ids')
+            if _auids and isinstance(_auids, list):
+                if not profile or str(profile.id) not in [str(x) for x in _auids]:
                     continue
             results.append({
                 'id': str(c.id),
@@ -3437,8 +3483,13 @@ class MobileValidateCouponView(APIView):
         if not code:
             return Response({'is_valid': False, 'detail': 'Promo code is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        member_id = request.data.get('member_id') or request.data.get('user_profile_id') or request.data.get('user_id')
         profile = None
-        if request.user and request.user.is_authenticated:
+        if member_id:
+            profile = UserProfile.objects.using(alias).filter(
+                models.Q(id=member_id) | models.Q(user_id=member_id)
+            ).first()
+        if not profile and request.user and request.user.is_authenticated:
             profile = UserProfile.objects.using(alias).filter(user=request.user).first()
 
         pkg = Package.objects.using(alias).filter(id=package_id).first() if package_id else None

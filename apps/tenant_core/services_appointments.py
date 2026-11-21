@@ -210,7 +210,7 @@ class AppointmentSchedulingService:
                 status__in=['ASSIGNED', 'CONFIRMED'],
                 occurrence__start_at__lt=appt.end_at,
                 occurrence__end_at__gt=appt.start_at,
-            ).exists()
+            ).exclude(occurrence__status__in=['CANCELLED', 'DEACTIVATED']).exists()
             if conflict_class:
                 raise ValidationError(f"Trainer {trainer.trainer_code} has a conflicting group class assignment.")
 

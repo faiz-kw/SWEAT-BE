@@ -4033,6 +4033,7 @@ class LeadConversionService:
         branch_id: str,
         coupon_code: Optional[str] = None,
         channel: str = 'STAFF',
+        order_type: str = 'NEW_MEMBERSHIP',
         db_alias: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -4097,6 +4098,7 @@ class LeadConversionService:
                 order_subtotal=subtotal,
                 branch=branch,
                 package=pv.package,
+                order_type=order_type,
                 db_alias=alias,
             )
             coupon_preview = val
