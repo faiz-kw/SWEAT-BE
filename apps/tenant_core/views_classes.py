@@ -477,6 +477,7 @@ class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
                 Q(branch__name__icontains=search_param)
             )
 
+        params = self.request.query_params
         start_time_param = (params.get('start_time') or params.get('time_from') or '').strip()
         end_time_param = (params.get('end_time') or params.get('time_to') or '').strip()
 
@@ -896,6 +897,7 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
                 Exists(matching_trainer)
             )
 
+        params = self.request.query_params
         start_time_param = (params.get('start_time') or params.get('time_from') or '').strip()
         end_time_param = (params.get('end_time') or params.get('time_to') or '').strip()
 
