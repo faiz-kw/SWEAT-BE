@@ -1010,9 +1010,12 @@ class BookingWaitlistAttendanceService:
                             if trials_used >= booking_policy.max_trial_bookings:
                                 raise ValidationError(f"Maximum trial bookings ({booking_policy.max_trial_bookings}) exceeded.")
 
-                # Check permitted booking types
+                # Check permitted booking types. TRIAL is governed by its own dedicated gates
+                # (allow_trial / max_trial_bookings above, plus trial-capacity and 1-trial checks in
+                # the trial view), so it is exempt from this session-type list — otherwise a policy
+                # whose allowed_booking_types omits 'TRIAL' silently blocks all free-trial bookings.
                 allowed_types = effective_bp.get('allowed_booking_types')
-                if allowed_types:
+                if allowed_types and booking_type != 'TRIAL':
                     # Normalize types: A member booking an occurrence/class is permitted under 'CLASS' or 'MEMBER'
                     normalized_type = 'CLASS' if booking_type in ['CLASS', 'MEMBER'] else booking_type
                     normalized_allowed = {'CLASS' if t in ['CLASS', 'MEMBER'] else t for t in allowed_types}
