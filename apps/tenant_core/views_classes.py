@@ -477,8 +477,8 @@ class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
                 Q(branch__name__icontains=search_param)
             )
 
-        start_time_param = (self.request.query_params.get('start_time') or self.request.query_params.get('time_from') or '').strip()
-        end_time_param = (self.request.query_params.get('end_time') or self.request.query_params.get('time_to') or '').strip()
+        start_time_param = (params.get('start_time') or params.get('time_from') or '').strip()
+        end_time_param = (params.get('end_time') or params.get('time_to') or '').strip()
 
         if start_time_param or end_time_param:
             from datetime import datetime as dt_parser
@@ -814,16 +814,17 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
         if permitted_branches is not None:
             qs = qs.filter(branch_id__in=permitted_branches)
 
-        branch_id = self.request.query_params.get('branch_id')
-        category_id = (self.request.query_params.get('category_id') or self.request.query_params.get('category') or '').strip()
-        category_code = (self.request.query_params.get('category_code') or '').strip()
-        occ_date = self.request.query_params.get('occurrence_date')
-        status_param = self.request.query_params.get('status')
-        trainer_id = self.request.query_params.get('trainer_id')
-        from_date = self.request.query_params.get('from_date')
-        to_date = self.request.query_params.get('to_date')
-        check_in_param = self.request.query_params.get('check_in_status')
-        search_param = (self.request.query_params.get('search') or '').strip()
+        params = getattr(self.request, 'query_params', getattr(self.request, 'GET', {}))
+        branch_id = params.get('branch_id')
+        category_id = (params.get('category_id') or params.get('category') or '').strip()
+        category_code = (params.get('category_code') or '').strip()
+        occ_date = params.get('occurrence_date')
+        status_param = params.get('status')
+        trainer_id = params.get('trainer_id')
+        from_date = params.get('from_date')
+        to_date = params.get('to_date')
+        check_in_param = params.get('check_in_status')
+        search_param = (params.get('search') or '').strip()
 
         if branch_id:
             qs = qs.filter(branch_id=branch_id)
@@ -840,10 +841,13 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             else:
                 qs = qs.filter(status=status_param)
         now = timezone.now()
-        upcoming_only = (self.request.query_params.get('upcoming_only') or '').strip().lower() == 'true'
+        upcoming_only = (params.get('upcoming_only') or '').strip().lower() == 'true'
 
         if trainer_id and trainer_id.upper() != 'ALL':
-            qs = qs.filter(trainer_assignments__trainer_profile_id=trainer_id).exclude(trainer_assignments__status__in=['CANCELLED', 'REPLACED'])
+            qs = qs.filter(
+                Q(trainer_assignments__trainer_profile_id=trainer_id) |
+                Q(trainer_assignments__trainer_profile__employee_profile__user_profile__user_id=trainer_id)
+            ).exclude(trainer_assignments__status__in=['CANCELLED', 'REPLACED'])
 
         if from_date:
             qs = qs.filter(occurrence_date__gte=from_date)
@@ -892,8 +896,8 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
                 Exists(matching_trainer)
             )
 
-        start_time_param = (self.request.query_params.get('start_time') or self.request.query_params.get('time_from') or '').strip()
-        end_time_param = (self.request.query_params.get('end_time') or self.request.query_params.get('time_to') or '').strip()
+        start_time_param = (params.get('start_time') or params.get('time_from') or '').strip()
+        end_time_param = (params.get('end_time') or params.get('time_to') or '').strip()
 
         if start_time_param or end_time_param:
             from datetime import datetime as dt_parser

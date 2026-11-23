@@ -574,6 +574,10 @@ class BookingPolicyConfig(models.Model):
         default=20,
         help_text="Minutes before scheduled class start when turnstile QR pass becomes accessible"
     )
+    qr_scan_grace_period_minutes = models.IntegerField(
+        default=20,
+        help_text="Minutes after scheduled class start when member can still scan QR pass at turnstile for attendance"
+    )
 
     # 7. Policy Application Scope
     apply_to_existing_bookings = models.BooleanField(

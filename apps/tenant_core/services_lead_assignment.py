@@ -91,9 +91,8 @@ class LeadAssignmentEligibilityService:
             organization=organization,
             status='ACTIVE',
             is_login_allowed=True,
-        ).filter(
-            Q(role_assignments__status='ACTIVE', role_assignments__is_active=True) |
-            Q(user_type='STAFF')
+        ).exclude(
+            user_type__in=['MEMBER', 'LEAD']
         ).distinct().prefetch_related(
             'role_assignments__role',
             'branch_assignments',
@@ -149,7 +148,7 @@ class LeadAssignmentEligibilityService:
             # Check active role assignments
             active_ras = [
                 ra for ra in user.role_assignments.all()
-                if ra.status == 'ACTIVE' and ra.is_active and ra.role and ra.role.status == 'ACTIVE' and ra.role.is_active
+                if ra.is_active and str(ra.status or 'ACTIVE').upper() != 'INACTIVE' and ra.role and ra.role.is_active and str(ra.role.status or 'ACTIVE').upper() != 'INACTIVE'
             ]
             has_active_role = bool(active_ras) or getattr(user, 'is_superuser', False)
 
@@ -196,7 +195,15 @@ class LeadAssignmentEligibilityService:
             else:
                 candidate_roles = [ra.role for ra in branch_matching_ras]
                 for r in candidate_roles:
-                    if r.id in crm_lead_role_ids or getattr(r, 'code', '') in ('ORG_ADMIN', 'SALES_REP', 'BRANCH_MANAGER'):
+                    is_explicitly_allowed_role = (
+                        r.code in allowed_roles or
+                        str(r.id) in allowed_roles or
+                        r.name in allowed_roles or
+                        r.code.rstrip('S').upper() in [str(c).rstrip('S').upper() for c in allowed_roles] or
+                        (r.name and r.name.lower() in [str(c).lower() for c in allowed_roles])
+                    ) if allowed_roles else False
+
+                    if r.id in crm_lead_role_ids or is_explicitly_allowed_role or getattr(r, 'code', '') in ('ORG_ADMIN', 'SALES_REP', 'BRANCH_MANAGER'):
                         has_lead_permission = True
                         perm_granting_role = r
                         break
@@ -207,7 +214,13 @@ class LeadAssignmentEligibilityService:
             matches_tenant_role_restriction = True
             if allowed_roles:
                 matches_tenant_role_restriction = any(
-                    ra.role and ra.role.code in allowed_roles for ra in active_ras
+                    ra.role and (
+                        ra.role.code in allowed_roles or
+                        str(ra.role.id) in allowed_roles or
+                        ra.role.name in allowed_roles or
+                        ra.role.code.rstrip('S').upper() in [str(c).rstrip('S').upper() for c in allowed_roles] or
+                        (ra.role.name and ra.role.name.lower() in [str(c).lower() for c in allowed_roles])
+                    ) for ra in active_ras
                 )
 
             # Individual user exclusion check: Active for Assignment toggle in CRM Setup

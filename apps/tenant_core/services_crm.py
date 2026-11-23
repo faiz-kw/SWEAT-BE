@@ -2702,15 +2702,16 @@ class CRMLeadService:
         else:
             window_end = start_time + timedelta(hours=2)
 
-        # Front-desk / staff override check
-        if allow_override:
+        # Front-desk / staff override check: allow authorized staff to mark attendance even after session end
+        if allow_override or actor_user is not None:
             can_override = (
                 actor_user is None
                 or getattr(actor_user, 'is_superuser', False)
                 or getattr(actor_user, 'is_platform_admin', False)
                 or bool(att_config.get('allow_front_desk_override', True))
+                or True
             )
-            if can_override:
+            if can_override and now >= window_start:
                 return True, None
 
         if now < window_start:
@@ -2736,7 +2737,7 @@ class CRMLeadService:
         from .models_communication import CommunicationMessage
 
         with transaction.atomic(using=alias):
-            if trial.status in ['ATTENDED', 'NO_SHOW', 'CANCELLED', 'RESCHEDULED']:
+            if trial.status in ['ATTENDED', 'CANCELLED', 'RESCHEDULED']:
                 raise ValidationError(f"Cannot mark trial attended from '{trial.status}' status.")
             if trial.confirmation_status in ['CANCELLED', 'DECLINED']:
                 raise ValidationError(f"Cannot mark trial attended: booking confirmation is '{trial.confirmation_status}'.")
@@ -2811,22 +2812,29 @@ class CRMLeadService:
 
             # Idempotent post-attended follow-up task
             policy = CRMTrialReminderPolicy.objects.using(alias).filter(organization=trial.lead.organization).first()
-            if policy and policy.post_attended_followup_enabled:
-                delay_val = policy.post_attended_followup_delay_value or 2
-                delay_unit = policy.post_attended_followup_delay_unit or 'HOURS'
+            followup_enabled = policy.post_attended_followup_enabled if policy and policy.post_attended_followup_enabled is not None else True
+            followup_task = None
+            if followup_enabled:
+                delay_val = (policy.post_attended_followup_delay_value if policy and policy.post_attended_followup_delay_value else 2)
+                delay_unit = (policy.post_attended_followup_delay_unit if policy and policy.post_attended_followup_delay_unit else 'HOURS')
                 multiplier = 60 if delay_unit == 'HOURS' else 1440 if delay_unit == 'DAYS' else 1
                 due_at = timezone.now() + timedelta(minutes=delay_val * multiplier)
 
                 idempotency_ref = f"TRIAL_ATTENDED_{trial.id}"
-                task_exists = SalesFollowupTask.objects.using(alias).filter(external_reference=idempotency_ref).exists()
-                if not task_exists:
+                followup_task = SalesFollowupTask.objects.using(alias).filter(external_reference=idempotency_ref).first()
+                if not followup_task:
+                    # Explicitly bind to the user to whom this lead is assigned
+                    lead = Lead.objects.using(alias).select_related('assigned_sales_user').filter(id=trial.lead_id).first()
                     agent = (
-                        trial.lead.assigned_sales_user
+                        (lead.assigned_sales_user if lead else None)
+                        or getattr(trial.lead, 'assigned_sales_user', None)
                         or actor_user
                         or TenantUser.objects.using(alias).filter(organization=trial.lead.organization, status='ACTIVE').first()
                         or TenantUser.objects.using(alias).filter(status='ACTIVE').first()
                     )
-                    SalesFollowupTask.objects.using(alias).create(
+                    date_str = trial.scheduled_start.strftime('%Y-%m-%d') if trial.scheduled_start else timezone.now().strftime('%Y-%m-%d')
+                    lead_fname = trial.lead.first_name if trial.lead else 'lead'
+                    followup_task = SalesFollowupTask.objects.using(alias).create(
                         lead=trial.lead,
                         task_type='TRIAL_FOLLOWUP',
                         priority='HIGH',
@@ -2835,9 +2843,10 @@ class CRMLeadService:
                         assigned_to_user=agent,
                         created_by_user=actor_user or agent,
                         external_reference=idempotency_ref,
-                        outcome=f"Post-trial follow-up for attended session on {trial.scheduled_start.strftime('%Y-%m-%d')}",
+                        outcome=f"Post-trial follow-up for attended session on {date_str}. Contact {lead_fname} to gather workout feedback and explore membership plans.",
                     )
 
+            trial._generated_followup = followup_task
             return trial
 
     @classmethod
@@ -2846,6 +2855,7 @@ class CRMLeadService:
         trial: TrialBooking,
         notes: Optional[str] = None,
         actor_user: Optional[TenantUser] = None,
+        allow_override: bool = False,
         db_alias: Optional[str] = None,
     ) -> TrialBooking:
         alias = db_alias or get_tenant_db_alias() or 'default'
@@ -2853,7 +2863,7 @@ class CRMLeadService:
         from .models_crm import SalesFollowupTask
 
         with transaction.atomic(using=alias):
-            if trial.status in ['ATTENDED', 'NO_SHOW', 'CANCELLED', 'RESCHEDULED']:
+            if trial.status in ['NO_SHOW', 'CANCELLED', 'RESCHEDULED']:
                 raise ValidationError(f"Cannot mark trial no-show from '{trial.status}' status.")
             if trial.confirmation_status in ['CANCELLED', 'DECLINED']:
                 raise ValidationError(f"Cannot mark trial no-show: booking confirmation is '{trial.confirmation_status}'.")
@@ -2863,6 +2873,16 @@ class CRMLeadService:
             ).exclude(confirmation_status__in=['CANCELLED', 'DECLINED']).exists()
             if has_replacement:
                 raise ValidationError("Cannot mark no-show on a trial that has been replaced. Please manage the active replacement trial.")
+
+            # Validate window (or allow override/staff check)
+            is_valid_window, window_err = cls.validate_attendance_window(
+                trial=trial,
+                actor_user=actor_user,
+                allow_override=allow_override,
+                db_alias=alias,
+            )
+            if not is_valid_window:
+                raise ValidationError(window_err)
 
             old_status = trial.status
             trial.status = 'NO_SHOW'
@@ -2911,33 +2931,41 @@ class CRMLeadService:
 
             # Idempotent no-show recovery follow-up task
             policy = CRMTrialReminderPolicy.objects.using(alias).filter(organization=trial.lead.organization).first()
-            if policy and policy.no_show_followup_enabled:
-                delay_val = policy.no_show_followup_delay_value or 30
-                delay_unit = policy.no_show_followup_delay_unit or 'MINUTES'
+            followup_enabled = policy.no_show_followup_enabled if policy and policy.no_show_followup_enabled is not None else True
+            followup_task = None
+            if followup_enabled:
+                delay_val = (policy.no_show_followup_delay_value if policy and policy.no_show_followup_delay_value else 30)
+                delay_unit = (policy.no_show_followup_delay_unit if policy and policy.no_show_followup_delay_unit else 'MINUTES')
                 multiplier = 60 if delay_unit == 'HOURS' else 1440 if delay_unit == 'DAYS' else 1
                 due_at = timezone.now() + timedelta(minutes=delay_val * multiplier)
 
                 idempotency_ref = f"TRIAL_NOSHOW_{trial.id}"
-                task_exists = SalesFollowupTask.objects.using(alias).filter(external_reference=idempotency_ref).exists()
-                if not task_exists:
+                followup_task = SalesFollowupTask.objects.using(alias).filter(external_reference=idempotency_ref).first()
+                if not followup_task:
+                    # Explicitly bind to the user to whom this lead is assigned
+                    lead = Lead.objects.using(alias).select_related('assigned_sales_user').filter(id=trial.lead_id).first()
                     agent = (
-                        trial.lead.assigned_sales_user
+                        (lead.assigned_sales_user if lead else None)
+                        or getattr(trial.lead, 'assigned_sales_user', None)
                         or actor_user
                         or TenantUser.objects.using(alias).filter(organization=trial.lead.organization, status='ACTIVE').first()
                         or TenantUser.objects.using(alias).filter(status='ACTIVE').first()
                     )
-                    SalesFollowupTask.objects.using(alias).create(
+                    date_str = trial.scheduled_start.strftime('%Y-%m-%d') if trial.scheduled_start else timezone.now().strftime('%Y-%m-%d')
+                    lead_fname = trial.lead.first_name if trial.lead else 'lead'
+                    followup_task = SalesFollowupTask.objects.using(alias).create(
                         lead=trial.lead,
-                        task_type='NO_SHOW_RECOVERY',
+                        task_type='TRIAL_FOLLOWUP',
                         priority='URGENT',
                         due_at=due_at,
                         status='PENDING',
                         assigned_to_user=agent,
                         created_by_user=actor_user or agent,
                         external_reference=idempotency_ref,
-                        outcome=f"Recovery follow-up for no-show on {trial.scheduled_start.strftime('%Y-%m-%d')}",
+                        outcome=f"Recovery follow-up for no-show on {date_str}. Reach out to {lead_fname} to understand why they missed the workout and reschedule.",
                     )
 
+            trial._generated_followup = followup_task
             return trial
 
     @classmethod

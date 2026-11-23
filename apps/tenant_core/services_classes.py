@@ -19,7 +19,7 @@ import uuid
 from decimal import Decimal
 from datetime import date, datetime, timedelta, time, timezone as dt_timezone
 from zoneinfo import ZoneInfo
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 from django.db import transaction, models
 from django.db.models import Q
 from django.utils import timezone
@@ -433,7 +433,14 @@ class ClassSchedulingService:
         alias = db_alias or 'default'
         with transaction.atomic(using=alias):
             occ = ClassOccurrence.objects.using(alias).select_for_update().get(id=occurrence_id)
-            trainer = TrainerProfile.objects.using(alias).select_for_update().select_related('employee_profile').get(id=trainer_profile_id)
+            try:
+                trainer = TrainerProfile.objects.using(alias).select_for_update().select_related('employee_profile').get(id=trainer_profile_id)
+            except (TrainerProfile.DoesNotExist, ValueError):
+                trainer = TrainerProfile.objects.using(alias).select_for_update().select_related('employee_profile').filter(
+                    employee_profile__user_profile__user_id=trainer_profile_id
+                ).first()
+                if not trainer:
+                    raise ValidationError(f"Trainer profile '{trainer_profile_id}' not found.")
 
             # 1. Active status check
             emp_active = True

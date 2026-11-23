@@ -67,6 +67,7 @@ DEFAULT_BOOKING_POLICY: Dict[str, Any] = {
 
     # 6. Turnstile QR Access Configuration
     'qr_activation_minutes_before_class': 20,
+    'qr_scan_grace_period_minutes': 20,
 
     # 7. Scope
     'apply_to_existing_bookings': False,
@@ -192,6 +193,7 @@ class BookingPolicyService:
                 'no_show_cooling_off_days',
                 'restricted_max_advance_bookings',
                 'qr_activation_minutes_before_class',
+                'qr_scan_grace_period_minutes',
                 'notify_unpaid_auto_cancellation',
                 'notify_unconfirmed_auto_cancellation',
                 'notify_late_cancellation',
@@ -321,14 +323,28 @@ class BookingPolicyService:
                 start_time = getattr(booking, 'scheduled_start', None) or (
                     getattr(booking, 'occurrence', None).start_at if getattr(booking, 'occurrence', None) else None
                 )
+                if not start_time and getattr(booking, 'class_occurrence_id', None):
+                    from .models_classes import ClassOccurrence
+                    db_name = getattr(getattr(booking, '_state', None), 'db', None) or 'default'
+                    occ = ClassOccurrence.objects.using(db_name).filter(id=booking.class_occurrence_id).first()
+                    if occ:
+                        start_time = occ.start_at
+
                 minutes = int(policy.get('auto_cancel_unconfirmed_minutes', 60))
                 creation_deadline = created_time + timedelta(minutes=minutes)
                 session_deadline = (start_time - timedelta(minutes=minutes)) if start_time else None
 
-                if current_time >= creation_deadline:
-                    return True, 'AUTO_CANCELLED_UNCONFIRMED', f"Auto-cancelled: Booking not confirmed within {minutes} minutes of reservation."
-                elif session_deadline and current_time >= session_deadline:
-                    return True, 'AUTO_CANCELLED_UNCONFIRMED', f"Auto-cancelled: Booking not confirmed {minutes} minutes before session."
+                # For provisional cart reservations (RESERVED): expiration is enforced from creation time
+                if booking.status == 'RESERVED':
+                    if current_time >= creation_deadline:
+                        return True, 'AUTO_CANCELLED_UNCONFIRMED', f"Auto-cancelled: Booking not confirmed within {minutes} minutes of reservation."
+                    elif session_deadline and start_time and session_deadline <= current_time < start_time:
+                        return True, 'AUTO_CANCELLED_UNCONFIRMED', f"Auto-cancelled: Booking not confirmed {minutes} minutes before session."
+
+                # For booked sessions (BOOKED, such as TrialBooking): only cancel if unconfirmed when session deadline arrives before start
+                elif booking.status == 'BOOKED':
+                    if session_deadline and start_time and session_deadline <= current_time < start_time:
+                        return True, 'AUTO_CANCELLED_UNCONFIRMED', f"Auto-cancelled: Booking not confirmed {minutes} minutes before session."
 
         return False, None, None
 

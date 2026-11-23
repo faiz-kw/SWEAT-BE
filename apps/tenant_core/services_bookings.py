@@ -2480,11 +2480,30 @@ class BookingWaitlistAttendanceService:
 
                     att_status = 'PRESENT'
                     if start_time and end_time:
-                        booking_policy = cls.resolve_booking_policy(occ, db_alias=alias) if occ else None
-                        late_mins = booking_policy.late_entry_minutes if (booking_policy and booking_policy.late_entry_minutes is not None) else 20
+                        from .services_booking_policy import BookingPolicyService
+                        org = (
+                            (occ.branch.organization if occ and occ.branch else None)
+                            or (booking.branch.organization if booking and booking.branch else None)
+                            or getattr(user_profile, 'organization', None)
+                        )
+                        eff_policy = (
+                            BookingPolicyService.get_effective_policy(org, branch=occ.branch if occ else None, db_alias=alias)
+                            if org else {}
+                        )
 
-                        late_threshold = start_time + timedelta(minutes=late_mins)
-                        if scan_time <= late_threshold:
+                        grace_mins = eff_policy.get('qr_scan_grace_period_minutes')
+                        if grace_mins is None:
+                            booking_policy = cls.resolve_booking_policy(occ, db_alias=alias) if occ else None
+                            grace_mins = (
+                                booking_policy.late_entry_minutes
+                                if (booking_policy and booking_policy.late_entry_minutes is not None)
+                                else 15
+                            )
+                        else:
+                            grace_mins = int(grace_mins)
+
+                        grace_threshold = start_time + timedelta(minutes=grace_mins)
+                        if scan_time <= grace_threshold:
                             att_status = 'PRESENT'
                         elif scan_time <= end_time:
                             att_status = 'LATE'

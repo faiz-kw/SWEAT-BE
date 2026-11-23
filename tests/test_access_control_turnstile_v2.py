@@ -24,6 +24,7 @@ from apps.tenant_core.models import (
     AttendanceRecord,
     AccessEvent,
     AccessPass,
+    BookingPolicyConfig,
 )
 from apps.tenant_core.services_access_control import (
     generate_compact_qr_token,
@@ -610,3 +611,89 @@ class TimeWatchTurnstileV2Tests(TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertFalse(res.data.get('allow_access'))
         self.assertEqual(res.data.get('reason'), 'INVALID_PASS')
+
+    def test_turnstile_scan_after_grace_period_marked_late(self):
+        """When member scans past qr_scan_grace_period_minutes, access is granted but attendance status is LATE."""
+        now = timezone.now()
+        self.occurrence.start_at = now - timedelta(minutes=25)
+        self.occurrence.end_at = now + timedelta(minutes=35)
+        self.occurrence.save(using=self.db)
+
+        token = generate_compact_qr_token()
+        t_hash = hash_qr_token(token)
+
+        AccessPass.objects.using(self.db).create(
+            user_profile=self.profile,
+            booking=self.booking,
+            branch=self.branch,
+            token_hash=t_hash,
+            valid_from=now - timedelta(minutes=30),
+            valid_until=now + timedelta(hours=1),
+            status='ACTIVE'
+        )
+
+        view = TurnstileVerifyPunchView.as_view()
+        payload = {
+            'card_no': token,
+            'device_id': 'TIMEWATCH-ENTRY-01',
+            'direction': 'ENTRY',
+            'branch_id': str(self.branch.id)
+        }
+        req = self.factory.post('/api/v1/tenant/access/turnstile/verify-punch/', payload, format='json')
+        req._tenant_alias = self.db
+        res = view(req)
+
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(res.data.get('allow_access'))
+        self.assertEqual(res.data.get('status'), 'GRANTED')
+        self.assertIn('Late Entry', res.data.get('message', ''))
+
+        att = AttendanceRecord.objects.using(self.db).filter(booking=self.booking).first()
+        self.assertIsNotNone(att)
+        self.assertEqual(att.status, 'LATE')
+
+    def test_booking_policy_grace_period_custom_override(self):
+        """When BookingPolicyConfig sets custom qr_scan_grace_period_minutes (e.g. 5m), scan at 10m is marked LATE."""
+        now = timezone.now()
+        BookingPolicyConfig.objects.using(self.db).create(
+            organization=self.org,
+            branch=self.branch,
+            qr_scan_grace_period_minutes=5
+        )
+        self.occurrence.start_at = now - timedelta(minutes=10)
+        self.occurrence.end_at = now + timedelta(minutes=50)
+        self.occurrence.save(using=self.db)
+
+        token = generate_compact_qr_token()
+        t_hash = hash_qr_token(token)
+
+        AccessPass.objects.using(self.db).create(
+            user_profile=self.profile,
+            booking=self.booking,
+            branch=self.branch,
+            token_hash=t_hash,
+            valid_from=now - timedelta(minutes=15),
+            valid_until=now + timedelta(hours=1),
+            status='ACTIVE'
+        )
+
+        view = TurnstileVerifyPunchView.as_view()
+        payload = {
+            'card_no': token,
+            'device_id': 'TIMEWATCH-ENTRY-01',
+            'direction': 'ENTRY',
+            'branch_id': str(self.branch.id)
+        }
+        req = self.factory.post('/api/v1/tenant/access/turnstile/verify-punch/', payload, format='json')
+        req._tenant_alias = self.db
+        res = view(req)
+
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(res.data.get('allow_access'))
+        self.assertEqual(res.data.get('status'), 'GRANTED')
+        self.assertIn('Late Entry', res.data.get('message', ''))
+
+        att = AttendanceRecord.objects.using(self.db).filter(booking=self.booking).first()
+        self.assertIsNotNone(att)
+        self.assertEqual(att.status, 'LATE')
+

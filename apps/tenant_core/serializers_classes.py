@@ -284,6 +284,10 @@ class ClassScheduleRuleSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError({"branch": f"Branch '{branch.name}' is not ACTIVE."})
 
                 class_template = attrs.get('class_template') or getattr(self.instance, 'class_template', None)
+                if class_template and not self.instance and getattr(class_template, 'status', 'ACTIVE') != 'ACTIVE':
+                    raise serializers.ValidationError({
+                        "class_template": f"Cannot create schedule rule for class '{class_template.name}' because it is not ACTIVE."
+                    })
                 if class_template and class_template.program:
                     from .models_catalog import ProgramBranchAvailability
                     from .context import get_tenant_db_alias

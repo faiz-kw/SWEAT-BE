@@ -284,8 +284,29 @@ class BookingViewSet(viewsets.ModelViewSet):
             )
 
         status_filter = self.request.query_params.get('status')
-        if status_filter and status_filter.upper() != 'ALL':
-            qs = qs.filter(status=status_filter)
+        if status_filter:
+            sf = status_filter.upper()
+            if sf == 'ACTIVE':
+                qs = qs.filter(status__in=['RESERVED', 'BOOKED', 'CONFIRMED'])
+            elif sf == 'CONFIRMED':
+                qs = qs.filter(status='CONFIRMED')
+            elif sf == 'BOOKED':
+                qs = qs.filter(status='BOOKED')
+            elif sf == 'WAITLISTED':
+                qs = qs.filter(status='WAITLISTED')
+            elif sf == 'ATTENDED':
+                qs = qs.filter(status__in=['ATTENDED', 'COMPLETED', 'LATE', 'LATE_ENTRY', 'LATE_SHOW'])
+            elif sf == 'NO_SHOW':
+                qs = qs.filter(status='NO_SHOW')
+            elif sf == 'CANCELLED':
+                qs = qs.filter(status__in=['CANCELLED', 'LATE_CANCELLED'])
+            elif sf == 'RESCHEDULED':
+                qs = qs.filter(status='RESCHEDULED')
+            elif sf != 'ALL':
+                qs = qs.filter(status=status_filter)
+        else:
+            # Active Bookings view by default shows active reservations/bookings
+            qs = qs.filter(status__in=['RESERVED', 'BOOKED', 'CONFIRMED'])
 
         search = (self.request.query_params.get('search') or '').strip()
         if search:
@@ -339,11 +360,27 @@ class BookingViewSet(viewsets.ModelViewSet):
                 trial_qs = trial_qs.filter(class_occurrence_id=occurrence_id)
 
             status_filter = request.query_params.get('status')
-            if status_filter and status_filter.upper() != 'ALL':
-                if status_filter == 'CONFIRMED':
+            if status_filter:
+                sf = status_filter.upper()
+                if sf == 'ACTIVE':
+                    trial_qs = trial_qs.filter(status__in=['BOOKED', 'CONFIRMED'])
+                elif sf == 'CONFIRMED':
                     trial_qs = trial_qs.filter(models.Q(status='CONFIRMED') | models.Q(confirmation_status='CONFIRMED'))
-                else:
+                elif sf == 'BOOKED':
+                    trial_qs = trial_qs.filter(status='BOOKED')
+                elif sf == 'ATTENDED':
+                    trial_qs = trial_qs.filter(status__in=['ATTENDED', 'COMPLETED'])
+                elif sf == 'NO_SHOW':
+                    trial_qs = trial_qs.filter(status='NO_SHOW')
+                elif sf == 'CANCELLED':
+                    trial_qs = trial_qs.filter(status__in=['CANCELLED', 'LATE_CANCELLED'])
+                elif sf == 'RESCHEDULED':
+                    trial_qs = trial_qs.filter(status='RESCHEDULED')
+                elif sf != 'ALL':
                     trial_qs = trial_qs.filter(status=status_filter)
+            else:
+                # Active Bookings view by default shows active trials
+                trial_qs = trial_qs.filter(status__in=['BOOKED', 'CONFIRMED'])
 
             # Program Filter for Trials
             program_id = request.query_params.get('program_id') or request.query_params.get('program')
@@ -427,9 +464,9 @@ class BookingViewSet(viewsets.ModelViewSet):
                     'id': str(t.id),
                     'is_trial': True,
                     'booking_number': f"TRL-{str(t.id)[:8].upper()}",
-                    'status': t.status,
-                    'confirmation_status': t.confirmation_status,
-                    'booking_type': 'PROSPECT',
+                    'status': t.status or 'BOOKED',
+                    'confirmation_status': t.confirmation_status or 'PENDING',
+                    'booking_type': 'TRIAL',
                     'booking_source': 'TRIAL',
                     'waitlist_position': None,
                     'booked_at': t.created_at.isoformat() if t.created_at else None,
@@ -503,9 +540,9 @@ class BookingViewSet(viewsets.ModelViewSet):
                 'id': str(trial.id),
                 'is_trial': True,
                 'booking_number': f"TRL-{str(trial.id)[:8].upper()}",
-                'status': trial.status,
-                'confirmation_status': trial.confirmation_status,
-                'booking_type': 'PROSPECT',
+                'status': trial.status or 'BOOKED',
+                'confirmation_status': trial.confirmation_status or 'PENDING',
+                'booking_type': 'TRIAL',
                 'booking_source': 'TRIAL',
                 'member_name': f"{trial.lead.first_name} {trial.lead.last_name}".strip() if trial.lead else 'Prospect',
                 'member_email': trial.lead.email_normalized if trial.lead else None,
@@ -785,11 +822,11 @@ class BookingViewSet(viewsets.ModelViewSet):
                 att_status = request.data.get('status', 'PRESENT')
                 notes = request.data.get('notes')
                 try:
-                    if att_status in ['PRESENT', 'ATTENDED']:
-                        attended = CRMLeadService.mark_trial_attended(trial=trial, notes=notes, actor_user=request.user, db_alias=alias)
+                    if att_status in ['PRESENT', 'ATTENDED', 'LATE', 'LATE_SHOW', 'LATE_ENTRY']:
+                        attended = CRMLeadService.mark_trial_attended(trial=trial, notes=notes, actor_user=request.user, allow_override=True, db_alias=alias)
                         return Response({'status': attended.status, 'detail': 'Trial marked as attended.'}, status=status.HTTP_200_OK)
                     elif att_status in ['NO_SHOW', 'ABSENT']:
-                        noshow = CRMLeadService.mark_trial_no_show(trial=trial, notes=notes, actor_user=request.user, db_alias=alias)
+                        noshow = CRMLeadService.mark_trial_no_show(trial=trial, notes=notes, actor_user=request.user, allow_override=True, db_alias=alias)
                         return Response({'status': noshow.status, 'detail': 'Trial marked as no show.'}, status=status.HTTP_200_OK)
                     return Response({'detail': f"Unsupported attendance status '{att_status}' for trial."}, status=status.HTTP_400_BAD_REQUEST)
                 except ValidationError as e:
@@ -1625,7 +1662,7 @@ class TurnstileVerifyPunchView(APIView):
 
         # 5. GRANTED ACCESS (ENTRY or EXIT)
         with transaction.atomic(using=alias):
-            BookingWaitlistAttendanceService.log_access_event(
+            event = BookingWaitlistAttendanceService.log_access_event(
                 user_profile=target_user,
                 branch=branch,
                 booking=target_booking,
@@ -1645,7 +1682,11 @@ class TurnstileVerifyPunchView(APIView):
             access_pass.save(using=alias, update_fields=['status', 'consumed_at', 'updated_at'])
 
         if direction == 'ENTRY':
-            welcome_msg = f"Welcome {user_name}! Access Granted."
+            att_rec = AttendanceRecord.objects.using(alias).filter(booking=target_booking).first() if target_booking else None
+            if att_rec and att_rec.status == 'LATE':
+                welcome_msg = f"Welcome {user_name}! Late Entry Recorded."
+            else:
+                welcome_msg = f"Welcome {user_name}! Access Granted."
         else:
             welcome_msg = f"Goodbye {user_name}! Workout completed. Have a great day!"
 

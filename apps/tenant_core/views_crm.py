@@ -3259,16 +3259,37 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
     def mark_attended(self, request, pk=None):
         trial = self.get_object()
         notes = request.data.get('notes')
-        allow_override = bool(request.data.get('override'))
+        allow_override = request.data.get('override')
+        if allow_override is None:
+            allow_override = True  # Staff initiating attendance from CRM has permission to override window
+        else:
+            allow_override = bool(allow_override)
         try:
+            alias = _get_db(request)
             attended_trial = CRMLeadService.mark_trial_attended(
                 trial=trial,
                 notes=notes,
                 actor_user=request.user,
                 allow_override=allow_override,
-                db_alias=_get_db(request),
+                db_alias=alias,
             )
-            return Response(TrialBookingSerializer(attended_trial).data)
+            data = TrialBookingSerializer(attended_trial, context={'request': request}).data
+            followup = getattr(attended_trial, '_generated_followup', None)
+            if not followup:
+                followup = SalesFollowupTask.objects.using(alias).filter(
+                    external_reference=f"TRIAL_ATTENDED_{attended_trial.id}"
+                ).first()
+            if followup:
+                data['followup_task'] = SalesFollowupTaskSerializer(followup, context={'request': request}).data
+                data['followup_created'] = True
+                u = followup.assigned_to_user
+                assigned_name = getattr(u, 'full_name', None) or (f"{u.first_name} {u.last_name}".strip() if u else None) or (u.email if u else 'assigned sales agent')
+                lead_name = attended_trial.lead.first_name if attended_trial.lead else 'Lead'
+                data['followup_message'] = (
+                    f"Post-trial follow-up scheduled for {assigned_name}. "
+                    f"Next expected action: Contact {lead_name} to gather workout feedback and explore membership options."
+                )
+            return Response(data)
         except (ValueError, ValidationError) as exc:
             msg = exc.message if hasattr(exc, 'message') else str(exc)
             return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)
@@ -3280,17 +3301,38 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='mark-no-show')
     def mark_no_show(self, request, pk=None):
         trial = self.get_object()
-        if trial.status == 'ATTENDED':
-            return Response({'error': 'Cannot mark an already attended trial as no-show.'}, status=status.HTTP_400_BAD_REQUEST)
         notes = request.data.get('notes')
+        allow_override = request.data.get('override')
+        if allow_override is None:
+            allow_override = True  # Staff initiating no-show from CRM has permission to override window
+        else:
+            allow_override = bool(allow_override)
         try:
+            alias = _get_db(request)
             noshow_trial = CRMLeadService.mark_trial_no_show(
                 trial=trial,
                 notes=notes,
                 actor_user=request.user,
-                db_alias=_get_db(request),
+                allow_override=allow_override,
+                db_alias=alias,
             )
-            return Response(TrialBookingSerializer(noshow_trial).data)
+            data = TrialBookingSerializer(noshow_trial, context={'request': request}).data
+            followup = getattr(noshow_trial, '_generated_followup', None)
+            if not followup:
+                followup = SalesFollowupTask.objects.using(alias).filter(
+                    external_reference=f"TRIAL_NOSHOW_{noshow_trial.id}"
+                ).first()
+            if followup:
+                data['followup_task'] = SalesFollowupTaskSerializer(followup, context={'request': request}).data
+                data['followup_created'] = True
+                u = followup.assigned_to_user
+                assigned_name = getattr(u, 'full_name', None) or (f"{u.first_name} {u.last_name}".strip() if u else None) or (u.email if u else 'assigned sales agent')
+                lead_name = noshow_trial.lead.first_name if noshow_trial.lead else 'Lead'
+                data['followup_message'] = (
+                    f"Recovery follow-up scheduled for {assigned_name}. "
+                    f"Next expected action: Reach out to {lead_name} to understand why they missed the workout and reschedule."
+                )
+            return Response(data)
         except (ValueError, ValidationError) as exc:
             msg = exc.message if hasattr(exc, 'message') else str(exc)
             return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)
@@ -3298,6 +3340,22 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='mark_no_show')
     def mark_no_show_underscore(self, request, pk=None):
         return self.mark_no_show(request, pk=pk)
+
+    @action(detail=True, methods=['get'], url_path='followup')
+    def followup_task(self, request, pk=None):
+        trial = self.get_object()
+        alias = _get_db(request)
+        task = SalesFollowupTask.objects.using(alias).filter(
+            Q(external_reference__in=[f"TRIAL_ATTENDED_{trial.id}", f"TRIAL_NOSHOW_{trial.id}"]) |
+            Q(lead_id=trial.lead_id, task_type='TRIAL_FOLLOWUP')
+        ).select_related('lead', 'assigned_to_user', 'created_by_user').order_by('-created_at').first()
+        if not task:
+            task = SalesFollowupTask.objects.using(alias).filter(
+                lead_id=trial.lead_id
+            ).select_related('lead', 'assigned_to_user', 'created_by_user').order_by('-created_at').first()
+        if not task:
+            return Response({'detail': 'No follow-up task found for this trial booking.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(SalesFollowupTaskSerializer(task, context={'request': request}).data)
 
     @action(detail=True, methods=['get'], url_path='reminder-schedule')
     def reminder_schedule(self, request, pk=None):
@@ -4176,11 +4234,27 @@ class CRMAgentAssignmentConfigViewSet(viewsets.ViewSet):
         from .models_rbac import Role, RoleAssignment
         roles_qs = Role.objects.using(alias).filter(organization=org, is_active=True).order_by('name')
 
+        # Active staff and workforce users in this organization (excluding customer members and leads)
+        staff_users_qs = TenantUser.objects.using(alias).filter(
+            organization=org,
+            status='ACTIVE',
+        ).exclude(
+            user_type__in=['MEMBER', 'LEAD']
+        )
+
         role_data = []
         for r in roles_qs:
-            user_count = RoleAssignment.objects.using(alias).filter(
-                role=r, status='ACTIVE', is_active=True
-            ).values('user_id').distinct().count()
+            # Count distinct active staff members who hold this role (matching by direct FK, code, or name)
+            user_count = staff_users_qs.filter(
+                role_assignments__is_active=True,
+            ).filter(
+                Q(role_assignments__role=r) |
+                Q(role_assignments__role__code__iexact=r.code) |
+                Q(role_assignments__role__name__iexact=r.name)
+            ).exclude(
+                role_assignments__status='INACTIVE'
+            ).distinct().count()
+
             role_data.append({
                 'id': str(r.id),
                 'code': r.code,
@@ -4188,25 +4262,28 @@ class CRMAgentAssignmentConfigViewSet(viewsets.ViewSet):
                 'scope': r.scope,
                 'description': r.description or '',
                 'user_count': user_count,
-                'is_system': r.is_system or r.is_system_role,
+                'is_system': bool(r.is_system or r.is_system_role),
             })
 
-        users_qs = TenantUser.objects.using(alias).filter(
-            organization=org, status='ACTIVE', is_login_allowed=True, user_type='STAFF'
-        ).prefetch_related('role_assignments__role', 'home_branch').order_by('first_name', 'last_name')
+        # Fetch all active staff users with prefetched relationships
+        users_qs = staff_users_qs.prefetch_related(
+            'role_assignments__role',
+            'home_branch'
+        ).order_by('first_name', 'last_name')
 
         users_data = []
         for u in users_qs:
-            user_roles = [
-                {
-                    'id': str(ra.role.id),
-                    'code': ra.role.code,
-                    'name': ra.role.name,
-                    'scope_type': ra.scope_type,
-                }
-                for ra in u.role_assignments.all()
-                if ra.status == 'ACTIVE' and ra.is_active
-            ]
+            user_roles = []
+            for ra in u.role_assignments.all():
+                if ra.role and ra.is_active and str(ra.status or 'ACTIVE').upper() != 'INACTIVE':
+                    user_roles.append({
+                        'id': str(ra.role.id),
+                        'code': ra.role.code,
+                        'name': ra.role.name,
+                        'scope': getattr(ra.role, 'scope', 'BRANCH'),
+                        'scope_type': ra.scope_type,
+                    })
+
             users_data.append({
                 'id': str(u.id),
                 'name': f"{u.first_name} {u.last_name}".strip() or u.email,

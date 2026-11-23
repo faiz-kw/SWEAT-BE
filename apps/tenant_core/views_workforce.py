@@ -200,19 +200,28 @@ class TrainerProfileViewSet(viewsets.ModelViewSet):
         from .models_rbac import RoleAssignment
 
         assignments = RoleAssignment.objects.using(alias).filter(
-            status='ACTIVE', is_active=True, role__is_active=True,
+            is_active=True, role__is_active=True,
+        ).exclude(
+            status='INACTIVE'
         ).filter(
             Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now()),
         ).filter(
-            Q(role__code__iregex=r'(^|[^a-z])(?:trainer|coach|instructor)([^a-z]|$)') |
-            Q(role__name__iregex=r'(^|[^a-z])(?:trainer|coach|instructor)([^a-z]|$)')
+            Q(role__code__iregex=r'(^|[^a-z])(?:trainer|coach|instructor|pt)(?:s|es)?([^a-z]|$)') |
+            Q(role__name__iregex=r'(^|[^a-z])(?:trainer|coach|instructor|pt)(?:s|es)?([^a-z]|$)')
         )
-        users = TenantUser.objects.using(alias).filter(status='ACTIVE')
+        users = TenantUser.objects.using(alias).filter(status='ACTIVE').exclude(user_type__in=['MEMBER', 'LEAD'])
         if org:
             users = users.filter(organization=org)
             assignments = assignments.filter(organization=org)
+
+        existing_trainer_user_ids = TrainerProfile.objects.using(alias).filter(
+            trainer_status='ACTIVE'
+        ).values('employee_profile__user_profile__user_id')
+
         return users.filter(
-            Q(id__in=assignments.values('user_id')) | Q(user_type__iexact='TRAINER')
+            Q(id__in=assignments.values('user_id')) |
+            Q(user_type__in=['TRAINER', 'COACH', 'INSTRUCTOR', 'trainer', 'coach', 'instructor']) |
+            Q(id__in=existing_trainer_user_ids)
         )
 
     @classmethod
@@ -300,19 +309,30 @@ class TrainerProfileViewSet(viewsets.ModelViewSet):
         ).filter(
             employee_profile__user_profile__user__status='ACTIVE'
         )
-        status_filter = self.request.query_params.get('trainer_status')
+        params = getattr(self.request, 'query_params', getattr(self.request, 'GET', {}))
+        status_filter = params.get('trainer_status')
         if status_filter:
             qs = qs.filter(trainer_status=status_filter)
         else:
             qs = qs.filter(trainer_status='ACTIVE')
 
-        branch_id = self.request.query_params.get('branch_id')
+        branch_id = params.get('branch_id')
         if branch_id and branch_id not in ('all', 'ALL', '00000000-0000-0000-0000-000000000000', ''):
+            from .models_rbac import RoleAssignment
+            org_scoped_user_ids = RoleAssignment.objects.using(alias).filter(
+                is_active=True,
+            ).filter(
+                Q(role__scope='ORG') | Q(scope_type__in=['ORGANIZATION', 'ALL'])
+            ).exclude(status='INACTIVE').values('user_id')
+
             qs = qs.filter(
                 Q(employee_profile__user_profile__preferred_branch_id=branch_id) |
                 Q(employee_profile__user_profile__user__home_branch_id=branch_id) |
                 Q(employee_profile__user_profile__user__branch_assignments__branch_id=branch_id) |
-                Q(employee_profile__work_schedules__branch_id=branch_id)
+                Q(employee_profile__work_schedules__branch_id=branch_id) |
+                Q(employee_profile__user_profile__user_id__in=org_scoped_user_ids) |
+                Q(employee_profile__user_profile__user__branch_assignments__scope_type='ALL') |
+                Q(employee_profile__user_profile__preferred_branch__isnull=True)
             ).distinct()
 
         return qs

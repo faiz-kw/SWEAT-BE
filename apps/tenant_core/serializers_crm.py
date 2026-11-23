@@ -29,6 +29,7 @@ from .models_crm import (
 )
 from .models_attention import CRMAttentionPolicy
 import re
+from django.db.models import Q
 from django.utils import timezone
 from django.core.validators import validate_email, URLValidator
 from django.core.exceptions import ValidationError as DjangoValidationError
@@ -706,6 +707,8 @@ class TrialBookingSerializer(serializers.ModelSerializer):
     max_reschedules = serializers.SerializerMethodField()
     is_active_trial = serializers.SerializerMethodField()
     available_actions = serializers.SerializerMethodField()
+    has_followup = serializers.SerializerMethodField()
+    followup_id = serializers.SerializerMethodField()
 
     class Meta:
         model = TrialBooking
@@ -889,7 +892,7 @@ class TrialBookingSerializer(serializers.ModelSerializer):
         conf_status = obj.confirmation_status
         is_active = self.get_is_active_trial(obj)
 
-        if status in ['ATTENDED', 'NO_SHOW', 'CANCELLED', 'RESCHEDULED'] or conf_status in ['CANCELLED', 'DECLINED'] or not is_active:
+        if status in ['CANCELLED', 'RESCHEDULED'] or conf_status in ['CANCELLED', 'DECLINED'] or not is_active:
             can_reschedule = False
             can_cancel = False
             can_confirm = False
@@ -900,13 +903,15 @@ class TrialBookingSerializer(serializers.ModelSerializer):
             can_confirm = (status == 'BOOKED' and conf_status != 'CONFIRMED')
             can_request_reschedule = (status == 'BOOKED' and conf_status != 'RESCHEDULE_REQUESTED')
             stats = self._get_stats(obj)
-            can_reschedule = stats.get('reschedules_remaining', 0) > 0
-            can_cancel = True
-            from .services_crm import CRMLeadService
-            is_in_window, _ = CRMLeadService.validate_attendance_window(obj, db_alias=alias)
-            can_mark_attended = is_in_window
+            can_reschedule = (status not in ['ATTENDED', 'NO_SHOW']) and (stats.get('reschedules_remaining', 0) > 0)
+            can_cancel = (status not in ['ATTENDED'])
+
+            # Attendance actions: available once the scheduled session window opens or class has occurred
             now = timezone.now()
-            can_mark_no_show = bool(obj.scheduled_start and now >= obj.scheduled_start)
+            from datetime import timedelta
+            has_started = bool(obj.scheduled_start and now >= (obj.scheduled_start - timedelta(minutes=30)))
+            can_mark_attended = has_started and (status != 'ATTENDED')
+            can_mark_no_show = has_started and (status != 'NO_SHOW')
 
         from .services_crm import CRMLeadService
         can_book_new_trial, _ = CRMLeadService.resolve_trial_booking_policy(
@@ -941,6 +946,27 @@ class TrialBookingSerializer(serializers.ModelSerializer):
             'can_book_new_trial': can_book_new_trial,
             'can_convert_member': can_convert_member,
         }
+
+    def get_has_followup(self, obj):
+        alias = obj._state.db or 'default'
+        from .models_crm import SalesFollowupTask
+        return SalesFollowupTask.objects.using(alias).filter(
+            Q(external_reference__in=[f"TRIAL_ATTENDED_{obj.id}", f"TRIAL_NOSHOW_{obj.id}"]) |
+            Q(lead_id=obj.lead_id)
+        ).exists()
+
+    def get_followup_id(self, obj):
+        alias = obj._state.db or 'default'
+        from .models_crm import SalesFollowupTask
+        task = SalesFollowupTask.objects.using(alias).filter(
+            Q(external_reference__in=[f"TRIAL_ATTENDED_{obj.id}", f"TRIAL_NOSHOW_{obj.id}"]) |
+            Q(lead_id=obj.lead_id, task_type='TRIAL_FOLLOWUP')
+        ).order_by('-created_at').first()
+        if not task:
+            task = SalesFollowupTask.objects.using(alias).filter(
+                lead_id=obj.lead_id
+            ).order_by('-created_at').first()
+        return str(task.id) if task else None
 
 
 class TrialStatusHistorySerializer(serializers.ModelSerializer):
