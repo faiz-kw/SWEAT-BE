@@ -631,6 +631,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'apps.tenant_core.tasks_voice_calling.process_trial_voice_reminders_task',
         'schedule': float(os.getenv('CELERY_SCHEDULE_VOICE_REMINDERS_SECONDS', '1800.0')),  # every 30 min
     },
+    'tenant-reconcile-pending-payments': {
+        'task': 'apps.tenant_core.tasks.reconcile_pending_payment_orders_periodic_task',
+        'schedule': float(os.getenv('CELERY_SCHEDULE_RZP_RECONCILE_SECONDS', '600.0')),  # every 10 min
+    },
 }
 
 

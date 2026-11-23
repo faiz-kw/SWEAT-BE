@@ -763,3 +763,109 @@ class RazorpayPaymentFinalizerService:
                 'membership_activated': bool(membership),
                 'source': source,
             }
+
+
+class RazorpayReconciliationService:
+    """
+    Safety-net reconciliation for PENDING_PAYMENT orders.
+
+    The normal flow relies on the client calling /checkout/verify/ after payment. If that
+    call is missed (app closed/crashed after paying, network drop) — and the Razorpay webhook
+    is not wired up — a paid order stays PENDING_PAYMENT and the purchase/extension never
+    applies. This scans such orders and converges them server-side against the Razorpay API:
+      - a captured/authorized gateway payment -> finalize via RazorpayPaymentFinalizerService
+        (idempotent: activates / extends / stamps PAID exactly once),
+      - no gateway payment and older than the expiry window -> mark the order CANCELLED.
+    Orders younger than `grace_minutes` are left alone so an in-progress checkout is not disturbed.
+    """
+
+    @classmethod
+    def reconcile_pending_orders(
+        cls,
+        db_alias: Optional[str] = None,
+        grace_minutes: int = 15,
+        expire_hours: int = 72,
+        max_scan: int = 200,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        from datetime import timedelta
+        from django.utils import timezone
+        from .models_commerce import Order
+
+        alias = db_alias or 'default'
+        result = {
+            'scanned': 0, 'finalized': 0, 'cancelled': 0,
+            'still_pending': 0, 'errors': 0, 'skipped_not_configured': False,
+        }
+
+        if not RazorpayService.is_configured(db_alias=alias):
+            result['skipped_not_configured'] = True
+            return result
+
+        now = timezone.now()
+        grace_cutoff = now - timedelta(minutes=grace_minutes)
+        expire_cutoff = now - timedelta(hours=expire_hours)
+
+        qs = (
+            Order.objects.using(alias)
+            .filter(status='PENDING_PAYMENT', created_at__lte=grace_cutoff)
+            .exclude(gateway_order_id__isnull=True)
+            .exclude(gateway_order_id='')
+            .order_by('created_at')[:max_scan]
+        )
+
+        try:
+            client = RazorpayService.get_client(db_alias=alias)
+        except Exception as e:
+            logger.warning("Reconcile: Razorpay client unavailable for %s: %s", alias, e)
+            result['errors'] += 1
+            return result
+
+        for order in qs:
+            result['scanned'] += 1
+            try:
+                resp = client.order.payments(order.gateway_order_id) or {}
+                items = resp.get('items', []) if isinstance(resp, dict) else []
+                pay = (
+                    next((p for p in items if p.get('status') == 'captured'), None)
+                    or next((p for p in items if p.get('status') == 'authorized'), None)
+                )
+                if pay:
+                    if dry_run:
+                        result['finalized'] += 1
+                        continue
+                    try:
+                        RazorpayPaymentFinalizerService.finalize_payment(
+                            razorpay_order_id=order.gateway_order_id,
+                            razorpay_payment_id=pay.get('id'),
+                            order_id=str(order.id),
+                            source='RECOVERY',
+                            db_alias=alias,
+                        )
+                        result['finalized'] += 1
+                        logger.info(
+                            "Reconcile: finalized order %s (rzp_order=%s payment=%s)",
+                            order.order_number, order.gateway_order_id, pay.get('id'),
+                        )
+                    except Exception as fe:
+                        result['errors'] += 1
+                        logger.error("Reconcile: finalize failed for %s: %s", order.order_number, fe)
+                else:
+                    if order.created_at <= expire_cutoff:
+                        if not dry_run:
+                            order.status = 'CANCELLED'
+                            order.save(using=alias, update_fields=['status', 'updated_at'])
+                        result['cancelled'] += 1
+                        logger.info(
+                            "Reconcile: cancelled stale unpaid order %s (age>%sh, no gateway payment)",
+                            order.order_number, expire_hours,
+                        )
+                    else:
+                        result['still_pending'] += 1
+            except Exception as e:
+                result['errors'] += 1
+                logger.warning(
+                    "Reconcile: error checking order %s (rzp_order=%s): %s",
+                    order.order_number, order.gateway_order_id, e,
+                )
+        return result
