@@ -29,6 +29,8 @@ from .models_crm import (
 )
 from .models_attention import CRMAttentionPolicy
 import re
+import uuid
+from django.db import models
 from django.db.models import Q
 from django.utils import timezone
 from django.core.validators import validate_email, URLValidator
@@ -376,6 +378,46 @@ class LeadSerializer(serializers.ModelSerializer):
             mutable_data['phone'] = mutable_data['phone_normalized']
         if 'email_normalized' in mutable_data and not mutable_data.get('email'):
             mutable_data['email'] = mutable_data['email_normalized']
+        # Allow branch_id as an alias for branch (front-desk / quick-intake payloads)
+        if 'branch_id' in mutable_data and not mutable_data.get('branch'):
+            mutable_data['branch'] = mutable_data['branch_id']
+        # Allow lead_source to be given as a source code / source_type string
+        # (e.g. 'WALK_IN') instead of a LeadSource UUID; resolve it within the org.
+        raw_source = mutable_data.get('lead_source')
+        if raw_source and isinstance(raw_source, str):
+            try:
+                uuid.UUID(raw_source)
+            except (ValueError, AttributeError, TypeError):
+                code = raw_source.strip().upper()
+                request = self.context.get('request')
+                org = getattr(request, 'organization', None) if request else None
+                if not org:
+                    user = getattr(request, 'user', None) if request else None
+                    org = getattr(user, 'organization', None)
+                if not org:
+                    raise serializers.ValidationError({'lead_source': 'Unable to resolve lead source for this organization.'})
+                from config.routers import get_tenant_db_alias
+                alias = (
+                    get_tenant_db_alias()
+                    or getattr(getattr(org, '_state', None), 'db', None)
+                    or 'default'
+                )
+                matches = LeadSource.objects.using(alias).filter(organization=org).filter(
+                    models.Q(code__iexact=code) | models.Q(source_type__iexact=code)
+                )
+                source = matches.filter(status='ACTIVE').first() or matches.first()
+                if not source:
+                    valid_types = {c[0] for c in LeadSource.SOURCE_TYPES}
+                    if code not in valid_types:
+                        raise serializers.ValidationError({'lead_source': f"Unknown lead source '{raw_source}'."})
+                    source = LeadSource.objects.using(alias).create(
+                        organization=org,
+                        code=code,
+                        name=code.replace('_', ' ').title(),
+                        source_type=code,
+                        status='ACTIVE',
+                    )
+                mutable_data['lead_source'] = str(source.id)
         return super().to_internal_value(mutable_data)
 
     def validate_first_name(self, value):

@@ -178,8 +178,10 @@ class BookingWaitlistAttendanceService:
         if policy:
             return policy
 
-        # Auto-initialize active default organization AttendancePolicySet if none exists
-        if org:
+        # Auto-initialize a default org AttendancePolicySet ONLY when the org has NO policy at
+        # all. If an admin has deactivated existing policies, respect that intent and do not
+        # resurrect enforcement (also avoids MultipleObjectsReturned when duplicates exist).
+        if org and not AttendancePolicySet.objects.using(alias).filter(organization=org).exists():
             policy, created = AttendancePolicySet.objects.using(alias).get_or_create(
                 organization=org,
                 name=f"{org.name} Standard Attendance Policy",
@@ -867,16 +869,28 @@ class BookingWaitlistAttendanceService:
             else:
                 fallback_candidates.append(mem)
 
-        # 1. Dedicated category pack matching occurrence first (preserves flexible Elite credits)
+        # Prefer a pack whose HOME branch matches the class branch, so the booking uses a
+        # HOME session (no passport needed) instead of being treated as cross-branch. Without
+        # this, a member holding two valid packs (e.g. a Goregaon pack and an Andheri pack) could
+        # get the wrong-branch pack picked and fail with a false "no passport" / wrong-pack error.
+        occ_branch_id = str(occurrence.branch_id) if getattr(occurrence, 'branch_id', None) else None
+        def _branch_rank(m):
+            return 0 if (occ_branch_id and str(getattr(m, 'home_branch_id', '')) == occ_branch_id) else 1
+
+        # 1. Dedicated category pack matching occurrence first (preserves flexible Elite credits);
+        #    home-branch match wins, then soonest expiry (end_date order is preserved as the tiebreak).
         if dedicated_candidates:
+            dedicated_candidates.sort(key=_branch_rank)
             return dedicated_candidates[0]
 
         # 2. Elite Universal Credit Pack fallback
         if elite_candidates:
+            elite_candidates.sort(key=_branch_rank)
             return elite_candidates[0]
 
-        # 3. Fallback to general active membership
+        # 3. Fallback to general active membership (also prefer home-branch match)
         if fallback_candidates:
+            fallback_candidates.sort(key=_branch_rank)
             return fallback_candidates[0]
 
         return active_memberships[0]
@@ -2649,6 +2663,7 @@ class BookingWaitlistAttendanceService:
 
         reconciled_no_show = 0
         reconciled_attended = 0
+        _synced_member_uids = set()  # no-show: refresh each member's legacy check-ins at most once per run
 
         for b in list(bookings_qs):
             occ = b.occurrence
@@ -2671,14 +2686,43 @@ class BookingWaitlistAttendanceService:
                     b.save(using=alias, update_fields=['status', 'completed_at', 'updated_at'])
                 reconciled_attended += 1
             else:
-                # Mark as NO_SHOW automatically
-                cls.record_attendance(
-                    booking=b,
-                    status='NO_SHOW',
-                    check_in_method='SYSTEM',
-                    db_alias=alias,
-                )
-                reconciled_no_show += 1
+                # SYNC-BEFORE-NO-SHOW: the member may have physically checked in (legacy
+                # 'attended' flag) while their check-in has not yet synced into reos. Pull their
+                # legacy check-ins (at most once per member per run) and re-check, so a member
+                # who actually attended is never falsely marked NO_SHOW. Falls back to NO_SHOW on
+                # any sync failure (no worse than before).
+                try:
+                    _ref = getattr(b.user_profile, 'legacy_reference', None) or ''
+                    if _ref.startswith('user:'):
+                        _luid = int(_ref.split(':', 1)[1])
+                        if _luid not in _synced_member_uids:
+                            _synced_member_uids.add(_luid)
+                            from .services_legacy_live_sync import sync_member_attendance_from_legacy
+                            sync_member_attendance_from_legacy(_luid, alias)
+                            att = AttendanceRecord.objects.using(alias).filter(booking=b).first()
+                except Exception:
+                    pass
+
+                if att and att.check_in_status == 'SUCCESSFUL':
+                    if b.status != 'COMPLETED':
+                        b.status = 'COMPLETED'
+                        b.completed_at = att.check_in_at or now
+                        b.save(using=alias, update_fields=['status', 'completed_at', 'updated_at'])
+                    reconciled_attended += 1
+                elif policy is not None:
+                    # Only auto-mark NO_SHOW when an ACTIVE attendance policy exists (enforcement
+                    # ON). When enforcement is paused (no active policy), we do NOT create a
+                    # NO_SHOW: reos-native app bookings currently have no reliable attendance
+                    # capture, so blindly marking them absent produces false no-shows (whole
+                    # classes marked absent). Leave the booking untouched until enforcement is
+                    # re-enabled with working attendance capture.
+                    cls.record_attendance(
+                        booking=b,
+                        status='NO_SHOW',
+                        check_in_method='SYSTEM',
+                        db_alias=alias,
+                    )
+                    reconciled_no_show += 1
 
         # Reconcile un-attended past TrialBookings
         from .models_crm import TrialBooking

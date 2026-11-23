@@ -342,8 +342,29 @@ class SendOTPView(APIView):
         print(f"[DEV OTP GENERATED] Tenant: {tenant_slug} | Phone: {phone} | OTP: {otp_code}")
         print(f"=======================================================\n")
 
-        # Dispatch genuine WhatsApp message via Gupshup BpcUAT
-        dispatch_result = _dispatch_whatsapp_otp(phone, otp_code)
+        # Static-OTP test target(s): skip the REAL WhatsApp send for configured target phone(s),
+        # so a real member is not pinged with an OTP while we test their account with the fallback
+        # code. Reads the same Redis config used by the verify-side bypass.
+        _skip_real_send = False
+        try:
+            import json as _json_sup, re as _re_sup
+            _r_sup = _get_redis()
+            _raw_sup = _r_sup.get('sweat_dynamic_fallback_otp') if _r_sup else None
+            if _raw_sup:
+                _fb_sup = _json_sup.loads(_raw_sup if isinstance(_raw_sup, str) else _raw_sup.decode())
+                if _fb_sup.get('is_enabled') and _fb_sup.get('target_phone'):
+                    _targets_sup = [_re_sup.sub(r'\D', '', p)[-10:] for p in str(_fb_sup['target_phone']).split(',') if p.strip()]
+                    if _re_sup.sub(r'\D', '', str(phone))[-10:] in _targets_sup:
+                        _skip_real_send = True
+        except Exception:
+            _skip_real_send = False
+
+        # Dispatch genuine WhatsApp message via Gupshup BpcUAT (unless suppressed for a test target)
+        if _skip_real_send:
+            logger.info("[OTP SUPPRESS] Real send skipped for test target %s (static fallback OTP active)", phone)
+            dispatch_result = {'dispatched': False, 'suppressed': True}
+        else:
+            dispatch_result = _dispatch_whatsapp_otp(phone, otp_code)
 
         response_data = {
             'success': True,

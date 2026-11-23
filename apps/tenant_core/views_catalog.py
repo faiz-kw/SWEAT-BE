@@ -387,6 +387,43 @@ class ProgramCategoryViewSet(viewsets.ModelViewSet):
         status_param = self.request.query_params.get('status')
         if status_param and status_param.upper() != 'ALL':
             qs = qs.filter(status=status_param.upper())
+        # member_specific=true -> only categories the requesting member holds a (non-expired)
+        # membership in, so the app shows just the member's own purchased program areas.
+        if str(self.request.query_params.get('member_specific', '')).lower() in ('true', '1', 'yes'):
+            from django.utils import timezone as _tz
+            from .models_workforce import UserProfile as _UP
+            from .models_memberships import Membership as _MB
+            _today = _tz.now().date()
+            _user = getattr(self.request, 'user', None)
+            _profile = _UP.objects.using(alias).filter(user=_user).first() if _user else None
+            _cat_ids = set()
+            _cat_names = set()
+            if _profile:
+                for _m in (_MB.objects.using(alias)
+                           .filter(user_profile=_profile, status__in=['ACTIVE', 'FROZEN'], end_date__gte=_today)
+                           .select_related('program__category', 'package__program__category')):
+                    _prog = _m.program or (_m.package.program if _m.package else None)
+                    _cat = getattr(_prog, 'category', None) if _prog else None
+                    if _cat:
+                        _cat_ids.add(_cat.id)
+                        _cat_names.add(str(_cat.name).strip().lower())
+            if _cat_ids or _cat_names:
+                # Match by id, or by name. Some legacy memberships carry a generic category name
+                # (e.g. "Sweat Pilates") whose object id differs from the active catalog category;
+                # those map to the same-named active category or its "<name> - Group Classes" variant.
+                _match_ids = []
+                _seen_names = set()
+                for _pc in qs.order_by('display_order', 'name'):
+                    _pn = str(_pc.name).strip().lower()
+                    if _pc.id in _cat_ids or _pn in _cat_names or any(_pn == (mn + ' - group classes') for mn in _cat_names):
+                        # de-duplicate by name (the catalog can contain duplicate same-named
+                        # categories; the member should see each of their categories only once).
+                        if _pn not in _seen_names:
+                            _match_ids.append(_pc.id)
+                            _seen_names.add(_pn)
+                qs = qs.filter(id__in=_match_ids) if _match_ids else qs.none()
+            else:
+                qs = qs.none()
         return qs.order_by('display_order', 'name')
 
     def perform_create(self, serializer):

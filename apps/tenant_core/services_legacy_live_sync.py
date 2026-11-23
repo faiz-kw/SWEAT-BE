@@ -803,3 +803,82 @@ def sync_live_legacy_member_to_tenant(primary_uid: int, tenant_alias: str, org_i
                 )
 
     return profile
+
+
+def sync_member_attendance_from_legacy(primary_uid: int, tenant_alias: str, since_days: int = 60) -> int:
+    """
+    Lightweight attendance-only sync: pull the member's ATTENDED legacy bookings and upsert
+    SUCCESSFUL AttendanceRecords onto the matching, already-existing reos Bookings.
+
+    Unlike sync_live_legacy_member_to_tenant(), this does NOT touch memberships, packages,
+    orders, or create bookings -- it only records check-ins that already happened in legacy but
+    have not yet synced into reos. Safe to call from the no-show reconciler before marking a
+    member absent, so a member who physically checked in is never falsely marked NO_SHOW.
+
+    Returns the number of check-in records upserted. Never raises (returns 0 on any error).
+    """
+    from datetime import timedelta as _td
+    try:
+        primary_uid = int(primary_uid)
+    except Exception:
+        return 0
+    try:
+        conn = get_legacy_db_connection()
+    except Exception as e:
+        logger.warning(f"[ATT-SYNC] legacy connection failed for uid={primary_uid}: {e}")
+        return 0
+    rows = []
+    try:
+        cutoff = timezone.now() - _td(days=since_days)
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT b.uid, b.attended, b.attendance_tIme, b.book_source
+                FROM bookings b
+                WHERE b.user_id = %s AND b.attended = 1 AND b.createdon >= %s
+                """,
+                (primary_uid, cutoff),
+            )
+            rows = cursor.fetchall()
+    except Exception as e:
+        logger.warning(f"[ATT-SYNC] legacy query failed for uid={primary_uid}: {e}")
+        rows = []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    upserted = 0
+    for r in rows:
+        try:
+            b_uid = r[0]
+            att_time = r[2]
+            bsrc_raw = str(r[3] or '').lower()
+            bkg_uuid = uuid.UUID(gen_uuid('booking', b_uid))
+            bkg = Booking.objects.using(tenant_alias).filter(id=bkg_uuid).select_related('occurrence').first()
+            if not bkg:
+                continue
+            att_uuid = uuid.UUID(gen_uuid('attendance', b_uid))
+            checkin_dt = att_time or (bkg.occurrence.start_at if bkg.occurrence_id else timezone.now())
+            if checkin_dt and timezone.is_naive(checkin_dt):
+                checkin_dt = timezone.make_aware(checkin_dt)
+            AttendanceRecord.objects.using(tenant_alias).update_or_create(
+                id=att_uuid,
+                defaults={
+                    'booking': bkg,
+                    'user_profile_id': bkg.user_profile_id,
+                    'branch_id': bkg.branch_id,
+                    'occurrence_id': bkg.occurrence_id,
+                    'status': 'PRESENT',
+                    'check_in_status': 'SUCCESSFUL',
+                    'check_in_method': 'MOBILE' if 'mobile' in bsrc_raw else 'FRONT_DESK',
+                    'check_in_at': checkin_dt,
+                    'attendance_completed': True,
+                },
+            )
+            upserted += 1
+        except Exception as e:
+            logger.warning(f"[ATT-SYNC] upsert failed (uid={primary_uid}): {e}")
+            continue
+    return upserted
