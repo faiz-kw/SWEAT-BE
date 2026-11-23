@@ -3206,8 +3206,15 @@ class MobilePackagesView(APIView):
             if not price_obj:
                 continue
 
-            # Entitlement / Session count lookup
-            ent_def = latest_version.entitlement_definitions.first()
+            # Entitlement / Session count lookup. Use the BASE (non-passport) entitlement: passport
+            # is a cross-branch cap within the base sessions, not a separate/additive session pool.
+            _edefs = list(latest_version.entitlement_definitions.all())
+            ent_def = next(
+                (e for e in _edefs
+                 if 'CROSS' not in str(getattr(e, 'entitlement_type', '') or '').upper()
+                 and 'PASSPORT' not in str(getattr(e, 'entitlement_type', '') or '').upper()),
+                None,
+            ) or (_edefs[0] if _edefs else None)
             raw_units = getattr(ent_def, 'allocated_units', None) or getattr(ent_def, 'total_units', None) if ent_def else None
             session_count = int(raw_units) if raw_units is not None and not getattr(ent_def, 'is_unlimited', False) else 12
             is_unlimited = bool(ent_def and getattr(ent_def, 'is_unlimited', False))
@@ -5354,7 +5361,10 @@ class MobileMembershipActionsView(APIView):
             except Exception:
                 raw_sc = getattr(v, 'session_count', None)
                 home_sess = int(raw_sc) if raw_sc is not None else 12
-            tot = 999 if is_unlimited else (home_sess + cross_sess)
+            # Passport (cross-branch) is a cap WITHIN the base sessions, not an additive pool:
+            # a cross-branch booking also consumes a home session, so the true bookable total is
+            # the home pool alone. Do NOT add cross_sess, or the total is overstated (e.g. 144->172).
+            tot = 999 if is_unlimited else home_sess
             return {
                 'home_sessions': home_sess,
                 'passport_sessions': cross_sess,
@@ -5533,6 +5543,12 @@ class MobileMembershipActionsView(APIView):
         remaining_sessions = 0
         used_sessions = 0
         for ent in active_m.entitlements.using(alias).all():
+            # Passport (cross-branch) is a cap WITHIN the base sessions, not an additive pool
+            # (a cross-branch booking also consumes a home session). Exclude it so the current-pack
+            # total stays consistent with the home-only target totals used for the upgrade diff.
+            _etype = str(getattr(ent, 'entitlement_type', '') or '').upper()
+            if 'CROSS' in _etype or 'PASSPORT' in _etype:
+                continue
             alloc = int(getattr(ent, 'allocated_units', None) or getattr(ent, 'total_units', 0) or 0)
             cons = int(getattr(ent, 'consumed_units', 0) or 0)
             total_sessions += alloc
