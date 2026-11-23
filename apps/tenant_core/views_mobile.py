@@ -1638,15 +1638,43 @@ class MobileScheduleView(APIView):
         import re as _re_mg
         from .models_wod import WorkoutContentItem as _WCI
         _muscle_cache = {}
-        def _get_targeted_muscles(_tpl):
+        def _get_targeted_muscles(_occ):
+            # Mirror the web streaming-config selection (views_classes): pick the WorkoutContentItem
+            # DATE-matched (and category-matched) to THIS occurrence, not a generic template .first().
+            # Cached by (template_id, occurrence_date) so it costs one lookup per distinct class/day.
+            _tpl = getattr(_occ, 'class_template', None) if _occ else None
             if not _tpl:
                 return []
-            _key = str(_tpl.id)
+            _tpl_name = _tpl.name or ''
+            _cat_code = (getattr(_tpl.category, 'code', '') if getattr(_tpl, 'category', None) else '') or ''
+            _occ_date = getattr(_occ, 'occurrence_date', None)
+            _occ_date_str = _occ_date.strftime('%Y-%m-%d') if _occ_date else ''
+            _key = (str(_tpl.id), _occ_date_str)
             if _key in _muscle_cache:
                 return _muscle_cache[_key]
             _res = []
             try:
-                _wi = _WCI.objects.using(alias).filter(movement_name__icontains=_tpl.name, status='ACTIVE').first()
+                _wi = None
+                # 1. date-aware + category-aware lookup (same heuristics as the web endpoint)
+                if _occ_date_str:
+                    for _itm in _WCI.objects.using(alias).filter(raw_import_data__date=_occ_date_str, status='ACTIVE'):
+                        _rd = _itm.raw_import_data or {}
+                        _raw_cat = str(_rd.get('category_code', '')).upper()
+                        _raw_sheet = str(_rd.get('sheet', '')).upper()
+                        _name_upper = (_itm.movement_name or '').upper()
+                        if ((_cat_code and _cat_code in _raw_cat) or
+                            ('STRETCH' in _cat_code and ('STRETCH' in _raw_sheet or 'STRETCH' in _name_upper)) or
+                            ('TOTAL' in _cat_code and 'PILATES' in _cat_code and ('SWEAT TOTAL' in _raw_sheet or 'PILATES TOTAL' in _name_upper or 'SWEAT TOTAL' in _name_upper)) or
+                            ('ATHLETIC' in _cat_code and ('ATHLETIC' in _raw_sheet or 'ATHLETIC' in _name_upper)) or
+                            ('BOOTCAMP' in _cat_code and ('BOOTCAMP' in _raw_sheet or 'BOOTCAMP' in _name_upper or _raw_sheet == '01. TOTAL'))):
+                            _wi = _itm
+                            break
+                    # 2. fallback: same shot_date + template name
+                    if not _wi:
+                        _wi = _WCI.objects.using(alias).filter(shot_date=_occ_date, movement_name__icontains=_tpl_name, status='ACTIVE').first()
+                # 3. final fallback: newest generic template-name match
+                if not _wi:
+                    _wi = _WCI.objects.using(alias).filter(movement_name__icontains=_tpl_name, status='ACTIVE').order_by('-created_at').first()
                 if _wi:
                     _raw = (_wi.raw_import_data or {}).get('muscles')
                     if _raw:
@@ -1853,7 +1881,7 @@ class MobileScheduleView(APIView):
                 'end_at': occ.end_at.isoformat() if occ.end_at else None,
                 'duration_minutes': template.default_duration_minutes if template else 50,
                 'intensity_level': getattr(template, 'intensity_level', 'All Levels') if template else 'All Levels',
-                'targeted_muscles': _get_targeted_muscles(template),
+                'targeted_muscles': _get_targeted_muscles(occ),
                 'trainer': {
                     'name': trainer_name,
                     'title': trainer_title,
