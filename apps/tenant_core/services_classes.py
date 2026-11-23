@@ -19,7 +19,7 @@ import uuid
 from decimal import Decimal
 from datetime import date, datetime, timedelta, time, timezone as dt_timezone
 from zoneinfo import ZoneInfo
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 from django.db import transaction, models
 from django.db.models import Q
 from django.utils import timezone

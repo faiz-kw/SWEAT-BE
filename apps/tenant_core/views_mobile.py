@@ -159,6 +159,19 @@ def _get_or_create_user_profile(user, alias, branch=None):
             member_type='TRIAL',
             acquisition_source='MOBILE_APP',
         )
+
+    # SELF-HEAL user_type: a user with an ACTIVE membership must be MEMBER (never stuck as LEAD).
+    # Some membership-creation paths (CRM / legacy sync) do not flip user_type, which left genuine
+    # members seeing the trial flow and unable to book in the app. Promote here so it cannot recur.
+    # Promote-only (LEAD/other -> MEMBER); never demotes.
+    try:
+        if getattr(user, 'user_type', None) != 'MEMBER':
+            from .models_memberships import Membership
+            if Membership.objects.using(alias).filter(user_profile=profile, status='ACTIVE').exists():
+                user.user_type = 'MEMBER'
+                user.save(using=alias, update_fields=['user_type'])
+    except Exception:
+        pass
     return profile
 
 
@@ -886,6 +899,40 @@ class MobileMeView(APIView):
                 'home_branch': _m.home_branch.name if _m.home_branch else None,
             })
 
+        # Upcoming (future-dated) packs: a member may hold a pre-purchased pack that starts
+        # later. These are NOT bookable yet (excluded from active_memberships above), but the app
+        # should still SHOW them as upcoming. Returned as a separate display-only array.
+        future_memberships_list = []
+        for _fm in (Membership.objects.using(alias)
+                    .filter(user_profile=profile, status='ACTIVE', start_date__gt=_me_now)
+                    .select_related('package', 'package__program', 'program', 'home_branch')
+                    .order_by('start_date', '-created_at')):
+            _fents = _primary_entitlements(_fm.entitlements.using(alias).filter(status__in=['ACTIVE', 'FROZEN']))
+            _falloc = sum(e.allocated_units for e in _fents)
+            _fcons = sum(e.consumed_units for e in _fents)
+            _frem = max(Decimal('0'), _falloc - _fcons)
+            _fp = _fm.program or (_fm.package.program if _fm.package else None)
+            _fp_name = _fp.name if _fp else ''
+            _fpk_name = _fm.package.name if _fm.package else ''
+            _fd_name = format_program_package_name(_fp_name, _fpk_name)
+            _starts_in = max(0, (_fm.start_date - timezone.now().date()).days) if _fm.start_date else 0
+            future_memberships_list.append({
+                'membership_id': str(_fm.id),
+                'package_name': _fd_name,
+                'raw_package_name': _fpk_name,
+                'program_name': _fp_name,
+                'display_package_name': _fd_name,
+                'status': 'UPCOMING',
+                'is_bookable': False,
+                'allocated_sessions': float(_falloc),
+                'consumed_sessions': float(_fcons),
+                'remaining_sessions': float(_frem),
+                'start_date': _fm.start_date.isoformat() if _fm.start_date else None,
+                'end_date': _fm.end_date.isoformat() if _fm.end_date else None,
+                'starts_in_days': _starts_in,
+                'home_branch': _fm.home_branch.name if _fm.home_branch else None,
+            })
+
         # Check if 1 free trial session was already redeemed
         has_trial = (
             Booking.objects.using(alias).filter(user_profile=profile, booking_type='TRIAL').exists()
@@ -960,6 +1007,7 @@ class MobileMeView(APIView):
             'credits_available': total_remaining_credits,
             'active_membership': membership_data,
             'active_memberships': active_memberships_list,
+            'future_memberships': future_memberships_list,
             'passport_sessions': passport_sessions,
             'active_packs_count': active_packs_count,
             'free_trial_redeemed': has_trial,
@@ -1372,6 +1420,7 @@ class MobileScheduleView(APIView):
                 active_mems = list(
                     Membership.objects.using(alias)
                     .filter(user_profile=user_profile, status='ACTIVE', end_date__gte=timezone.now().date())
+                    .filter(models.Q(start_date__lte=timezone.now().date()) | models.Q(start_date__isnull=True))
                     .select_related('program', 'package', 'package_version', 'home_branch', 'purchase_branch')
                     .order_by('-created_at')
                 )
@@ -1583,6 +1632,35 @@ class MobileScheduleView(APIView):
         )
 
         results = []
+        # Targeted muscle groups per class (cached by template, mirrors the web logic): match the
+        # template name to a WorkoutContentItem and read muscles from raw_import_data['muscles']
+        # or MUSCLE_GROUP tags. Cached so it costs one query per distinct template, not per class.
+        import re as _re_mg
+        from .models_wod import WorkoutContentItem as _WCI
+        _muscle_cache = {}
+        def _get_targeted_muscles(_tpl):
+            if not _tpl:
+                return []
+            _key = str(_tpl.id)
+            if _key in _muscle_cache:
+                return _muscle_cache[_key]
+            _res = []
+            try:
+                _wi = _WCI.objects.using(alias).filter(movement_name__icontains=_tpl.name, status='ACTIVE').first()
+                if _wi:
+                    _raw = (_wi.raw_import_data or {}).get('muscles')
+                    if _raw:
+                        if isinstance(_raw, list):
+                            _res = [str(m).strip() for m in _raw if str(m).strip()]
+                        else:
+                            _res = [m.strip() for m in _re_mg.split(r'[,|&/]', str(_raw)) if m.strip()]
+                    else:
+                        _res = [ct.tag.name for ct in _wi.content_tags.using(alias).select_related('tag').filter(tag__tag_group='MUSCLE_GROUP') if ct.tag]
+            except Exception:
+                _res = []
+            _muscle_cache[_key] = _res
+            return _res
+
         for occ in qs:
             template = occ.class_template
             category = template.category if template else None
@@ -1775,6 +1853,7 @@ class MobileScheduleView(APIView):
                 'end_at': occ.end_at.isoformat() if occ.end_at else None,
                 'duration_minutes': template.default_duration_minutes if template else 50,
                 'intensity_level': getattr(template, 'intensity_level', 'All Levels') if template else 'All Levels',
+                'targeted_muscles': _get_targeted_muscles(template),
                 'trainer': {
                     'name': trainer_name,
                     'title': trainer_title,
@@ -2349,23 +2428,44 @@ class MobileBookClassView(APIView):
 
         # 2. Resolve active membership matching the occurrence's program
         prog_id = occurrence.class_template.program_id if occurrence.class_template else None
+        # Validate packs against the CLASS date (not "today"): a pack is usable only if the class
+        # falls within its start-end window (start_date <= class_date <= end_date). This excludes a
+        # pack not yet started by the class date AND one that expires before it, and correctly
+        # allows a pre-purchased pack once the class reaches its start. Order by soonest expiry
+        # (use-it-or-lose-it), not by created-at (which could pick the wrong valid pack).
+        _occ_date = occurrence.start_at.date() if getattr(occurrence, 'start_at', None) else timezone.now().date()
         active_mems_qs = (
             Membership.objects.using(alias)
             .filter(
                 user_profile=profile,
                 status='ACTIVE',
-                end_date__gte=timezone.now().date(),
+                end_date__gte=_occ_date,
+            )
+            .filter(
+                models.Q(start_date__lte=_occ_date) | models.Q(start_date__isnull=True)
             )
             .select_related('package', 'package_version', 'program')
-            .order_by('-created_at')
+            .order_by('end_date', 'start_date')
         )
         active_membership = None
+        _occ_branch_id = getattr(occurrence, 'branch_id', None)
         if prog_id:
-            active_membership = active_mems_qs.filter(
+            _prog_qs = active_mems_qs.filter(
                 models.Q(program_id=prog_id) | models.Q(package__program_id=prog_id)
-            ).first()
+            )
+            # Prefer a pack whose HOME branch matches this class's branch, so the booking uses a
+            # home session (no passport) instead of being treated as cross-branch. Without this, a
+            # member with two same-program packs at different branches could get the wrong-branch
+            # pack and a false "no passport" error.
+            active_membership = (
+                (_prog_qs.filter(home_branch_id=_occ_branch_id).first() if _occ_branch_id else None)
+                or _prog_qs.first()
+            )
         if not active_membership:
-            active_membership = active_mems_qs.first()
+            active_membership = (
+                (active_mems_qs.filter(home_branch_id=_occ_branch_id).first() if _occ_branch_id else None)
+                or active_mems_qs.first()
+            )
 
         if not active_membership:
             return Response(
@@ -4212,6 +4312,16 @@ class MobileCheckoutVerifyView(APIView):
                 },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+        # Stamp the paid order as fulfilled once the membership action actually applied
+        try:
+            if membership is not None and order.fulfillment_status != 'FULFILLED':
+                order.fulfillment_status = 'FULFILLED'
+                order.fulfilled_at = timezone.now()
+                order.fulfilled_by_user = user
+                order.save(using=alias, update_fields=['fulfillment_status', 'fulfilled_at', 'fulfilled_by_user', 'updated_at'])
+        except Exception as _ff_err:
+            logger.warning("Could not stamp fulfillment on order %s: %s", order.order_number, _ff_err)
 
         credits_summary = []
         if membership:
