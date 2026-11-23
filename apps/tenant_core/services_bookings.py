@@ -1489,7 +1489,23 @@ class BookingWaitlistAttendanceService:
             within_cutoff = not policy_eval['is_late']
             session_action = policy_eval['session_action']
             treated_as_no_show = policy_eval['treated_as_no_show']
+            # Refund the ACTUAL units this booking consumed on its linked entitlement, not a flat 1.
+            # Class credit cost can be >1 (e.g. Elite credit packs deduct the class's credit value),
+            # so a hardcoded 1 would under-refund credits on cancellation. Read it from the ledger
+            # scoped to the booking's own entitlement so cross-branch dual-deductions aren't double counted.
             session_units = Decimal('1.00')
+            try:
+                from .models_memberships import MembershipEntitlementLedger
+                if booking.entitlement_id:
+                    _consumed = MembershipEntitlementLedger.objects.using(alias).filter(
+                        booking_id=booking.id,
+                        transaction_type='CONSUMPTION',
+                        membership_entitlement_id=booking.entitlement_id,
+                    ).aggregate(total=models.Sum('units'))['total']
+                    if _consumed:
+                        session_units = abs(Decimal(str(_consumed)))
+            except Exception:
+                session_units = Decimal('1.00')
 
             # If an explicit BookingCancellationRule exists, it overrides default policy
             if applied_rule:
