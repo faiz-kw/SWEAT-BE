@@ -25,7 +25,7 @@ Endpoints:
 
 import logging
 from decimal import Decimal
-from rest_framework import viewsets, filters, status
+from rest_framework import viewsets, filters, status, serializers
 from rest_framework.decorators import action
 from rest_framework.response import Response
 import re
@@ -187,6 +187,7 @@ def get_user_effective_branch_ids(user, db_alias: str = 'default') -> Optional[S
 
 class LeadSourceViewSet(viewsets.ModelViewSet):
     serializer_class = LeadSourceSerializer
+    pagination_class = None
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
     required_module = 'crm'
     required_submodule = 'leads'
@@ -532,6 +533,31 @@ class LeadViewSet(viewsets.ModelViewSet):
             qs = qs.filter(Q(branch_id__in=permitted_branches) | Q(assigned_sales_user=self.request.user) | Q(branch_id__isnull=True))
         # --- FIX: INCLUDE ORGANIZATION-WIDE LEADS IN BRANCH SCOPE END ---
 
+        # Enforce role-based lead visibility:
+        # Supervisors (Org Admins, Super Admins, Branch Managers, Sales Managers, or Reporting Managers) can view branch/org leads.
+        # Staff/Sales/HR reps without supervisor roles can ONLY view leads assigned to them.
+        from apps.tenant_core.security_utils import get_user_role_codes
+        user_roles = get_user_role_codes(self.request)
+        is_lead_supervisor = (
+            getattr(self.request.user, 'is_superuser', False)
+            or any(r in ('ORG_ADMIN', 'SUPER_ADMIN', 'TENANT_ADMIN', 'BRANCH_MANAGER', 'SALES_MANAGER') for r in user_roles)
+        )
+        if not is_lead_supervisor:
+            try:
+                emp_prof = getattr(getattr(self.request.user, 'profile', None), 'employee_profile', None)
+                if emp_prof and TenantUser.objects.using(alias).filter(profile__employee_profile__reporting_manager=emp_prof).exists():
+                    is_lead_supervisor = True
+            except Exception:
+                pass
+
+        if not is_lead_supervisor:
+            unassigned_filter = self.request.query_params.get('unassigned')
+            is_unassigned_query = unassigned_filter and str(unassigned_filter).lower() in ('true', '1')
+            if is_unassigned_query:
+                qs = qs.filter(assigned_sales_user__isnull=True)
+            else:
+                qs = qs.filter(Q(assigned_sales_user=self.request.user) | Q(assigned_trainer_user=self.request.user))
+
         status_val = self.request.query_params.get('current_status')
         if status_val and status_val not in ('all', 'ALL'):
             if status_val == 'TRIAL_BOOKED':
@@ -582,12 +608,12 @@ class LeadViewSet(viewsets.ModelViewSet):
             elif bucket == 'DUE_TODAY':
                 qs = qs.filter(followup_tasks__status='PENDING', followup_tasks__due_at__date=today).distinct()
             elif bucket == 'OVERDUE':
-                qs = qs.filter(Q(followup_tasks__status='PENDING', followup_tasks__due_at__date__lt=today) | Q(sla_status='BREACHED')).distinct()
+                qs = qs.filter(Q(followup_tasks__status='PENDING', followup_tasks__due_at__date__lt=today) | Q(response_sla_status='BREACHED')).distinct()
             else:
                 qs = qs.filter(
                     Q(current_status='NEW_LEAD') |
                     Q(followup_tasks__status='PENDING', followup_tasks__due_at__date__lte=today) |
-                    Q(sla_status='BREACHED')
+                    Q(response_sla_status='BREACHED')
                 ).distinct()
         else:
             assigned_to_me = self.request.query_params.get('assigned_to_me')
@@ -721,21 +747,25 @@ class LeadViewSet(viewsets.ModelViewSet):
             extra_fields['assignment_mode'] = assignment_mode
 
         is_staff_manual = hasattr(self.request, 'user') and getattr(self.request.user, 'is_authenticated', False) and hasattr(self.request.user, 'organization_id')
-        lead = CRMLeadService.create_lead(
-            organization=org,
-            first_name=serializer.validated_data.get('first_name'),
-            last_name=serializer.validated_data.get('last_name'),
-            phone=serializer.validated_data.get('phone_normalized'),
-            email=serializer.validated_data.get('email_normalized'),
-            branch=branch,
-            lead_source=lead_source or serializer.validated_data.get('lead_source'),
-            assigned_sales_user=assigned_sales_user if assignment_mode != 'AUTO' else None,
-            actor_user=self.request.user if is_staff_manual else None,
-            extra_fields=extra_fields,
-            attribution_data=serializer.validated_data.get('attribution'),
-            block_if_duplicate=is_staff_manual,
-            db_alias=alias,
-        )
+        try:
+            lead = CRMLeadService.create_lead(
+                organization=org,
+                first_name=serializer.validated_data.get('first_name'),
+                last_name=serializer.validated_data.get('last_name'),
+                phone=serializer.validated_data.get('phone_normalized'),
+                email=serializer.validated_data.get('email_normalized'),
+                branch=branch,
+                lead_source=lead_source or serializer.validated_data.get('lead_source'),
+                assigned_sales_user=assigned_sales_user if assignment_mode != 'AUTO' else None,
+                actor_user=self.request.user if is_staff_manual else None,
+                extra_fields=extra_fields,
+                attribution_data=serializer.validated_data.get('attribution'),
+                block_if_duplicate=is_staff_manual,
+                db_alias=alias,
+            )
+        except ValidationError as ve:
+            msg = ve.message if hasattr(ve, 'message') else str(ve.messages[0] if hasattr(ve, 'messages') else ve)
+            raise serializers.ValidationError({'detail': msg})
         serializer.instance = lead
 
         # Check if caller requested automated AI call trigger, provided voice consent,
@@ -926,11 +956,11 @@ class LeadViewSet(viewsets.ModelViewSet):
 
                 my_day_new = my_day_base.filter(current_status='NEW_LEAD').count()
                 my_day_due = my_day_base.filter(followup_tasks__status='PENDING', followup_tasks__due_at__date=today).distinct().count()
-                my_day_over = my_day_base.filter(Q(followup_tasks__status='PENDING', followup_tasks__due_at__date__lt=today) | Q(sla_status='BREACHED')).distinct().count()
+                my_day_over = my_day_base.filter(Q(followup_tasks__status='PENDING', followup_tasks__due_at__date__lt=today) | Q(response_sla_status='BREACHED')).distinct().count()
                 my_day_tot = my_day_base.filter(
                     Q(current_status='NEW_LEAD') |
                     Q(followup_tasks__status='PENDING', followup_tasks__due_at__date__lte=today) |
-                    Q(sla_status='BREACHED')
+                    Q(response_sla_status='BREACHED')
                 ).distinct().count()
 
                 my_day_metrics = {
@@ -1112,12 +1142,13 @@ class LeadViewSet(viewsets.ModelViewSet):
             Q(phone__icontains=q) |
             Q(profile__member_number__icontains=q)
         )
+        from .security_utils import mask_phone_if_restricted
         results = [
             {
                 'id': str(u.id),
                 'name': f"{u.first_name} {u.last_name}".strip() or u.email,
                 'email': u.email,
-                'phone': u.phone,
+                'phone': mask_phone_if_restricted(request, u.phone, target_user_id=u.id),
                 'member_number': getattr(getattr(u, 'profile', None), 'member_number', None),
             }
             for u in qs.filter(filter_q)[:20]
@@ -1155,11 +1186,12 @@ class LeadViewSet(viewsets.ModelViewSet):
         if exclude_id:
             qs = qs.exclude(id=exclude_id)
 
+        from .security_utils import mask_phone_if_restricted
         matches = [
             {
                 'id': str(lead.id),
                 'full_name': f"{lead.first_name} {lead.last_name}".strip() or "Unnamed Lead",
-                'phone': lead.phone_normalized,
+                'phone': mask_phone_if_restricted(request, lead.phone_normalized),
                 'email': lead.email_normalized,
                 'current_status': lead.current_status,
                 'branch_name': lead.branch.name if lead.branch else None,
@@ -1338,7 +1370,7 @@ class LeadViewSet(viewsets.ModelViewSet):
         lead = self.get_object()
         alias = _get_db(request)
         limit = int(request.query_params.get('limit', 50))
-        events = CRMLeadService.get_lead_timeline(lead, limit=limit, db_alias=alias)
+        events = CRMLeadService.get_lead_timeline(lead, limit=limit, db_alias=alias, request=request)
         return Response(events)
 
     @action(detail=True, methods=['get', 'post'], url_path='attributions')
@@ -1459,7 +1491,10 @@ class LeadViewSet(viewsets.ModelViewSet):
     def trials(self, request, pk=None):
         lead = self.get_object()
         alias = _get_db(request)
-        all_trials = list(TrialBooking.objects.using(alias).filter(lead=lead).select_related(
+        # Exclude 'Experience the Studio' visit intents -- those have their own section/endpoint.
+        all_trials = list(TrialBooking.objects.using(alias).filter(lead=lead).exclude(
+            trial_type='STUDIO_EXPERIENCE'
+        ).select_related(
             'branch', 'assigned_trainer_profile'
         ).order_by('-created_at'))
 
@@ -1469,6 +1504,20 @@ class LeadViewSet(viewsets.ModelViewSet):
         else:
             trials_sorted = all_trials
         return Response(TrialBookingSerializer(trials_sorted, many=True).data)
+
+    @action(detail=True, methods=['get'], url_path='experience-studio')
+    def experience_studio(self, request, pk=None):
+        """
+        GET /api/v1/tenant/leads/{id}/experience-studio/
+        The lead's 'Experience the Studio' visit intents (branch + preferred date/time + class).
+        Dedicated section in the lead profile, separate from Trials.
+        """
+        lead = self.get_object()
+        alias = _get_db(request)
+        exps = TrialBooking.objects.using(alias).filter(
+            lead=lead, trial_type='STUDIO_EXPERIENCE'
+        ).select_related('branch').order_by('-created_at')
+        return Response(TrialBookingSerializer(exps, many=True).data)
 
     @action(detail=True, methods=['post'], url_path='call')
     def call(self, request, pk=None):
@@ -2092,6 +2141,7 @@ class LeadViewSet(viewsets.ModelViewSet):
         package_version_id = request.data.get('package_version_id')
         branch_id = request.data.get('branch_id')
         coupon_code = request.data.get('coupon_code')
+        order_type = request.data.get('order_type') or request.query_params.get('order_type') or 'NEW_MEMBERSHIP'
 
         if not package_version_id:
             return Response(
@@ -2119,6 +2169,7 @@ class LeadViewSet(viewsets.ModelViewSet):
                 branch_id=str(branch_id),
                 coupon_code=coupon_code,
                 channel=channel,
+                order_type=order_type,
                 db_alias=alias,
             )
             return Response(quote)
@@ -2151,6 +2202,7 @@ class LeadViewSet(viewsets.ModelViewSet):
         package_version_id = request.data.get('package_version_id')
         branch_id = request.data.get('branch_id')
         coupon_code = request.data.get('coupon_code')
+        order_type = request.data.get('order_type') or request.query_params.get('order_type') or 'NEW_MEMBERSHIP'
 
         if not package_version_id or not branch_id:
             return Response(
@@ -3993,11 +4045,24 @@ class CommunicationMessageViewSet(viewsets.ReadOnlyModelViewSet):
         if data.get('related_followup_id'):
             followup = SalesFollowupTask.objects.using(alias).filter(id=data['related_followup_id'], organization=org).first()
 
+        from .security_utils import is_masked_phone
+        recipient_val = (data.get('recipient') or '').strip()
+        if lead and (not recipient_val or is_masked_phone(recipient_val)):
+            if data['channel'] == 'EMAIL':
+                recipient_val = (lead.email_normalized or '').strip()
+            else:
+                recipient_val = (lead.phone_normalized or '').strip()
+        if not recipient_val:
+            return Response(
+                {'error': 'Recipient phone or email is not available on this lead.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         try:
             msg = CommunicationService.send_communication(
                 organization=org,
                 channel=data['channel'],
-                recipient=data['recipient'],
+                recipient=recipient_val,
                 lead=lead,
                 template=template,
                 subject=data.get('subject', ''),
@@ -4010,7 +4075,10 @@ class CommunicationMessageViewSet(viewsets.ReadOnlyModelViewSet):
                 created_by_user=request.user,
                 provider_preference=data.get('provider_preference'),
             )
-            return Response(CommunicationMessageSerializer(msg).data, status=status.HTTP_201_CREATED)
+            return Response(
+                CommunicationMessageSerializer(msg, context={'request': request}).data,
+                status=status.HTTP_201_CREATED,
+            )
         except ConsentViolationError as cve:
             return Response({'error': str(cve), 'code': 'CONSENT_DENIED'}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as exc:
@@ -4568,4 +4636,128 @@ class InAppNotificationViewSet(viewsets.ModelViewSet):
             qs = qs.filter(organization=org)
         count = qs.update(is_read=True, read_at=now)
         return Response({'marked_read': count})
+
+
+class LeadTransferViewSet(viewsets.ViewSet):
+    """
+    ViewSet for bulk lead and pipeline transfers, RM offboarding reassignments, and audit history.
+    """
+    permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
+    required_module = 'crm'
+    required_submodule = 'leads'
+    required_permission = 'crm.leads.transfer'
+    permission_action_map = {
+        'source_reps': 'crm.leads.transfer',
+        'preview': 'crm.leads.transfer',
+        'execute': 'crm.leads.transfer',
+        'rollback': 'crm.leads.transfer',
+        'history': 'crm.leads.transfer',
+    }
+
+    @action(detail=False, methods=['get'], url_path='source-reps')
+    def source_reps(self, request):
+        alias = _get_db(request)
+        org = _get_org(request)
+        if not org:
+            return Response({'error': 'Organization context missing'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from .services_lead_transfer import get_transfer_source_reps
+        source_reps = get_transfer_source_reps(org, db_alias=alias)
+        return Response({'source_reps': source_reps})
+
+    @action(detail=False, methods=['post'], url_path='preview')
+    def preview(self, request):
+        alias = _get_db(request)
+        org = _get_org(request)
+        if not org:
+            return Response({'error': 'Organization context missing'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from .services_lead_transfer import preview_transfer
+        data = request.data or {}
+        preview_data = preview_transfer(
+            organization=org,
+            source_user_id=data.get('source_user_id'),
+            lead_ids=data.get('lead_ids'),
+            is_all_matching=data.get('is_all_matching', False),
+            branch_id=data.get('branch_id'),
+            stage_filter=data.get('stage_filter'),
+            include_converted=data.get('include_converted', True),
+            include_lost=data.get('include_lost', True),
+            db_alias=alias,
+        )
+        return Response(preview_data)
+
+    @action(detail=False, methods=['post'], url_path='execute')
+    def execute(self, request):
+        alias = _get_db(request)
+        org = _get_org(request)
+        if not org:
+            return Response({'error': 'Organization context missing'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from .services_lead_transfer import execute_transfer
+        data = request.data or {}
+        try:
+            result = execute_transfer(
+                organization=org,
+                actor_user=request.user,
+                source_user_id=data.get('source_user_id'),
+                lead_ids=data.get('lead_ids'),
+                is_all_matching=data.get('is_all_matching', False),
+                target_user_ids=data.get('target_user_ids', []),
+                transfer_mode=data.get('transfer_mode', 'ROUND_ROBIN'),
+                custom_weights=data.get('custom_weights'),
+                branch_id=data.get('branch_id'),
+                stage_filter=data.get('stage_filter'),
+                include_converted=data.get('include_converted', True),
+                include_lost=data.get('include_lost', True),
+                stop_auto_assign=data.get('stop_auto_assign', True),
+                auto_switch_meta=data.get('auto_switch_meta', True),
+                reason=data.get('reason', ''),
+                db_alias=alias,
+            )
+            return Response(result, status=status.HTTP_200_OK)
+        except ValidationError as e:
+            return Response({'error': e.message_dict if hasattr(e, 'message_dict') else str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.exception("Failed to execute lead transfer")
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['post'], url_path='rollback')
+    def rollback(self, request):
+        alias = _get_db(request)
+        org = _get_org(request)
+        if not org:
+            return Response({'error': 'Organization context missing'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from .services_lead_transfer import rollback_transfer
+        batch_id = request.data.get('batch_id')
+        if not batch_id:
+            return Response({'error': 'batch_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            result = rollback_transfer(
+                organization=org,
+                batch_id=batch_id,
+                actor_user=request.user,
+                db_alias=alias,
+            )
+            return Response(result, status=status.HTTP_200_OK)
+        except ValidationError as e:
+            return Response({'error': e.message_dict if hasattr(e, 'message_dict') else str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.exception("Failed to rollback lead transfer")
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['get'], url_path='history')
+    def history(self, request):
+        alias = _get_db(request)
+        org = _get_org(request)
+        if not org:
+            return Response({'error': 'Organization context missing'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from .services_lead_transfer import get_transfer_history
+        limit = int(request.query_params.get('limit', 50))
+        history_data = get_transfer_history(org, db_alias=alias, limit=limit)
+        return Response({'history': history_data})
+
 

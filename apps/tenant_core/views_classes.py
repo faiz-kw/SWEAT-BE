@@ -199,9 +199,9 @@ class ClassCategoryViewSet(viewsets.ModelViewSet):
         alias = _get_db(self.request)
         org = _get_org(self.request)
         qs = ClassCategory.objects.using(alias).filter(organization=org)
-        status_filter = self.request.query_params.get('status')
-        if status_filter:
-            qs = qs.filter(status=status_filter)
+        status_filter = (self.request.query_params.get('status') or '').strip()
+        if status_filter and status_filter.upper() != 'ALL':
+            qs = qs.filter(status__iexact=status_filter)
         return qs.order_by('display_order')
 
     def perform_create(self, serializer):
@@ -252,9 +252,9 @@ class ClassTemplateViewSet(viewsets.ModelViewSet):
         category_id = self.request.query_params.get('category_id')
         if category_id:
             qs = qs.filter(category_id=category_id)
-        status_filter = self.request.query_params.get('status')
-        if status_filter:
-            qs = qs.filter(status=status_filter)
+        status_filter = (self.request.query_params.get('status') or '').strip()
+        if status_filter and status_filter.upper() != 'ALL':
+            qs = qs.filter(status__iexact=status_filter)
         return qs.order_by('name')
 
     def _save_branch_capacities(self, instance, branch_capacities, alias):
@@ -311,12 +311,36 @@ class ClassTemplateViewSet(viewsets.ModelViewSet):
         )
 
     def perform_update(self, serializer):
+        old_status = serializer.instance.status if serializer.instance else None
         instance = serializer.save()
         alias = _get_db(self.request)
         org = _get_org(self.request)
         branch_capacities = self.request.data.get('branch_capacities')
         if branch_capacities is not None:
             self._save_branch_capacities(instance, branch_capacities, alias)
+
+        # If class template is deactivated, cancel all future sessions and release assigned trainers immediately
+        if instance.status != 'ACTIVE' and old_status == 'ACTIVE':
+            future_occs = list(
+                ClassOccurrence.objects.using(alias).filter(
+                    class_template=instance,
+                    start_at__gte=timezone.now(),
+                    status__in=['SCHEDULED', 'OPEN'],
+                )
+            )
+            if future_occs:
+                occ_ids = [o.id for o in future_occs]
+                ClassOccurrence.objects.using(alias).filter(id__in=occ_ids).update(
+                    status='CANCELLED',
+                    updated_at=timezone.now()
+                )
+                ClassSchedulingService.release_trainers_for_occurrences(
+                    occurrence_ids=occ_ids,
+                    reason=f"Class template '{instance.name}' deactivated",
+                    actor=self.request.user,
+                    db_alias=alias,
+                )
+
         record_business_audit(
             organization=org,
             module='classes',
@@ -487,116 +511,156 @@ class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
     def create(self, request, *args, **kwargs):
         alias = _get_db(request)
         branches = request.data.get('branches')
+        if not branches and request.data.get('branch'):
+            branches = [request.data.get('branch')]
+        elif not isinstance(branches, list) or len(branches) == 0:
+            branches = [request.data.get('branch')] if request.data.get('branch') else []
+
+        if not branches:
+            return Response({'branch': 'Please select at least one branch.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        raw_time_slots = request.data.get('time_slots')
+        if not isinstance(raw_time_slots, list) or len(raw_time_slots) == 0:
+            if request.data.get('start_time') and request.data.get('end_time'):
+                raw_time_slots = [{
+                    'start_time': request.data.get('start_time'),
+                    'end_time': request.data.get('end_time')
+                }]
+            else:
+                return Response({'time_slots': 'Please configure at least one valid time slot.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Intra-request validation for time slots
+        validated_slots = []
+        seen_slots = set()
+        for idx, slot in enumerate(raw_time_slots, start=1):
+            st = str(slot.get('start_time') or '').strip()
+            et = str(slot.get('end_time') or '').strip()
+            if not st or not et:
+                return Response({'time_slots': f"Slot #{idx} is missing start time or end time."}, status=status.HTTP_400_BAD_REQUEST)
+            if et <= st:
+                return Response({'time_slots': f"Slot #{idx} ({st} – {et}): End time must be strictly greater than start time."}, status=status.HTTP_400_BAD_REQUEST)
+            key = (st[:5], et[:5])
+            if key in seen_slots:
+                return Response({'time_slots': f"Duplicate time slot ({key[0]} – {key[1]}) found in submission."}, status=status.HTTP_400_BAD_REQUEST)
+            seen_slots.add(key)
+            validated_slots.append({'start_time': st, 'end_time': et})
+
         auto_generate = request.data.get('generate_slots', True)
         gen_from = request.data.get('generate_from_date') or request.data.get('valid_from')
         gen_to = request.data.get('generate_to_date') or request.data.get('valid_until')
 
-        # Multi-branch batch creation
-        if isinstance(branches, list) and len(branches) > 0:
-            if not gen_to and gen_from:
-                try:
-                    from_d = date.fromisoformat(str(gen_from))
-                    gen_to = (from_d + timedelta(days=30)).isoformat()
-                except Exception:
-                    pass
+        if not gen_to and gen_from:
+            try:
+                from_d = date.fromisoformat(str(gen_from))
+                gen_to = (from_d + timedelta(days=30)).isoformat()
+            except Exception:
+                pass
 
-            created_rules = []
-            total_occurrences_count = 0
+        created_rules = []
+        total_occurrences_count = 0
+        duplicate_rules = []
+        partial_errors = []
 
-            with transaction.atomic(using=alias):
-                for branch_id in branches:
+        with transaction.atomic(using=alias):
+            for branch_id in branches:
+                for s in validated_slots:
+                    sid = transaction.savepoint(using=alias)
                     data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
                     data['branch'] = branch_id
+                    data['start_time'] = s['start_time']
+                    data['end_time'] = s['end_time']
                     data.pop('branches', None)
+                    data.pop('time_slots', None)
                     data.pop('generate_slots', None)
                     data.pop('generate_from_date', None)
                     data.pop('generate_to_date', None)
 
                     serializer = self.get_serializer(data=data)
-                    serializer.is_valid(raise_exception=True)
-                    rule = serializer.save()
+                    if not serializer.is_valid():
+                        transaction.savepoint_rollback(sid, using=alias)
+                        err_dict = serializer.errors
+                        err_msg = '; '.join([f"{k}: {v[0] if isinstance(v, list) else v}" for k, v in err_dict.items()])
+                        if 'already exists' in err_msg.lower():
+                            duplicate_rules.append(err_msg)
+                        else:
+                            partial_errors.append(f"Branch {branch_id} ({s['start_time']}–{s['end_time']}): {err_msg}")
+                        continue
 
-                    record_business_audit(
-                        organization=rule.branch.organization,
-                        branch=rule.branch,
-                        module='classes',
-                        action_code='SCHEDULE_RULE_CREATED',
-                        entity_type='ClassScheduleRule',
-                        entity_id=rule.id,
-                        actor_user=request.user,
-                        event_description=f"Created recurring schedule rule for {rule.class_template.name} at {rule.branch.name}",
-                        after_data={
-                            'template_name': rule.class_template.name,
-                            'branch_name': rule.branch.name,
-                            'days': rule.days_of_week,
-                            'time_window': f"{rule.start_time.strftime('%H:%M')} – {rule.end_time.strftime('%H:%M')}",
-                            'status': rule.status,
-                        },
-                        db_alias=alias,
-                    )
-                    created_rules.append(rule)
+                    try:
+                        rule = serializer.save()
+                        record_business_audit(
+                            organization=rule.branch.organization,
+                            branch=rule.branch,
+                            module='classes',
+                            action_code='SCHEDULE_RULE_CREATED',
+                            entity_type='ClassScheduleRule',
+                            entity_id=rule.id,
+                            actor_user=request.user,
+                            event_description=f"Created recurring schedule rule for {rule.class_template.name} at {rule.branch.name} ({s['start_time']}–{s['end_time']})",
+                            after_data={
+                                'template_name': rule.class_template.name,
+                                'branch_name': rule.branch.name,
+                                'days': rule.days_of_week,
+                                'time_window': f"{s['start_time']} – {s['end_time']}",
+                                'status': rule.status,
+                            },
+                            db_alias=alias,
+                        )
+                        created_rules.append(rule)
 
-                    if auto_generate and gen_from and gen_to:
-                        try:
-                            from_d = date.fromisoformat(str(gen_from))
-                            to_d = date.fromisoformat(str(gen_to))
-                            occs = ClassSchedulingService.generate_occurrences_from_rule(
-                                rule=rule,
-                                from_date=from_d,
-                                to_date=to_d,
-                                actor=request.user,
-                                db_alias=alias,
-                            )
-                            total_occurrences_count += len(occs)
-                        except Exception as exc:
-                            logger.warning(f"Failed to generate occurrences for rule {rule.id}: {exc}")
+                        if auto_generate and gen_from and gen_to:
+                            try:
+                                from_d = date.fromisoformat(str(gen_from))
+                                to_d = date.fromisoformat(str(gen_to))
+                                occs = ClassSchedulingService.generate_occurrences_from_rule(
+                                    rule=rule,
+                                    from_date=from_d,
+                                    to_date=to_d,
+                                    actor=request.user,
+                                    db_alias=alias,
+                                )
+                                total_occurrences_count += len(occs)
+                            except Exception as exc:
+                                logger.warning(f"Failed to generate occurrences for rule {rule.id}: {exc}")
 
-            serialized = self.get_serializer(created_rules, many=True).data
+                        transaction.savepoint_commit(sid, using=alias)
+                    except Exception as exc:
+                        transaction.savepoint_rollback(sid, using=alias)
+                        partial_errors.append(f"Branch {branch_id} ({s['start_time']}–{s['end_time']}): {str(exc)}")
+
+        total_attempts = len(branches) * len(validated_slots)
+        if not created_rules:
+            if duplicate_rules and len(duplicate_rules) == total_attempts:
+                return Response({
+                    'error': f"All requested recurring rules already exist: {duplicate_rules[0]}"
+                }, status=status.HTTP_400_BAD_REQUEST)
+            if partial_errors:
+                return Response({
+                    'error': ' | '.join(partial_errors)
+                }, status=status.HTTP_400_BAD_REQUEST)
             return Response({
-                'rules': serialized,
-                'count': len(created_rules),
-                'occurrences_generated': total_occurrences_count,
-            }, status=status.HTTP_201_CREATED)
+                'error': 'Failed to create recurring schedule rules. Please check operating hours and availability.'
+            }, status=status.HTTP_400_BAD_REQUEST)
 
-        # Single branch creation
-        data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
-        data.pop('branches', None)
-        data.pop('generate_slots', None)
-        data.pop('generate_from_date', None)
-        data.pop('generate_to_date', None)
+        serialized = self.get_serializer(created_rules, many=True).data
+        message = f"Successfully created {len(created_rules)} recurring schedule rule(s) across {len(branches)} branch(es)"
+        if total_occurrences_count > 0:
+            message += f" and generated {total_occurrences_count} class slot(s)."
+        else:
+            message += "."
+        if duplicate_rules:
+            message += f" Note: {len(duplicate_rules)} duplicate rule(s) already existed and were skipped."
+        if partial_errors:
+            message += f" Warning: {len(partial_errors)} slot(s) were skipped due to branch schedule conflicts."
 
-        serializer = self.get_serializer(data=data)
-        serializer.is_valid(raise_exception=True)
-        self.perform_create(serializer)
-        rule = serializer.instance
-
-        total_occurrences_count = 0
-        if auto_generate and gen_from:
-            if not gen_to:
-                try:
-                    from_d = date.fromisoformat(str(gen_from))
-                    gen_to = (from_d + timedelta(days=30)).isoformat()
-                except Exception:
-                    pass
-            if gen_to:
-                try:
-                    from_d = date.fromisoformat(str(gen_from))
-                    to_d = date.fromisoformat(str(gen_to))
-                    occs = ClassSchedulingService.generate_occurrences_from_rule(
-                        rule=rule,
-                        from_date=from_d,
-                        to_date=to_d,
-                        actor=request.user,
-                        db_alias=alias,
-                    )
-                    total_occurrences_count = len(occs)
-                except Exception as exc:
-                    logger.warning(f"Failed to generate occurrences for rule {rule.id}: {exc}")
-
-        resp_data = serializer.data
-        resp_data['occurrences_generated'] = total_occurrences_count
-        headers = self.get_success_headers(serializer.data)
-        return Response(resp_data, status=status.HTTP_201_CREATED, headers=headers)
+        return Response({
+            'rules': serialized,
+            'count': len(created_rules),
+            'occurrences_generated': total_occurrences_count,
+            'duplicates_skipped': len(duplicate_rules),
+            'partial_errors': partial_errors,
+            'message': message,
+        }, status=status.HTTP_201_CREATED)
 
     def perform_create(self, serializer):
         rule = serializer.save()
@@ -621,8 +685,32 @@ class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
         )
 
     def perform_update(self, serializer):
+        old_status = serializer.instance.status if serializer.instance else None
         rule = serializer.save()
         alias = _get_db(self.request)
+
+        # If schedule rule is deactivated, cancel all future sessions and release assigned trainers immediately
+        if rule.status != 'ACTIVE' and old_status == 'ACTIVE':
+            future_occs = list(
+                ClassOccurrence.objects.using(alias).filter(
+                    schedule_rule=rule,
+                    start_at__gte=timezone.now(),
+                    status__in=['SCHEDULED', 'OPEN'],
+                )
+            )
+            if future_occs:
+                occ_ids = [o.id for o in future_occs]
+                ClassOccurrence.objects.using(alias).filter(id__in=occ_ids).update(
+                    status='CANCELLED',
+                    updated_at=timezone.now()
+                )
+                ClassSchedulingService.release_trainers_for_occurrences(
+                    occurrence_ids=occ_ids,
+                    reason=f"Recurring schedule rule '{rule}' deactivated",
+                    actor=self.request.user,
+                    db_alias=alias,
+                )
+
         record_business_audit(
             organization=rule.branch.organization,
             branch=rule.branch,
@@ -664,6 +752,34 @@ class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
             return Response(ClassOccurrenceSerializer(occurrences, many=True).data, status=status.HTTP_201_CREATED)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+# Trial statuses that hold a seat in the class list "Booked" count. NO_SHOW and CONVERTED still
+# count (the prospect held the seat); CANCELLED / RESCHEDULED released it.
+TRIAL_SEAT_HOLDING_STATUSES = ('BOOKED', 'CONFIRMED', 'ATTENDED', 'NO_SHOW', 'CONVERTED')
+
+
+def annotate_trial_booking_count(qs, alias):
+    """Annotate each occurrence with `annotated_trial_count` (seat-holding trial bookings).
+
+    TrialBooking.class_occurrence_id is a plain UUID column, not a ForeignKey, so trials are not
+    reachable through `occurrence.bookings`. A correlated subquery keeps this to one SQL query.
+    """
+    from django.db.models import Count, IntegerField, OuterRef, Subquery
+    from django.db.models.functions import Coalesce
+    from .models_crm import TrialBooking
+
+    trial_counts = (
+        TrialBooking.objects.using(alias)
+        .filter(class_occurrence_id=OuterRef('pk'), status__in=TRIAL_SEAT_HOLDING_STATUSES)
+        .order_by()
+        .values('class_occurrence_id')
+        .annotate(total=Count('id'))
+        .values('total')
+    )
+    return qs.annotate(
+        annotated_trial_count=Coalesce(Subquery(trial_counts, output_field=IntegerField()), 0)
+    )
 
 
 class ClassOccurrenceViewSet(viewsets.ModelViewSet):
@@ -726,8 +842,8 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
         now = timezone.now()
         upcoming_only = (self.request.query_params.get('upcoming_only') or '').strip().lower() == 'true'
 
-        if trainer_id:
-            qs = qs.filter(trainer_assignments__trainer_profile_id=trainer_id)
+        if trainer_id and trainer_id.upper() != 'ALL':
+            qs = qs.filter(trainer_assignments__trainer_profile_id=trainer_id).exclude(trainer_assignments__status__in=['CANCELLED', 'REPLACED'])
 
         if from_date:
             qs = qs.filter(occurrence_date__gte=from_date)
@@ -748,10 +864,16 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
                 occurrence_id=OuterRef('pk'),
                 status='CONFIRMED',
             )
+            any_trainer = ClassOccurrenceTrainer.objects.using(alias).filter(
+                occurrence_id=OuterRef('pk'),
+            ).exclude(status__in=['CANCELLED', 'REPLACED'])
+
             if check_in_param.upper() == 'CHECKED_IN':
                 qs = qs.filter(Exists(confirmed_trainer))
             elif check_in_param.upper() == 'PENDING':
-                qs = qs.filter(~Exists(confirmed_trainer))
+                qs = qs.filter(Exists(any_trainer) & ~Exists(confirmed_trainer))
+            elif check_in_param.upper() in ['NO_TRAINER', 'UNASSIGNED']:
+                qs = qs.filter(~Exists(any_trainer))
 
         if search_param:
             matching_trainer = ClassOccurrenceTrainer.objects.using(alias).filter(
@@ -826,7 +948,7 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
         ordering = (self.request.query_params.get('ordering') or '').strip()
         order_fields = ('-start_at', '-id') if ordering in ['-start_at', '-occurrence_date'] else ('start_at', 'id')
 
-        return qs.select_related(
+        return annotate_trial_booking_count(qs, alias).select_related(
             'class_template', 'class_template__category', 'class_template__program', 'branch'
         ).prefetch_related(
             'trainer_assignments__trainer_profile__employee_profile__user_profile__user',
@@ -877,6 +999,19 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             db_alias=alias,
         )
 
+    def perform_update(self, serializer):
+        old_status = serializer.instance.status if serializer.instance else None
+        instance = serializer.save()
+        new_status = instance.status
+        alias = _get_db(self.request)
+        if new_status in ('CANCELLED', 'DEACTIVATED') and old_status not in ('CANCELLED', 'DEACTIVATED'):
+            ClassSchedulingService.release_trainers_for_occurrences(
+                occurrence_ids=[instance.id],
+                reason=f"Class slot updated to {new_status}",
+                actor=self.request.user,
+                db_alias=alias,
+            )
+
     @action(detail=True, methods=['post'], url_path='assign-trainer')
     def assign_trainer(self, request, pk=None):
         alias = _get_db(request)
@@ -905,8 +1040,7 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
         alias = _get_db(request)
         trainer_profile_id = request.data.get('trainer_profile_id')
         assignment_id = request.data.get('assignment_id')
-        if not trainer_profile_id and not assignment_id:
-            return Response({'error': 'trainer_profile_id or assignment_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+        unassign_all = request.data.get('unassign_all', False)
 
         from .models_classes import ClassOccurrenceTrainer
         qs = ClassOccurrenceTrainer.objects.using(alias).filter(occurrence_id=pk)
@@ -914,9 +1048,12 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             qs = qs.filter(id=assignment_id)
         elif trainer_profile_id:
             qs = qs.filter(trainer_profile_id=trainer_profile_id)
+        elif not unassign_all:
+            # Default to clearing active assignments for this occurrence if not specific
+            pass
 
         deleted_count, _ = qs.delete()
-        if deleted_count == 0:
+        if deleted_count == 0 and not unassign_all and (assignment_id or trainer_profile_id):
             return Response({'error': 'Trainer assignment not found for this occurrence.'}, status=status.HTTP_404_NOT_FOUND)
 
         from .services_classes import record_business_audit
@@ -1226,7 +1363,7 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
                     break
 
         embed_player_url = (
-            f"https://www.youtube-nocookie.com/embed/{yt_id}?rel=0&modestbranding=1&controls=1&showinfo=0&iv_load_policy=3&fs=0"
+            f"https://www.youtube-nocookie.com/embed/{yt_id}?rel=0&modestbranding=1&controls=1&showinfo=0&iv_load_policy=3&fs=0&cc_load_policy=0"
             if yt_id else (video_url or '')
         )
 
@@ -1375,7 +1512,7 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             if 'youtu' in url:
                 m_yt = re.search(r'(?:v=|\/embed\/|\/shorts\/|youtu\.be\/|\/v\/)([a-zA-Z0-9_-]{11})', url)
                 if m_yt:
-                    embed_url = f"https://www.youtube-nocookie.com/embed/{m_yt.group(1)}?rel=0&modestbranding=1"
+                    embed_url = f"https://www.youtube-nocookie.com/embed/{m_yt.group(1)}?rel=0&modestbranding=1&controls=1&showinfo=0&iv_load_policy=3&fs=0&cc_load_policy=0"
 
             data.append({
                 'id': str(itm.id),
@@ -1492,7 +1629,7 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
                     break
 
         embed_player_url = (
-            f"https://www.youtube-nocookie.com/embed/{yt_id}?rel=0&modestbranding=1&controls=1&showinfo=0&iv_load_policy=3&fs=0"
+            f"https://www.youtube-nocookie.com/embed/{yt_id}?rel=0&modestbranding=1&controls=1&showinfo=0&iv_load_policy=3&fs=0&cc_load_policy=0"
             if yt_id else (video_url or '')
         )
 
@@ -1777,6 +1914,23 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
         start_time_str = instance.start_at.strftime('%H:%M') if instance.start_at else ''
         end_time_str = instance.end_at.strftime('%H:%M') if instance.end_at else ''
 
+        active_trainers = list(
+            ClassOccurrenceTrainer.objects.using(alias).filter(
+                occurrence=instance,
+                status__in=['ASSIGNED', 'CONFIRMED'],
+            ).select_related('trainer_profile', 'trainer_profile__employee_profile__user_profile')
+        )
+        assigned_trainers_preview = []
+        for at in active_trainers:
+            t_name = ClassOccurrenceTrainerSerializer(at).get_trainer_name(at)
+            assigned_trainers_preview.append({
+                'id': str(at.id),
+                'trainer_id': str(at.trainer_profile_id),
+                'trainer_name': t_name,
+                'trainer_code': getattr(at.trainer_profile, 'trainer_code', ''),
+                'role': at.trainer_role,
+            })
+
         return Response({
             'occurrence_id': str(instance.id),
             'class_name': instance.class_template.name if instance.class_template else 'Class Session',
@@ -1790,6 +1944,7 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             'waitlist_count': waitlist_count,
             'is_recurring': bool(instance.schedule_rule_id),
             'affected_bookings': affected_list,
+            'assigned_trainers': assigned_trainers_preview,
         }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'], url_path='cancel')
@@ -1824,12 +1979,20 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             )
 
         with transaction.atomic(using=alias):
-            # 1. Update occurrence status
+            # 1. Immediately release any assigned trainers so they are free for other classes and appointments
+            released_trainers_count = ClassSchedulingService.release_trainers_for_occurrences(
+                occurrence_ids=[instance.id],
+                reason=f"Class session {target_status.lower()}: {reason or 'Cancelled by admin'}",
+                actor=request.user,
+                db_alias=alias,
+            )
+
+            # 2. Update occurrence status
             old_status = instance.status
             instance.status = target_status
             instance.save(using=alias, update_fields=['status', 'updated_at'])
 
-            # 2. Query and process all active bookings
+            # 3. Query and process all active bookings
             active_bookings = list(
                 Booking.objects.using(alias).filter(
                     occurrence=instance,
@@ -1914,6 +2077,7 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
                         'reason': reason,
                         'cancelled_bookings_count': cancelled_bookings_count,
                         'notifications_sent_count': notifications_sent_count,
+                        'released_trainers_count': released_trainers_count,
                     },
                     db_alias=alias,
                 )
@@ -1925,6 +2089,7 @@ class ClassOccurrenceViewSet(viewsets.ModelViewSet):
             'cancelled_bookings_count': cancelled_bookings_count,
             'notifications_sent_count': notifications_sent_count,
             'credits_restored_count': credits_restored_count,
+            'released_trainers_count': released_trainers_count,
         }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'], url_path='restore')

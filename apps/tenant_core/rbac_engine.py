@@ -106,6 +106,7 @@ class RBACAuthorizationEngine:
             required_submodule=required_submodule,
             required_permission=required_permission,
             branch_id=branch_id,
+            request=request,
         )
 
         if request is not None and hasattr(request, '_rbac_eval_cache'):
@@ -123,6 +124,7 @@ class RBACAuthorizationEngine:
         required_submodule: Optional[str],
         required_permission: Optional[str],
         branch_id: Optional[str],
+        request=None,
     ) -> Tuple[bool, str, str]:
 
         # -------------------------------------------------------------------
@@ -171,7 +173,31 @@ class RBACAuthorizationEngine:
                     return False, f'Requested branch {branch_id} does not exist.', 'CHECK_3_BRANCH_NOT_FOUND'
 
                 if target_branch.status != 'ACTIVE':
-                    return False, f'Branch {target_branch.name} is {target_branch.status}. Operations blocked.', 'CHECK_3_BRANCH_INACTIVE'
+                    # Allow deactivation / teardown / cleanup operations on inactive branches
+                    is_deactivating = False
+                    if request is not None and getattr(request, 'method', None) in ('PATCH', 'PUT', 'DELETE'):
+                        if request.method == 'DELETE':
+                            is_deactivating = True
+                        else:
+                            try:
+                                req_data = getattr(request, '_full_data', None)
+                                if req_data is None and hasattr(request, 'data'):
+                                    req_data = request.data
+                                if isinstance(req_data, dict) and str(req_data.get('status', '')).upper() == 'INACTIVE':
+                                    is_deactivating = True
+                            except Exception:
+                                try:
+                                    import json
+                                    body = getattr(request, 'body', None)
+                                    if body:
+                                        b_data = json.loads(body.decode('utf-8'))
+                                        if isinstance(b_data, dict) and str(b_data.get('status', '')).upper() == 'INACTIVE':
+                                            is_deactivating = True
+                                except Exception:
+                                    pass
+
+                    if not is_deactivating:
+                        return False, f'Branch {target_branch.name} is {target_branch.status}. Operations blocked.', 'CHECK_3_BRANCH_INACTIVE'
 
         # -------------------------------------------------------------------
         # CHECK 4: Tenant product module ENABLED (Master DB: tenant_modules.is_enabled == TRUE)

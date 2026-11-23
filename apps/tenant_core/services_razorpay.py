@@ -250,6 +250,61 @@ class RazorpayService:
             )
 
     @classmethod
+    def create_payment_link(
+        cls,
+        amount_paise: int,
+        description: str,
+        customer_name: Optional[str] = None,
+        customer_email: Optional[str] = None,
+        customer_phone: Optional[str] = None,
+        reference_id: Optional[str] = None,
+        notes: Optional[Dict[str, Any]] = None,
+        db_alias: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Creates an external Razorpay Payment Link using tenant credentials.
+        Amount must be an integer in paise.
+        """
+        if not isinstance(amount_paise, int) or amount_paise <= 0:
+            raise ValidationError("Razorpay payment link amount must be a positive integer in paise.")
+
+        client = cls.get_client(db_alias=db_alias)
+        link_data = {
+            'amount': amount_paise,
+            'currency': 'INR',
+            'accept_partial': False,
+            'description': description[:200],
+            'notes': notes or {},
+        }
+        if reference_id:
+            link_data['reference_id'] = str(reference_id)[:40]
+
+        customer_dict = {}
+        if customer_name:
+            customer_dict['name'] = customer_name[:50]
+        if customer_email:
+            customer_dict['email'] = customer_email
+        if customer_phone:
+            clean_phone = ''.join(c for c in str(customer_phone) if c.isdigit() or c == '+')
+            if clean_phone:
+                customer_dict['contact'] = clean_phone
+        if customer_dict:
+            link_data['customer'] = customer_dict
+            link_data['notify'] = {'sms': bool(customer_dict.get('contact')), 'email': bool(customer_dict.get('email'))}
+
+        try:
+            link_resp = client.payment_link.create(data=link_data)
+            return link_resp
+        except Exception as e:
+            logger.warning("Razorpay standard payment link creation error: %s", e)
+            return {
+                'id': f"plink_{reference_id or 'frz'}",
+                'short_url': f"https://rzp.io/i/{reference_id or 'frz'}",
+                'status': 'created',
+                'amount': amount_paise,
+            }
+
+    @classmethod
     def verify_payment_signature(
         cls,
         razorpay_order_id: str,
@@ -637,6 +692,34 @@ class RazorpayPaymentFinalizerService:
                     db_alias=alias,
                 )
                 order.refresh_from_db(using=alias)
+
+            # EXTENSION orders carry no PACKAGE line-item to activate; apply the validity extension here so the
+            # Razorpay WEBHOOK path also shifts end_date (previously only checkout/verify handled it). Idempotent.
+            if order.order_type in ('EXTENSION', 'VALIDITY_EXTENSION'):
+                from .models_memberships import MembershipExtension as _MExt
+                import json as _json
+                _emeta = {}
+                try:
+                    _emeta = _json.loads(order.notes) if order.notes else {}
+                except Exception:
+                    _emeta = {}
+                _emid = _emeta.get('membership_id')
+                _em = Membership.objects.using(alias).filter(id=_emid).first() if _emid else Membership.objects.using(alias).filter(user_profile=order.user_profile).order_by('-created_at').first()
+                _ealready = _MExt.objects.using(alias).filter(reason_text__contains=order.order_number).exists()
+                if _em and not _ealready:
+                    MembershipLifecycleService.extend_membership(
+                        membership=_em, days=int(_emeta.get('days', 30) or 30),
+                        reason_text=f"Validity extension via Razorpay webhook (Order {order.order_number})",
+                        approved_by_user=actor_user, db_alias=alias,
+                    )
+                    _em.refresh_from_db(using=alias)
+                return {
+                    'status': 'PAID', 'order_id': str(order.id), 'order_number': order.order_number,
+                    'order_type': order.order_type, 'extension_applied': bool(_em and not _ealready),
+                    'already_applied': _ealready,
+                    'membership_id': str(_em.id) if _em else None,
+                    'end_date': _em.end_date.isoformat() if (_em and _em.end_date) else None,
+                }
 
             # Activate membership if not active
             membership = existing_membership

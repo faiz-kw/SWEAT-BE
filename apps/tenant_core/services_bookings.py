@@ -246,16 +246,53 @@ class BookingWaitlistAttendanceService:
         ).first()
 
         if member_state and member_state.booking_mode == 'SINGLE_BOOKING':
-            active_advance = Booking.objects.using(alias).filter(
-                user_profile=user_profile,
-                status__in=['CONFIRMED', 'RESERVED'],
-                occurrence__start_at__gt=timezone.now()
-            ).count()
-            if active_advance >= member_state.current_max_advance_bookings:
-                return (
-                    False,
-                    f"Booking restricted due to previous no-shows. Maximum active advance bookings allowed: {member_state.current_max_advance_bookings}."
+            # Dynamic Cooling-Off Expiration Check
+            branch = occurrence.branch if occurrence else None
+            from .services_booking_policy import BookingPolicyService
+            effective_bp = BookingPolicyService.get_effective_policy(organization, branch=branch, db_alias=alias)
+            cooling_days = int(
+                effective_bp.get('no_show_cooling_off_days')
+                or getattr(attendance_policy, 'restriction_duration_days', 7)
+                or 7
+            )
+            now = timezone.now()
+
+            # If cooling-off window has elapsed, auto-restore member to NORMAL mode
+            if member_state.restriction_started_at and now > (member_state.restriction_started_at + timedelta(days=cooling_days)):
+                member_state.booking_mode = 'NORMAL'
+                member_state.consecutive_no_show_count = 0
+                normal_max = int(
+                    effective_bp.get('max_upcoming_bookings')
+                    or getattr(attendance_policy, 'normal_max_advance_bookings', 7)
+                    or 7
                 )
+                member_state.current_max_advance_bookings = normal_max
+                member_state.save(using=alias, update_fields=['booking_mode', 'consecutive_no_show_count', 'current_max_advance_bookings', 'updated_at'])
+
+                try:
+                    AttendancePolicyEvent.objects.using(alias).create(
+                        user_profile=user_profile,
+                        attendance_policy_set=attendance_policy,
+                        event_type='POLICY_RESET',
+                        new_booking_mode='NORMAL',
+                        reason=f"No-show restriction cooling-off period ({cooling_days} days) completed; auto-restored to NORMAL",
+                        triggered_by_type='SYSTEM',
+                        created_at=now
+                    )
+                except Exception as log_e:
+                    logger.warning("Failed to log cooling-off reset event: %s", log_e)
+            else:
+                active_advance = Booking.objects.using(alias).filter(
+                    user_profile=user_profile,
+                    status__in=['CONFIRMED', 'RESERVED'],
+                    occurrence__start_at__gt=now
+                ).count()
+                max_allowed = member_state.current_max_advance_bookings or int(effective_bp.get('restricted_max_advance_bookings', 1))
+                if active_advance >= max_allowed:
+                    return (
+                        False,
+                        f"Booking restricted due to previous no-shows. Maximum active advance bookings allowed: {max_allowed}."
+                    )
 
         return True, ""
 
@@ -785,7 +822,22 @@ class BookingWaitlistAttendanceService:
         elite_candidates = []
         fallback_candidates = []
 
+        from .models_memberships import MembershipFreeze
         for mem in active_memberships:
+            # Multi-contract isolation: If this specific membership is frozen on occ_date,
+            # skip it as a booking candidate so other active/unfrozen contracts can be utilized.
+            is_frozen_on_date = (
+                mem.status == 'FROZEN'
+                or MembershipFreeze.objects.using(alias).filter(
+                    membership=mem,
+                    status__in=['ACTIVE', 'SCHEDULED'],
+                    freeze_from__lte=occ_date,
+                    freeze_until__gte=occ_date,
+                ).exists()
+            )
+            if is_frozen_on_date:
+                continue
+
             active_ents = [e for e in mem.entitlements.all() if e.status == 'ACTIVE']
             credit_ent = next((e for e in active_ents if e.entitlement_type == 'CREDIT_WALLET'), None)
             is_elite = bool(credit_ent and (credit_ent.is_unlimited or (credit_ent.remaining_units is not None and credit_ent.remaining_units > 0) or credit_ent.allocated_units))
@@ -900,13 +952,22 @@ class BookingWaitlistAttendanceService:
                 if not can_book:
                     raise ValidationError(restriction_reason)
 
-            # 4. Check Booking Policy via canonical hierarchy
+            # 4. Resolve Configurable Booking Policy & Hierarchy
+            from .services_booking_policy import BookingPolicyService
+            effective_bp = BookingPolicyService.get_effective_policy(organization, branch=branch, db_alias=alias)
             booking_policy = cls.resolve_booking_policy(occurrence, db_alias=alias)
 
-            if booking_policy and not is_staff_override:
+            if not is_staff_override:
                 now = timezone.now()
-                # Check max upcoming bookings (allows up to 7 advance sessions)
-                max_upcoming = max(int(getattr(booking_policy, 'max_upcoming_bookings', 7) or 7), 7)
+                # Check max upcoming bookings dynamically (respects configured UI value, e.g. 10)
+                configured_max = effective_bp.get('max_upcoming_bookings')
+                if configured_max:
+                    max_upcoming = int(configured_max)
+                elif booking_policy and booking_policy.max_upcoming_bookings:
+                    max_upcoming = int(booking_policy.max_upcoming_bookings)
+                else:
+                    max_upcoming = 7
+
                 upcoming_count = Booking.objects.using(alias).filter(
                     user_profile=user_profile,
                     status__in=['CONFIRMED', 'RESERVED'],
@@ -915,42 +976,41 @@ class BookingWaitlistAttendanceService:
                 if upcoming_count >= max_upcoming:
                     raise ValidationError(f"Maximum upcoming bookings ({max_upcoming}) exceeded.")
 
-                # Check booking window
-                diff_minutes = int((occurrence.start_at - now).total_seconds() / 60)
-                if booking_policy.booking_open_minutes_before and diff_minutes > booking_policy.booking_open_minutes_before:
-                    raise ValidationError("Booking window has not opened yet for this class occurrence.")
-                if booking_policy.booking_close_minutes_before and diff_minutes < booking_policy.booking_close_minutes_before:
-                    raise ValidationError("Booking window has closed for this class occurrence.")
+                # Check booking window from policy hierarchy if configured
+                if booking_policy:
+                    diff_minutes = int((occurrence.start_at - now).total_seconds() / 60)
+                    if booking_policy.booking_open_minutes_before and diff_minutes > booking_policy.booking_open_minutes_before:
+                        raise ValidationError("Booking window has not opened yet for this class occurrence.")
+                    if booking_policy.booking_close_minutes_before and diff_minutes < booking_policy.booking_close_minutes_before:
+                        raise ValidationError("Booking window has closed for this class occurrence.")
 
-                # Check trial allowed
-                if booking_type == 'TRIAL':
-                    if not booking_policy.allow_trial:
-                        raise ValidationError("Trial bookings are not permitted by organization policy.")
-                    if booking_policy.max_trial_bookings:
-                        trials_used = Booking.objects.using(alias).filter(
-                            user_profile=user_profile,
-                            booking_type='TRIAL'
-                        ).count()
-                        if trials_used >= booking_policy.max_trial_bookings:
-                            raise ValidationError(f"Maximum trial bookings ({booking_policy.max_trial_bookings}) exceeded.")
+                    # Check trial allowed
+                    if booking_type == 'TRIAL':
+                        if not booking_policy.allow_trial:
+                            raise ValidationError("Trial bookings are not permitted by organization policy.")
+                        if booking_policy.max_trial_bookings:
+                            trials_used = Booking.objects.using(alias).filter(
+                                user_profile=user_profile,
+                                booking_type='TRIAL'
+                            ).count()
+                            if trials_used >= booking_policy.max_trial_bookings:
+                                raise ValidationError(f"Maximum trial bookings ({booking_policy.max_trial_bookings}) exceeded.")
 
-            # 4b. Check Configurable BookingPolicyService for booking types & advance limits
-            from .services_booking_policy import BookingPolicyService
-            effective_bp = BookingPolicyService.get_effective_policy(organization, branch=branch, db_alias=alias)
-            allowed_types = effective_bp.get('allowed_booking_types')
-            if allowed_types:
-                # Normalize types: A member booking an occurrence/class is permitted under 'CLASS' or 'MEMBER'
-                normalized_type = 'CLASS' if booking_type in ['CLASS', 'MEMBER'] else booking_type
-                normalized_allowed = {'CLASS' if t in ['CLASS', 'MEMBER'] else t for t in allowed_types}
-                if normalized_type not in normalized_allowed:
-                    raise ValidationError(f"Booking type '{booking_type}' is not permitted by current booking policy.")
+                # Check permitted booking types
+                allowed_types = effective_bp.get('allowed_booking_types')
+                if allowed_types:
+                    # Normalize types: A member booking an occurrence/class is permitted under 'CLASS' or 'MEMBER'
+                    normalized_type = 'CLASS' if booking_type in ['CLASS', 'MEMBER'] else booking_type
+                    normalized_allowed = {'CLASS' if t in ['CLASS', 'MEMBER'] else t for t in allowed_types}
+                    if normalized_type not in normalized_allowed:
+                        raise ValidationError(f"Booking type '{booking_type}' is not permitted by current booking policy.")
 
-            # Check advance booking window limit (up to 7 days ahead; staff/admin bypasses)
-            adv_days_max = effective_bp.get('advance_booking_days_max') or 7
-            if not is_staff_override and adv_days_max and occurrence.occurrence_date:
-                max_allowed_date = timezone.now().date() + timedelta(days=int(adv_days_max))
-                if occurrence.occurrence_date > max_allowed_date:
-                    raise ValidationError(f"Advance bookings beyond {adv_days_max} days are not permitted.")
+                # Check advance booking window limit dynamically from effective_bp (e.g. 14 days)
+                adv_days_max = effective_bp.get('advance_booking_days_max') or 14
+                if adv_days_max and occurrence.occurrence_date:
+                    max_allowed_date = timezone.now().date() + timedelta(days=int(adv_days_max))
+                    if occurrence.occurrence_date > max_allowed_date:
+                        raise ValidationError(f"Advance bookings beyond {adv_days_max} days are not permitted.")
 
             # 5. Member validation & Package Class Access
             units_to_consume = Decimal('1.00')
@@ -974,9 +1034,10 @@ class BookingWaitlistAttendanceService:
                     freeze_until__gte=occ_date,
                 ).first()
                 if matching_freeze:
+                    pkg_title = membership.package.name if (membership and membership.package) else "Membership"
                     raise ValidationError(
-                        f"Membership is frozen from {matching_freeze.freeze_from} to {matching_freeze.freeze_until}. "
-                        "No class bookings allowed during the freeze window."
+                        f"Membership '{pkg_title}' is frozen from {matching_freeze.freeze_from} to {matching_freeze.freeze_until}. "
+                        "No class bookings allowed under this membership during the freeze window."
                     )
 
                 if membership.status not in ('ACTIVE', 'FROZEN'):
@@ -1172,12 +1233,11 @@ class BookingWaitlistAttendanceService:
                             if passport_cfg.get('is_enabled') is False or passport_cfg.get('allow_cross_branch_booking') is False:
                                 raise ValidationError("Cross-branch studio access is currently disabled by administration policy.", code="PASSPORT_DISABLED")
 
-                            from .models_catalog import PackageBranchAvailability
-                            pkg = membership.package_version.package if membership.package_version else membership.package
-                            if pkg:
-                                pba_qs = PackageBranchAvailability.objects.using(alias).filter(package=pkg)
-                                if pba_qs.exists() and not pba_qs.filter(branch=occurrence.branch, status='ENABLED').exists():
-                                    raise ValidationError(f"Membership package does not permit access to '{occurrence.branch.name}'.")
+                            # NOTE: cross-branch access here is authorized by the member's PASSPORT (CROSS_BRANCH)
+                            # entitlement, validated just below. PackageBranchAvailability governs sales/catalog
+                            # availability (which branch a package is sold at), NOT passport usage - so it must not
+                            # block a passport booking (it was stranding 400+ members whose package enables only
+                            # their home branch while granting passport sessions).
 
                             passport_ent = ent_qs.filter(
                                 models.Q(entitlement_type='CROSS_BRANCH_SESSION') | models.Q(entitlement_type='CROSS_BRANCH')
@@ -2305,6 +2365,39 @@ class BookingWaitlistAttendanceService:
                 changed_at=now
             )
 
+            # Comprehensive Activity & Audit Log
+            try:
+                from .audit_engine import UnifiedAuditEngine
+                member_user = user_profile.user if user_profile else None
+                member_name = f"{user_profile.first_name_snapshot or ''} {user_profile.last_name_snapshot or ''}".strip() or (member_user.email if member_user else 'Member')
+                cls_title = occurrence.class_template.name if (occurrence and occurrence.class_template) else "Class"
+                UnifiedAuditEngine.record_activity(
+                    action_code=f'OPERATIONS.ATTENDANCE_{status}',
+                    action_category='OPERATIONS',
+                    action_verb='CHECKED_IN' if status == 'PRESENT' else status,
+                    module='CLASSES',
+                    submodule='ATTENDANCE',
+                    entity_type='AttendanceRecord',
+                    entity_id=str(record.id),
+                    entity_name=f"{cls_title} ({member_name})",
+                    actor_user=marked_by_user,
+                    actor_type='STAFF' if marked_by_user else 'SYSTEM',
+                    branch=branch,
+                    organization=organization,
+                    before_state={'booking_status': old_booking_status},
+                    after_state={'booking_status': booking.status, 'attendance_status': status, 'method': check_in_method},
+                    reason=f"Attendance recorded as {status} via {check_in_method}",
+                    event_description=f"Attendance recorded as {status} for member {member_name} in '{cls_title}' via {check_in_method}.",
+                    metadata={
+                        'booking_id': str(booking.id),
+                        'occurrence_id': str(occurrence.id) if occurrence else None,
+                        'check_in_method': check_in_method,
+                    },
+                    db_alias=alias,
+                )
+            except Exception as log_err:
+                logger.warning(f"Failed to record attendance audit log: {log_err}")
+
             return record
 
     @classmethod
@@ -2435,6 +2528,46 @@ class BookingWaitlistAttendanceService:
                         status='CONSUMED_EXITED',
                         updated_at=now
                     )
+
+            # Turnstile IoT Activity & Audit Log
+            try:
+                from .audit_engine import UnifiedAuditEngine
+                member_user = user_profile.user if user_profile else None
+                member_name = f"{user_profile.first_name_snapshot or ''} {user_profile.last_name_snapshot or ''}".strip() or (member_user.email if member_user else 'Member')
+                is_denied = effective_event_type == 'DENIED'
+                UnifiedAuditEngine.record_activity(
+                    action_code='IOT.PUNCH_DENIED' if is_denied else f'IOT.PUNCH_{dir_value}',
+                    action_category='ACCESS_CONTROL',
+                    action_verb='DENIED' if is_denied else dir_value,
+                    module='ACCESS_CONTROL',
+                    submodule='TURNSTILE',
+                    entity_type='AccessEvent',
+                    entity_id=str(event.id),
+                    entity_name=f"Turnstile {dir_value} ({member_name})",
+                    actor_type='IOT_DEVICE',
+                    actor_name=device_reference or 'Turnstile Device',
+                    actor_role='Turnstile Reader',
+                    branch=branch,
+                    result='FAILURE' if is_denied else 'SUCCESS',
+                    error_code=effective_reconciliation if is_denied else '',
+                    error_message=f"Access denied: {effective_reconciliation}" if is_denied else '',
+                    reason=f"Turnstile {dir_value} attempt",
+                    event_description=(
+                        f"Turnstile device '{device_reference or 'Hardware Reader'}' DENIED {dir_value} entry for member {member_name}. Reason: {effective_reconciliation}."
+                        if is_denied else
+                        f"Turnstile device '{device_reference or 'Hardware Reader'}' GRANTED {dir_value} punch for member {member_name} at {branch.name if branch else 'Branch'}."
+                    ),
+                    metadata={
+                        'direction': dir_value,
+                        'device_reference': device_reference,
+                        'provider_reference': provider_reference,
+                        'reconciliation_status': effective_reconciliation,
+                    },
+                    source_channel='TURNSTILE_IOT',
+                    db_alias=alias,
+                )
+            except Exception as log_err:
+                logger.warning(f"Failed to record access event audit log: {log_err}")
 
             return event
 

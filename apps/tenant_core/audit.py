@@ -137,7 +137,10 @@ def resolve_actor(
     if actor is not None and isinstance(actor, TenantUser):
         return actor, 'TENANT_USER', actor.email or ''
 
-    if actor_type in ['TENANT_USER', 'SUPER_ADMIN', 'INTEGRATION', 'SYSTEM_JOB']:
+    if actor_email and not actor_type:
+        actor_type = 'TENANT_USER'
+
+    if actor_type in ['TENANT_USER', 'SUPER_ADMIN', 'INTEGRATION', 'SYSTEM_JOB', 'STAFF', 'ADMIN']:
         return None, actor_type, actor_email or ''
 
     raise PermissionDenied("Cannot resolve audit actor without verified request or valid system context.")
@@ -201,8 +204,8 @@ def resolve_scope(
 
 
 def emit_audit_event(
-    action: str,
-    resource_type: str,
+    action: str = '',
+    resource_type: str = '',
     resource_id: Optional[str] = None,
     request=None,
     instance: Optional[models.Model] = None,
@@ -217,6 +220,8 @@ def emit_audit_event(
     location_id: Optional[uuid.UUID] = None,
     branch_id: Optional[uuid.UUID] = None,
     db_alias: Optional[str] = None,
+    *args,
+    **kwargs,
 ) -> TenantAuditEvent:
     """
     Emits an immutable TenantAuditEvent into the dedicated tenant database.
@@ -228,6 +233,13 @@ def emit_audit_event(
     - Derives scope from the persisted instance.
     - Recursively sanitizes before_state and after_state.
     """
+    final_action = action or kwargs.get('action') or 'MUTATION'
+    final_resource_type = resource_type or kwargs.get('target_type') or kwargs.get('resource_type') or 'General'
+    final_resource_id = str(resource_id or kwargs.get('target_id') or (getattr(instance, 'pk', '') if instance else ''))
+    final_actor_id = kwargs.get('actor_id')
+    final_actor_email = actor_email or kwargs.get('actor_email')
+    final_actor_type = actor_type or kwargs.get('actor_type')
+
     # 1. Resolve tenant database alias (strictly fail closed)
     target_db = db_alias or get_tenant_db_alias()
     if not target_db or target_db == 'default':
@@ -236,13 +248,74 @@ def emit_audit_event(
             "Writing tenant audit records to the Master DB ('default') is strictly blocked."
         )
 
+    from config.routers import set_tenant_db_alias
+    prev_alias = get_tenant_db_alias()
+    if not prev_alias:
+        set_tenant_db_alias(target_db)
+
+    try:
+        return _execute_emit_audit_event(
+            final_action=final_action,
+            final_resource_type=final_resource_type,
+            final_resource_id=final_resource_id,
+            final_actor_id=final_actor_id,
+            final_actor_email=final_actor_email,
+            final_actor_type=final_actor_type,
+            target_db=target_db,
+            request=request,
+            instance=instance,
+            before_state=before_state,
+            after_state=after_state,
+            description=description,
+            actor=actor,
+            organization_id=organization_id,
+            company_entity_id=company_entity_id,
+            location_id=location_id,
+            branch_id=branch_id,
+            *args,
+            **kwargs,
+        )
+    finally:
+        if not prev_alias:
+            set_tenant_db_alias(prev_alias)
+
+
+def _execute_emit_audit_event(
+    final_action: str,
+    final_resource_type: str,
+    final_resource_id: str,
+    final_actor_id: Optional[str],
+    final_actor_email: Optional[str],
+    final_actor_type: Optional[str],
+    target_db: str,
+    request=None,
+    instance: Optional[models.Model] = None,
+    before_state: Optional[dict] = None,
+    after_state: Optional[dict] = None,
+    description: str = '',
+    actor=None,
+    organization_id: Optional[uuid.UUID] = None,
+    company_entity_id: Optional[uuid.UUID] = None,
+    location_id: Optional[uuid.UUID] = None,
+    branch_id: Optional[uuid.UUID] = None,
+    *args,
+    **kwargs,
+) -> TenantAuditEvent:
+
     # 2. Resolve actor
     actor_obj, resolved_actor_type, resolved_actor_email = resolve_actor(
         request=request,
         actor=actor,
-        actor_type=actor_type,
-        actor_email=actor_email,
+        actor_type=final_actor_type,
+        actor_email=final_actor_email,
     )
+    if not actor_obj and final_actor_id and target_db:
+        try:
+            actor_obj = TenantUser.objects.using(target_db).filter(id=final_actor_id).first()
+            if actor_obj and not resolved_actor_email:
+                resolved_actor_email = actor_obj.email
+        except Exception:
+            pass
 
     # 3. Resolve scope
     inferred_org, inferred_ce, inferred_loc, inferred_br = resolve_scope(
@@ -277,8 +350,9 @@ def emit_audit_event(
     sanitized_before = sanitize_audit_state(before_state)
     sanitized_after = sanitize_audit_state(after_state)
 
-    final_resource_id = str(resource_id or (getattr(instance, 'pk', '') if instance else ''))
-    final_desc = description or f"[{action}] {resource_type} ({final_resource_id})"
+    if not final_resource_id and instance:
+        final_resource_id = str(getattr(instance, 'pk', ''))
+    final_desc = description or f"[{final_action}] {final_resource_type} ({final_resource_id})"
 
     # 6. Persist to dedicated tenant DB
     audit_event = TenantAuditEvent.objects.using(target_db).create(
@@ -289,8 +363,8 @@ def emit_audit_event(
         company_entity_id=final_ce_id,
         location_id=final_loc_id,
         branch_id=final_br_id,
-        action=action,
-        resource_type=resource_type,
+        action=final_action,
+        resource_type=final_resource_type,
         resource_id=final_resource_id,
         description=final_desc,
         before_state=sanitized_before,
@@ -301,5 +375,34 @@ def emit_audit_event(
         correlation_id=correlation_id,
         source_application=source_application,
     )
+
+    # 7. Bridge to Canonical ActivityAuditLog for complete unified CRM visibility
+    try:
+        from .audit_engine import UnifiedAuditEngine
+        mod = 'ADMINISTRATION' if any(kw in final_resource_type.upper() for kw in ['ROLE', 'PERMISSION', 'BRANCH', 'LOCATION', 'ORGANIZATION', 'SETTING', 'TENANTUSER', 'SECURITY']) else (
+            'MEMBERS' if 'MEMBER' in final_resource_type.upper() else 'GENERAL'
+        )
+        action_code = final_action if '.' in final_action else f"{final_resource_type.upper()}.{final_action.upper()}"
+        UnifiedAuditEngine.record_activity(
+            action_code=action_code,
+            module=mod,
+            entity_type=final_resource_type,
+            entity_id=final_resource_id,
+            request=request,
+            actor_user=actor_obj,
+            actor_type='ADMIN' if resolved_actor_type in ['SUPER_ADMIN', 'ADMIN'] else 'STAFF',
+            actor_email=resolved_actor_email,
+            actor_role=kwargs.get('actor_roles') or getattr(actor_obj, 'role', ''),
+            instance=instance,
+            before_state=sanitized_before,
+            after_state=sanitized_after,
+            event_description=final_desc,
+            metadata=kwargs.get('metadata'),
+            branch_id=final_br_id,
+            organization_id=final_org_id,
+            db_alias=target_db,
+        )
+    except Exception as bridge_err:
+        logger.warning(f"Failed to mirror TenantAuditEvent to ActivityAuditLog: {bridge_err}")
 
     return audit_event

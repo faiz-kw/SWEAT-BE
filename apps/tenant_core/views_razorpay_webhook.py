@@ -92,6 +92,29 @@ class RazorpayWebhookView(APIView):
                 "Razorpay webhook signature verification failed for tenant=%s (db=%s)",
                 tenant_slug or 'global', db_alias
             )
+            if db_alias != 'default':
+                try:
+                    from .audit_engine import UnifiedAuditEngine
+                    UnifiedAuditEngine.record_activity(
+                        action_code='RAZORPAY.SIGNATURE_FAILED',
+                        action_category='SECURITY',
+                        action_verb='rejected webhook signature',
+                        module='COMMERCE',
+                        submodule='PAYMENTS',
+                        entity_type='WebhookEvent',
+                        entity_name=f"Razorpay Webhook ({data.get('event') or 'unknown'})",
+                        actor_type='WEBHOOK',
+                        actor_name='Razorpay Gateway',
+                        source_channel='WEBHOOK',
+                        result='FAILURE',
+                        error_code='RAZORPAY_SIGNATURE_INVALID',
+                        error_message='Webhook HMAC signature verification failed.',
+                        event_description=f"Security alert: Rejected Razorpay webhook ({data.get('event') or 'unknown'}) due to invalid HMAC signature.",
+                        request=request,
+                        db_alias=db_alias,
+                    )
+                except Exception:
+                    pass
             return Response(
                 {'error': 'Invalid webhook signature.', 'code': 'RAZORPAY_SIGNATURE_INVALID'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -139,6 +162,34 @@ class RazorpayWebhookView(APIView):
                     db_alias=db_alias,
                     raw_event=data,
                 )
+                try:
+                    from .audit_engine import UnifiedAuditEngine
+                    amount_inr = float(payment_entity.get('amount', 0)) / 100.0
+                    UnifiedAuditEngine.record_activity(
+                        action_code='RAZORPAY.PAYMENT_CAPTURED',
+                        action_category='COMMERCE',
+                        action_verb='captured payment',
+                        module='COMMERCE',
+                        submodule='PAYMENTS',
+                        entity_type='PaymentTransaction',
+                        entity_id=rzp_payment_id,
+                        entity_name=f"Razorpay Payment {rzp_payment_id}",
+                        actor_type='WEBHOOK',
+                        actor_name='Razorpay Gateway',
+                        source_channel='WEBHOOK',
+                        result='SUCCESS',
+                        event_description=f"Razorpay webhook captured payment {rzp_payment_id} for order {rzp_order_id} (₹{amount_inr:.2f}).",
+                        metadata={
+                            'razorpay_order_id': rzp_order_id,
+                            'razorpay_payment_id': rzp_payment_id,
+                            'amount_inr': amount_inr,
+                            'event': event,
+                        },
+                        request=request,
+                        db_alias=db_alias,
+                    )
+                except Exception:
+                    pass
                 return Response({
                     'status': 'ok',
                     'event': event,
@@ -165,6 +216,40 @@ class RazorpayWebhookView(APIView):
                 ).update(
                     status='FAILED'
                 )
+
+            # Audit logging for payment failure webhook
+            try:
+                from .audit_engine import UnifiedAuditEngine
+                error_desc = payment_entity.get('error_description') or 'Payment failed on Razorpay'
+                error_code = payment_entity.get('error_code') or 'PAYMENT_FAILED'
+                amount_inr = float(payment_entity.get('amount', 0)) / 100.0
+                UnifiedAuditEngine.record_activity(
+                    action_code='COMMERCE.PAYMENT_FAILED',
+                    action_category='COMMERCE',
+                    action_verb='FAILED',
+                    module='COMMERCE',
+                    submodule='PAYMENTS',
+                    entity_type='PaymentTransaction',
+                    entity_id=rzp_payment_id,
+                    entity_name=f"Razorpay Payment {rzp_payment_id}",
+                    actor_type='WEBHOOK',
+                    actor_name='Razorpay Gateway',
+                    source_channel='WEBHOOK',
+                    result='FAILURE',
+                    error_code=error_code,
+                    error_message=error_desc,
+                    event_description=f"Razorpay webhook payment {rzp_payment_id} for order {rzp_order_id} (₹{amount_inr:.2f}) FAILED. Error: {error_desc}.",
+                    metadata={
+                        'razorpay_payment_id': rzp_payment_id,
+                        'razorpay_order_id': rzp_order_id,
+                        'amount_inr': amount_inr,
+                        'method': payment_entity.get('method'),
+                    },
+                    db_alias=db_alias,
+                )
+            except Exception as log_err:
+                logger.warning(f"Failed to record payment failed audit: {log_err}")
+
             return Response({'status': 'ok', 'event': event}, status=status.HTTP_200_OK)
 
         # Acknowledge other events

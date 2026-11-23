@@ -101,7 +101,7 @@ class LeadAssignmentEligibilityService:
             'profile__employee_profile',
         ).select_related('home_branch')
 
-        if excluded_users:
+        if excluded_users and not include_unavailable:
             qs = qs.exclude(id__in=list(excluded_users))
 
         # Pre-resolve all roles granting canonical lead management permission in a single fast query
@@ -196,15 +196,22 @@ class LeadAssignmentEligibilityService:
             else:
                 candidate_roles = [ra.role for ra in branch_matching_ras]
                 for r in candidate_roles:
-                    if r.id in crm_lead_role_ids or getattr(r, 'code', '') == 'ORG_ADMIN':
+                    if r.id in crm_lead_role_ids or getattr(r, 'code', '') in ('ORG_ADMIN', 'SALES_REP', 'BRANCH_MANAGER'):
                         has_lead_permission = True
                         perm_granting_role = r
                         break
 
-            # Optional secondary business restriction (CRMAgentAssignmentConfig.allowed_role_codes)
+            # Secondary business restriction: CRMAgentAssignmentConfig.allowed_role_codes
+            # If allowed_roles is configured in CRM Setup, the representative MUST possess an active role matching allowed_roles.
+            # Page access ('crm.leads.view' or 'crm.leads.edit') or superuser status alone does NOT grant lead assignment eligibility.
             matches_tenant_role_restriction = True
-            if allowed_roles and not allow_all_staff_fallback and not getattr(user, 'is_superuser', False):
-                matches_tenant_role_restriction = any(ra.role.code in allowed_roles for ra in branch_matching_ras)
+            if allowed_roles:
+                matches_tenant_role_restriction = any(
+                    ra.role and ra.role.code in allowed_roles for ra in active_ras
+                )
+
+            # Individual user exclusion check: Active for Assignment toggle in CRM Setup
+            is_excluded_by_config = str(user.id) in excluded_users
 
             # Determine primary role for display purposes (role_label / role_code)
             display_ra = None
@@ -243,17 +250,21 @@ class LeadAssignmentEligibilityService:
                 avail_status = 'NO_PERMISSION'
                 avail_reason = 'User has no active role assignments in organization'
                 is_available = False
-            elif not has_branch_match:
-                avail_status = 'OUTSIDE_BRANCH'
-                avail_reason = f"User is not assigned to branch '{branch.name if branch else branch_id}'"
+            elif not matches_tenant_role_restriction:
+                avail_status = 'ROLE_RESTRICTED'
+                avail_reason = 'User role is not enabled to receive leads in CRM Setup'
+                is_available = False
+            elif is_excluded_by_config:
+                avail_status = 'EXCLUDED'
+                avail_reason = 'User is marked inactive for lead assignment in CRM Setup'
                 is_available = False
             elif not has_lead_permission:
                 avail_status = 'NO_PERMISSION'
                 avail_reason = f"User lacks required effective permission '{cls.CANONICAL_LEAD_PERMISSION}'"
                 is_available = False
-            elif not matches_tenant_role_restriction:
-                avail_status = 'ROLE_RESTRICTED'
-                avail_reason = 'Role not included in tenant allowed assignment roles'
+            elif not has_branch_match:
+                avail_status = 'OUTSIDE_BRANCH'
+                avail_reason = f"User is not assigned to branch '{branch.name if branch else branch_id}'"
                 is_available = False
             elif is_on_leave:
                 avail_status = 'ON_LEAVE'
@@ -675,6 +686,38 @@ class LeadAssignmentExecutionService:
                 idempotency_key=f"lead_assigned:{lead.id}:{assigned_to_user.id}:{new_assign.id}",
                 db_alias=alias,
             )
+
+            # Record in LeadTransferBatch for Pipeline Transfers & Audit Log
+            if prev_user != assigned_to_user:
+                try:
+                    from .models_crm import LeadTransferBatch, TrialBooking, SalesFollowupTask
+                    from .services_lead_transfer import get_user_display_name
+
+                    trials_cnt = TrialBooking.objects.using(alias).filter(lead=lead).count()
+                    tasks_cnt = SalesFollowupTask.objects.using(alias).filter(lead=lead, status__in=['PENDING', 'IN_PROGRESS']).count()
+
+                    t_mode = 'TAKEOVER' if assignment_strategy == 'TAKEOVER' else ('ROUND_ROBIN' if assignment_source == 'AUTO' else 'INDIVIDUAL')
+                    LeadTransferBatch.objects.using(alias).create(
+                        organization=lead.organization,
+                        source_user=prev_user,
+                        source_user_name=get_user_display_name(prev_user) if prev_user else 'Unassigned',
+                        target_users_summary=[{
+                            'user_id': str(assigned_to_user.id),
+                            'user_name': get_user_display_name(assigned_to_user),
+                            'leads_count': 1,
+                            'percentage': 100.0,
+                        }],
+                        transfer_mode=t_mode,
+                        leads_count=1,
+                        trials_count=trials_cnt,
+                        followups_count=tasks_cnt,
+                        affected_lead_ids=[str(lead.id)],
+                        reason=reason or (f"Reassigned to {get_user_display_name(assigned_to_user)}" if prev_user else f"Assigned to {get_user_display_name(assigned_to_user)}"),
+                        performed_by_user=actor_user,
+                        status='COMPLETED',
+                    )
+                except Exception as log_exc:
+                    logger.warning("Failed to record LeadTransferBatch for assignment of lead %s: %s", lead.id, log_exc)
 
             return new_assign
 

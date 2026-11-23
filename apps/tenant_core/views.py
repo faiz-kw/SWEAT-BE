@@ -248,6 +248,12 @@ class TenantDBMixin:
                             status='INACTIVE', is_active=False, is_primary=False
                         )
             else:
+                clear_home = (
+                    data.get('clear_home_branch') is True
+                    or ('home_branch' in data and not data.get('home_branch'))
+                    or ('primary_branch_id' in data and not data.get('primary_branch_id'))
+                    or (str(branch_id).lower() in ('all', 'none', 'null', ''))
+                )
                 if br_obj:
                     instance.home_branch = br_obj
                     instance.save(using=db, update_fields=['home_branch'])
@@ -260,9 +266,13 @@ class TenantDBMixin:
                         RoleAssignment.objects.using(db).filter(
                             user=instance, is_active=True, role__scope='BRANCH', branch_id=old_branch_id,
                         ).update(branch=br_obj, scope_type='BRANCH')
+                elif clear_home and ('home_branch' in data or 'primary_branch_id' in data or 'clear_home_branch' in data):
+                    instance.home_branch = None
+                    instance.save(using=db, update_fields=['home_branch'])
+                    UserBranch.objects.using(db).filter(user=instance).update(status='INACTIVE', is_active=False, is_primary=False)
 
                 existing_role = role_obj and RoleAssignment.objects.using(db).filter(user=instance, role=role_obj, is_active=True).exists()
-                if role_obj and (br_obj or not existing_role):
+                if role_obj and (br_obj or not existing_role or clear_home):
                     RoleAssignment.objects.using(db).filter(user=instance, is_active=True).update(is_active=False, status='INACTIVE')
                     assigned_branch = instance.home_branch if role_obj.scope == 'BRANCH' else None
                     RoleAssignment.objects.using(db).create(
@@ -834,8 +844,8 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
         from .models_workforce import EmployeeProfile
         from .models_memberships import Membership
 
-        # Fast direct staff filter using indexed user_type and relationships
-        qs = qs.filter(user_type='STAFF').select_related(
+        # Fast direct staff filter: include staff and trainers while strictly excluding customer members and leads
+        qs = qs.exclude(user_type__in=['MEMBER', 'LEAD']).select_related(
             'organization', 'home_branch', 'home_branch__location', 'profile'
         )
 
@@ -1006,7 +1016,7 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
                 if role_obj is None:
                     raise ValidationError({'role_id': 'Select a valid role.'})
 
-            if role_obj and instance.organization_id != role_obj.organization_id:
+            if role_obj and role_obj.organization_id and instance.organization_id != role_obj.organization_id:
                 instance.organization = role_obj.organization
                 instance.save(using=db, update_fields=['organization'])
 
@@ -1036,7 +1046,7 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
 
             branch_id = data.get('home_branch') or data.get('primary_branch_id') or data.get('branch_id') or data.get('branch')
             br_obj = None
-            if branch_id:
+            if branch_id and str(branch_id).lower() not in ('all', 'none', 'null', ''):
                 try:
                     br_obj = Branch.objects.using(db).filter(id=uuid.UUID(str(branch_id))).first()
                 except (ValueError, TypeError, AttributeError):
@@ -1071,6 +1081,12 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
                 except Exception as sync_e:
                     logger.warning("Failed to sync updated username for %s: %s", instance.email, sync_e)
 
+            clear_home = (
+                data.get('clear_home_branch') is True
+                or ('home_branch' in data and not data.get('home_branch'))
+                or ('primary_branch_id' in data and not data.get('primary_branch_id'))
+                or (str(branch_id).lower() in ('all', 'none', 'null', ''))
+            )
             if br_obj:
                 instance.home_branch = br_obj
                 instance.save(using=db, update_fields=['home_branch'])
@@ -1084,17 +1100,30 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
                     RoleAssignment.objects.using(db).filter(
                         user=instance, is_active=True, role__scope='BRANCH', branch_id=old_branch_id,
                     ).update(branch=br_obj, scope_type='BRANCH')
+            elif clear_home and ('home_branch' in data or 'primary_branch_id' in data or 'clear_home_branch' in data):
+                instance.home_branch = None
+                instance.save(using=db, update_fields=['home_branch'])
+                UserBranch.objects.using(db).filter(user=instance, scope_type='HOME').update(status='INACTIVE', is_active=False, is_primary=False)
 
             existing_role = role_obj and RoleAssignment.objects.using(db).filter(user=instance, role=role_obj, is_active=True).exists()
-            if role_obj and branch_access is None and (br_obj or not existing_role):
+            if role_obj and branch_access is None and (br_obj or not existing_role or clear_home):
                 RoleAssignment.objects.using(db).filter(user=instance, is_active=True).update(is_active=False, status='INACTIVE')
                 assigned_branch = instance.home_branch if role_obj.scope == 'BRANCH' else None
-                RoleAssignment.objects.using(db).create(
-                    organization=instance.organization, user=instance, role=role_obj,
-                    branch=assigned_branch,
-                    scope_type='BRANCH' if assigned_branch else 'ORGANIZATION',
-                    status='ACTIVE', is_active=True,
-                )
+                ra = RoleAssignment.objects.using(db).filter(
+                    organization=instance.organization, user=instance, role=role_obj, branch=assigned_branch,
+                ).first()
+                if ra:
+                    ra.status = 'ACTIVE'
+                    ra.is_active = True
+                    ra.scope_type = 'BRANCH' if assigned_branch else 'ORGANIZATION'
+                    ra.save(using=db, update_fields=['status', 'is_active', 'scope_type', 'updated_at'])
+                else:
+                    RoleAssignment.objects.using(db).create(
+                        organization=instance.organization, user=instance, role=role_obj,
+                        branch=assigned_branch,
+                        scope_type='BRANCH' if assigned_branch else 'ORGANIZATION',
+                        status='ACTIVE', is_active=True,
+                    )
 
             if branch_access is not None:
                 for branch_obj, enabled in resolved_access:
@@ -1110,6 +1139,24 @@ class TenantUserViewSet(TenantScopeMixin, TenantDBMixin, viewsets.ModelViewSet):
                     assignment.status = 'ACTIVE' if enabled else 'INACTIVE'
                     assignment.scope_type = 'BRANCH'
                     assignment.save(using=db)
+
+                    is_pri = (branch_obj == br_obj or branch_obj.id == instance.home_branch_id) if enabled else False
+                    if enabled:
+                        UserBranch.objects.using(db).update_or_create(
+                            user=instance,
+                            branch=branch_obj,
+                            defaults={
+                                'is_primary': is_pri,
+                                'scope_type': 'HOME' if is_pri else 'ADDITIONAL',
+                                'relationship_type': 'PRIMARY' if is_pri else 'SECONDARY',
+                                'status': 'ACTIVE',
+                                'is_active': True,
+                            }
+                        )
+                    else:
+                        UserBranch.objects.using(db).filter(user=instance, branch=branch_obj).update(
+                            status='INACTIVE', is_active=False, is_primary=False
+                        )
 
             # Update department if provided
             dept_id = data.get('department_id') or data.get('department')
@@ -1726,6 +1773,35 @@ class RoleViewSet(TenantDBMixin, viewsets.ModelViewSet):
                         defaults={'granted': granted}
                     )
 
+            # Audit logging for permissions matrix update
+            try:
+                from .audit_engine import UnifiedAuditEngine
+                actor_user = getattr(request, 'user', None)
+                UnifiedAuditEngine.record_activity(
+                    action_code='ACCESS_CONTROL.PERMISSIONS_UPDATED',
+                    action_category='ACCESS_CONTROL',
+                    action_verb='UPDATED',
+                    module='ACCESS_CONTROL',
+                    submodule='ROLES',
+                    entity_type='Role',
+                    entity_id=str(role.id),
+                    entity_name=role.name,
+                    actor_user=actor_user if isinstance(actor_user, TenantUser) else None,
+                    actor_type='ADMIN',
+                    request=request,
+                    organization=org,
+                    reason='Admin updated role permission matrix',
+                    event_description=f"Role permission matrix updated for '{role.name}'. Updated {len(permissions_data)} permissions, {len(module_access_data)} modules, {len(submodule_access_data)} submodules.",
+                    metadata={
+                        'permissions_count': len(permissions_data),
+                        'modules_count': len(module_access_data),
+                        'submodules_count': len(submodule_access_data),
+                    },
+                    db_alias=db,
+                )
+            except Exception as log_err:
+                logger.warning(f"Failed to record role permissions audit: {log_err}")
+
             # Return refreshed role data
             serializer = self.get_serializer(role)
             return Response(serializer.data, status=status.HTTP_200_OK)
@@ -2024,8 +2100,16 @@ class PermissionViewSet(TenantDBMixin, viewsets.ReadOnlyModelViewSet):
         db = self.get_db()
         try:
             from .models_rbac import Permission
-            # Auto-seed canonical permissions if missing so all modules appear on UI
-            if Permission.objects.using(db).filter(is_active=True).count() < 100:
+            from .security_utils import SENSITIVE_PERMISSION_CODES
+            # Auto-seed canonical permissions if missing so all modules & privacy controls appear on UI
+            existing_sensitive = Permission.objects.using(db).filter(
+                permission_code__in=list(SENSITIVE_PERMISSION_CODES),
+                is_active=True,
+            ).count()
+            if (
+                Permission.objects.using(db).filter(is_active=True).count() < 100
+                or existing_sensitive < len(SENSITIVE_PERMISSION_CODES)
+            ):
                 from .rbac_defaults import sync_default_role_permissions
                 sync_default_role_permissions(db_alias=db, overwrite_custom=False)
         except Exception as e:

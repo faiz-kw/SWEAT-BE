@@ -70,6 +70,7 @@ from .services_bookings import BookingWaitlistAttendanceService, ParqRequiredVal
 from .services_memberships import MembershipLifecycleService
 from .services_discounts import DiscountCouponEngineService
 from .services_crm import CRMLeadService
+from .views_members import format_program_package_name
 
 logger = logging.getLogger(__name__)
 
@@ -799,29 +800,49 @@ class MobileMeView(APIView):
         profile = _get_or_create_user_profile(user, alias)
 
         # Resolve active membership and session units
+        _me_now = timezone.now().date()  # running-first-fix
         active_membership = (
             Membership.objects.using(alias)
-            .filter(
-                user_profile=profile,
-                status='ACTIVE',
-                end_date__gte=timezone.now().date(),
-            )
+            .filter(user_profile=profile, status='ACTIVE', end_date__gte=_me_now)
+            .filter(models.Q(start_date__lte=_me_now) | models.Q(start_date__isnull=True))
             .select_related('package', 'package_version', 'purchase_branch', 'home_branch')
-            .order_by('-created_at')
+            .order_by('end_date', '-created_at')
+            .first()
+        ) or (
+            Membership.objects.using(alias)
+            .filter(user_profile=profile, status='ACTIVE', end_date__gte=_me_now)
+            .select_related('package', 'package__program', 'program', 'package_version', 'purchase_branch', 'home_branch')
+            .order_by('start_date', '-created_at')
+            .first()
+        ) or (
+            Membership.objects.using(alias)
+            .filter(user_profile=profile, status='FROZEN', end_date__gte=_me_now)
+            .select_related('package', 'package__program', 'program', 'package_version', 'purchase_branch', 'home_branch')
+            .order_by('end_date', '-created_at')
             .first()
         )
 
         membership_data = None
         if active_membership:
-            entitlements = _primary_entitlements(active_membership.entitlements.using(alias).filter(status='ACTIVE'))
+            entitlements = _primary_entitlements(active_membership.entitlements.using(alias).filter(status__in=['ACTIVE', 'FROZEN']))
             total_allocated = sum(e.allocated_units for e in entitlements)
             total_consumed = sum(e.consumed_units for e in entitlements)
             total_remaining = max(Decimal('0'), total_allocated - total_consumed)
             days_left = max(0, (active_membership.end_date - timezone.now().date()).days)
 
+            _prog = active_membership.program or (active_membership.package.program if active_membership.package else None)
+            _prog_name = _prog.name if _prog else ''
+            _pkg_name = active_membership.package.name if active_membership.package else ''
+            _disp_name = format_program_package_name(_prog_name, _pkg_name)
+
             membership_data = {
                 'membership_id': str(active_membership.id),
-                'package_name': active_membership.package.name,
+                'package_name': _disp_name,
+                'raw_package_name': _pkg_name,
+                'program_name': _prog_name,
+                'display_package_name': _disp_name,
+                'status': active_membership.status,
+                'is_frozen': active_membership.status == 'FROZEN',
                 'allocated_sessions': float(total_allocated),
                 'consumed_sessions': float(total_consumed),
                 'remaining_sessions': float(total_remaining),
@@ -830,6 +851,40 @@ class MobileMeView(APIView):
                 'days_remaining': days_left,
                 'near_expiry': days_left <= 7 or total_remaining <= Decimal('2.0'),
             }
+
+        # All currently-running memberships (so the app can show EVERY active pack, not just the primary)
+        active_memberships_list = []
+        for _m in (Membership.objects.using(alias)
+                   .filter(user_profile=profile, status__in=['ACTIVE', 'FROZEN'], end_date__gte=_me_now)
+                   .filter(models.Q(start_date__lte=_me_now) | models.Q(start_date__isnull=True))
+                   .select_related('package', 'package__program', 'program', 'home_branch')
+                   .order_by('end_date', '-created_at')):
+            _ents = _primary_entitlements(_m.entitlements.using(alias).filter(status__in=['ACTIVE', 'FROZEN']))
+            _alloc = sum(e.allocated_units for e in _ents)
+            _cons = sum(e.consumed_units for e in _ents)
+            _rem = max(Decimal('0'), _alloc - _cons)
+            _dl = max(0, (_m.end_date - timezone.now().date()).days) if _m.end_date else 0
+            _p = _m.program or (_m.package.program if _m.package else None)
+            _p_name = _p.name if _p else ''
+            _pk_name = _m.package.name if _m.package else ''
+            _d_name = format_program_package_name(_p_name, _pk_name)
+            active_memberships_list.append({
+                'membership_id': str(_m.id),
+                'package_name': _d_name,
+                'raw_package_name': _pk_name,
+                'program_name': _p_name,
+                'display_package_name': _d_name,
+                'status': _m.status,
+                'is_frozen': _m.status == 'FROZEN',
+                'allocated_sessions': float(_alloc),
+                'consumed_sessions': float(_cons),
+                'remaining_sessions': float(_rem),
+                'start_date': _m.start_date.isoformat() if _m.start_date else None,
+                'end_date': _m.end_date.isoformat() if _m.end_date else None,
+                'days_remaining': _dl,
+                'near_expiry': _dl <= 7 or _rem <= Decimal('2.0'),
+                'home_branch': _m.home_branch.name if _m.home_branch else None,
+            })
 
         # Check if 1 free trial session was already redeemed
         has_trial = (
@@ -840,12 +895,38 @@ class MobileMeView(APIView):
             ).exists()
         )
 
-        total_remaining_credits = float(membership_data.get('remaining_sessions', 0.0)) if membership_data else 0.0
+        if active_memberships_list:
+            total_remaining_credits = sum(float(m.get('remaining_sessions', 0.0) or 0.0) for m in active_memberships_list)
+        else:
+            total_remaining_credits = float(membership_data.get('remaining_sessions', 0.0)) if membership_data else 0.0
         active_branch = (
-            (active_membership.purchase_branch or active_membership.home_branch)
+            (active_membership.home_branch or active_membership.purchase_branch)
             if active_membership else None
         )
         resolved_branch = active_branch or getattr(profile, 'preferred_branch', None) or getattr(user, 'home_branch', None)
+
+        # Passport (cross-branch) sessions aggregated across ALL active memberships. Passport
+        # can live on a different pack than the one in `active_membership` (the newest), so it
+        # must be summed across every active pack rather than read from a single membership.
+        from .models_memberships import MembershipEntitlement as _MEnt
+        _today_me = timezone.now().date()
+        _passport_remaining = Decimal('0')
+        _passport_unlimited = False
+        for _pe in _MEnt.objects.using(alias).filter(
+            membership__user_profile=profile,
+            membership__status='ACTIVE',
+            membership__end_date__gte=_today_me,
+            status='ACTIVE',
+            entitlement_type__in=['CROSS_BRANCH', 'CROSS_BRANCH_SESSION'],
+        ):
+            if getattr(_pe, 'is_unlimited', False):
+                _passport_unlimited = True
+            else:
+                _passport_remaining += (_pe.remaining_units or Decimal('0'))
+        passport_sessions = 'Unlimited' if _passport_unlimited else float(_passport_remaining)
+        active_packs_count = Membership.objects.using(alias).filter(
+            user_profile=profile, status='ACTIVE', end_date__gte=_today_me
+        ).count()
 
         return Response({
             'user': {
@@ -878,6 +959,9 @@ class MobileMeView(APIView):
             'credits': total_remaining_credits,
             'credits_available': total_remaining_credits,
             'active_membership': membership_data,
+            'active_memberships': active_memberships_list,
+            'passport_sessions': passport_sessions,
+            'active_packs_count': active_packs_count,
             'free_trial_redeemed': has_trial,
         })
 
@@ -1275,6 +1359,9 @@ class MobileScheduleView(APIView):
         user_home_ent = None
         user_booking_map = {}
         included_class_ids = None
+        member_home_branch_ids = set()
+        member_has_passport = False
+        member_has_passport_entitlement = False
 
         if user:
             user_profile = _get_or_create_user_profile(user, alias)
@@ -1302,11 +1389,14 @@ class MobileScheduleView(APIView):
                     prog = m.program or (m.package.program if m.package else None)
                     if prog and str(prog.id) not in purchased_program_ids:
                         purchased_program_ids.add(str(prog.id))
+                        _p_name = prog.name if prog else ''
+                        _pk_name = m.package.name if m.package else ''
                         purchased_programs.append({
                             'id': str(prog.id),
                             'name': prog.name,
                             'package_id': str(m.package.id) if m.package else '',
-                            'package_name': m.package.name if m.package else '',
+                            'package_name': _pk_name,
+                            'display_package_name': format_program_package_name(_p_name, _pk_name),
                             'membership_id': str(m.id),
                         })
 
@@ -1333,6 +1423,17 @@ class MobileScheduleView(APIView):
                         rule_ids = {str(r.class_template_id) for r in rules if r.class_template_id}
                         if rule_ids:
                             included_class_ids = rule_ids
+
+        # Branch restriction is the ONLY access gate in this system (no package->class rules exist).
+        # Eligibility must consider ALL the member's active packs, not just the primary one.
+        member_home_branch_ids = {str(m.home_branch_id) for m in active_mems if m.home_branch_id}
+        for _m in active_mems:
+            for _e in _m.entitlements.using(alias).filter(status='ACTIVE', entitlement_type__in=['CROSS_BRANCH_SESSION', 'CROSS_BRANCH']):
+                member_has_passport_entitlement = True
+                if _e.is_unlimited or (_e.remaining_units or 0) > 0:
+                    member_has_passport = True
+            if member_has_passport:
+                break
 
         branch_id_param = request.query_params.get('branch_id')
         category_id = request.query_params.get('category_id')
@@ -1579,13 +1680,16 @@ class MobileScheduleView(APIView):
             if hide_full and not is_bookable:
                 continue
 
-            # Trainer details
+            # Trainer details.
+            # When no trainer is assigned we return TRUTHFUL empty values (no fake Pilates
+            # specialties/bio/photo) so the app can show its own fallback (e.g. company logo)
+            # and never prints "Reformer Pilates" on a non-Pilates class.
             trainer_name = 'SWEAT Trainer'
             trainer_photo = ''
-            trainer_title = 'Master Coach'
-            trainer_bio = 'Certified Reformer Pilates & Conditioning Specialist.'
-            trainer_specialties = ['Reformer Pilates', 'Strength & Core', 'Postural Alignment']
-            trainer_experience = 5.0
+            trainer_title = ''
+            trainer_bio = ''
+            trainer_specialties = []
+            trainer_experience = 0.0
 
             trainer_assignment = occ.trainer_assignments.filter(trainer_role='LEAD').first() or occ.trainer_assignments.first()
             if trainer_assignment and trainer_assignment.trainer_profile:
@@ -1614,7 +1718,7 @@ class MobileScheduleView(APIView):
                 cat_credits = getattr(template.category, 'credits', None)
             required_credits = float(cat_credits) if (cat_credits is not None and float(cat_credits) > 0) else 1.0
 
-            is_cross_branch = bool(active_mem and active_mem.home_branch and occ.branch_id != active_mem.home_branch_id)
+            is_cross_branch = bool(active_mem and occ.branch_id and str(occ.branch_id) not in member_home_branch_ids)
             can_raise_ticket = False
             can_purchase_passport = False
             is_included = True
@@ -1632,25 +1736,17 @@ class MobileScheduleView(APIView):
                 else:
                     # Session based membership
                     if is_cross_branch:
-                        if not user_passport_ent or (not user_passport_ent.is_unlimited and (user_passport_ent.allocated_units is None or user_passport_ent.allocated_units <= 0)):
-                            is_included = False
-                            ineligible_reason = "Your package does not include any passport session. Raise a ticket for purchase."
-                            can_raise_ticket = True
-                        elif not user_passport_ent.is_unlimited and (user_passport_ent.remaining_units or 0) <= 0:
-                            home_rem = float(user_home_ent.remaining_units or 0) if (user_home_ent and not user_home_ent.is_unlimited) else (999.0 if (user_home_ent and user_home_ent.is_unlimited) else 0.0)
-                            if home_rem > 0:
-                                is_included = False
-                                ineligible_reason = "All passport sessions have been consumed. You can purchase additional passport sessions to book at this branch."
-                                can_purchase_passport = True
-                            else:
-                                is_included = False
-                                ineligible_reason = "No remaining session credits in your active pack. Please renew or purchase a new pack."
-                        elif user_home_ent and not user_home_ent.is_unlimited and (user_home_ent.remaining_units or 0) <= 0:
-                            is_included = False
-                            ineligible_reason = "No remaining session credits in your active pack. Please renew or purchase a new pack."
-                        else:
+                        if member_has_passport:
                             is_included = True
                             ineligible_reason = None
+                        elif member_has_passport_entitlement:
+                            is_included = False
+                            ineligible_reason = "All passport (cross-branch) sessions have been consumed. Purchase additional passport sessions to book at this branch."
+                            can_purchase_passport = True
+                        else:
+                            is_included = False
+                            ineligible_reason = "This class is at a branch your membership doesn't cover. A cross-branch (passport) session is required."
+                            can_raise_ticket = True
                     else:
                         is_included = (str(template.id) in included_class_ids) if (included_class_ids is not None and template) else True
                         if not is_included and template:
@@ -1661,10 +1757,13 @@ class MobileScheduleView(APIView):
             results.append({
                 'id': str(occ.id),
                 'class_id': str(template.id) if template else None,
-                'class_name': template.name if template else 'Reformer Session',
+                'class_name': template.name if template else 'SWEAT Class',
+                # Class/program image for the card. Empty when unset so the app shows the
+                # company-logo fallback instead of a generic Pilates placeholder.
+                'image_url': (template.image_url if (template and template.image_url) else ''),
                 'program_id': str(template.program_id) if (template and template.program_id) else None,
-                'program_name': template.program.name if (template and template.program) else (category.name if category else 'Pilates Reformer'),
-                'category': category.name if category else 'Pilates Reformer',
+                'program_name': template.program.name if (template and template.program) else (category.name if category else ''),
+                'category': category.name if category else '',
                 'category_id': str(category.id) if category else None,
                 'category_code': category.code if category else None,
                 'branch': {
@@ -2077,6 +2176,123 @@ class MobileClaimFreeTrialView(APIView):
         return Response(resp_data, status=status.HTTP_201_CREATED)
 
 
+class ExperienceStudioView(APIView):
+    """
+    POST /api/v1/mobile/experience-studio/
+    Captures a lead's 'Experience the Studio' visit intent: branch + date + preferred time + class.
+    LOOSE preference -- no capacity check, no slot held, and does NOT consume the free trial.
+    Stored as a TrialBooking(trial_type='STUDIO_EXPERIENCE') so it surfaces in the CRM lead
+    profile under a dedicated 'Experience the Studio' section.
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        from datetime import time as dt_time, timezone as dt_timezone
+        from zoneinfo import ZoneInfo
+        from .models_crm import Lead, LeadSource, TrialBooking
+
+        alias, tenant = _resolve_mobile_tenant_and_db(request)
+        if not alias or not tenant:
+            return Response(
+                {'detail': 'Organization not found or inactive. Please specify a valid organization.',
+                 'code': 'TENANT_NOT_FOUND'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        data = request.data or {}
+        first_name = (data.get('first_name') or data.get('name') or '').strip()
+        last_name = (data.get('last_name') or '').strip()
+        email = (data.get('email') or '').strip().lower()
+        phone = (data.get('phone') or data.get('contactNumber') or '').strip()
+        branch_id = data.get('branch_id') or data.get('branch')
+        date_str = data.get('date')
+        time_str = (data.get('time') or data.get('time_slot') or data.get('preferred_time') or '').strip()
+        class_name = (data.get('class') or data.get('class_name') or data.get('program') or '').strip()
+        program_id = data.get('program_id')
+
+        if not email and not phone:
+            return Response({'detail': 'Please provide your name and email or phone number.',
+                             'code': 'GUEST_INFO_REQUIRED'}, status=status.HTTP_400_BAD_REQUEST)
+        if not branch_id:
+            return Response({'detail': 'Please select a branch to visit.', 'code': 'BRANCH_REQUIRED'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        branch = Branch.objects.using(alias).filter(id=branch_id).first()
+        if not branch:
+            return Response({'detail': 'Branch not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Build the preferred visit time (branch tz -> UTC). Loose: just a preference.
+        tz_name = getattr(branch, 'timezone', None) or 'Asia/Kolkata'
+        try:
+            btz = ZoneInfo(tz_name)
+        except Exception:
+            btz = ZoneInfo('Asia/Kolkata')
+        try:
+            d = datetime.strptime(date_str[:10], '%Y-%m-%d').date() if date_str else timezone.now().date()
+        except Exception:
+            d = timezone.now().date()
+        start_t = None
+        for fmt in ('%H:%M', '%I:%M %p', '%I %p', '%H:%M:%S', '%I:%M%p'):
+            try:
+                start_t = datetime.strptime(time_str, fmt).time()
+                break
+            except Exception:
+                continue
+        if not start_t:
+            start_t = dt_time(10, 0)
+        start_dt = datetime.combine(d, start_t).replace(tzinfo=btz).astimezone(dt_timezone.utc)
+        end_dt = start_dt + timedelta(hours=1)
+
+        org = Organization.objects.using(alias).filter(status='ACTIVE').first()
+
+        # Resolve or create the lead.
+        lead = None
+        if email:
+            lead = Lead.objects.using(alias).filter(email_normalized__iexact=email).first()
+        if not lead and phone:
+            lead = Lead.objects.using(alias).filter(phone_normalized=re.sub(r'\D', '', phone)[-10:]).first()
+        if not lead:
+            lead_source, _ = LeadSource.objects.using(alias).get_or_create(
+                organization=org, code='MOBILE_APP',
+                defaults={'name': 'Mobile App', 'source_type': 'MOBILE_APP', 'status': 'ACTIVE'})
+            lead = CRMLeadService.create_lead(
+                organization=org, first_name=first_name or 'Guest', last_name=last_name,
+                phone=phone, email=email, branch=branch, lead_source=lead_source, db_alias=alias)
+
+        # Optional: record the class/program of interest on the lead.
+        if program_id:
+            from .models_catalog import Program
+            prog = Program.objects.using(alias).filter(id=program_id).first()
+            if prog and hasattr(lead, 'interested_program_id'):
+                lead.interested_program = prog
+                try:
+                    lead.save(using=alias, update_fields=['interested_program', 'updated_at'])
+                except Exception:
+                    lead.save(using=alias, update_fields=['interested_program'])
+
+        note = ("Experience the Studio - class of interest: %s" % class_name) if class_name else "Experience the Studio visit"
+        exp = TrialBooking.objects.using(alias).create(
+            lead=lead,
+            branch=branch,
+            trial_type='STUDIO_EXPERIENCE',
+            scheduled_start=start_dt,
+            scheduled_end=end_dt,
+            status='BOOKED',
+            confirmation_status='PENDING',
+            booking_source='MOBILE_APP',
+            notes=note,
+        )
+
+        return Response({
+            'id': str(exp.id),
+            'type': 'STUDIO_EXPERIENCE',
+            'branch': {'id': str(branch.id), 'name': branch.name},
+            'date': d.isoformat(),
+            'time': start_t.strftime('%H:%M'),
+            'class': class_name or None,
+            'lead_id': str(lead.id) if lead else None,
+            'message': 'Thanks! See you at the studio. Our team will reach out to confirm your visit.',
+        }, status=status.HTTP_201_CREATED)
+
+
 class MobileBookClassView(APIView):
     """
     POST /api/v1/mobile/bookings/book/
@@ -2285,7 +2501,8 @@ class MobileMyBookingsView(APIView):
             # Trainer info
             trainer_name = 'SWEAT Trainer'
             if occ:
-                trainer_rec = occ.trainer_assignments.filter(trainer_role='LEAD').first() or occ.trainer_assignments.first()
+                _tas = list(occ.trainer_assignments.all())
+                trainer_rec = next((a for a in _tas if a.trainer_role == 'LEAD'), None) or (_tas[0] if _tas else None)
                 if trainer_rec and trainer_rec.trainer_profile and getattr(trainer_rec.trainer_profile, 'employee_profile', None):
                     emp = trainer_rec.trainer_profile.employee_profile
                     if emp.user_profile and emp.user_profile.user:
@@ -2419,6 +2636,41 @@ class MobileCancelBookingView(APIView):
             else 'Booking cancelled. Session credit forfeited per gym policy.'
         )
 
+        # In-app notification to the member: class cancelled (+ whether the credit was restored).
+        try:
+            from zoneinfo import ZoneInfo
+            from .models_govern import InAppNotification
+            occ = booking.occurrence
+            tpl = occ.class_template if occ else None
+            cls_name = tpl.name if tpl else 'your class'
+            org = (tpl.category.organization if (tpl and tpl.category) else None) or getattr(user, 'organization', None)
+            when = ''
+            if occ and occ.start_at:
+                tz_name = getattr(booking.branch, 'timezone', None) or 'Asia/Kolkata'
+                try:
+                    when = ' on ' + occ.start_at.astimezone(ZoneInfo(tz_name)).strftime('%d %b, %I:%M %p')
+                except Exception:
+                    when = ''
+            if is_refunded:
+                msg = f"Your {cls_name} class{when} has been cancelled and 1 session credit has been restored to your account."
+                title = 'Class Cancelled - Credit Restored'
+            else:
+                msg = (f"Your {cls_name} class{when} has been cancelled. As it was within "
+                       f"{policy_eval.get('cutoff_hours', 12)} hours of the start time, the session was not refunded per studio policy.")
+                title = 'Class Cancelled'
+            if org and user:
+                InAppNotification.objects.using(alias).create(
+                    organization=org,
+                    user=user,
+                    notification_type='BOOKING_CANCELLED',
+                    title=title,
+                    message=msg,
+                    deep_link=f"/bookings?booking={booking.id}",
+                    data={'booking_id': str(booking.id), 'refunded': is_refunded},
+                )
+        except Exception as _notif_err:
+            logger.warning("Could not create cancellation in-app notification: %s", _notif_err)
+
         return Response({
             'detail': detail_msg,
             'booking_id': str(booking.id),
@@ -2429,6 +2681,47 @@ class MobileCancelBookingView(APIView):
             'refunded': is_refunded,
             'fee_applied': str(policy_eval['fee']),
         })
+
+
+class MobileNotificationsView(APIView):
+    """
+    GET  /api/v1/mobile/notifications/   -> member's in-app notifications + unread count.
+    POST /api/v1/mobile/notifications/   -> mark read: {"ids": [...]} or {"all": true}.
+    Powers the app's notification bell/inbox (e.g. class-cancelled / credit-restored alerts).
+    """
+    permission_classes = [IsAuthenticated]
+
+    def _alias(self, request):
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        return alias or getattr(request.user._state, 'db', None) or get_tenant_db_alias() or 'default'
+
+    def get(self, request):
+        alias = self._alias(request)
+        from .models_govern import InAppNotification
+        qs = InAppNotification.objects.using(alias).filter(user=request.user).order_by('-created_at')[:50]
+        unread = InAppNotification.objects.using(alias).filter(user=request.user, is_read=False).count()
+        items = [{
+            'id': str(n.id),
+            'type': n.notification_type,
+            'title': n.title,
+            'message': n.message,
+            'is_read': n.is_read,
+            'deep_link': n.deep_link,
+            'data': n.data,
+            'created_at': n.created_at.isoformat() if n.created_at else None,
+        } for n in qs]
+        return Response({'unread_count': unread, 'notifications': items})
+
+    def post(self, request):
+        alias = self._alias(request)
+        from .models_govern import InAppNotification
+        data = request.data or {}
+        qs = InAppNotification.objects.using(alias).filter(user=request.user, is_read=False)
+        if not data.get('all'):
+            ids = data.get('ids') or []
+            qs = qs.filter(id__in=ids)
+        marked = qs.update(is_read=True, read_at=timezone.now())
+        return Response({'marked_read': marked})
 
 
 class MobileRescheduleBookingView(APIView):
@@ -2772,7 +3065,7 @@ class MobilePackagesView(APIView):
                 has_avail_rules = PackageBranchAvailability.objects.using(alias).filter(package=pkg).exists()
                 if has_avail_rules:
                     is_avail = PackageBranchAvailability.objects.using(alias).filter(
-                        package=pkg, branch_id=branch_id, is_available=True
+                        package=pkg, branch_id=branch_id, status='ENABLED'
                     ).exists()
                     if not is_avail:
                         continue
@@ -2803,15 +3096,19 @@ class MobilePackagesView(APIView):
             elif session_count == 1:
                 badge = 'DROP-IN'
 
+            _pkg_prog_name = pkg.program.name if pkg.program else ''
+            _pkg_disp_name = format_program_package_name(_pkg_prog_name, pkg.name)
             results.append({
                 'id': str(pkg.id),
                 'package_version_id': str(latest_version.id),
                 'price_id': str(price_obj.id),
                 'name': pkg.name,
+                'display_name': _pkg_disp_name,
+                'display_package_name': _pkg_disp_name,
                 'code': pkg.code,
                 'description': latest_version.description_snapshot or getattr(pkg, 'description', '') or 'All-access Reformer Pilates package.',
                 'program_id': str(pkg.program_id) if pkg.program_id else None,
-                'program_name': pkg.program.name if pkg.program else '',
+                'program_name': _pkg_prog_name,
                 'program_code': pkg.program.code if pkg.program else '',
                 'sessions': 'Unlimited' if is_unlimited else session_count,
                 'session_count': None if is_unlimited else session_count,
@@ -2846,13 +3143,15 @@ class MobileMyCreditsView(APIView):
             .filter(
                 user_profile=profile,
             )
-            .select_related('package')
+            .select_related('package', 'package__program', 'program')
             .prefetch_related('entitlements')
             .order_by('-created_at')
         )
 
         packs = []
         total_remaining_credits = 0
+        active_remaining_credits = 0
+        frozen_remaining_credits = 0
 
         for m in memberships:
             entitlements = _primary_entitlements(m.entitlements.all())
@@ -2867,13 +3166,26 @@ class MobileMyCreditsView(APIView):
             if m.status == 'ACTIVE' and m.end_date and m.end_date < today:
                 effective_status = 'EXPIRED'
 
-            if effective_status == 'ACTIVE' and not is_unlimited:
+            if effective_status in ('ACTIVE', 'FROZEN') and not is_unlimited:
                 total_remaining_credits += int(remaining)
+                if effective_status == 'ACTIVE':
+                    active_remaining_credits += int(remaining)
+                elif effective_status == 'FROZEN':
+                    frozen_remaining_credits += int(remaining)
+
+            _m_prog = m.program or (m.package.program if m.package else None)
+            _m_prog_name = _m_prog.name if _m_prog else ''
+            _m_pkg_name = m.package.name if m.package else ''
+            _m_disp = format_program_package_name(_m_prog_name, _m_pkg_name)
 
             packs.append({
                 'membership_id': str(m.id),
-                'package_name': m.package.name,
+                'package_name': _m_disp,
+                'raw_package_name': _m_pkg_name,
+                'program_name': _m_prog_name,
+                'display_package_name': _m_disp,
                 'status': effective_status,
+                'is_frozen': effective_status == 'FROZEN',
                 'allocated_sessions': allocated,
                 'consumed_sessions': consumed,
                 'remaining_sessions': 'Unlimited' if is_unlimited else remaining,
@@ -2916,10 +3228,14 @@ class MobileMyCreditsView(APIView):
         packs.sort(key=lambda p: p['end_date'] or '', reverse=True)
         packs.sort(key=lambda p: status_rank.get(p['status'], 2))
         active_packs_count = sum(1 for p in packs if p['status'] == 'ACTIVE')
+        frozen_packs_count = sum(1 for p in packs if p['status'] == 'FROZEN')
 
         return Response({
             'total_credits_available': total_remaining_credits,
+            'active_credits': active_remaining_credits,
+            'frozen_credits': frozen_remaining_credits,
             'active_packs_count': active_packs_count,
+            'frozen_packs_count': frozen_packs_count,
             'packs': packs,
             'rewards_wallet': rewards_wallet,
             'reward_points': rewards_wallet,
@@ -3045,6 +3361,31 @@ class MobileDiscountCouponsView(APIView):
             alias = getattr(alias, 'db', None) or get_tenant_db_alias() or 'default'
 
         now = timezone.now()
+        req_package_id = request.query_params.get('package_id')
+        req_branch_id = request.query_params.get('branch_id')
+        req_subtotal = request.query_params.get('subtotal')
+        req_order_type = (request.query_params.get('order_type') or '').strip().upper() or None
+        req_member_id = request.query_params.get('member_id') or request.query_params.get('user_profile_id') or request.query_params.get('user_id')
+
+        # Authoritative member profile and lifecycle state resolution
+        profile = DiscountCouponEngineService.resolve_authoritative_member_profile(
+            req_member_id, request_user=request.user, db_alias=alias
+        )
+
+        member_lifecycle = None
+        if profile:
+            member_lifecycle = DiscountCouponEngineService.get_member_lifecycle_state(profile, alias)
+        elif req_order_type in ('NEW_MEMBERSHIP', 'NEW_PACKAGE', 'LEAD_CONVERSION', 'CONVERT_LEAD'):
+            member_lifecycle = 'NEW'
+        elif req_member_id:
+            from .models_crm import Lead as _LeadRef
+            if _LeadRef.objects.using(alias).filter(id=req_member_id).exists():
+                member_lifecycle = 'NEW'
+
+        req_program_id = None
+        if req_package_id:
+            from .models_catalog import Package as _PkgRef
+            req_program_id = _PkgRef.objects.using(alias).filter(id=req_package_id).values_list('program_id', flat=True).first()
         codes = (
             DiscountCode.objects.using(alias)
             .filter(
@@ -3062,6 +3403,62 @@ class MobileDiscountCouponsView(APIView):
         results = []
         for c in codes:
             camp = c.campaign
+            if isinstance(camp.configuration, dict) and camp.configuration.get('hidden'):
+                continue
+            if not camp.is_currently_valid():
+                continue
+            if camp.usage_limit:
+                redemption_count = getattr(camp, 'redemptions', None)
+                if redemption_count and redemption_count.count() >= camp.usage_limit:
+                    continue
+            _cfg = camp.configuration if isinstance(camp.configuration, dict) else {}
+            if req_package_id:
+                _code_pkg_id = str(c.package_id) if c.package_id else None
+                _cfg_pkg_ids = [str(x) for x in _cfg.get('package_ids', []) if x] if isinstance(_cfg.get('package_ids'), list) else []
+                _cfg_single_pkg_id = str(_cfg.get('package_id')) if (_cfg.get('package_id') and not _cfg_pkg_ids) else None
+                _allowed_pkgs = [_code_pkg_id] if _code_pkg_id else (_cfg_pkg_ids if _cfg_pkg_ids else ([_cfg_single_pkg_id] if _cfg_single_pkg_id else []))
+                _cfg_program_ids = [str(x) for x in _cfg.get('program_ids', []) if x] if isinstance(_cfg.get('program_ids'), list) else []
+
+                pkg_matches = False
+                if _allowed_pkgs and str(req_package_id) in _allowed_pkgs:
+                    pkg_matches = True
+                elif _cfg_program_ids and req_program_id and str(req_program_id) in _cfg_program_ids:
+                    pkg_matches = True
+                elif not _allowed_pkgs and not _cfg_program_ids:
+                    pkg_matches = True
+
+                if not pkg_matches:
+                    continue
+            if req_branch_id:
+                _code_branch_id = str(c.branch_id) if c.branch_id else None
+                _cfg_branch_ids = [str(x) for x in _cfg.get('branch_ids', []) if x] if isinstance(_cfg.get('branch_ids'), list) else []
+                _cfg_single_branch_id = str(_cfg.get('branch_id')) if (_cfg.get('branch_id') and not _cfg_branch_ids) else None
+                _allowed_branches = [_code_branch_id] if _code_branch_id else (_cfg_branch_ids if _cfg_branch_ids else ([_cfg_single_branch_id] if _cfg_single_branch_id else []))
+                if _allowed_branches and str(req_branch_id) not in _allowed_branches:
+                    continue
+            if req_subtotal:
+                try:
+                    subtotal_val = float(req_subtotal)
+                    if camp.minimum_order_amount and subtotal_val < float(camp.minimum_order_amount):
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            if req_order_type:
+                _aots = _cfg.get('order_types') if isinstance(_cfg.get('order_types'), list) else None
+                if _aots and not DiscountCouponEngineService.matches_order_type(req_order_type, _aots):
+                    continue
+
+            # Member lifecycle / status filtering
+            _amt = _cfg.get('allowed_member_types') or _cfg.get('member_type')
+            if _amt and member_lifecycle:
+                if not DiscountCouponEngineService.matches_member_type(member_lifecycle, _amt):
+                    continue
+
+            # User-lock filtering (allowed_user_ids)
+            _auids = _cfg.get('allowed_user_ids')
+            if _auids and isinstance(_auids, list):
+                if not profile or str(profile.id) not in [str(x) for x in _auids]:
+                    continue
             results.append({
                 'id': str(c.id),
                 'code': c.code,
@@ -3091,13 +3488,15 @@ class MobileValidateCouponView(APIView):
         code = (request.data.get('code') or '').strip().upper()
         package_id = request.data.get('package_id')
         subtotal = Decimal(str(request.data.get('subtotal') or '0'))
+        order_type = (request.data.get('order_type') or 'NEW_MEMBERSHIP').strip().upper()
 
         if not code:
             return Response({'is_valid': False, 'detail': 'Promo code is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        profile = None
-        if request.user and request.user.is_authenticated:
-            profile = UserProfile.objects.using(alias).filter(user=request.user).first()
+        member_id = request.data.get('member_id') or request.data.get('user_profile_id') or request.data.get('user_id')
+        profile = DiscountCouponEngineService.resolve_authoritative_member_profile(
+            member_id, request_user=request.user, db_alias=alias
+        )
 
         pkg = Package.objects.using(alias).filter(id=package_id).first() if package_id else None
 
@@ -3107,6 +3506,7 @@ class MobileValidateCouponView(APIView):
             order_subtotal=subtotal,
             package=pkg,
             db_alias=alias,
+            order_type=order_type,
         )
 
         if not result.get('is_valid'):
@@ -3117,13 +3517,20 @@ class MobileValidateCouponView(APIView):
 
         discount_amount = float(result.get('discount_amount', 0))
         final_payable = max(0.0, float(subtotal) - discount_amount)
+        _sub = float(subtotal) or 0.0
+        _pct = round((discount_amount / _sub) * 100, 2) if _sub else 0.0
 
         return Response({
             'is_valid': True,
             'code': code,
             'discount_amount': discount_amount,
+            'discount': discount_amount,
+            'discount_percent': _pct,
+            'percentage': _pct,
             'original_price': float(subtotal),
             'final_price': final_payable,
+            'final_amount': final_payable,
+            'payable_amount': final_payable,
             'detail': f'Promo code applied! You save ₹{discount_amount:.2f}',
         })
 
@@ -3225,6 +3632,7 @@ class MobileCheckoutOrderView(APIView):
                 order_subtotal=subtotal,
                 package=package,
                 db_alias=alias,
+                order_type='NEW_MEMBERSHIP',
             )
             if v_res.get('is_valid'):
                 discount_amount = Decimal(str(v_res.get('discount_amount', 0)))
@@ -3629,7 +4037,7 @@ class MobileCheckoutVerifyView(APIView):
                     if not m_to_ext:
                         m_to_ext = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
                     if m_to_ext:
-                        membership = MembershipLifecycleService.extend_membership(
+                        membership, _ = MembershipLifecycleService.extend_membership(
                             membership=m_to_ext,
                             days=ext_days,
                             reason_text=f"Self-service validity extension of {ext_days} days (Order {order.order_number})",
@@ -3656,6 +4064,42 @@ class MobileCheckoutVerifyView(APIView):
                             db_alias=alias,
                         )
                         membership = m_to_frz
+
+                elif action_type == 'PASSPORT':
+                    m_id = meta.get('membership_id')
+                    qty = Decimal(str(meta.get('quantity', 1) or 1))
+                    m_psp = Membership.objects.using(alias).filter(id=m_id).first() if m_id else None
+                    if not m_psp:
+                        m_psp = Membership.objects.using(alias).filter(user_profile=profile, status='ACTIVE').order_by('-created_at').first()
+                    if m_psp:
+                        from .models_memberships import MembershipEntitlementLedger
+                        p_ent = MembershipEntitlement.objects.using(alias).filter(
+                            membership=m_psp, entitlement_type__in=['CROSS_BRANCH_SESSION', 'CROSS_BRANCH']
+                        ).first()
+                        if p_ent:
+                            p_ent.allocated_units = (p_ent.allocated_units or Decimal('0.00')) + qty
+                            p_ent.status = 'ACTIVE'
+                            p_ent.save(using=alias, update_fields=['allocated_units', 'status', 'updated_at'])
+                        else:
+                            p_ent = MembershipEntitlement.objects.using(alias).create(
+                                membership=m_psp,
+                                entitlement_type='CROSS_BRANCH_SESSION',
+                                allocated_units=qty,
+                                consumed_units=Decimal('0.00'),
+                                valid_from=m_psp.start_date,
+                                valid_until=m_psp.end_date,
+                                status='ACTIVE',
+                            )
+                        MembershipEntitlementLedger.objects.using(alias).create(
+                            membership_entitlement=p_ent,
+                            transaction_type='ALLOCATION',
+                            units=qty,
+                            reason_code='PASSPORT_TOPUP_PURCHASE',
+                            reason_text=f"Paid passport purchase (Order {order.order_number})",
+                            balance_after=p_ent.remaining_units,
+                            created_by_user=user,
+                        )
+                        membership = m_psp
 
                 else:
                     # Default / NEW_MEMBERSHIP
@@ -3706,6 +4150,59 @@ class MobileCheckoutVerifyView(APIView):
                             )
                     except Exception as conv_crm_err:
                         logger.warning("Could not sync CRM lead conversion for %s: %s", user.email, conv_crm_err)
+
+                # 4. Record coupon redemption if coupon was applied
+                applied_c_code = meta.get('coupon_code')
+                if applied_c_code and order.discount_amount and order.discount_amount > Decimal('0.00'):
+                    try:
+                        from .models_discounts import DiscountCode, DiscountRedemption
+                        d_code_obj = (
+                            DiscountCode.objects.using(alias)
+                            .filter(code__iexact=str(applied_c_code).strip())
+                            .select_related('campaign')
+                            .first()
+                        )
+                        if d_code_obj and not DiscountRedemption.objects.using(alias).filter(order=order).exists():
+                            DiscountRedemption.objects.using(alias).create(
+                                discount_code=d_code_obj,
+                                campaign=d_code_obj.campaign,
+                                order=order,
+                                user_profile=profile,
+                                discount_amount=order.discount_amount,
+                                eligibility_snapshot={
+                                    'code': d_code_obj.code,
+                                    'campaign_name': d_code_obj.campaign.name,
+                                    'discount_type': d_code_obj.campaign.discount_type,
+                                    'discount_value': str(d_code_obj.campaign.discount_value),
+                                    'order_type': order.order_type,
+                                    'action_type': action_type,
+                                },
+                                redeemed_at=timezone.now(),
+                            )
+                    except Exception as red_err:
+                        logger.warning("Could not record DiscountRedemption for order %s: %s", order.order_number, red_err)
+
+                # 5. Generate authoritative MemberInvoice snapshot
+                try:
+                    from .models_commerce import MemberInvoice
+                    if not MemberInvoice.objects.using(alias).filter(order=order).exists():
+                        inv_num = f"INV-{timezone.now().strftime('%Y%m')}-{uuid.uuid4().hex[:6].upper()}"
+                        MemberInvoice.objects.using(alias).create(
+                            invoice_number=inv_num,
+                            order=order,
+                            user_profile=profile,
+                            branch=order.branch,
+                            subtotal=order.subtotal,
+                            discount_amount=order.discount_amount,
+                            reward_amount=order.reward_amount,
+                            tax_amount=order.tax_amount,
+                            total_amount=order.total_amount,
+                            currency=order.currency,
+                            status='PAID',
+                            issued_at=timezone.now(),
+                        )
+                except Exception as inv_err:
+                    logger.warning("Could not generate MemberInvoice for order %s: %s", order.order_number, inv_err)
         except Exception as exc:
             logger.exception("Failed to verify and process checkout for order %s: %s", order.order_number, exc)
             return Response(
@@ -3761,7 +4258,7 @@ class MobileOrdersView(APIView):
             Order.objects.using(alias)
             .filter(user_profile=profile)
             .select_related('branch')
-            .prefetch_related('items__package')
+            .prefetch_related('items__package', 'discount_redemptions__discount_code', 'invoices')
             .order_by('-created_at')
         )
         data = []
@@ -3779,6 +4276,20 @@ class MobileOrdersView(APIView):
                     'tax_amount': str(it.tax_amount),
                     'total_amount': str(it.total_amount),
                 })
+
+            coupon_code_val = None
+            first_redemption = o.discount_redemptions.all().first()
+            if first_redemption and first_redemption.discount_code:
+                coupon_code_val = first_redemption.discount_code.code
+            elif o.notes:
+                try:
+                    meta_notes = json.loads(o.notes)
+                    coupon_code_val = meta_notes.get('coupon_code')
+                except Exception:
+                    pass
+
+            first_inv = o.invoices.all().first()
+
             data.append({
                 'id': str(o.id),
                 'order_number': o.order_number,
@@ -3786,6 +4297,8 @@ class MobileOrdersView(APIView):
                 'status': o.status,
                 'subtotal': str(o.subtotal),
                 'discount_amount': str(o.discount_amount),
+                'coupon_code': coupon_code_val,
+                'invoice_number': first_inv.invoice_number if first_inv else None,
                 'tax_amount': str(o.tax_amount),
                 'total_amount': str(o.total_amount),
                 'currency': o.currency,
@@ -4665,37 +5178,58 @@ class MobileMembershipActionsView(APIView):
             alias = getattr(user._state, 'db', None) or get_tenant_db_alias() or 'default'
         profile = _get_or_create_user_profile(user, alias)
 
-        def _get_ver_days(v):
+        def _extract_pkg_sessions_and_days(v):
             if not v:
-                return 30
-            if getattr(v, 'duration_days', None) is not None:
-                return v.duration_days
-            val = getattr(v, 'duration_value', 30) or 30
-            u = str(getattr(v, 'duration_unit', 'MONTH') or 'MONTH').upper().rstrip('S')
-            if u == 'DAY':
-                return val
-            elif u == 'WEEK':
-                return val * 7
-            elif u == 'MONTH':
-                return val * 30
-            elif u == 'YEAR':
-                return val * 365
-            return val
+                return {'home_sessions': 0, 'passport_sessions': 0, 'total_sessions': 12, 'is_unlimited': False, 'days': 30}
+            days = getattr(v, 'validity_days', None) or getattr(v, 'total_days', None)
+            if not days:
+                val = getattr(v, 'duration_value', 30) or 30
+                u = str(getattr(v, 'duration_unit', 'MONTH') or 'MONTH').upper().rstrip('S')
+                if u == 'DAY':
+                    days = val
+                elif u == 'WEEK':
+                    days = val * 7
+                elif u == 'MONTH':
+                    days = val * 30
+                elif u == 'YEAR':
+                    days = val * 365
+                else:
+                    days = val
+            home_sess = 0
+            cross_sess = 0
+            is_unlimited = bool(getattr(v, 'is_trial', False) or getattr(v, 'is_trial_package', False))
+            try:
+                ents = list(v.entitlement_definitions.using(alias).all())
+                if ents:
+                    for ed in ents:
+                        if getattr(ed, 'is_unlimited', False):
+                            is_unlimited = True
+                        etype = str(getattr(ed, 'entitlement_type', '')).upper()
+                        u_count = int(getattr(ed, 'allocated_units', 0) or 0)
+                        if 'CROSS' in etype or 'PASSPORT' in etype:
+                            cross_sess += u_count
+                        else:
+                            home_sess += u_count
+                else:
+                    raw_sc = getattr(v, 'session_count', None)
+                    home_sess = int(raw_sc) if raw_sc is not None else 12
+            except Exception:
+                raw_sc = getattr(v, 'session_count', None)
+                home_sess = int(raw_sc) if raw_sc is not None else 12
+            tot = 999 if is_unlimited else (home_sess + cross_sess)
+            return {
+                'home_sessions': home_sess,
+                'passport_sessions': cross_sess,
+                'total_sessions': tot,
+                'is_unlimited': is_unlimited,
+                'days': int(days or 30),
+            }
+
+        def _get_ver_days(v):
+            return _extract_pkg_sessions_and_days(v)['days']
 
         def _get_ver_sessions(v):
-            if not v:
-                return 12
-            if getattr(v, 'session_count', None) is not None:
-                return v.session_count
-            tot = 0
-            try:
-                for ped in v.entitlement_definitions.using(alias).all():
-                    if getattr(ped, 'is_unlimited', False):
-                        return 999
-                    tot += int(getattr(ped, 'allocated_units', 0) or 0)
-            except Exception:
-                pass
-            return tot or 12
+            return _extract_pkg_sessions_and_days(v)['total_sessions']
 
         from decimal import Decimal
         from django.db.models import Q
@@ -4709,7 +5243,15 @@ class MobileMembershipActionsView(APIView):
         from .models_crm import IntakeSubmission
         from .services_razorpay import RazorpayService
 
+        _am_now = timezone.now().date()  # running-first-fix
         active_m = (
+            Membership.objects.using(alias)
+            .filter(user_profile=profile, status='ACTIVE', end_date__gte=_am_now)
+            .filter(models.Q(start_date__lte=_am_now) | models.Q(start_date__isnull=True))
+            .select_related('package', 'package_version', 'program', 'home_branch')
+            .order_by('end_date', '-created_at')
+            .first()
+        ) or (
             Membership.objects.using(alias)
             .filter(user_profile=profile)
             .select_related('package', 'package_version', 'program', 'home_branch')
@@ -4762,7 +5304,11 @@ class MobileMembershipActionsView(APIView):
         )
 
         # Retrieve dynamic settings for extension & freeze
-        os_obj = OrganizationSettings.objects.using(alias).first()
+        os_obj = None
+        if org:
+            os_obj = OrganizationSettings.objects.using(alias).filter(organization=org).first()
+        if not os_obj:
+            os_obj = OrganizationSettings.objects.using(alias).filter(allow_member_freeze=True).first() or OrganizationSettings.objects.using(alias).first()
         cfg = getattr(os_obj, 'membership_config', {}) or {}
         ext_cfg = cfg.get('extension_policy', {})
         frz_cfg = cfg.get('freeze_policy', {})
@@ -4886,36 +5432,60 @@ class MobileMembershipActionsView(APIView):
 
         # RENEW OPTIONS: Strictly fixed to active_m.program!
         renew_options = []
+        from .models_catalog import PackageBranchAvailability, ProgramBranchAvailability
         if active_m.program:
             pkg_qs = (
                 Package.objects.using(alias)
                 .filter(status='ACTIVE', program=active_m.program)
                 .select_related('program')
-                .prefetch_related('versions__prices')
+                .prefetch_related('versions__prices', 'versions__entitlement_definitions', 'branch_availabilities__branch')
             )
             for pkg in pkg_qs:
                 ver = pkg.versions.filter(status='ACTIVE').order_by('-version_number').first()
                 if not ver:
                     continue
-                if effective_branch and hasattr(ver, 'available_branches'):
-                    if ver.available_branches.exists() and not ver.available_branches.filter(id=effective_branch.id).exists():
-                        continue
+                # Exclude trial packages from self-service renewal
+                if getattr(ver, 'is_trial', False) or getattr(ver, 'is_trial_package', False) or getattr(ver, 'only_for_trial', False):
+                    continue
+                if getattr(ver, 'show_on_app', True) is False and getattr(ver, 'show_on_web', True) is False:
+                    continue
+
+                # Authoritative Branch Availability from CRM PackageBranchAvailability
+                pbas = PackageBranchAvailability.objects.using(alias).filter(package=pkg, status='ENABLED')
+                pkg_branch_ids = [str(b.branch_id) for b in pbas if b.branch and b.branch.status == 'ACTIVE']
+                if not pkg_branch_ids and pkg.program:
+                    prog_pbas = ProgramBranchAvailability.objects.using(alias).filter(program=pkg.program, is_active=True)
+                    pkg_branch_ids = [str(b.branch_id) for b in prog_pbas if b.branch and b.branch.status == 'ACTIVE']
+
+                if filter_branch_id and pkg_branch_ids and filter_branch_id not in pkg_branch_ids:
+                    continue
+
                 price_obj = ver.prices.filter(status='ACTIVE').first()
-                if not price_obj:
+                if not price_obj or float(price_obj.base_price) <= 0:
                     continue
                 b_price = float(price_obj.base_price)
                 t_pct = float(price_obj.tax_percent or 18.0)
                 t_amt = round(b_price * (t_pct / 100.0), 2)
                 tot = round(b_price + t_amt, 2)
+                _rn_prog_name = pkg.program.name if pkg.program else ''
+                _rn_disp = format_program_package_name(_rn_prog_name, pkg.name)
+                metrics = _extract_pkg_sessions_and_days(ver)
+
                 renew_options.append({
                     'package_id': str(pkg.id),
                     'package_version_id': str(ver.id),
                     'name': pkg.name,
+                    'display_name': _rn_disp,
+                    'display_package_name': _rn_disp,
                     'program_id': str(pkg.program.id),
-                    'program_name': pkg.program.name,
+                    'program_name': _rn_prog_name,
                     'program_code': pkg.program.code,
-                    'duration_days': _get_ver_days(ver),
-                    'session_count': _get_ver_sessions(ver),
+                    'duration_days': metrics['days'],
+                    'session_count': metrics['total_sessions'],
+                    'home_sessions': metrics['home_sessions'],
+                    'passport_sessions': metrics['passport_sessions'],
+                    'is_unlimited': metrics['is_unlimited'],
+                    'available_branch_ids': pkg_branch_ids,
                     'base_price': b_price,
                     'tax_percent': t_pct,
                     'tax_amount': t_amt,
@@ -4941,7 +5511,7 @@ class MobileMembershipActionsView(APIView):
             Package.objects.using(alias)
             .filter(status='ACTIVE', program__status='ACTIVE')
             .select_related('program')
-            .prefetch_related('versions__prices')
+            .prefetch_related('versions__prices', 'versions__entitlement_definitions', 'branch_availabilities__branch')
         )
         for pkg in all_pkg_qs:
             ver = pkg.versions.filter(status='ACTIVE').order_by('-version_number').first()
@@ -4949,26 +5519,48 @@ class MobileMembershipActionsView(APIView):
                 continue
             if active_m.package and pkg.id == active_m.package.id and active_m.package_version and ver.id == active_m.package_version.id:
                 continue
+            # Exclude trial packages from self-service upgrade
+            if getattr(ver, 'is_trial', False) or getattr(ver, 'is_trial_package', False) or getattr(ver, 'only_for_trial', False):
+                continue
+            if getattr(ver, 'show_on_app', True) is False and getattr(ver, 'show_on_web', True) is False:
+                continue
+
+            # Branch availability
+            pbas = PackageBranchAvailability.objects.using(alias).filter(package=pkg, status='ENABLED')
+            pkg_branch_ids = [str(b.branch_id) for b in pbas if b.branch and b.branch.status == 'ACTIVE']
+            if not pkg_branch_ids and pkg.program:
+                prog_pbas = ProgramBranchAvailability.objects.using(alias).filter(program=pkg.program, is_active=True)
+                pkg_branch_ids = [str(b.branch_id) for b in prog_pbas if b.branch and b.branch.status == 'ACTIVE']
+
+            if filter_branch_id and pkg_branch_ids and filter_branch_id not in pkg_branch_ids:
+                continue
+
             price_obj = ver.prices.filter(status='ACTIVE').first()
-            if not price_obj:
+            if not price_obj or float(price_obj.base_price) <= 0:
                 continue
             b_price = float(price_obj.base_price)
             t_pct = float(price_obj.tax_percent or 18.0)
             t_amt = round(b_price * (t_pct / 100.0), 2)
             tot = round(b_price + t_amt, 2)
             price_diff = max(0.0, round(tot - cur_total_price, 2))
-            extra_sessions = max(0, _get_ver_sessions(ver) - cur_sessions)
-            extra_days = max(0, _get_ver_days(ver) - cur_days)
+            metrics = _extract_pkg_sessions_and_days(ver)
+            extra_sessions = max(0, metrics['total_sessions'] - cur_sessions)
+            extra_days = max(0, metrics['days'] - cur_days)
 
             upgrade_options.append({
                 'package_id': str(pkg.id),
                 'package_version_id': str(ver.id),
                 'name': pkg.name,
+                'display_name': format_program_package_name(pkg.program.name if pkg.program else '', pkg.name),
                 'program_id': str(pkg.program.id) if pkg.program else '',
                 'program_name': pkg.program.name if pkg.program else '',
                 'program_code': pkg.program.code if pkg.program else '',
-                'duration_days': _get_ver_days(ver),
-                'session_count': _get_ver_sessions(ver),
+                'duration_days': metrics['days'],
+                'session_count': metrics['total_sessions'],
+                'home_sessions': metrics['home_sessions'],
+                'passport_sessions': metrics['passport_sessions'],
+                'is_unlimited': metrics['is_unlimited'],
+                'available_branch_ids': pkg_branch_ids,
                 'base_price': b_price,
                 'tax_percent': t_pct,
                 'tax_amount': t_amt,
@@ -4979,16 +5571,23 @@ class MobileMembershipActionsView(APIView):
                 'currency': price_obj.currency or 'INR',
             })
 
+        _act_prog = active_m.program or (active_m.package.program if active_m.package else None)
+        _act_prog_name = _act_prog.name if _act_prog else ''
+        _act_pkg_name = active_m.package.name if active_m.package else 'Custom Membership'
+        _act_disp = format_program_package_name(_act_prog_name, _act_pkg_name)
+
         active_membership_data = {
             'id': str(active_m.id),
             'membership_number': active_m.membership_number,
             'status': active_m.status,
             'package_id': str(active_m.package.id) if active_m.package else None,
-            'package_name': active_m.package.name if active_m.package else 'Custom Membership',
+            'package_name': _act_disp,
+            'raw_package_name': _act_pkg_name,
+            'display_package_name': _act_disp,
             'package_version_id': str(active_m.package_version.id) if active_m.package_version else None,
-            'program_id': str(active_m.program.id) if active_m.program else None,
-            'program_name': active_m.program.name if active_m.program else None,
-            'program_code': active_m.program.code if active_m.program else None,
+            'program_id': str(_act_prog.id) if _act_prog else None,
+            'program_name': _act_prog_name or None,
+            'program_code': _act_prog.code if _act_prog else None,
             'branch_id': str(active_m.home_branch.id) if active_m.home_branch else None,
             'branch_name': active_m.home_branch.name if active_m.home_branch else None,
             'start_date': str(active_m.start_date) if active_m.start_date else None,
@@ -5062,7 +5661,15 @@ class MobileMembershipRenewView(APIView):
         from .models_crm import IntakeSubmission
         from .services_razorpay import RazorpayService
 
+        _am_now = timezone.now().date()  # running-first-fix
         active_m = (
+            Membership.objects.using(alias)
+            .filter(user_profile=profile, status='ACTIVE', end_date__gte=_am_now)
+            .filter(models.Q(start_date__lte=_am_now) | models.Q(start_date__isnull=True))
+            .select_related('package', 'package_version', 'program', 'home_branch')
+            .order_by('end_date', '-created_at')
+            .first()
+        ) or (
             Membership.objects.using(alias)
             .filter(user_profile=profile)
             .select_related('package', 'package_version', 'program', 'home_branch')
@@ -5109,6 +5716,17 @@ class MobileMembershipRenewView(APIView):
         tax_pct = price_obj.tax_percent or Decimal('18.0')
         tax_amount = round(base_price * (tax_pct / Decimal('100.0')), 2)
         total_price = base_price + tax_amount
+
+        # Renewal coupon (order-type gated to RENEWAL)
+        renew_coupon_code = (request.data.get('coupon_code') or '').strip()
+        renew_discount = Decimal('0.00')
+        renew_original_total = total_price
+        if renew_coupon_code:
+            from .services_discounts import DiscountCouponEngineService as _ENG
+            _cv = _ENG.validate_coupon(code_str=renew_coupon_code, user_profile=profile, order_subtotal=total_price, package=package, db_alias=alias, order_type='RENEWAL')
+            if _cv.get('is_valid'):
+                renew_discount = Decimal(str(_cv.get('discount_amount') or 0))
+        total_price = max(Decimal('0.00'), total_price - renew_discount)
 
         # Process PAR-Q decision
         parq_decision = str(request.data.get('parq_decision', 'REUSE')).upper().strip()
@@ -5163,6 +5781,7 @@ class MobileMembershipRenewView(APIView):
             'package_version_id': str(ver.id),
             'parq_decision': parq_decision,
             'parq_submission_id': parq_submission_id,
+            'coupon_code': renew_coupon_code if renew_coupon_code else None,
         }
 
         with transaction.atomic(using=alias):
@@ -5171,6 +5790,7 @@ class MobileMembershipRenewView(APIView):
                 order.subtotal = base_price
                 order.tax_amount = tax_amount
                 order.total_amount = total_price
+                order.discount_amount = renew_discount
                 order.notes = json.dumps(metadata_dict)
                 order.save(using=alias)
             else:
@@ -5183,7 +5803,7 @@ class MobileMembershipRenewView(APIView):
                     source='MOBILE_APP',
                     status='PENDING_PAYMENT',
                     subtotal=base_price,
-                    discount_amount=Decimal('0.00'),
+                    discount_amount=renew_discount,
                     tax_amount=tax_amount,
                     total_amount=total_price,
                     currency=price_obj.currency or 'INR',
@@ -5234,6 +5854,11 @@ class MobileMembershipRenewView(APIView):
             'razorpay_order_id': rzp_order_id,
             'status': order.status,
             'amount': float(total_price),
+            'internal_order_id': str(order.id),
+            'coupon_applied': bool(renew_discount > 0),
+            'coupon_code': renew_coupon_code if renew_discount > 0 else '',
+            'original_amount': float(renew_original_total),
+            'discount_amount': float(renew_discount),
             'amount_paise': amount_paise,
             'currency': order.currency,
             'razorpay_key_id': key_id,
@@ -5272,7 +5897,15 @@ class MobileMembershipUpgradeView(APIView):
         from .services_razorpay import RazorpayService
         from .services_memberships import MembershipLifecycleService
 
+        _am_now = timezone.now().date()  # running-first-fix
         active_m = (
+            Membership.objects.using(alias)
+            .filter(user_profile=profile, status='ACTIVE', end_date__gte=_am_now)
+            .filter(models.Q(start_date__lte=_am_now) | models.Q(start_date__isnull=True))
+            .select_related('package', 'package_version', 'program', 'home_branch')
+            .order_by('end_date', '-created_at')
+            .first()
+        ) or (
             Membership.objects.using(alias)
             .filter(user_profile=profile)
             .select_related('package', 'package_version', 'program', 'home_branch')
@@ -5317,6 +5950,17 @@ class MobileMembershipUpgradeView(APIView):
         target_tax = round(target_base * (target_tax_pct / Decimal('100.0')), 2)
         target_total = target_base + target_tax
 
+        # Upgrade coupon (order-type gated to UPGRADE) - discounts the target package
+        upg_coupon_code = (request.data.get('coupon_code') or '').strip()
+        upg_discount = Decimal('0.00')
+        upg_original_target = target_total
+        if upg_coupon_code:
+            from .services_discounts import DiscountCouponEngineService as _ENG
+            _cv = _ENG.validate_coupon(code_str=upg_coupon_code, user_profile=profile, order_subtotal=target_total, package=target_pkg, db_alias=alias, order_type='UPGRADE')
+            if _cv.get('is_valid'):
+                upg_discount = Decimal(str(_cv.get('discount_amount') or 0))
+        target_total = max(Decimal('0.00'), target_total - upg_discount)
+
         # Current package value calculation
         cur_total = Decimal('0.00')
         cur_base = Decimal('0.00')
@@ -5355,6 +5999,7 @@ class MobileMembershipUpgradeView(APIView):
             'parq_decision': parq_decision,
             'parq_submission_id': parq_submission_id,
             'reason': reason,
+            'coupon_code': upg_coupon_code if upg_coupon_code else None,
         }
 
         with transaction.atomic(using=alias):
@@ -5367,7 +6012,7 @@ class MobileMembershipUpgradeView(APIView):
                 source='MOBILE_APP',
                 status='PENDING_PAYMENT',
                 subtotal=diff_base,
-                discount_amount=Decimal('0.00'),
+                discount_amount=upg_discount,
                 tax_amount=diff_tax,
                 total_amount=diff_total,
                 currency=target_price_obj.currency or 'INR',
@@ -5417,6 +6062,11 @@ class MobileMembershipUpgradeView(APIView):
             'razorpay_order_id': rzp_order_id,
             'status': order.status,
             'amount': float(diff_total),
+            'internal_order_id': str(order.id),
+            'coupon_applied': bool(upg_discount > 0),
+            'coupon_code': upg_coupon_code if upg_discount > 0 else '',
+            'original_amount': float(max(Decimal('0.00'), round(upg_original_target - cur_total, 2))),
+            'discount_amount': float(max(Decimal('0.00'), round((upg_original_target - cur_total) - diff_total, 2))),
             'amount_paise': amount_paise,
             'currency': order.currency,
             'razorpay_key_id': key_id,
@@ -5666,7 +6316,13 @@ class MobileMembershipFreezeView(APIView):
         if not active_m:
             return Response({'detail': 'Only active memberships can be frozen.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        _os_perm = OrganizationSettings.objects.using(alias).first()
+        _org = getattr(active_m, 'organization', None) or (active_m.package.organization if active_m and active_m.package else None) or getattr(user, 'organization', None)
+        _os_perm = None
+        if _org:
+            _os_perm = OrganizationSettings.objects.using(alias).filter(organization=_org).first()
+        if not _os_perm:
+            _os_perm = OrganizationSettings.objects.using(alias).filter(allow_member_freeze=True).first() or OrganizationSettings.objects.using(alias).first()
+
         _frz_perm = (getattr(_os_perm, 'membership_config', {}) or {}).get('freeze_policy', {}) if _os_perm else {}
         _freeze_enabled = _frz_perm.get('enabled', getattr(_os_perm, 'allow_member_freeze', True) if _os_perm else True)
         if not _freeze_enabled:
@@ -5883,6 +6539,30 @@ class MobileDirectTurnstileOpenView(APIView):
         try:
             resp = opener.open(url, timeout=3)
             res_str = resp.read().decode('utf-8', errors='ignore').strip()
+            try:
+                from .audit_engine import UnifiedAuditEngine
+                from .models_users import TenantUser
+                actor_user = getattr(request, 'user', None)
+                UnifiedAuditEngine.record_activity(
+                    action_code='IOT.DIRECT_UNLOCK',
+                    action_category='ACCESS_CONTROL',
+                    action_verb='UNLOCKED',
+                    module='ACCESS_CONTROL',
+                    submodule='TURNSTILE',
+                    entity_type='TurnstileHardware',
+                    entity_id='192.168.1.108',
+                    entity_name='Turnstile Channel 1',
+                    actor_user=actor_user if isinstance(actor_user, TenantUser) else None,
+                    actor_type='MEMBER' if actor_user else 'SYSTEM',
+                    request=request,
+                    result='SUCCESS',
+                    reason='Direct mobile turnstile unlock command',
+                    event_description="Direct turnstile gate unlock command triggered from mobile app.",
+                    source_channel='MOBILE_APP',
+                    metadata={'ip': '192.168.1.108', 'channel': 1},
+                )
+            except Exception:
+                pass
             return Response({"success": True, "detail": "Turnstile gate unlocked!", "result": res_str}, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({"success": False, "error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -5912,18 +6592,35 @@ class MobilePassportTopupView(APIView):
         if quantity <= 0:
             return Response({'error': 'Quantity must be at least 1.', 'code': 'INVALID_QUANTITY'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # 1. Resolve active membership
-        active_mem = (
+        # 1. Resolve the active membership that carries the passport flow.
+        # Passport (cross-branch) lives per-pack and may NOT be on the newest membership, so
+        # prefer an active pack that already has a cross-branch entitlement, else one with
+        # remaining home sessions, else the newest active pack.
+        _today = timezone.now().date()
+        _active_mems = list(
             Membership.objects.using(alias)
-            .filter(
-                user_profile=profile,
-                status='ACTIVE',
-                end_date__gte=timezone.now().date(),
-            )
+            .filter(user_profile=profile, status='ACTIVE', end_date__gte=_today)
             .select_related('package', 'package_version')
             .order_by('-created_at')
-            .first()
         )
+        active_mem = None
+        for _m in _active_mems:
+            if _m.entitlements.using(alias).filter(
+                status='ACTIVE', entitlement_type__in=['CROSS_BRANCH', 'CROSS_BRANCH_SESSION']
+            ).exists():
+                active_mem = _m
+                break
+        if not active_mem:
+            for _m in _active_mems:
+                _ent_active = _m.entitlements.using(alias).filter(status='ACTIVE')
+                _he = _ent_active.filter(entitlement_type='HOME_BRANCH_SESSION').first() or _ent_active.exclude(
+                    entitlement_type__in=['CROSS_BRANCH_SESSION', 'CROSS_BRANCH', 'CREDIT_WALLET']
+                ).first()
+                if _he and (_he.is_unlimited or (_he.remaining_units or 0) > 0):
+                    active_mem = _m
+                    break
+        if not active_mem:
+            active_mem = _active_mems[0] if _active_mems else None
         if not active_mem:
             return Response({
                 'error': 'An active membership is required to purchase passport sessions.',
@@ -5954,51 +6651,72 @@ class MobilePassportTopupView(APIView):
 
         total_price = unit_price * Decimal(str(quantity))
 
-        return Response({'detail': 'Passport purchase is not available on the app. Please contact studio administration.', 'code': 'PASSPORT_NOT_PERMITTED'}, status=status.HTTP_403_FORBIDDEN)
-
-        # 4. Top up passport session entitlement
         from django.db import transaction
-        from .models_memberships import MembershipEntitlement, MembershipEntitlementLedger
+        from .models_commerce import Order, OrderItem
+        from .services_razorpay import RazorpayService
 
+        metadata_dict = {
+            'action_type': 'PASSPORT',
+            'membership_id': str(active_mem.id),
+            'quantity': quantity,
+            'unit_price': str(unit_price),
+        }
         with transaction.atomic(using=alias):
-            passport_ent = ent_qs.filter(
-                models.Q(entitlement_type='CROSS_BRANCH_SESSION') | models.Q(entitlement_type='CROSS_BRANCH')
-            ).first()
-
-            if passport_ent:
-                passport_ent.allocated_units = (passport_ent.allocated_units or Decimal('0.00')) + Decimal(str(quantity))
-                passport_ent.status = 'ACTIVE'
-                passport_ent.save(using=alias, update_fields=['allocated_units', 'status', 'updated_at'])
-            else:
-                passport_ent = MembershipEntitlement.objects.using(alias).create(
-                    membership=active_mem,
-                    entitlement_type='CROSS_BRANCH_SESSION',
-                    allocated_units=Decimal(str(quantity)),
-                    consumed_units=Decimal('0.00'),
-                    valid_from=active_mem.start_date,
-                    valid_until=active_mem.end_date,
-                    status='ACTIVE',
-                )
-
-            MembershipEntitlementLedger.objects.using(alias).create(
-                membership_entitlement=passport_ent,
-                transaction_type='ALLOCATION',
-                units=Decimal(str(quantity)),
-                reason_code='PASSPORT_TOPUP_PURCHASE',
-                reason_text=f"Purchased {quantity} passport session(s) at ₹{unit_price} each",
-                balance_after=passport_ent.remaining_units,
-                created_by_user=user,
+            order_num = f"PSP-{uuid.uuid4().hex[:8].upper()}"
+            order = Order.objects.using(alias).create(
+                branch=active_mem.home_branch,
+                user_profile=profile,
+                order_number=order_num,
+                order_type='OTHER',
+                source='MOBILE_APP',
+                status='PENDING_PAYMENT',
+                subtotal=total_price,
+                discount_amount=Decimal('0.00'),
+                tax_amount=Decimal('0.00'),
+                total_amount=total_price,
+                currency='INR',
+                notes=json.dumps(metadata_dict),
+            )
+            OrderItem.objects.using(alias).create(
+                order=order,
+                item_type='PACKAGE',
+                item_name_snapshot=f"Passport Sessions x{quantity}",
+                quantity=Decimal(str(quantity)),
+                unit_price_snapshot=unit_price,
+                tax_amount=Decimal('0.00'),
+                total_amount=total_price,
             )
 
+        amount_paise = RazorpayService.convert_inr_to_paise(total_price)
+        key_id = 'rzp_test_placeholder'
+        rzp_order_id = f"order_test_{order.order_number}"
+        if RazorpayService.is_configured(db_alias=alias) and amount_paise > 0:
+            key_id, _ = RazorpayService.get_credentials(db_alias=alias)
+            try:
+                rzp_order = RazorpayService.create_order(
+                    amount_paise=amount_paise,
+                    receipt=order.order_number,
+                    currency=order.currency,
+                    notes={'internal_order_id': str(order.id), 'order_type': 'PASSPORT'},
+                    db_alias=alias,
+                )
+                rzp_order_id = rzp_order['id']
+            except Exception as e:
+                logger.error("Razorpay passport order creation failed: %s", e)
+
         return Response({
-            'success': True,
-            'message': f"Successfully added {quantity} passport session(s).",
-            'quantity_added': quantity,
+            'order_id': str(order.id),
+            'order_number': order.order_number,
+            'razorpay_order_id': rzp_order_id,
+            'razorpay_key_id': key_id,
+            'amount': float(total_price),
+            'amount_paise': amount_paise,
+            'currency': order.currency,
+            'quantity': quantity,
             'unit_price': float(unit_price),
-            'total_price': float(total_price),
-            'passport_sessions_remaining': float(passport_ent.remaining_units or 0),
-            'home_sessions_remaining': float(home_ent.remaining_units or 0) if not home_ent.is_unlimited else 'UNLIMITED',
-        }, status=status.HTTP_200_OK)
+            'requires_payment': True,
+            'detail': f"Passport order for {quantity} session(s) created. Complete payment to activate.",
+        }, status=status.HTTP_201_CREATED)
 
 
 class MobileTicketsView(APIView):
@@ -6089,3 +6807,55 @@ class MobileTicketsView(APIView):
             'status': ticket.status,
             'created_at': ticket.created_at.isoformat(),
         }, status=status.HTTP_201_CREATED)
+
+
+class MobilePricingQuoteView(APIView):
+    """
+    GET / POST /api/v1/mobile/pricing/quote/ and /api/v1/tenant/pricing/quote/
+    Unified Canonical Quotation Brain powered by UnifiedPricingService.
+    Pure read-only calculation of catalog price, coupon discount, statutory GST, and final payable.
+    """
+    permission_classes = [AllowAny]
+
+    def _execute_quote(self, request, params):
+        alias, _ = _resolve_mobile_tenant_and_db(request)
+        if not alias:
+            alias = getattr(getattr(request, 'user', None), '_state', None)
+            alias = getattr(alias, 'db', None) or get_tenant_db_alias() or 'default'
+
+        profile_id = params.get('user_profile_id')
+        if not profile_id and request.user and getattr(request.user, 'is_authenticated', False):
+            p = UserProfile.objects.using(alias).filter(user=request.user).values_list('id', flat=True).first()
+            if p:
+                profile_id = str(p)
+
+        from .services_pricing import UnifiedPricingService
+
+        try:
+            quote = UnifiedPricingService.calculate_quote(
+                order_type=params.get('order_type', 'NEW_MEMBERSHIP'),
+                package_id=params.get('package_id'),
+                package_version_id=params.get('package_version_id'),
+                branch_id=params.get('branch_id'),
+                user_profile_id=profile_id,
+                lead_id=params.get('lead_id'),
+                current_membership_id=params.get('current_membership_id'),
+                coupon_code=params.get('coupon_code'),
+                db_alias=alias,
+            )
+            return Response(quote, status=status.HTTP_200_OK)
+        except ValidationError as e:
+            detail_msg = e.detail if hasattr(e, 'detail') else str(e)
+            if isinstance(detail_msg, list):
+                detail_msg = str(detail_msg[0])
+            return Response({'error': str(detail_msg)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.exception("Quotation error in MobilePricingQuoteView")
+            return Response({'error': str(e) or 'Failed to calculate quotation.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    def get(self, request):
+        return self._execute_quote(request, request.query_params)
+
+    def post(self, request):
+        return self._execute_quote(request, request.data)
+

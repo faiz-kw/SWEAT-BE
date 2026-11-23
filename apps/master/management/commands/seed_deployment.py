@@ -221,7 +221,6 @@ class Command(BaseCommand):
                 database_name=default_db_name,
                 db_name=default_db_name,
                 status='ACTIVE',
-                connection_role='PRIMARY_RW',
             )
             self.stdout.write(f"  Created TenantDataSource with DB: {default_db_name}")
 
@@ -236,15 +235,6 @@ class Command(BaseCommand):
         except Exception as exc:
             self.stdout.write(self.style.WARNING(f"  ! migrate_all_tenants notice: {exc}"))
 
-        # Synchronize Tenant Catalog & RBAC from Master
-        sync_result = sync_tenant_catalog_and_rbac(db_alias=db_alias)
-        self.stdout.write(self.style.SUCCESS(
-            f"  [OK] Tenant Catalog synced: {sync_result.get('modules', 0)} modules, {sync_result.get('permissions', 0)} permissions."
-        ))
-
-        # Synchronize Default Role Permissions
-        sync_default_role_permissions(db_alias=db_alias, overwrite_custom=False)
-        self.stdout.write(self.style.SUCCESS("  [OK] Canonical system role permissions templates synchronized."))
 
         # ------------------------------------------------------------------
         # Steps 5-7: Tenant DB Context Scoped Operations
@@ -314,6 +304,16 @@ class Command(BaseCommand):
                 }
             )
             self.stdout.write(self.style.SUCCESS(f"  [OK] Organization: {org.name} | Branch: {branch.name} ({branch.code})"))
+
+            # Synchronize Tenant Catalog & RBAC from Master
+            sync_result = sync_tenant_catalog_and_rbac(db_alias=db_alias, org=org)
+            self.stdout.write(self.style.SUCCESS(
+                f"  [OK] Tenant Catalog synced: {sync_result.get('modules', 0)} modules, {sync_result.get('permissions', 0)} permissions."
+            ))
+
+            # Synchronize Default Role Permissions
+            sync_default_role_permissions(db_alias=db_alias, org=org, overwrite_custom=False)
+            self.stdout.write(self.style.SUCCESS("  [OK] Canonical system role permissions templates synchronized."))
 
             # --------------------------------------------------------------
             # Step 6: Seed Staff & Administrative User Accounts

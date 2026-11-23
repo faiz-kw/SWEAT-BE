@@ -273,6 +273,50 @@ class CommerceService:
                 )
                 invoice.save(using=alias)
 
+                # 4. Atomic Discount Redemption Ledgering & Usage Cap Decrement
+                if order.discount_amount and order.discount_amount > Decimal('0.00'):
+                    try:
+                        from .models_discounts import DiscountCode, DiscountCampaign, DiscountRedemption
+                        import re
+                        coupon_str = None
+                        if order.notes:
+                            c_match = re.search(r'Coupon:\s*([A-Za-z0-9_-]+)', str(order.notes), re.IGNORECASE)
+                            if c_match:
+                                coupon_str = c_match.group(1).strip()
+
+                        if coupon_str:
+                            code_obj = (
+                                DiscountCode.objects.using(alias)
+                                .select_for_update()
+                                .filter(code__iexact=coupon_str)
+                                .select_related('campaign')
+                                .first()
+                            )
+                            if code_obj:
+                                camp_obj = (
+                                    DiscountCampaign.objects.using(alias)
+                                    .select_for_update()
+                                    .filter(id=code_obj.campaign_id)
+                                    .first()
+                                )
+                                if camp_obj:
+                                    if camp_obj.usage_limit and camp_obj.usage_limit > 0:
+                                        camp_obj.usage_limit = max(0, camp_obj.usage_limit - 1)
+                                    camp_obj.redemption_count = (getattr(camp_obj, 'redemption_count', 0) or 0) + 1
+                                    camp_obj.save(using=alias)
+
+                                DiscountRedemption.objects.using(alias).create(
+                                    organization=order.branch.organization if order.branch else None,
+                                    campaign=code_obj.campaign,
+                                    discount_code=code_obj,
+                                    user_profile=order.user_profile,
+                                    order=order,
+                                    discount_amount=order.discount_amount,
+                                    redeemed_at=timezone.now(),
+                                )
+                    except Exception as red_err:
+                        logger.warning("Failed to record DiscountRedemption in record_payment for order %s: %s", order.id, red_err)
+
                 # Accrue reward points according to admin policy
                 try:
                     from .services_rewards import ReferralRewardService

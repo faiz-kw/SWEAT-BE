@@ -714,6 +714,31 @@ class VerifyOTPView(APIView):
         user.last_login_at = now
         user.save(using=alias, update_fields=['last_login_at'])
 
+        # Record Member Portal OTP Login in canonical ActivityAuditLog
+        try:
+            from apps.tenant_core.audit_engine import UnifiedAuditEngine
+            UnifiedAuditEngine.record_activity(
+                action_code='PORTAL.LOGIN',
+                action_category='AUTHENTICATION',
+                action_verb='signed in via OTP',
+                module='MEMBER_PORTAL',
+                submodule='AUTHENTICATION',
+                entity_type='TenantUser',
+                entity_id=str(user.id),
+                entity_name=f"{user.first_name} {user.last_name}".strip() or user.phone or user.email,
+                actor_user=user,
+                actor_type='MEMBER',
+                actor_role='MEMBER',
+                branch=user.home_branch,
+                source_channel='MEMBER_PORTAL',
+                result='SUCCESS',
+                event_description=f"Member {f'{user.first_name} {user.last_name}'.strip() or phone} signed in to Member Portal via OTP.",
+                request=request,
+                db_alias=alias,
+            )
+        except Exception:
+            pass
+
         # Issue JWT tokens (Access + Refresh)
         tokens = _build_tenant_token(user, tenant, alias)
 

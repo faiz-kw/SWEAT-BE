@@ -50,6 +50,7 @@ DEFAULT_ROLES_CONFIG: Dict[str, dict] = {
             # CRM
             'crm.dashboard.view',
             'crm.leads.view', 'crm.leads.create', 'crm.leads.edit', 'crm.leads.convert',
+            'crm.leads.transfer',
             'crm.pipeline.view', 'crm.pipeline.create', 'crm.pipeline.edit',
             'crm.trials.view', 'crm.trials.create', 'crm.trials.edit',
             'crm.follow-ups.view', 'crm.follow-ups.create', 'crm.follow-ups.edit',
@@ -239,6 +240,7 @@ CANONICAL_SUBMODULES = {
     ('core', 'departments'): {'name': 'Department Management'},
     ('core', 'audit'): {'name': 'Audit Logs & Governance'},
     ('core', 'security'): {'name': 'Security & Access Control'},
+    ('core', 'privacy'): {'name': 'Privacy & Data Protection'},
 
     ('crm', 'dashboard'): {'name': 'CRM Dashboard & Sales Analytics'},
     ('crm', 'leads'): {'name': 'Lead Management'},
@@ -388,6 +390,7 @@ CANONICAL_TAB_PERMISSIONS = [
     ('crm', 'leads', 'crm.leads.edit', 'Edit Leads', 'edit'),
     ('crm', 'leads', 'crm.leads.delete', 'Delete Leads', 'delete'),
     ('crm', 'leads', 'crm.leads.convert', 'Convert Leads to Members', 'convert'),
+    ('crm', 'leads', 'crm.leads.transfer', 'Bulk Transfer & Reassign RM Leads', 'transfer'),
     ('crm', 'pipeline', 'crm.pipeline.view', 'View Sales Pipeline Deals', 'view'),
     ('crm', 'pipeline', 'crm.pipeline.create', 'Create Pipeline Deals', 'create'),
     ('crm', 'pipeline', 'crm.pipeline.edit', 'Move / Update Deals', 'edit'),
@@ -531,6 +534,7 @@ CANONICAL_TAB_PERMISSIONS = [
     ('core', 'departments', 'core.departments.edit', 'Edit Departments', 'edit'),
     ('core', 'audit', 'core.audit.view', 'View Audit Logs', 'view'),
     ('core', 'security', 'core.security.view', 'View Security & Sessions', 'view'),
+    ('core', 'privacy', 'core.privacy.view_phone_number', 'View Complete Phone Numbers', 'view_phone_number'),
 
     # Community Module
     ('community', 'hub', 'community.view', 'View Community Hub', 'view'),

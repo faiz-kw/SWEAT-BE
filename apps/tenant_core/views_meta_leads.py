@@ -1,6 +1,8 @@
 import os
-from django.http import HttpResponseRedirect
+import re
 import urllib.parse
+import requests
+from django.http import HttpResponseRedirect
 """Organisation-wide CRM configuration, Meta OAuth lifecycle, and import APIs."""
 import uuid
 import logging
@@ -22,6 +24,7 @@ from .models_meta_leads import MetaLeadMapping, MetaLeadImport, MetaConnection, 
 from .models_org import Branch
 from .models_crm import LeadSource, Lead, SalesFollowupTask, CRMAgentAssignmentConfig
 from .models_users import TenantUser
+from .models_rbac import Role, RoleAssignment
 from .permissions import RequireActiveTenantAndOrg, TenantRBACPermission
 from .services_meta_leads import (
     require_tenant_alias,
@@ -55,17 +58,21 @@ class MappingSerializer(serializers.ModelSerializer):
     branch = serializers.UUIDField(allow_null=True, required=False)
     fallback_branch = serializers.UUIDField(allow_null=True, required=False)
     lead_source = serializers.UUIDField()
+    assigned_role = serializers.UUIDField(allow_null=True, required=False)
+    assigned_role_name = serializers.CharField(read_only=True, required=False)
     assigned_sales_user = serializers.UUIDField(allow_null=True, required=False)
+    assigned_sales_users = serializers.ListField(child=serializers.UUIDField(), required=False, allow_empty=True)
     expected_version = serializers.IntegerField(write_only=True, required=False, min_value=1)
+    page_name = serializers.CharField(read_only=True, required=False)
 
     class Meta:
         model = MetaLeadMapping
-        fields = ['id', 'page_id', 'form_id', 'name', 'is_active', 'version', 'expected_version',
+        fields = ['id', 'page_id', 'page_name', 'form_id', 'name', 'is_active', 'version', 'expected_version',
                   'field_mappings', 'field_defaults', 'branch_mode', 'branch', 'branch_field', 'branch_answers',
                   'unmatched_branch_policy', 'fallback_branch', 'lead_source', 'initial_stage', 'repeat_policy',
-                  'assignment_mode', 'assigned_sales_user', 'create_followup_task', 'followup_task_type',
-                  'followup_due_hours', 'updated_at']
-        read_only_fields = ['id', 'version', 'updated_at']
+                  'assignment_mode', 'assigned_role', 'assigned_role_name', 'assigned_sales_user', 'assigned_sales_users',
+                  'create_followup_task', 'followup_task_type', 'followup_due_hours', 'updated_at']
+        read_only_fields = ['id', 'page_name', 'assigned_role_name', 'version', 'updated_at']
         validators = []
 
     def validate_page_id(self, value):
@@ -81,10 +88,39 @@ class MappingSerializer(serializers.ModelSerializer):
         return val
 
     def to_representation(self, instance):
-        result = super().to_representation({
-            key: getattr(instance, key + '_id' if key in ('branch', 'fallback_branch', 'lead_source', 'assigned_sales_user') else key)
-            for key in self.Meta.fields if key != 'expected_version'
-        })
+        fields_to_read = [k for k in self.Meta.fields if k not in ('expected_version', 'page_name', 'assigned_role_name')]
+        data_dict = {
+            key: getattr(instance, key + '_id' if key in ('branch', 'fallback_branch', 'lead_source', 'assigned_role', 'assigned_sales_user') else key)
+            for key in fields_to_read
+        }
+        result = super().to_representation(data_dict)
+        alias = getattr(self.context.get('view'), 'alias', None) or self.context.get('alias')
+        page_name = None
+        if alias and getattr(instance, 'page_id', None):
+            try:
+                p_conn = MetaPageConnection.objects.using(alias).filter(
+                    organization_id=instance.organization_id, page_id=instance.page_id
+                ).first()
+                if p_conn and p_conn.page_name:
+                    page_name = p_conn.page_name
+            except Exception:
+                pass
+        result['page_name'] = page_name
+
+        assigned_role_name = None
+        if alias and getattr(instance, 'assigned_role_id', None):
+            try:
+                r_obj = Role.objects.using(alias).filter(id=instance.assigned_role_id).first()
+                if r_obj:
+                    assigned_role_name = r_obj.name
+            except Exception:
+                pass
+        result['assigned_role_name'] = assigned_role_name
+
+        sales_users = getattr(instance, 'assigned_sales_users', None) or []
+        if not sales_users and getattr(instance, 'assigned_sales_user_id', None):
+            sales_users = [str(instance.assigned_sales_user_id)]
+        result['assigned_sales_users'] = [str(uid) for uid in sales_users]
         return result
 
     def validate(self, attrs):
@@ -93,7 +129,7 @@ class MappingSerializer(serializers.ModelSerializer):
             if key in attrs:
                 return attrs[key]
             if self.instance:
-                return getattr(self.instance, key + '_id' if key in ('branch', 'fallback_branch', 'lead_source', 'assigned_sales_user') else key)
+                return getattr(self.instance, key + '_id' if key in ('branch', 'fallback_branch', 'lead_source', 'assigned_role', 'assigned_sales_user') else key)
             return default
         if self.instance and attrs.get('expected_version') != self.instance.version:
             raise serializers.ValidationError({'expected_version': 'Settings changed or version is missing. Reload and save again.'})
@@ -198,15 +234,47 @@ class MappingSerializer(serializers.ModelSerializer):
 
         assignment_mode = value('assignment_mode', 'TENANT_POLICY')
         if assignment_mode == 'SPECIFIC_USER':
-            user_id = value('assigned_sales_user')
-            if not user_id:
-                raise serializers.ValidationError({'assigned_sales_user': 'Select the designated sales representative.'})
-            staff = TenantUser.objects.using(alias).filter(id=user_id, organization=org, status='ACTIVE', is_login_allowed=True).first()
-            if not staff:
-                raise serializers.ValidationError({'assigned_sales_user': 'Designated sales representative must be an active staff member in this organisation.'})
-            attrs['assigned_sales_user'] = staff
+            role_id = value('assigned_role')
+            if role_id:
+                try:
+                    role_uuid = uuid.UUID(str(role_id))
+                    role_obj = Role.objects.using(alias).filter(id=role_uuid, organization=org, is_active=True).first()
+                    if not role_obj:
+                        raise serializers.ValidationError({'assigned_role': 'Selected role does not exist or is inactive.'})
+                    attrs['assigned_role'] = role_obj
+                except (ValueError, TypeError):
+                    raise serializers.ValidationError({'assigned_role': 'Invalid role identifier.'})
+            else:
+                attrs['assigned_role'] = None
+
+            raw_users = value('assigned_sales_users') or []
+            if isinstance(raw_users, (list, tuple)):
+                user_ids = [str(u).strip() for u in raw_users if str(u).strip()]
+            else:
+                user_ids = []
+
+            single_user = value('assigned_sales_user')
+            if not user_ids and single_user:
+                user_ids = [str(single_user).strip()]
+
+            if not user_ids:
+                raise serializers.ValidationError({'assigned_sales_users': 'Select at least one designated team member.'})
+
+            valid_users_qs = TenantUser.objects.using(alias).filter(
+                id__in=user_ids, organization=org, status='ACTIVE', is_login_allowed=True
+            )
+            valid_user_map = {str(u.id): u for u in valid_users_qs}
+            missing_users = [u for u in user_ids if u not in valid_user_map]
+            if missing_users:
+                raise serializers.ValidationError({'assigned_sales_users': f'Selected team member(s) not found or inactive: {", ".join(missing_users)}'})
+
+            attrs['assigned_sales_users'] = user_ids
+            # Set assigned_sales_user to the first valid user for backward compatibility
+            attrs['assigned_sales_user'] = valid_user_map[user_ids[0]]
         else:
+            attrs['assigned_role'] = None
             attrs['assigned_sales_user'] = None
+            attrs['assigned_sales_users'] = []
 
         initial_stage = value('initial_stage', 'NEW_LEAD')
         valid_stages = {s[0] for s in Lead.STATUSES}
@@ -249,9 +317,62 @@ class MappingSerializer(serializers.ModelSerializer):
         return attrs
 
 
+def _resolve_meta_form_info(organization_id, page_id: str, form_id: str, page_conn, request_cache: dict) -> dict:
+    """Resolve Meta form name & status dynamically with request + Django cache protection."""
+    cache_tuple = (str(page_id or ''), str(form_id or ''))
+    if not cache_tuple[0] or not cache_tuple[1]:
+        return {}
+    if cache_tuple in request_cache:
+        return request_cache[cache_tuple]
+
+    from django.core.cache import cache
+    cache_key = f"meta_form_info:{organization_id}:{cache_tuple[0]}:{cache_tuple[1]}"
+    try:
+        cached = cache.get(cache_key)
+        if isinstance(cached, dict):
+            request_cache[cache_tuple] = cached
+            return cached
+    except Exception as exc:
+        logger.debug("Meta form info cache read skipped for %s: %s", cache_key, exc)
+
+    info: dict = {}
+    enc_token = getattr(page_conn, 'encrypted_page_access_token', '') if page_conn else ''
+    if enc_token and not is_synthetic_token(enc_token):
+        try:
+            page_token = decrypt_token(enc_token)
+            if page_token:
+                client = MetaGraphClient(timeout=4)
+                details = client.fetch_form_details(cache_tuple[1], page_token)
+                if isinstance(details, dict):
+                    if details.get('name'):
+                        info['name'] = str(details['name']).strip()
+                    if details.get('status'):
+                        info['status'] = str(details['status']).strip()
+        except Exception as exc:
+            logger.warning(
+                "Could not fetch Meta form details for page_id=%s form_id=%s: %s",
+                cache_tuple[0], cache_tuple[1], exc,
+            )
+
+    request_cache[cache_tuple] = info
+    try:
+        # Cache resolved names for 6 hours; negative-cache misses for 10 minutes to prevent API thrashing
+        cache.set(cache_key, info, timeout=21600 if info.get('name') else 600)
+    except Exception as exc:
+        logger.debug("Meta form info cache write skipped for %s: %s", cache_key, exc)
+    return info
+
+
 class ImportSerializer(serializers.ModelSerializer):
     matched_lead = serializers.SerializerMethodField()
     resolution = serializers.SerializerMethodField()
+    facebook_account_name = serializers.SerializerMethodField()
+    facebook_account_id = serializers.SerializerMethodField()
+    page_name = serializers.SerializerMethodField()
+    form_name = serializers.SerializerMethodField()
+    meta_form_status = serializers.SerializerMethodField()
+    mapping_state = serializers.SerializerMethodField()
+    mapping_info = serializers.SerializerMethodField()
 
     class Meta:
         model = MetaLeadImport
@@ -259,9 +380,120 @@ class ImportSerializer(serializers.ModelSerializer):
             'id', 'mode', 'page_id', 'form_id', 'external_lead_id', 'status', 'lead',
             'mapping_version', 'attempt_count', 'error_code', 'error_message',
             'campaign_id', 'campaign_name', 'adset_id', 'adset_name', 'ad_id', 'ad_name', 'is_organic',
-            'received_at', 'processed_at', 'matched_lead', 'resolution', 'field_data', 'mapping_snapshot'
+            'received_at', 'processed_at', 'matched_lead', 'resolution', 'field_data', 'mapping_snapshot',
+            'facebook_account_name', 'facebook_account_id', 'page_name',
+            'form_name', 'meta_form_status', 'mapping_state', 'mapping_info',
         ]
         read_only_fields = fields
+
+    def _get_page_conn(self, obj):
+        page_id = str(getattr(obj, 'page_id', '') or '')
+        if not page_id:
+            return None
+        page_conn_map = self.context.get('page_conn_map')
+        if isinstance(page_conn_map, dict):
+            return page_conn_map.get(page_id)
+        alias = getattr(self.context.get('view'), 'alias', None) or self.context.get('alias')
+        if not alias:
+            return None
+        try:
+            return (
+                MetaPageConnection.objects.using(alias)
+                .filter(organization_id=obj.organization_id, page_id=page_id)
+                .select_related('connection')
+                .first()
+            )
+        except Exception as exc:
+            logger.warning("Failed to load MetaPageConnection for page_id=%s: %s", page_id, exc)
+            return None
+
+    def _get_mapping(self, obj):
+        key = (str(getattr(obj, 'page_id', '') or ''), str(getattr(obj, 'form_id', '') or ''))
+        if not key[0] or not key[1]:
+            return None
+        mapping_map = self.context.get('mapping_map')
+        if isinstance(mapping_map, dict):
+            return mapping_map.get(key)
+        alias = getattr(self.context.get('view'), 'alias', None) or self.context.get('alias')
+        if not alias:
+            return None
+        try:
+            return (
+                MetaLeadMapping.objects.using(alias)
+                .filter(organization_id=obj.organization_id, page_id=key[0], form_id=key[1])
+                .first()
+            )
+        except Exception as exc:
+            logger.warning("Failed to load MetaLeadMapping for page_id=%s form_id=%s: %s", key[0], key[1], exc)
+            return None
+
+    def _get_meta_form_info(self, obj):
+        snapshot = obj.mapping_snapshot if isinstance(obj.mapping_snapshot, dict) else {}
+        if snapshot.get('meta_form_name'):
+            return {
+                'name': snapshot.get('meta_form_name'),
+                'status': snapshot.get('meta_form_status'),
+            }
+        # Only query Meta Graph API (cached) when the form is not yet mapped in CRM
+        if self._get_mapping(obj) is not None:
+            return {}
+        if obj.status not in ('NEEDS_MAPPING', 'PENDING', 'FAILED'):
+            return {}
+        req_cache = self.context.setdefault('form_info_cache', {})
+        return _resolve_meta_form_info(
+            obj.organization_id,
+            str(obj.page_id or ''),
+            str(obj.form_id or ''),
+            self._get_page_conn(obj),
+            req_cache,
+        )
+
+    def get_facebook_account_name(self, obj):
+        pc = self._get_page_conn(obj)
+        conn = getattr(pc, 'connection', None) if pc else None
+        return getattr(conn, 'meta_user_name', None) or None
+
+    def get_facebook_account_id(self, obj):
+        pc = self._get_page_conn(obj)
+        conn = getattr(pc, 'connection', None) if pc else None
+        return getattr(conn, 'meta_user_id', None) or None
+
+    def get_page_name(self, obj):
+        pc = self._get_page_conn(obj)
+        return getattr(pc, 'page_name', None) or None
+
+    def get_form_name(self, obj):
+        mapping = self._get_mapping(obj)
+        if mapping and mapping.name:
+            return mapping.name
+        snapshot = obj.mapping_snapshot if isinstance(obj.mapping_snapshot, dict) else {}
+        if snapshot.get('name'):
+            return snapshot.get('name')
+        if snapshot.get('meta_form_name'):
+            return snapshot.get('meta_form_name')
+        info = self._get_meta_form_info(obj)
+        return info.get('name') or None
+
+    def get_meta_form_status(self, obj):
+        info = self._get_meta_form_info(obj)
+        return info.get('status') or None
+
+    def get_mapping_state(self, obj):
+        mapping = self._get_mapping(obj)
+        if not mapping:
+            return 'UNCONFIGURED'
+        return 'ACTIVE' if mapping.is_active else 'PAUSED'
+
+    def get_mapping_info(self, obj):
+        mapping = self._get_mapping(obj)
+        if not mapping:
+            return None
+        return {
+            'id': str(mapping.id),
+            'name': mapping.name,
+            'is_active': bool(mapping.is_active),
+            'version': mapping.version,
+        }
 
     def get_resolution(self, obj):
         if isinstance(obj.mapping_snapshot, dict):
@@ -281,9 +513,23 @@ class ImportSerializer(serializers.ModelSerializer):
                     val = vals[0] if vals else None
                     if val:
                         if 'email' in name and not email:
-                            email = validate_lead_email(val, required=False)
+                            try:
+                                email = validate_lead_email(val, required=False)
+                            except Exception:
+                                email = None
                         elif any(p in name for p in ('phone', 'mobile', 'contact')) and not phone:
-                            phone = validate_lead_phone(val, required=False)
+                            try:
+                                phone = validate_lead_phone(val, required=False)
+                            except Exception:
+                                # Safe fallback for 11+ digit phone entries (e.g. Meta test submissions)
+                                digits = re.sub(r'\D', '', str(val))
+                                if len(digits) >= 10:
+                                    try:
+                                        phone = validate_lead_phone(digits[-10:], required=False)
+                                    except Exception:
+                                        phone = None
+                                else:
+                                    phone = None
 
             contact = Q()
             if email:
@@ -294,18 +540,29 @@ class ImportSerializer(serializers.ModelSerializer):
                 lead = Lead.objects.using(alias).filter(organization_id=obj.organization_id).filter(contact).first()
 
         if lead:
+            from .security_utils import mask_phone_if_restricted
+            req = self.context.get('request')
+            masked_phone = mask_phone_if_restricted(req, lead.phone_normalized)
             name = f"{lead.first_name} {lead.last_name}".strip()
             return {
                 'id': str(lead.id),
-                'name': name or lead.phone_normalized or lead.email_normalized or 'Existing Lead',
+                'name': name or masked_phone or lead.email_normalized or 'Existing Lead',
                 'first_name': lead.first_name,
                 'last_name': lead.last_name,
                 'email': lead.email_normalized,
-                'phone': lead.phone_normalized,
+                'phone': masked_phone,
                 'status': lead.current_status,
                 'created_at': lead.created_at.isoformat() if lead.created_at else None,
             }
         return None
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        from .security_utils import sanitize_meta_field_data
+        req = self.context.get('request')
+        if 'field_data' in data:
+            data['field_data'] = sanitize_meta_field_data(req, data['field_data'])
+        return data
 
 
 class SimulationSerializer(serializers.Serializer):
@@ -323,7 +580,9 @@ class SimulationSerializer(serializers.Serializer):
 
 
 class MetaPagination(PageNumberPagination):
-    page_size = 25
+    page_size = 50
+    page_size_query_param = 'page_size'
+    max_page_size = 200
 
 
 class MetaAccessMixin:
@@ -351,6 +610,7 @@ class MetaAccessMixin:
         'oauth_callback_alias': 'crm.settings.edit',
         'disconnect': 'crm.settings.edit',
         'reconnect': 'crm.settings.edit',
+        'refresh_pages': 'crm.settings.edit',
         'health': 'crm.settings.view',
         'retry_failed': 'crm.settings.edit',
         'connect_token': 'crm.settings.edit',
@@ -547,9 +807,22 @@ def _format_connection_details(conn, db_alias=None, pages=None) -> dict:
 
 class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):
     serializer_class = MappingSerializer
+    pagination_class = MetaPagination
 
     def get_queryset(self):
-        return MetaLeadMapping.objects.using(self.alias).filter(organization=self.organization)
+        qs = MetaLeadMapping.objects.using(self.alias).filter(organization=self.organization)
+        params = getattr(self.request, 'query_params', getattr(self.request, 'GET', {}))
+        page_id = params.get('page_id')
+        if page_id and str(page_id).strip() and str(page_id).strip().upper() != 'ALL':
+            qs = qs.filter(page_id=str(page_id).strip())
+        is_active = params.get('is_active')
+        if is_active is not None and str(is_active).strip():
+            val = str(is_active).strip().lower()
+            if val in ('true', '1', 'active'):
+                qs = qs.filter(is_active=True)
+            elif val in ('false', '0', 'paused'):
+                qs = qs.filter(is_active=False)
+        return qs.order_by('-updated_at', '-id')
 
     def get_serializer_context(self):
         return {**super().get_serializer_context(), 'organization': self.organization, 'alias': self.alias}
@@ -808,6 +1081,17 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
     def oauth_callback(self, request):
         is_browser_redirect = (request.method == 'GET')
         frontend_origin = (getattr(settings, 'FRONTEND_URL', None) or os.getenv('FRONTEND_URL', '')).rstrip('/')
+        if not frontend_origin:
+            origin_header = request.headers.get('Origin') or request.headers.get('Referer')
+            if origin_header:
+                from urllib.parse import urlparse
+                parsed = urlparse(origin_header)
+                if parsed.scheme and parsed.netloc:
+                    frontend_origin = f"{parsed.scheme}://{parsed.netloc}"
+            if not frontend_origin:
+                scheme = 'https' if request.is_secure() else 'http'
+                host = request.get_host() if hasattr(request, 'get_host') else ''
+                frontend_origin = f"{scheme}://{host}" if host else ''
         target_path = '/crm/setup?tab=meta'
 
         # Ensure instance attributes exist immediately
@@ -1240,6 +1524,20 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
                 p_name = p.get('name', f"Page {p_id}")
                 p_token = p.get('access_token', '')
 
+                # Self-healing fallback if token was omitted by business page edge
+                if not p_token and user_token:
+                    try:
+                        from .services_meta_graph import GRAPH_API_BASE
+                        pt_resp = requests.get(
+                            f"{GRAPH_API_BASE}/{p_id}",
+                            params={'access_token': user_token, 'fields': 'access_token'},
+                            timeout=10
+                        )
+                        if pt_resp.status_code == 200:
+                            p_token = pt_resp.json().get('access_token', '')
+                    except Exception:
+                        pass
+
                 subscribed = False
                 if p_token:
                     try:
@@ -1503,11 +1801,34 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
             'allow_unassigned_fallback': config.allow_unassigned_fallback if config else True,
             'require_branch_match': config.require_branch_match if config else True,
         }
+        active_roles = list(Role.objects.using(self.alias).filter(
+            organization=self.organization, is_active=True
+        ).exclude(code__in=['MEMBER', 'LEAD']).order_by('name').values('id', 'name', 'code', 'scope'))
+
         eligible_users = list(TenantUser.objects.using(self.alias).filter(
             organization=self.organization, status='ACTIVE', is_login_allowed=True
         ).order_by('first_name', 'last_name').values('id', 'first_name', 'last_name', 'email'))
+
+        user_ids = [u['id'] for u in eligible_users]
+        role_assignments = list(RoleAssignment.objects.using(self.alias).filter(
+            organization=self.organization, user_id__in=user_ids, is_active=True, status='ACTIVE'
+        ).select_related('role'))
+
+        user_roles_map = {}
+        for ra in role_assignments:
+            if ra.role and ra.role.is_active and ra.role.code not in ('MEMBER', 'LEAD'):
+                user_roles_map.setdefault(str(ra.user_id), []).append({
+                    'id': str(ra.role.id),
+                    'code': ra.role.code,
+                    'name': ra.role.name,
+                })
+
         for u in eligible_users:
+            u['id'] = str(u['id'])
             u['name'] = f"{u['first_name']} {u['last_name']}".strip() or u['email']
+            u_roles = user_roles_map.get(str(u['id']), [])
+            u['roles'] = u_roles
+            u['role_ids'] = [r['id'] for r in u_roles]
 
         conns = list(MetaConnection.objects.using(self.alias).filter(
             organization=self.organization
@@ -1556,6 +1877,9 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
             'meta_app_configured': bool(app_id),
             'webhook_endpoint': '/api/v1/webhooks/meta/leads/',
             'simulator_enabled': simulator_enabled(),
+            'has_received_enquiries': MetaLeadImport.objects.using(self.alias).filter(organization=self.organization, status='IMPORTED').exists(),
+            'active_mappings_count': MetaLeadMapping.objects.using(self.alias).filter(organization=self.organization, is_active=True).count(),
+            'total_mappings_count': MetaLeadMapping.objects.using(self.alias).filter(organization=self.organization).count(),
             'simulator_requirement': 'Development/test deployment, DEBUG enabled, META_LEAD_SIMULATOR_ENABLED enabled and COMMUNICATIONS_OUTBOUND_ENABLED disabled.',
             'destination_fields': [{'value': k, 'label': v} for k, v in DESTINATION_FIELDS.items()],
             'allowed_default_fields': [
@@ -1579,6 +1903,7 @@ class MetaLeadMappingViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retr
             'assignment_modes': [{'value': k, 'label': v} for k, v in MetaLeadMapping.ASSIGNMENT_MODES],
             'task_types': [{'value': k, 'label': v} for k, v in SalesFollowupTask.TASK_TYPES],
             'branches': list(Branch.objects.using(self.alias).filter(organization=self.organization, status='ACTIVE').values('id', 'name', 'code')),
+            'roles': active_roles,
             'lead_sources': list(LeadSource.objects.using(self.alias).filter(organization=self.organization, source_type='META', status='ACTIVE').values('id', 'name')),
             'eligible_users': eligible_users,
             'tenant_assignment_policy': policy_summary,
@@ -1714,14 +2039,46 @@ class MetaLeadImportViewSet(MetaAccessMixin, mixins.ListModelMixin, mixins.Retri
             qs = qs.filter(mode=mode)
         status = params.get('status')
         if status:
-            qs = qs.filter(status=status)
+            if status == 'NEEDS_ATTENTION':
+                qs = qs.filter(status__in=['NEEDS_MAPPING', 'NEEDS_ASSIGNMENT', 'NEEDS_REVIEW'])
+            elif status == 'FAILED':
+                qs = qs.filter(status__in=['FAILED', 'DEAD_LETTER'])
+            elif ',' in status:
+                statuses = [s.strip() for s in status.split(',') if s.strip()]
+                qs = qs.filter(status__in=statuses)
+            else:
+                qs = qs.filter(status=status)
         return qs
 
+    def get_serializer_context(self):
+        ctx = {**super().get_serializer_context(), 'organization': self.organization, 'alias': self.alias}
+        page_conn_map = {}
+        mapping_map = {}
+        try:
+            for pc in (
+                MetaPageConnection.objects.using(self.alias)
+                .filter(organization=self.organization)
+                .select_related('connection')
+            ):
+                page_conn_map[str(pc.page_id)] = pc
+        except Exception as exc:
+            logger.warning("Failed to preload MetaPageConnection map for imports list: %s", exc)
+        try:
+            for m in MetaLeadMapping.objects.using(self.alias).filter(organization=self.organization):
+                mapping_map[(str(m.page_id), str(m.form_id))] = m
+        except Exception as exc:
+            logger.warning("Failed to preload MetaLeadMapping map for imports list: %s", exc)
+        ctx['page_conn_map'] = page_conn_map
+        ctx['mapping_map'] = mapping_map
+        ctx['form_info_cache'] = {}
+        return ctx
+
     def retrieve(self, request, *args, **kwargs):
+        from .security_utils import sanitize_meta_field_data
         event = self.get_object()
         return Response({
             **self.get_serializer(event).data,
-            'field_data': event.field_data,
+            'field_data': sanitize_meta_field_data(request, event.field_data),
             'mapping_snapshot': event.mapping_snapshot,
         })
 

@@ -149,6 +149,7 @@ class DiscountEligibilityRule(models.Model):
     valid_from = models.DateTimeField()
     valid_until = models.DateTimeField(null=True, blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='ACTIVE')
+    configuration = models.JSONField(default=dict, blank=True)
     created_by_user = models.ForeignKey(TenantUser, on_delete=models.PROTECT, null=True, blank=True, related_name='created_discount_rules')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

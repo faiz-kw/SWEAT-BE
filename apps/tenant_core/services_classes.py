@@ -133,15 +133,13 @@ class ClassSchedulingService:
             if class_template.program.status != 'ACTIVE':
                 raise ValidationError(f"Cannot schedule class '{class_template.name}' because its program '{class_template.program.name}' is not ACTIVE.")
             from .models_catalog import ProgramBranchAvailability
-            is_pba_active = ProgramBranchAvailability.objects.using(alias).filter(
-                program=class_template.program,
-                branch=branch,
-                is_active=True
-            ).exists()
-            if not is_pba_active:
-                raise ValidationError(f"Cannot schedule class '{class_template.name}' at '{branch.name}' because its program '{class_template.program.name}' is not active at this branch.")
+            pba_qs = ProgramBranchAvailability.objects.using(alias).filter(program=class_template.program)
+            if pba_qs.exists():
+                is_pba_active = pba_qs.filter(branch=branch, is_active=True).exists()
+                if not is_pba_active:
+                    raise ValidationError(f"Cannot schedule class '{class_template.name}' at '{branch.name}' because its program '{class_template.program.name}' is not active at this branch.")
 
-        # Rule 11: Validate against branch weekly working hours
+        # Rule 11: Validate against branch weekly working hours (including split shifts)
         day_names = {1: 'Monday', 2: 'Tuesday', 3: 'Wednesday', 4: 'Thursday', 5: 'Friday', 6: 'Saturday', 7: 'Sunday'}
         for dow in (days_of_week or []):
             wh = BranchWorkingHours.objects.using(alias).filter(branch=branch, day_of_week=dow).first()
@@ -150,14 +148,30 @@ class ClassSchedulingService:
                 if not wh.is_open:
                     raise ValidationError(f"Branch '{branch.name}' is closed on {d_name}.")
                 if not wh.is_24_hours:
-                    if wh.open_time and start_time < wh.open_time:
-                        raise ValidationError(
-                            f"Class start time {start_time.strftime('%H:%M')} is before branch opening time {wh.open_time.strftime('%H:%M')} on {d_name}."
-                        )
-                    if wh.close_time and end_time > wh.close_time:
-                        raise ValidationError(
-                            f"Class end time {end_time.strftime('%H:%M')} is after branch closing time {wh.close_time.strftime('%H:%M')} on {d_name}."
-                        )
+                    fits_s1 = bool(wh.open_time and wh.close_time and start_time >= wh.open_time and end_time <= wh.close_time)
+                    fits_s2 = bool(
+                        getattr(wh, 'has_split_shift', False) and
+                        getattr(wh, 'open_time_2', None) and
+                        getattr(wh, 'close_time_2', None) and
+                        start_time >= wh.open_time_2 and
+                        end_time <= wh.close_time_2
+                    )
+                    if getattr(wh, 'has_split_shift', False) and getattr(wh, 'open_time_2', None) and getattr(wh, 'close_time_2', None):
+                        if not (fits_s1 or fits_s2):
+                            raise ValidationError(
+                                f"Class time ({start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}) falls outside branch operating shifts "
+                                f"({wh.open_time.strftime('%H:%M')}–{wh.close_time.strftime('%H:%M')} & "
+                                f"{wh.open_time_2.strftime('%H:%M')}–{wh.close_time_2.strftime('%H:%M')}) on {d_name}."
+                            )
+                    else:
+                        if wh.open_time and start_time < wh.open_time:
+                            raise ValidationError(
+                                f"Class start time {start_time.strftime('%H:%M')} is before branch opening time {wh.open_time.strftime('%H:%M')} on {d_name}."
+                            )
+                        if wh.close_time and end_time > wh.close_time:
+                            raise ValidationError(
+                                f"Class end time {end_time.strftime('%H:%M')} is after branch closing time {wh.close_time.strftime('%H:%M')} on {d_name}."
+                            )
 
         rule = ClassScheduleRule(
             class_template=class_template,
@@ -242,12 +256,25 @@ class ClassSchedulingService:
                     continue
 
                 if eff.get('is_open') and not eff.get('is_24_hours'):
-                    if eff.get('open_time') and rule.start_time < eff['open_time']:
-                        curr += timedelta(days=1)
-                        continue
-                    if eff.get('close_time') and rule.end_time > eff['close_time']:
-                        curr += timedelta(days=1)
-                        continue
+                    fits_shift_1 = bool(eff.get('open_time') and eff.get('close_time') and rule.start_time >= eff['open_time'] and rule.end_time <= eff['close_time'])
+                    fits_shift_2 = bool(
+                        eff.get('has_split_shift') and
+                        eff.get('open_time_2') and
+                        eff.get('close_time_2') and
+                        rule.start_time >= eff['open_time_2'] and
+                        rule.end_time <= eff['close_time_2']
+                    )
+                    if eff.get('has_split_shift') and eff.get('open_time_2') and eff.get('close_time_2'):
+                        if not (fits_shift_1 or fits_shift_2):
+                            curr += timedelta(days=1)
+                            continue
+                    else:
+                        if eff.get('open_time') and rule.start_time < eff['open_time']:
+                            curr += timedelta(days=1)
+                            continue
+                        if eff.get('close_time') and rule.end_time > eff['close_time']:
+                            curr += timedelta(days=1)
+                            continue
 
                 # Construct timestamps localized to branch timezone then stored as UTC
                 tz_name = getattr(rule.branch, 'timezone', None) or 'Asia/Kolkata'
@@ -266,7 +293,14 @@ class ClassSchedulingService:
                     branch=rule.branch,
                     class_template=rule.class_template,
                     start_at=start_dt,
-                ).exists()
+                ).exclude(status__in=['CANCELLED', 'DEACTIVATED']).exists()
+
+                if not exists and rule.class_template.program_id:
+                    exists = ClassOccurrence.objects.using(alias).filter(
+                        branch=rule.branch,
+                        class_template__program_id=rule.class_template.program_id,
+                        start_at=start_dt,
+                    ).exclude(status__in=['CANCELLED', 'DEACTIVATED']).exists()
 
                 if not exists:
                     occ = ClassOccurrence(
@@ -402,7 +436,10 @@ class ClassSchedulingService:
             trainer = TrainerProfile.objects.using(alias).select_for_update().select_related('employee_profile').get(id=trainer_profile_id)
 
             # 1. Active status check
-            if trainer.trainer_status != 'ACTIVE' or trainer.employee_profile.employment_status != 'ACTIVE':
+            emp_active = True
+            if hasattr(trainer, 'employee_profile') and trainer.employee_profile:
+                emp_active = (getattr(trainer.employee_profile, 'employment_status', 'ACTIVE') == 'ACTIVE')
+            if trainer.trainer_status != 'ACTIVE' or not emp_active:
                 raise ValidationError(f"Trainer {trainer.trainer_code} is not active.")
 
             # 2. Specialty & Group delivery check
@@ -428,16 +465,37 @@ class ClassSchedulingService:
             # 3. Schedule shift and leave check (Admins/Managers can schedule/assign outside strict shifts)
             is_admin_override = True
             if actor:
-                actor_role = str(getattr(actor, 'role', '')).upper()
-                role_codes = {str(r).upper() for r in (getattr(actor, '_role_codes', set()) or set())}
-                role_list = [str(r).upper() for r in getattr(actor, '_roles', [])]
+                actor_role = str(getattr(actor, 'role', '')).upper().replace(' ', '_').replace('-', '_')
+                role_codes = {str(r).upper().replace(' ', '_').replace('-', '_') for r in (getattr(actor, '_role_codes', set()) or set())}
+                role_list = [str(r).upper().replace(' ', '_').replace('-', '_') for r in getattr(actor, '_roles', [])]
+                actor_user_type = str(getattr(actor, 'user_type', '')).upper()
+
+                admin_roles = {
+                    'ADMIN', 'SUPER_ADMIN', 'ORG_ADMIN', 'BRANCH_MANAGER', 'MANAGER', 'STAFF',
+                    'ORGANIZATION_ADMIN', 'ORGANIZATION_ADMINISTRATOR'
+                }
+
                 is_admin_override = (
                     getattr(actor, 'is_staff', False)
                     or getattr(actor, 'is_superuser', False)
-                    or actor_role in ['ADMIN', 'SUPER_ADMIN', 'ORG_ADMIN', 'BRANCH_MANAGER', 'MANAGER', 'STAFF', 'ORGANIZATION_ADMIN']
-                    or bool(role_codes.intersection({'ADMIN', 'SUPER_ADMIN', 'ORG_ADMIN', 'BRANCH_MANAGER', 'MANAGER', 'STAFF', 'ORGANIZATION_ADMIN'}))
-                    or any(r in ['ADMIN', 'SUPER_ADMIN', 'ORG_ADMIN', 'BRANCH_MANAGER', 'MANAGER', 'STAFF', 'ORGANIZATION_ADMIN'] for r in role_list)
+                    or actor_user_type in ['STAFF', 'ADMIN', 'ORGANIZATION_ADMIN', 'ORGANIZATION_ADMINISTRATOR']
+                    or actor_role in admin_roles
+                    or bool(role_codes.intersection(admin_roles))
+                    or any(r in admin_roles for r in role_list)
                 )
+
+                if not is_admin_override and hasattr(actor, 'id'):
+                    try:
+                        from .models_rbac import RoleAssignment
+                        assigned_roles = RoleAssignment.objects.using(alias).filter(user_id=actor.id).select_related('role')
+                        for ra in assigned_roles:
+                            r_code = (ra.role.code or '').upper().replace(' ', '_').replace('-', '_')
+                            r_name = (ra.role.name or '').upper().replace(' ', '_').replace('-', '_')
+                            if r_code in admin_roles or r_name in admin_roles:
+                                is_admin_override = True
+                                break
+                    except Exception:
+                        pass
 
             if not is_admin_override:
                 duration = int((occ.end_at - occ.start_at).total_seconds() // 60)
@@ -474,10 +532,26 @@ class ClassSchedulingService:
                 Q(trainer_profile=trainer) &
                 Q(status__in=['ASSIGNED', 'CONFIRMED']) &
                 time_filter
-            ).exclude(occurrence=occ).exists()
+            ).exclude(occurrence=occ).exclude(occurrence__status__in=['CANCELLED', 'DEACTIVATED']).exists()
 
             if conflict:
                 raise ValidationError("Trainer has an overlapping class assignment.")
+
+            # Resolve tenant_actor for assigned_by_user ForeignKey
+            tenant_actor = None
+            if actor:
+                if getattr(actor, '__class__', None).__name__ == 'TenantUser':
+                    tenant_actor = actor
+                else:
+                    try:
+                        from .models_users import TenantUser
+                        actor_email = getattr(actor, 'email', None)
+                        actor_id = getattr(actor, 'id', None)
+                        tenant_actor = TenantUser.objects.using(alias).filter(
+                            Q(id=actor_id) | (Q(email__iexact=actor_email) if actor_email else Q(pk__isnull=True))
+                        ).first()
+                    except Exception:
+                        tenant_actor = None
 
             # Check if this trainer is already assigned to this occurrence (update role if exists)
             existing_assignment = ClassOccurrenceTrainer.objects.using(alias).filter(
@@ -485,20 +559,35 @@ class ClassSchedulingService:
                 trainer_profile=trainer,
             ).first()
             if existing_assignment:
+                if trainer_role == 'LEAD':
+                    ClassOccurrenceTrainer.objects.using(alias).filter(
+                        occurrence=occ,
+                        trainer_role='LEAD',
+                        status__in=['ASSIGNED', 'CONFIRMED'],
+                    ).exclude(id=existing_assignment.id).update(status='REPLACED')
+
                 existing_assignment.trainer_role = trainer_role
-                existing_assignment.status = 'CONFIRMED'
-                existing_assignment.assigned_by_user = actor
+                if existing_assignment.status not in ['CONFIRMED', 'ASSIGNED']:
+                    existing_assignment.status = 'ASSIGNED'
+                existing_assignment.assigned_by_user = tenant_actor
                 existing_assignment.assigned_at = timezone.now()
                 existing_assignment.save(using=alias)
                 assignment = existing_assignment
             else:
-                # Create assignment
+                if trainer_role == 'LEAD':
+                    ClassOccurrenceTrainer.objects.using(alias).filter(
+                        occurrence=occ,
+                        trainer_role='LEAD',
+                        status__in=['ASSIGNED', 'CONFIRMED'],
+                    ).update(status='REPLACED')
+
+                # Create new assignment in ASSIGNED (pending check-in) status
                 assignment = ClassOccurrenceTrainer(
                     occurrence=occ,
                     trainer_profile=trainer,
                     trainer_role=trainer_role,
-                    status='CONFIRMED',
-                    assigned_by_user=actor,
+                    status='ASSIGNED',
+                    assigned_by_user=tenant_actor,
                     assigned_at=timezone.now(),
                 )
                 assignment.save(using=alias)
@@ -510,12 +599,113 @@ class ClassSchedulingService:
                 action_code='TRAINER_ASSIGNED',
                 entity_type='ClassOccurrenceTrainer',
                 entity_id=assignment.id,
-                actor_user=actor,
+                actor_user=tenant_actor,
                 event_description=f"Assigned {trainer} to {occ} as {trainer_role}",
                 after_data={'occurrence_id': str(occ.id), 'trainer_id': str(trainer.id), 'role': trainer_role},
                 db_alias=alias,
             )
             return assignment
+
+    @classmethod
+    def release_trainers_for_occurrences(
+        cls,
+        occurrence_ids: Union[List[Union[str, uuid.UUID]], Any],
+        reason: str = "Class session disabled/cancelled",
+        actor: Optional[Any] = None,
+        db_alias: Optional[str] = None,
+    ) -> int:
+        """
+        Robustly and immediately releases all active trainer assignments for the specified
+        class occurrence(s) when the session is cancelled, deactivated, or disabled.
+
+        Guarantees:
+        1. Transitions all active assignments (ASSIGNED / CONFIRMED) to CANCELLED.
+        2. Frees up trainer availability instantly across group classes and PT appointments.
+        3. Logs immutable business audit records (TRAINER_RELEASED) with actor context.
+        4. Returns the count of released trainer assignments.
+        """
+        alias = db_alias or 'default'
+        if not occurrence_ids:
+            return 0
+
+        # Handle list, set, or QuerySet of IDs
+        if isinstance(occurrence_ids, (list, tuple, set)):
+            clean_ids = [str(oid) for oid in occurrence_ids if oid]
+        elif hasattr(occurrence_ids, 'values_list'):
+            clean_ids = list(occurrence_ids.values_list('id', flat=True))
+        else:
+            clean_ids = [str(occurrence_ids)]
+
+        if not clean_ids:
+            return 0
+
+        with transaction.atomic(using=alias):
+            active_assignments = list(
+                ClassOccurrenceTrainer.objects.using(alias).select_for_update().filter(
+                    occurrence_id__in=clean_ids,
+                    status__in=['ASSIGNED', 'CONFIRMED']
+                ).select_related(
+                    'occurrence',
+                    'trainer_profile',
+                    'occurrence__branch',
+                    'occurrence__branch__organization'
+                )
+            )
+
+            if not active_assignments:
+                return 0
+
+            target_ids = [a.id for a in active_assignments]
+            ClassOccurrenceTrainer.objects.using(alias).filter(id__in=target_ids).update(
+                status='CANCELLED'
+            )
+
+            # Resolve tenant_actor for audit logging
+            tenant_actor = None
+            if actor:
+                if getattr(actor, '__class__', None).__name__ == 'TenantUser':
+                    tenant_actor = actor
+                else:
+                    try:
+                        from .models_users import TenantUser
+                        actor_email = getattr(actor, 'email', None)
+                        actor_id = getattr(actor, 'id', None)
+                        tenant_actor = TenantUser.objects.using(alias).filter(
+                            Q(id=actor_id) | (Q(email__iexact=actor_email) if actor_email else Q(pk__isnull=True))
+                        ).first()
+                    except Exception:
+                        tenant_actor = None
+
+            from .services_reliability import record_business_audit
+            for assignment in active_assignments:
+                occ = assignment.occurrence
+                trainer = assignment.trainer_profile
+                org = occ.branch.organization if (occ and occ.branch) else None
+                if org:
+                    try:
+                        record_business_audit(
+                            organization=org,
+                            branch=occ.branch,
+                            module='classes',
+                            action_code='TRAINER_RELEASED',
+                            entity_type='ClassOccurrenceTrainer',
+                            entity_id=assignment.id,
+                            actor_user=tenant_actor,
+                            event_description=f"Released trainer {getattr(trainer, 'trainer_code', 'Trainer')} from cancelled/disabled class session on {getattr(occ, 'occurrence_date', '')}: {reason}",
+                            before_data={'status': assignment.status, 'role': assignment.trainer_role},
+                            after_data={'status': 'CANCELLED', 'reason': reason},
+                            metadata={
+                                'occurrence_id': str(occ.id),
+                                'trainer_id': str(trainer.id),
+                                'trainer_code': getattr(trainer, 'trainer_code', ''),
+                                'release_reason': reason,
+                            },
+                            db_alias=alias,
+                        )
+                    except Exception as audit_err:
+                        logger.warning(f"Failed to record audit log for released trainer: {audit_err}")
+
+            return len(active_assignments)
 
 
 class ContentStudioService:

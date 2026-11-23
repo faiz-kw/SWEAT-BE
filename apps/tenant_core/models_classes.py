@@ -285,6 +285,20 @@ class ClassOccurrence(models.Model):
         if not self.occurrence_date and self.start_at:
             self.occurrence_date = self.start_at.date()
         super().save(*args, **kwargs)
+        if self.status in ('CANCELLED', 'DEACTIVATED') and self.pk:
+            alias = getattr(self._state, 'db', None) or 'default'
+            try:
+                from .services_classes import ClassSchedulingService
+                ClassSchedulingService.release_trainers_for_occurrences(
+                    occurrence_ids=[self.pk],
+                    reason=f"Occurrence saved in {self.status} status",
+                    db_alias=alias,
+                )
+            except Exception:
+                ClassOccurrenceTrainer.objects.using(alias).filter(
+                    occurrence_id=self.pk,
+                    status__in=['ASSIGNED', 'CONFIRMED'],
+                ).update(status='CANCELLED')
 
     def __str__(self):
         return f"{self.class_template.name} @ {self.branch.name} on {self.occurrence_date} ({self.status})"
@@ -366,7 +380,7 @@ class ClassOccurrenceTrainer(models.Model):
         )
         if self.pk:
             conflicts = conflicts.exclude(pk=self.pk)
-        conflicts = conflicts.exclude(occurrence=occ)
+        conflicts = conflicts.exclude(occurrence=occ).exclude(occurrence__status__in=['CANCELLED', 'DEACTIVATED'])
 
         if conflicts.exists():
             c = conflicts.select_related('occurrence__branch', 'occurrence__class_template').first()

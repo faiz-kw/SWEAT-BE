@@ -19,9 +19,11 @@ from .views_mobile import (
     MobileTrainersView,
     MobileScheduleView,
     MobileClaimFreeTrialView,
+    ExperienceStudioView,
     MobileBookClassView,
     MobileMyBookingsView,
     MobileCancelBookingView,
+    MobileNotificationsView,
     MobileRescheduleBookingView,
     MobileQRPassView,
     MobilePackagesView,
@@ -30,6 +32,7 @@ from .views_mobile import (
     MobileRewardHistoryView,
     MobileDiscountCouponsView,
     MobileValidateCouponView,
+    MobilePricingQuoteView,
     MobileCheckoutOrderView,
     MobileCheckoutVerifyView,
     MobileOrdersView,
@@ -49,6 +52,8 @@ from .views_mobile import (
 )
 
 app_name = 'mobile_api'
+
+from .views_invoice import MobileMembershipHistoryView, MobileInvoiceRenderView
 
 urlpatterns = [
     # Direct on-site Turnstile test trigger
@@ -82,6 +87,8 @@ urlpatterns = [
     path('trials/claim/', MobileClaimFreeTrialView.as_view(), name='mobile-trials-claim'),
     path('trials/available-slots/', MobileScheduleView.as_view(), name='mobile-trials-slots'),
     path('trial-bookings/', MobileClaimFreeTrialView.as_view(), name='mobile-trial-bookings'),
+    path('experience-studio/', ExperienceStudioView.as_view(), name='mobile-experience-studio'),
+    path('notifications/', MobileNotificationsView.as_view(), name='mobile-notifications'),
     path('bookings/book/', MobileBookClassView.as_view(), name='mobile-book-class'),
     path('bookings/my-bookings/', MobileMyBookingsView.as_view(), name='mobile-my-bookings'),
     path('bookings/', MobileMyBookingsView.as_view(), name='mobile-bookings-direct'),
@@ -102,6 +109,8 @@ urlpatterns = [
     path('memberships/freeze/', MobileMembershipFreezeView.as_view(), name='mobile-membership-freeze'),
     path('memberships/unfreeze/', MobileMembershipUnfreezeView.as_view(), name='mobile-membership-unfreeze'),
     path('memberships/passport-topup/', MobilePassportTopupView.as_view(), name='mobile-membership-passport-topup'),
+    path('memberships/history/', MobileMembershipHistoryView.as_view(), name='mobile-membership-history'),
+    path('invoice/<uuid:invoice_id>/', MobileInvoiceRenderView.as_view(), name='mobile-invoice-render'),
     path('tickets/', MobileTicketsView.as_view(), name='mobile-tickets'),
     path('packages/', MobilePackagesView.as_view(), name='mobile-packages'),
     path('my-credits/', MobileMyCreditsView.as_view(), name='mobile-my-credits'),
@@ -112,7 +121,9 @@ urlpatterns = [
     path('coupons/', MobileDiscountCouponsView.as_view(), name='mobile-coupons'),
     path('discounts/', MobileDiscountCouponsView.as_view(), name='mobile-discounts'),
     path('coupons/validate/', MobileValidateCouponView.as_view(), name='mobile-validate-coupon'),
+    path('pricing/quote/', MobilePricingQuoteView.as_view(), name='mobile-pricing-quote'),
     path('checkout/create-order/', MobileCheckoutOrderView.as_view(), name='mobile-checkout-create-order'),
+    path('checkout/create-payment-link/', MobileCheckoutOrderView.as_view(), name='mobile-checkout-create-payment-link'),
     path('checkout/verify/', MobileCheckoutVerifyView.as_view(), name='mobile-checkout-verify'),
     path('orders/', MobileOrdersView.as_view(), name='mobile-orders'),
 

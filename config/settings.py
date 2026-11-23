@@ -114,6 +114,8 @@ MIDDLEWARE = [
     'config.middleware.CorrelationIDMiddleware',
     # Tenant DB routing middleware — resolves active tenant from verified JWT
     'config.tenant_middleware.TenantDatabaseMiddleware',
+    # Universal catch-all CRM mutation audit middleware — ensures zero blind spots across all modules
+    'apps.tenant_core.middleware_activity_audit.UniversalMutationAuditMiddleware',
 ]
 
 ROOT_URLCONF = 'config.urls'
@@ -270,6 +272,8 @@ REST_FRAMEWORK = {
         'auth_refresh': os.getenv('THROTTLE_RATE_REFRESH', '20/minute'),
         # Wellness AI vision rate limit (per authenticated member)
         'wellness_ai_vision': os.getenv('THROTTLE_RATE_WELLNESS_AI_VISION', '10/minute'),
+        # Vobiz Dial callbackUrl events (log-only webhook, several events per call leg)
+        'telephony_dial_events': os.getenv('THROTTLE_RATE_TELEPHONY_DIAL_EVENTS', '600/minute'),
         # General API throttles (authenticated vs anonymous)
         'user': os.getenv('THROTTLE_RATE_API_USER', '1000/minute'),
         'anon': os.getenv('THROTTLE_RATE_API_ANON', '60/minute'),
@@ -577,6 +581,7 @@ if 'test' in sys.argv:
         'auth_mfa':     '10000/minute',
         'auth_refresh': '10000/minute',
         'wellness_ai_vision': '10000/minute',
+        'telephony_dial_events': '10000/minute',
         # Disable global API throttles in tests: all test requests share the same loopback IP.
         'user': '10000/minute',
         'anon': '10000/minute',
@@ -660,6 +665,19 @@ VOICE_CALLING_ENABLED = os.getenv('VOICE_CALLING_ENABLED', 'false').lower() in (
 VOICE_CALLING_ENFORCE_HOURS = os.getenv('VOICE_CALLING_ENFORCE_HOURS', 'false' if DEBUG else 'true').lower() in ('true', '1', 't', 'yes')
 VOICE_CALLING_HOURS_START = int(os.getenv('VOICE_CALLING_HOURS_START', '9'))   # 09:00 IST
 VOICE_CALLING_HOURS_END   = int(os.getenv('VOICE_CALLING_HOURS_END',   '21'))  # 21:00 IST
+# Telephony routing: an agent is routable only if their browser sent a presence heartbeat this
+# recently. The WebPhone heartbeat is every 45 s, so 120 s tolerates two missed beats.
+TELEPHONY_BROWSER_LIVENESS_SECONDS = int(os.getenv('TELEPHONY_BROWSER_LIVENESS_SECONDS', '120'))
+# Inbound overflow: number of overflow rings AFTER the primary agent's ring.
+# 3 means the primary rep plus up to 3 overflow reps (4 reps in total), then the call is closed.
+TELEPHONY_MAX_OVERFLOW_ATTEMPTS_AFTER_PRIMARY = int(
+    os.getenv('TELEPHONY_MAX_OVERFLOW_ATTEMPTS_AFTER_PRIMARY', '3')
+)
+# Longest call a presence heartbeat will treat as still live. Past this, an open session no longer keeps
+# an agent ON_CALL: with no sweeper, a lost hangup webhook would otherwise strand the agent forever.
+TELEPHONY_MAX_CALL_DURATION_MINUTES = int(os.getenv('TELEPHONY_MAX_CALL_DURATION_MINUTES', '120'))
+# Temporary, for the heartbeat-cadence experiment: log the writer (user and tab) of each heartbeat.
+TELEPHONY_HEARTBEAT_TRACE = os.getenv('TELEPHONY_HEARTBEAT_TRACE', 'false').lower() in ('true', '1', 'yes')
 META_APP_ID = os.getenv('META_APP_ID', '').strip()
 META_APP_SECRET = os.getenv('META_APP_SECRET', '').strip()
 META_WEBHOOK_VERIFY_TOKEN = os.getenv('META_WEBHOOK_VERIFY_TOKEN', '').strip()

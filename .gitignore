@@ -93,3 +93,6 @@ celerybeat-schedule*
 
 # Scratch directory
 scratch/
+.env.prod
+*.bak.*
+*.bak

@@ -26,6 +26,7 @@ from .models_infra import File, Integration, LegacyEntityMap
 from .models_audit_outbox import (
     BusinessAuditEvent, IdempotencyRecord, DomainOutboxEvent, ReasonCode,
 )
+from .models_activity_audit import ActivityAuditLog
 
 from .models_workforce import (
     UserProfile, EmployeeProfile, TrainerProfile, SalesProfile,
@@ -38,7 +39,7 @@ from .models_crm import (
     IntakeSubmission, IntakeAnswer, TrialBooking, TrialStatusHistory,
     LeadConversion, SalesFollowupTask, LeadCommercialProfile,
     CRMStageSlaPolicy, CRMTrialReminderPolicy, CRMAgentAssignmentConfig,
-    CRMStageAutomationRule,
+    CRMStageAutomationRule, LeadTransferBatch,
 )
 
 from .models_catalog import (
@@ -73,7 +74,7 @@ __all__ = [
     # Infra
     'File', 'Integration', 'LegacyEntityMap',
     # Module N: Audit & Reliability
-    'BusinessAuditEvent', 'IdempotencyRecord', 'DomainOutboxEvent', 'ReasonCode',
+    'BusinessAuditEvent', 'IdempotencyRecord', 'DomainOutboxEvent', 'ReasonCode', 'ActivityAuditLog',
     # Module A: Workforce & Trainers
     'UserProfile', 'EmployeeProfile', 'TrainerProfile', 'SalesProfile',
     'EmployeeWorkSchedule', 'EmployeeScheduleException', 'TrainerSpecialty', 'TrainerSpecialtyAssignment',
@@ -83,7 +84,7 @@ __all__ = [
     'IntakeSubmission', 'IntakeAnswer', 'TrialBooking', 'TrialStatusHistory',
     'LeadConversion', 'SalesFollowupTask', 'LeadCommercialProfile',
     'CRMStageSlaPolicy', 'CRMTrialReminderPolicy', 'CRMAgentAssignmentConfig',
-    'CRMStageAutomationRule',
+    'CRMStageAutomationRule', 'LeadTransferBatch',
     # Module C: Terms & Legal
     'TermsDocument', 'TermsDocumentVersion', 'TermsAcceptance',
     # Module D: Programs, Packages & Catalog

@@ -177,8 +177,27 @@ def record_business_audit(
     """
     Creates an immutable business audit event with sanitized before/after state diffs.
     """
+    # If actor_user is not a TenantUser instance (e.g. PlatformUser/SuperAdmin), resolve or fallback safely
+    if actor_user is not None and getattr(actor_user, '__class__', None).__name__ != 'TenantUser':
+        resolved_tenant_user = None
+        try:
+            from .models_users import TenantUser
+            from django.db.models import Q
+            alias = db_alias or 'default'
+            actor_email = getattr(actor_user, 'email', None)
+            actor_id = getattr(actor_user, 'id', None)
+            resolved_tenant_user = TenantUser.objects.using(alias).filter(
+                Q(id=actor_id) | (Q(email__iexact=actor_email) if actor_email else Q(pk__isnull=True))
+            ).first()
+        except Exception:
+            resolved_tenant_user = None
+        if not metadata:
+            metadata = {}
+        metadata['raw_actor'] = str(actor_user)
+        actor_user = resolved_tenant_user
+
     manager = BusinessAuditEvent.objects.using(db_alias) if db_alias else BusinessAuditEvent.objects
-    return manager.create(
+    event = manager.create(
         organization=organization,
         branch=branch,
         actor_type=actor_type,
@@ -199,6 +218,33 @@ def record_business_audit(
         session_id=session_id,
         occurred_at=timezone.now(),
     )
+
+    # Bridge to Canonical ActivityAuditLog for complete unified CRM visibility
+    try:
+        from .audit_engine import UnifiedAuditEngine
+        UnifiedAuditEngine.record_activity(
+            action_code=action_code,
+            module=module,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            actor_user=actor_user,
+            actor_type='STAFF' if actor_type == 'USER' else actor_type,
+            organization=organization,
+            branch=branch,
+            before_state=before_data,
+            after_state=after_data,
+            event_description=event_description or '',
+            metadata=metadata,
+            ip_address=ip_address,
+            user_agent=user_agent or '',
+            request_id=str(request_id) if request_id else '',
+            source_channel=source_channel,
+            db_alias=db_alias,
+        )
+    except Exception as bridge_err:
+        logger.warning(f"Failed to mirror BusinessAuditEvent to ActivityAuditLog: {bridge_err}")
+
+    return event
 
 
 def enqueue_outbox_event(

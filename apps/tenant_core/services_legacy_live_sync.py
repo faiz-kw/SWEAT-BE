@@ -210,6 +210,60 @@ def search_legacy_members(query: str) -> list[dict]:
 
     return results
 
+_LEGACY_PLAN_PROGRAM = {
+    'bootcamp': 'Bootcamp',
+    'bootcamp trial': 'Bootcamp',
+    'transformation program': 'Transformation Program',
+    'base 90 day plan': 'Base 90 Day Plan',
+    'base 90 days plan': 'Base 90 Day Plan',
+    '90 days program': '90 Days Program',
+}
+
+
+def _resolve_legacy_package(planname, max_s, tenant_alias):
+    """Map a legacy plan name to the right catalog package (program + session count).
+    Returns (package_id, version_id, price_id, program_id) or None to keep the default."""
+    try:
+        from .models_catalog import PackageEntitlementDefinition
+        name = (planname or '').replace('&amp;', '&').strip().lower()
+        prog_name = _LEGACY_PLAN_PROGRAM.get(name)
+        if not prog_name:
+            return None
+        prog = Program.objects.using(tenant_alias).filter(name__iexact=prog_name).first()
+        if not prog:
+            return None
+        pkgs = list(Package.objects.using(tenant_alias).filter(program=prog, status='ACTIVE'))
+        if not pkgs:
+            return None
+        chosen_v = None
+        for pk in pkgs:
+            v = pk.versions.using(tenant_alias).filter(status='ACTIVE').order_by('-version_number').first()
+            if not v:
+                continue
+            ed = PackageEntitlementDefinition.objects.using(tenant_alias).filter(
+                package_version=v, entitlement_type='CLASS_SESSION').first()
+            alloc = int(ed.allocated_units) if ed and ed.allocated_units else None
+            if max_s and alloc == max_s:
+                chosen_v = v
+                break
+        if chosen_v is None:
+            for pk in pkgs:
+                if 'trial' in pk.name.lower():
+                    continue
+                v = pk.versions.using(tenant_alias).filter(status='ACTIVE').order_by('-version_number').first()
+                if v:
+                    chosen_v = v
+                    break
+        if chosen_v is None:
+            return None
+        price = chosen_v.prices.using(tenant_alias).filter(status='ACTIVE').first()
+        if not price:
+            return None
+        return (chosen_v.package_id, chosen_v.id, price.id, prog.id)
+    except Exception:
+        return None
+
+
 def sync_live_legacy_member_to_tenant(primary_uid: int, tenant_alias: str, org_id: str = None) -> UserProfile:
     """
     Performs on-demand live extraction from MySQL and creates/updates the member in PostgreSQL.
@@ -375,12 +429,10 @@ def sync_live_legacy_member_to_tenant(primary_uid: int, tenant_alias: str, org_i
                     start_date=datetime.strptime(start_d_str, '%Y-%m-%d').date() if start_d_str else timezone.now().date(),
                     end_date=datetime.strptime(end_d_str, '%Y-%m-%d').date() if end_d_str else timezone.now().date(),
                     status=status_val,
-                    home_branch_id=branch_uuid,
-                    purchase_branch_id=branch_uuid,
-                    package_id=uuid.UUID(DEFAULT_PACKAGE_ID),
-                    package_price_id=uuid.UUID(DEFAULT_PRICE_ID),
-                    package_version_id=uuid.UUID(DEFAULT_VERSION_ID),
-                    program_id=uuid.UUID(DEFAULT_PROGRAM_ID),
+                    # home_branch/purchase_branch intentionally NOT overwritten on re-sync:
+                    # respect any ops-initiated branch transfer. Branch is set only on create.
+                    # package/program/version also NOT overwritten on re-sync:
+                    # sync owns balances+status+dates only; package identity comes from the order/catalog.
                     legacy_reference=f"userplan:{p_uid}",
                     parq_status=getattr(existing_mem, 'parq_status', 'PENDING') or 'PENDING',
                     updated_at=timezone.now(),
@@ -388,6 +440,14 @@ def sync_live_legacy_member_to_tenant(primary_uid: int, tenant_alias: str, org_i
                 existing_mem.refresh_from_db()
                 mem = existing_mem
             else:
+                _rp = _resolve_legacy_package(planname, max_s, tenant_alias)
+                if _rp:
+                    _pkg_id, _ver_id, _price_id, _prog_id = _rp
+                else:
+                    _pkg_id = uuid.UUID(DEFAULT_PACKAGE_ID)
+                    _ver_id = uuid.UUID(DEFAULT_VERSION_ID)
+                    _price_id = uuid.UUID(DEFAULT_PRICE_ID)
+                    _prog_id = uuid.UUID(DEFAULT_PROGRAM_ID)
                 mem = Membership.objects.using(tenant_alias).create(
                     membership_number=m_number,
                     user_profile=profile,
@@ -396,10 +456,10 @@ def sync_live_legacy_member_to_tenant(primary_uid: int, tenant_alias: str, org_i
                     status=status_val,
                     home_branch_id=branch_uuid,
                     purchase_branch_id=branch_uuid,
-                    package_id=uuid.UUID(DEFAULT_PACKAGE_ID),
-                    package_price_id=uuid.UUID(DEFAULT_PRICE_ID),
-                    package_version_id=uuid.UUID(DEFAULT_VERSION_ID),
-                    program_id=uuid.UUID(DEFAULT_PROGRAM_ID),
+                    package_id=_pkg_id,
+                    package_price_id=_price_id,
+                    package_version_id=_ver_id,
+                    program_id=_prog_id,
                     legacy_reference=f"userplan:{p_uid}",
                     parq_status='PENDING',
                 )
@@ -471,7 +531,7 @@ def sync_live_legacy_member_to_tenant(primary_uid: int, tenant_alias: str, org_i
             .first()
         )
         if latest_pkg_mem and (latest_pkg_mem.purchase_branch_id or latest_pkg_mem.home_branch_id):
-            target_branch_id = latest_pkg_mem.purchase_branch_id or latest_pkg_mem.home_branch_id
+            target_branch_id = latest_pkg_mem.home_branch_id or latest_pkg_mem.purchase_branch_id
             if profile.preferred_branch_id != target_branch_id:
                 profile.preferred_branch_id = target_branch_id
                 profile.save(using=tenant_alias, update_fields=['preferred_branch'])
@@ -523,6 +583,12 @@ def sync_live_legacy_member_to_tenant(primary_uid: int, tenant_alias: str, org_i
 
             order_uuid = uuid.UUID(gen_uuid('order', t_uid))
             order_num = inv_id if inv_id else f"ORD-{t_uid:06d}"
+            # order_number has a UNIQUE constraint, but legacy invoice ids (inv_id) repeat across
+            # transactions. If this number is already held by a DIFFERENT order, make it unique per
+            # transaction so the member sync (incl. attendance/check-ins) no longer fails on a
+            # duplicate-key error (was stranding attendance -> false no-shows).
+            if Order.objects.using(tenant_alias).filter(order_number=order_num).exclude(id=order_uuid).exists():
+                order_num = f"{order_num}-{t_uid}"
             branch_uuid = uuid.UUID(DEFAULT_BRANCH_ID)
 
             is_paid = (t_amountpaid >= tot and tot > Decimal('0.00')) or ('paid' in txn_status or 'success' in txn_status)

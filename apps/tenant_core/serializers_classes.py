@@ -1,4 +1,7 @@
 from django.utils import timezone
+from django.core.exceptions import ObjectDoesNotExist
+import logging
+
 from rest_framework import serializers
 from .models_classes import (
     ClassCategory, ClassTemplate, ClassPrice, ClassBranchAvailability,
@@ -11,6 +14,8 @@ from .models_classes import (
 
 
 from .serializers_catalog import _generate_unique_code
+
+logger = logging.getLogger(__name__)
 
 
 class ClassCategorySerializer(serializers.ModelSerializer):
@@ -253,6 +258,8 @@ class ClassScheduleRuleSerializer(serializers.ModelSerializer):
         valid_from = attrs.get('valid_from') or (self.instance.valid_from if self.instance else None)
         valid_until = attrs.get('valid_until') if 'valid_until' in attrs else (self.instance.valid_until if self.instance else None)
 
+        target_status = attrs.get('status') or (self.instance.status if self.instance else 'ACTIVE')
+
         if not attrs.get('recurrence_type'):
             attrs['recurrence_type'] = 'WEEKLY'
         if not attrs.get('delivery_mode'):
@@ -266,74 +273,115 @@ class ClassScheduleRuleSerializer(serializers.ModelSerializer):
         if valid_from and valid_until and valid_until < valid_from:
             raise serializers.ValidationError({"valid_until": "Valid until date must be on or after valid from date."})
 
-        if valid_until and valid_until < timezone.now().date():
-            raise serializers.ValidationError({"valid_until": "Recurring schedule period cannot be entirely in the past."})
+        # Operational validations only apply when the rule is ACTIVE.
+        # Deactivating an inactive or past rule must never be blocked.
+        if target_status == 'ACTIVE':
+            if valid_until and valid_until < timezone.now().date():
+                raise serializers.ValidationError({"valid_until": "Recurring schedule period cannot be entirely in the past."})
 
-        if branch:
-            if getattr(branch, 'status', None) and branch.status != 'ACTIVE':
-                raise serializers.ValidationError({"branch": f"Branch '{branch.name}' is not ACTIVE."})
+            if branch:
+                if getattr(branch, 'status', None) and branch.status != 'ACTIVE':
+                    raise serializers.ValidationError({"branch": f"Branch '{branch.name}' is not ACTIVE."})
 
-            class_template = attrs.get('class_template') or getattr(self.instance, 'class_template', None)
-            if class_template and class_template.program:
-                from .models_catalog import ProgramBranchAvailability
-                from .context import get_tenant_db_alias
-                chk_alias = get_tenant_db_alias() or 'default'
-                if hasattr(branch, '_state') and branch._state.db:
-                    chk_alias = branch._state.db
-                if class_template.program.status != 'ACTIVE':
-                    raise serializers.ValidationError({
-                        "branch": f"Cannot schedule class '{class_template.name}' because its program '{class_template.program.name}' is not ACTIVE."
-                    })
-                is_pba_active = ProgramBranchAvailability.objects.using(chk_alias).filter(
-                    program=class_template.program,
-                    branch=branch,
-                    is_active=True
-                ).exists()
-                if not is_pba_active:
-                    raise serializers.ValidationError({
-                        "branch": f"Cannot schedule class '{class_template.name}' at '{branch.name}' because its program '{class_template.program.name}' is not active at this branch."
-                    })
-
-            # Check branch working hours
-            from .models_govern import BranchWorkingHours, BranchOperatingException
-            from .context import get_tenant_db_alias
-            alias = get_tenant_db_alias() or 'default'
-            day_names = {1: 'Monday', 2: 'Tuesday', 3: 'Wednesday', 4: 'Thursday', 5: 'Friday', 6: 'Saturday', 7: 'Sunday'}
-            for dow in (days_of_week or []):
-                wh = BranchWorkingHours.objects.using(alias).filter(branch=branch, day_of_week=dow).first()
-                if wh:
-                    d_name = day_names.get(dow, f'Day {dow}')
-                    if not wh.is_open:
-                        raise serializers.ValidationError({"branch": f"Branch '{branch.name}' is closed on {d_name}."})
-                    if not wh.is_24_hours:
-                        if wh.open_time and start_time and start_time < wh.open_time:
-                            raise serializers.ValidationError(
-                                {"start_time": f"Class start time ({start_time.strftime('%H:%M')}) is before branch opening time ({wh.open_time.strftime('%H:%M')}) on {d_name}."}
-                            )
-                        if wh.close_time and end_time and end_time > wh.close_time:
-                            raise serializers.ValidationError(
-                                {"end_time": f"Class end time ({end_time.strftime('%H:%M')}) is after branch closing time ({wh.close_time.strftime('%H:%M')}) on {d_name}."}
-                            )
-
-            # Check holiday exceptions when valid_from is single date or short range
-            if valid_from:
-                end_check = valid_until or valid_from
-                # If exact single day rule falls on a closed holiday
-                if valid_from == end_check:
-                    holiday = BranchOperatingException.objects.using(alias).filter(
-                        branch=branch, exception_date=valid_from, is_closed=True
-                    ).first()
-                    if holiday:
+                class_template = attrs.get('class_template') or getattr(self.instance, 'class_template', None)
+                if class_template and class_template.program:
+                    from .models_catalog import ProgramBranchAvailability
+                    from .context import get_tenant_db_alias
+                    chk_alias = get_tenant_db_alias() or 'default'
+                    if hasattr(branch, '_state') and branch._state.db:
+                        chk_alias = branch._state.db
+                    if class_template.program.status != 'ACTIVE':
                         raise serializers.ValidationError({
-                            "valid_from": f"Branch '{branch.name}' is closed on {valid_from} ({holiday.reason or 'Holiday/Maintenance'})."
+                            "branch": f"Cannot schedule class '{class_template.name}' because its program '{class_template.program.name}' is not ACTIVE."
                         })
+                    pba_qs = ProgramBranchAvailability.objects.using(chk_alias).filter(program=class_template.program)
+                    if pba_qs.exists():
+                        is_pba_active = pba_qs.filter(branch=branch, is_active=True).exists()
+                        if not is_pba_active:
+                            raise serializers.ValidationError({
+                                "branch": f"Cannot schedule class '{class_template.name}' at '{branch.name}' because its program '{class_template.program.name}' is not active at this branch."
+                            })
+
+                # Check branch working hours (including split-shift support)
+                from .models_govern import BranchWorkingHours, BranchOperatingException
+                from .context import get_tenant_db_alias
+                alias = get_tenant_db_alias() or 'default'
+                day_names = {1: 'Monday', 2: 'Tuesday', 3: 'Wednesday', 4: 'Thursday', 5: 'Friday', 6: 'Saturday', 7: 'Sunday'}
+                for dow in (days_of_week or []):
+                    wh = BranchWorkingHours.objects.using(alias).filter(branch=branch, day_of_week=dow).first()
+                    if wh:
+                        d_name = day_names.get(dow, f'Day {dow}')
+                        if not wh.is_open:
+                            raise serializers.ValidationError({"branch": f"Branch '{branch.name}' is closed on {d_name}."})
+                        if not wh.is_24_hours:
+                            fits_s1 = bool(wh.open_time and wh.close_time and start_time >= wh.open_time and end_time <= wh.close_time)
+                            fits_s2 = bool(
+                                getattr(wh, 'has_split_shift', False) and
+                                getattr(wh, 'open_time_2', None) and
+                                getattr(wh, 'close_time_2', None) and
+                                start_time >= wh.open_time_2 and
+                                end_time <= wh.close_time_2
+                            )
+                            if getattr(wh, 'has_split_shift', False) and getattr(wh, 'open_time_2', None) and getattr(wh, 'close_time_2', None):
+                                if not (fits_s1 or fits_s2):
+                                    raise serializers.ValidationError({
+                                        "start_time": (
+                                            f"Class ({start_time.strftime('%H:%M')}–{end_time.strftime('%H:%M')}) falls outside branch operating shifts "
+                                            f"({wh.open_time.strftime('%H:%M')}–{wh.close_time.strftime('%H:%M')} & "
+                                            f"{wh.open_time_2.strftime('%H:%M')}–{wh.close_time_2.strftime('%H:%M')}) on {d_name}."
+                                        )
+                                    })
+                            else:
+                                if wh.open_time and start_time and start_time < wh.open_time:
+                                    raise serializers.ValidationError(
+                                        {"start_time": f"Class start time ({start_time.strftime('%H:%M')}) is before branch opening time ({wh.open_time.strftime('%H:%M')}) on {d_name}."}
+                                    )
+                                if wh.close_time and end_time and end_time > wh.close_time:
+                                    raise serializers.ValidationError(
+                                        {"end_time": f"Class end time ({end_time.strftime('%H:%M')}) is after branch closing time ({wh.close_time.strftime('%H:%M')}) on {d_name}."}
+                                    )
+
+                # Prevent duplicate active recurring rule for the same template, branch, time, and overlapping days
+                if not self.instance and branch and class_template and start_time and end_time and target_status == 'ACTIVE':
+                    existing_rules = ClassScheduleRule.objects.using(alias).filter(
+                        branch=branch,
+                        class_template=class_template,
+                        start_time=start_time,
+                        end_time=end_time,
+                        status='ACTIVE',
+                    )
+                    target_days = set(days_of_week or [])
+                    for er in existing_rules:
+                        er_days = set(er.days_of_week or [])
+                        common_days = target_days.intersection(er_days)
+                        if common_days:
+                            common_names = [day_names.get(d, f"Day {d}") for d in sorted(common_days)]
+                            raise serializers.ValidationError({
+                                "start_time": (
+                                    f"An active recurring rule for '{class_template.name}' at '{branch.name}' already exists "
+                                    f"from {start_time.strftime('%H:%M')} to {end_time.strftime('%H:%M')} on {', '.join(common_names)}."
+                                )
+                            })
+
+                # Check holiday exceptions when valid_from is single date or short range
+                if valid_from:
+                    end_check = valid_until or valid_from
+                    # If exact single day rule falls on a closed holiday
+                    if valid_from == end_check:
+                        holiday = BranchOperatingException.objects.using(alias).filter(
+                            branch=branch, exception_date=valid_from, is_closed=True
+                        ).first()
+                        if holiday:
+                            raise serializers.ValidationError({
+                                "valid_from": f"Branch '{branch.name}' is closed on {valid_from} ({holiday.reason or 'Holiday/Maintenance'})."
+                            })
 
         return attrs
 
 
 class ClassOccurrenceTrainerSerializer(serializers.ModelSerializer):
     trainer_name = serializers.SerializerMethodField()
-    trainer_code = serializers.CharField(source='trainer_profile.trainer_code', read_only=True)
+    trainer_code = serializers.SerializerMethodField()
 
     class Meta:
         model = ClassOccurrenceTrainer
@@ -343,29 +391,43 @@ class ClassOccurrenceTrainerSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['id', 'assigned_at', 'created_at']
 
+    def get_trainer_code(self, obj):
+        try:
+            tp = obj.trainer_profile
+            return tp.trainer_code if tp else ''
+        except (ObjectDoesNotExist, AttributeError):
+            return ''
+        except Exception:
+            return ''
+
     def get_trainer_name(self, obj):
-        tp = getattr(obj, 'trainer_profile', None)
-        if not tp:
+        try:
+            tp = obj.trainer_profile
+            if not tp:
+                return 'Trainer'
+            emp = getattr(tp, 'employee_profile', None)
+            up = getattr(emp, 'user_profile', None) if emp else None
+            if up:
+                first = getattr(up, 'first_name_snapshot', '') or ''
+                last = getattr(up, 'last_name_snapshot', '') or ''
+                full = f"{first} {last}".strip()
+                if full and full.lower() not in ['sweat', 'sweat demo', 'demo']:
+                    return full
+                u = getattr(up, 'user', None)
+                if u:
+                    u_full = getattr(u, 'full_name', '') or ''
+                    if u_full and u_full.lower() not in ['sweat', 'sweat demo', 'demo']:
+                        return u_full
+                    u_name = f"{getattr(u, 'first_name', '')} {getattr(u, 'last_name', '')}".strip()
+                    if u_name and u_name.lower() not in ['sweat', 'sweat demo', 'demo']:
+                        return u_name
+                if full:
+                    return f"{full} ({tp.trainer_code})"
+            return tp.trainer_code or 'Trainer'
+        except (ObjectDoesNotExist, AttributeError):
             return 'Trainer'
-        emp = getattr(tp, 'employee_profile', None)
-        up = getattr(emp, 'user_profile', None) if emp else None
-        if up:
-            first = getattr(up, 'first_name_snapshot', '') or ''
-            last = getattr(up, 'last_name_snapshot', '') or ''
-            full = f"{first} {last}".strip()
-            if full and full.lower() not in ['sweat', 'sweat demo', 'demo']:
-                return full
-            u = getattr(up, 'user', None)
-            if u:
-                u_full = getattr(u, 'full_name', '') or ''
-                if u_full and u_full.lower() not in ['sweat', 'sweat demo', 'demo']:
-                    return u_full
-                u_name = f"{getattr(u, 'first_name', '')} {getattr(u, 'last_name', '')}".strip()
-                if u_name and u_name.lower() not in ['sweat', 'sweat demo', 'demo']:
-                    return u_name
-            if full:
-                return f"{full} ({tp.trainer_code})"
-        return tp.trainer_code or 'Trainer'
+        except Exception:
+            return 'Trainer'
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
@@ -407,7 +469,7 @@ class ClassOccurrenceTrainerSerializer(serializers.ModelSerializer):
             )
             if self.instance and self.instance.pk:
                 conflicts = conflicts.exclude(pk=self.instance.pk)
-            conflicts = conflicts.exclude(occurrence=occ)
+            conflicts = conflicts.exclude(occurrence=occ).exclude(occurrence__status__in=['CANCELLED', 'DEACTIVATED'])
 
             if conflicts.exists():
                 c = conflicts.select_related('occurrence__branch', 'occurrence__class_template').first()
@@ -423,6 +485,15 @@ class ClassOccurrenceTrainerSerializer(serializers.ModelSerializer):
         return attrs
 
 
+# Booking statuses that occupy a seat, used for the displayed "Booked" count only.
+# NO_SHOW still counts: the member held a seat and never cancelled it.
+# CANCELLED / RESCHEDULED / WAITLISTED are excluded because the seat is released.
+# Capacity enforcement lives in services_bookings and is intentionally not changed.
+SEAT_HOLDING_BOOKING_STATUSES = frozenset({
+    'CONFIRMED', 'RESERVED', 'COMPLETED', 'ATTENDED', 'BOOKED', 'NO_SHOW',
+})
+
+
 class ClassOccurrenceSerializer(serializers.ModelSerializer):
     class_name = serializers.CharField(source='class_template.name', read_only=True)
     description = serializers.CharField(source='class_template.description', read_only=True)
@@ -436,11 +507,29 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
     branch_longitude = serializers.DecimalField(source='branch.longitude', max_digits=10, decimal_places=7, read_only=True)
     branch_geofence_radius_meters = serializers.IntegerField(source='branch.geofence_radius_meters', read_only=True)
     branch_geofence_enforcement = serializers.CharField(source='branch.geofence_enforcement', read_only=True)
-    trainers = ClassOccurrenceTrainerSerializer(source='trainer_assignments', many=True, read_only=True)
+    trainers = serializers.SerializerMethodField()
+
+    def get_trainers(self, obj):
+        if obj.status in ('CANCELLED', 'DEACTIVATED'):
+            return []
+        assignments = []
+        try:
+            for a in obj.trainer_assignments.all():
+                if a.status in ['ASSIGNED', 'CONFIRMED']:
+                    try:
+                        if a.trainer_profile:
+                            assignments.append(a)
+                    except (ObjectDoesNotExist, AttributeError):
+                        continue
+        except Exception:
+            pass
+        return ClassOccurrenceTrainerSerializer(assignments, many=True, context=self.context).data
     active_content = serializers.SerializerMethodField()
     trainer_checked_in = serializers.SerializerMethodField()
     trainer_check_in_details = serializers.SerializerMethodField()
     booking_count = serializers.SerializerMethodField()
+    member_booking_count = serializers.SerializerMethodField()
+    trial_booking_count = serializers.SerializerMethodField()
     waitlist_count = serializers.SerializerMethodField()
     start_time = serializers.TimeField(write_only=True, required=False)
     end_time = serializers.TimeField(write_only=True, required=False)
@@ -517,7 +606,11 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
         lead_t = next((t.get('trainer_name') for t in trainers_list if t.get('trainer_name') and t.get('trainer_name') != 'Trainer'), None)
         if not lead_t and trainers_list:
             lead_t = trainers_list[0].get('trainer_name')
-        ret['trainer_name'] = lead_t or getattr(instance, 'lead_trainer_snapshot', None) or 'Unassigned'
+        if instance.status in ('CANCELLED', 'DEACTIVATED'):
+            ret['trainer_name'] = 'Unassigned'
+            ret['trainers'] = []
+        else:
+            ret['trainer_name'] = lead_t or getattr(instance, 'lead_trainer_snapshot', None) or 'Unassigned'
 
         if ret.get('online_join_url') == '__NONE__' or getattr(instance, 'online_provider', None) == 'NO_VIDEO':
             ret['online_join_url'] = ''
@@ -558,30 +651,56 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
             return False
 
     def get_trainer_check_in_details(self, obj):
+        if obj.status in ('CANCELLED', 'DEACTIVATED'):
+            return {
+                'checked_in': False,
+                'trainer_name': None,
+                'status': 'UNASSIGNED',
+            }
         try:
-            confirmed = next((t for t in obj.trainer_assignments.all() if t.status == 'CONFIRMED'), None)
+            valid_trainers = []
+            try:
+                for t in obj.trainer_assignments.all():
+                    if t.status in ['ASSIGNED', 'CONFIRMED']:
+                        try:
+                            if t.trainer_profile:
+                                valid_trainers.append(t)
+                        except (ObjectDoesNotExist, AttributeError):
+                            continue
+            except Exception:
+                valid_trainers = []
+
+            confirmed = next((t for t in valid_trainers if t.status == 'CONFIRMED'), None)
             if confirmed:
                 t_name = None
-                if confirmed.trainer_profile and getattr(confirmed.trainer_profile, 'employee_profile', None):
-                    up = getattr(confirmed.trainer_profile.employee_profile, 'user_profile', None)
-                    if up and getattr(up, 'user', None):
-                        t_name = up.user.full_name or up.user.email
-                if not t_name and confirmed.trainer_profile:
-                    t_name = confirmed.trainer_profile.trainer_code
+                try:
+                    tp = confirmed.trainer_profile
+                    if tp and getattr(tp, 'employee_profile', None):
+                        up = getattr(tp.employee_profile, 'user_profile', None)
+                        if up and getattr(up, 'user', None):
+                            t_name = up.user.full_name or up.user.email
+                    if not t_name and tp:
+                        t_name = tp.trainer_code
+                except (ObjectDoesNotExist, AttributeError):
+                    pass
                 return {
                     'checked_in': True,
                     'trainer_name': t_name or 'Trainer',
                     'status': 'CONFIRMED',
                 }
-            assigned = next((t for t in obj.trainer_assignments.all() if t.status in ['ASSIGNED', 'CONFIRMED']), None)
+            assigned = next((t for t in valid_trainers if t.status in ['ASSIGNED', 'CONFIRMED']), None)
             if assigned:
                 t_name = None
-                if assigned.trainer_profile and getattr(assigned.trainer_profile, 'employee_profile', None):
-                    up = getattr(assigned.trainer_profile.employee_profile, 'user_profile', None)
-                    if up and getattr(up, 'user', None):
-                        t_name = up.user.full_name or up.user.email
-                if not t_name and assigned.trainer_profile:
-                    t_name = assigned.trainer_profile.trainer_code
+                try:
+                    tp = assigned.trainer_profile
+                    if tp and getattr(tp, 'employee_profile', None):
+                        up = getattr(tp.employee_profile, 'user_profile', None)
+                        if up and getattr(up, 'user', None):
+                            t_name = up.user.full_name or up.user.email
+                    if not t_name and tp:
+                        t_name = tp.trainer_code
+                except (ObjectDoesNotExist, AttributeError):
+                    pass
                 return {
                     'checked_in': False,
                     'trainer_name': t_name or 'Trainer',
@@ -595,13 +714,30 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
         except Exception:
             return {'checked_in': False, 'status': 'UNKNOWN'}
 
+    @staticmethod
+    def _member_seat_count(obj) -> int:
+        """Seat-holding member/class bookings (Booking rows) for this occurrence."""
+        return sum(1 for b in obj.bookings.all() if b.status in SEAT_HOLDING_BOOKING_STATUSES)
+
     def get_booking_count(self, obj):
         if getattr(obj, 'annotated_booking_count', None) is not None:
             return obj.annotated_booking_count
         try:
-            return sum(1 for b in obj.bookings.all() if b.status in ['CONFIRMED', 'RESERVED', 'COMPLETED', 'ATTENDED', 'BOOKED'])
+            member_count = self._member_seat_count(obj)
         except Exception:
             return 0
+        # Trial bookings live in a separate table; the class list view annotates their count.
+        return member_count + self.get_trial_booking_count(obj)
+
+    def get_member_booking_count(self, obj) -> int:
+        try:
+            return self._member_seat_count(obj)
+        except Exception:
+            logger.warning('member_booking_count failed for occurrence %s', getattr(obj, 'pk', None), exc_info=True)
+            return 0
+
+    def get_trial_booking_count(self, obj) -> int:
+        return getattr(obj, 'annotated_trial_count', None) or 0
 
     def get_waitlist_count(self, obj):
         if getattr(obj, 'annotated_waitlist_count', None) is not None:
@@ -642,7 +778,8 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
             'online_provider', 'online_join_url', 'capacity', 'trial_capacity',
             'waitlist_capacity', 'booking_open_at', 'booking_close_at',
             'cancellation_cutoff_at', 'status', 'is_manual', 'is_override',
-            'trainers', 'trainer_checked_in', 'trainer_check_in_details', 'booking_count', 'waitlist_count',
+            'trainers', 'trainer_checked_in', 'trainer_check_in_details', 'booking_count',
+            'member_booking_count', 'trial_booking_count', 'waitlist_count',
             'active_content', 'is_eligible', 'ineligibility_reason', 'ineligibility_code', 'description', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
@@ -683,6 +820,8 @@ class ClassOccurrenceSerializer(serializers.ModelSerializer):
             occ_date = start_at.date()
 
         if tpl:
+            if not self.instance and getattr(tpl, 'status', 'ACTIVE') != 'ACTIVE':
+                raise serializers.ValidationError({"class_template": "Cannot schedule an occurrence for an inactive or non-active class template."})
             branch_avail = None
             if branch:
                 from .models_classes import ClassBranchAvailability

@@ -40,6 +40,7 @@ from .models_classes import (
     ClassScheduleImportBatch,
 )
 from .models_bookings import Booking
+from .models_attendance import AccessPass, AccessEvent, AttendanceRecord
 from .models_crm import (
     LeadSource,
     Lead,
@@ -504,6 +505,33 @@ class BookingAdmin(TenantModelAdmin):
     list_filter = ['status', 'booking_type']
     search_fields = ['booking_number']
     readonly_fields = ['id', 'created_at', 'updated_at']
+
+
+@admin.register(AccessPass)
+class AccessPassAdmin(TenantModelAdmin):
+    list_display = ['id', 'user_profile', 'booking', 'branch', 'status', 'pass_type', 'valid_from', 'valid_until', 'consumed_at']
+    list_filter = ['status', 'pass_type', 'branch']
+    search_fields = ['token_hash', 'user_profile__first_name_snapshot', 'user_profile__member_number', 'booking__booking_number']
+    readonly_fields = ['id', 'created_at', 'updated_at', 'token_hash', 'consumed_at']
+    list_select_related = ['user_profile', 'booking', 'branch']
+
+
+@admin.register(AttendanceRecord)
+class AttendanceRecordAdmin(TenantModelAdmin):
+    list_display = ['id', 'user_profile', 'booking', 'branch', 'status', 'check_in_method', 'check_in_at', 'check_out_at', 'attendance_completed']
+    list_filter = ['status', 'check_in_method', 'attendance_completed', 'branch']
+    search_fields = ['user_profile__first_name_snapshot', 'user_profile__member_number', 'booking__booking_number']
+    readonly_fields = ['id', 'created_at', 'updated_at', 'check_in_at', 'check_out_at']
+    list_select_related = ['user_profile', 'booking', 'branch']
+
+
+@admin.register(AccessEvent)
+class AccessEventAdmin(TenantModelAdmin):
+    list_display = ['id', 'user_profile', 'event_type', 'direction', 'device_reference', 'reconciliation_status', 'event_at']
+    list_filter = ['event_type', 'direction', 'reconciliation_status', 'branch']
+    search_fields = ['token_hash', 'device_reference', 'user_profile__first_name_snapshot', 'user_profile__member_number']
+    readonly_fields = ['id', 'created_at', 'token_hash', 'event_at']
+    list_select_related = ['user_profile', 'branch', 'booking']
 
 
 @admin.register(Membership)

@@ -1400,6 +1400,8 @@ class CallSession(models.Model):
     recording_url = models.URLField(max_length=1000, blank=True, default='')
     recording_storage_key = models.CharField(max_length=500, blank=True, default='')
     hangup_cause = models.CharField(max_length=100, blank=True, default='')
+    # User ids (as strings) of reps already rung for this call. Drives the inbound overflow chain.
+    tried_reps = models.JSONField(default=list, blank=True)
 
     idempotency_key = models.CharField(
         max_length=255,
@@ -1469,6 +1471,12 @@ class AgentPresence(models.Model):
         db_index=True,
     )
     last_heartbeat = models.DateTimeField(auto_now=True)
+    # Set ONLY by the agent's browser heartbeat (PUT /presence/). Deliberately not auto_now:
+    # last_heartbeat is rewritten by server-side saves, so it cannot prove the browser is open.
+    browser_heartbeat_at = models.DateTimeField(null=True, blank=True)
+    # When this agent was last handed an inbound call (stamped at claim, not at selection).
+    # Orders round robin: oldest first, NULL (never assigned) first of all.
+    last_call_assigned_at = models.DateTimeField(null=True, blank=True)
     active_session = models.ForeignKey(
         CallSession,
         on_delete=models.SET_NULL,
@@ -1486,6 +1494,74 @@ class AgentPresence(models.Model):
 
     def __str__(self):
         return f"{self.user.email} [{self.sip_username}]: {self.status}"
+
+
+class LeadTransferBatch(models.Model):
+    """
+    Audit log and execution record for bulk lead and pipeline transfers (RM handover / reassignments).
+    Preserves historical lineage, affected leads, and snapshot for audit and undo/rollback.
+    """
+    TRANSFER_MODES = [
+        ('SINGLE', 'Single Representative'),
+        ('ROUND_ROBIN', 'Round Robin Distribution'),
+        ('LEAST_BUSY', 'Least Busy Auto-Balance'),
+        ('INDIVIDUAL', 'Individual Reassignment'),
+        ('TAKEOVER', 'Representative Takeover'),
+    ]
+    STATUS_CHOICES = [
+        ('COMPLETED', 'Completed'),
+        ('ROLLED_BACK', 'Rolled Back'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey(
+        Organization,
+        on_delete=models.CASCADE,
+        related_name='lead_transfer_batches',
+        db_column='organization_id',
+    )
+    source_user = models.ForeignKey(
+        TenantUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='lead_transfers_out',
+        db_column='source_user_id',
+    )
+    source_user_name = models.CharField(max_length=200, blank=True, default='')
+    target_users_summary = models.JSONField(default=list, blank=True)
+    transfer_mode = models.CharField(max_length=30, choices=TRANSFER_MODES, default='ROUND_ROBIN')
+    leads_count = models.PositiveIntegerField(default=0)
+    trials_count = models.PositiveIntegerField(default=0)
+    followups_count = models.PositiveIntegerField(default=0)
+    filter_criteria = models.JSONField(default=dict, blank=True)
+    affected_lead_ids = models.JSONField(default=list, blank=True)
+    previous_assignments_snapshot = models.JSONField(default=dict, blank=True)
+    reason = models.TextField(blank=True, default='')
+    performed_by_user = models.ForeignKey(
+        TenantUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='transfers_performed',
+        db_column='performed_by_user_id',
+    )
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='COMPLETED', db_index=True)
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        app_label = 'tenant_core'
+        db_table = 'crm_lead_transfer_batches'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['organization', '-created_at'], name='idx_ltb_org_created'),
+            models.Index(fields=['source_user', '-created_at'], name='idx_ltb_source_created'),
+        ]
+
+    def __str__(self):
+        return f"Transfer Batch {self.id}: {self.leads_count} leads from {self.source_user_name or 'Unassigned'} ({self.transfer_mode})"
+
 
 
 

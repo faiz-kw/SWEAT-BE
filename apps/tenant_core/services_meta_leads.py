@@ -118,7 +118,9 @@ def process_simulation(organization, event_id, actor_user=None):
             event.mapping_snapshot.update(
                 branch_id=str(mapping.branch_id) if mapping.branch_id else None,
                 fallback_branch_id=str(mapping.fallback_branch_id) if getattr(mapping, 'fallback_branch_id', None) else None,
+                assigned_role_id=str(mapping.assigned_role_id) if getattr(mapping, 'assigned_role_id', None) else None,
                 assigned_sales_user_id=str(mapping.assigned_sales_user_id) if getattr(mapping, 'assigned_sales_user_id', None) else None,
+                assigned_sales_users=getattr(mapping, 'assigned_sales_users', []) or [],
                 lead_source_id=str(mapping.lead_source_id))
             try:
                 # Nested savepoint rolls back every CRM write on failure while retaining the receipt.
@@ -210,18 +212,61 @@ def process_live_import(organization, event_id, actor_user=None, graph_client=No
                 page_id=event.page_id, is_active=True
             ).exclude(encrypted_page_access_token='').first()
 
-        if not page_conn or not page_conn.encrypted_page_access_token:
+        # Self-healing fallback: if token is missing or decryption fails, fetch directly via user token
+        page_token = decrypt_token(page_conn.encrypted_page_access_token) if (page_conn and page_conn.encrypted_page_access_token) else None
+        if not page_token:
+            active_conn = None
+            if page_conn and page_conn.connection_id:
+                active_conn = MetaConnection.objects.using(alias).filter(
+                    id=page_conn.connection_id
+                ).exclude(encrypted_user_access_token='').first()
+            if not active_conn:
+                active_conn = MetaConnection.objects.using(alias).filter(
+                    organization=organization, status__in=('CONNECTED', 'LIVE_CONNECTED')
+                ).exclude(encrypted_user_access_token='').first()
+            if not active_conn:
+                active_conn = MetaConnection.objects.using(alias).filter(
+                    status__in=('CONNECTED', 'LIVE_CONNECTED')
+                ).exclude(encrypted_user_access_token='').first()
+
+            if active_conn and active_conn.encrypted_user_access_token:
+                user_token = decrypt_token(active_conn.encrypted_user_access_token)
+                if user_token:
+                    try:
+                        import requests
+                        from .services_meta_graph import GRAPH_API_BASE
+                        from .meta_crypto import encrypt_token
+                        resp = requests.get(
+                            f"{GRAPH_API_BASE}/{event.page_id}",
+                            params={'access_token': user_token, 'fields': 'access_token,name'},
+                            timeout=10,
+                        )
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            fetched_page_token = data.get('access_token')
+                            if fetched_page_token:
+                                page_token = fetched_page_token
+                                enc_page_token = encrypt_token(fetched_page_token)
+                                if page_conn:
+                                    page_conn.encrypted_page_access_token = enc_page_token
+                                    page_conn.save(using=alias)
+                                else:
+                                    page_conn = MetaPageConnection.objects.using(alias).create(
+                                        organization=organization,
+                                        connection=active_conn,
+                                        page_id=event.page_id,
+                                        page_name=data.get('name', f"Page {event.page_id}"),
+                                        encrypted_page_access_token=enc_page_token,
+                                        is_active=True,
+                                    )
+                                logger.info("Self-healed Page Access Token for page %s via user token", event.page_id)
+                    except Exception as exc:
+                        logger.warning("Failed self-healing page token for page %s: %s", event.page_id, exc)
+
+        if not page_token:
             event.status = 'FAILED'
             event.error_code = 'PAGE_NOT_CONNECTED'
             event.error_message = 'Page access token is missing or page connection is inactive. Reconnect the Meta account.'
-            event.save(using=alias)
-            return event
-
-        page_token = decrypt_token(page_conn.encrypted_page_access_token)
-        if not page_token:
-            event.status = 'FAILED'
-            event.error_code = 'TOKEN_DECRYPTION_FAILED'
-            event.error_message = 'Failed to decrypt Page access token. Re-authorize Meta connection.'
             event.save(using=alias)
             return event
 
@@ -303,6 +348,23 @@ def process_live_import(organization, event_id, actor_user=None, graph_client=No
                 organization = mapping.organization
 
         if not mapping:
+            # Opportunistically record Meta form name & status in mapping_snapshot so admins can identify unmapped forms immediately
+            snapshot = dict(event.mapping_snapshot) if isinstance(event.mapping_snapshot, dict) else {}
+            if event.form_id and not snapshot.get('meta_form_name') and page_token:
+                try:
+                    form_details = graph_client.fetch_form_details(event.form_id, page_token)
+                    if isinstance(form_details, dict):
+                        if form_details.get('name'):
+                            snapshot['meta_form_name'] = str(form_details['name']).strip()
+                        if form_details.get('status'):
+                            snapshot['meta_form_status'] = str(form_details['status']).strip()
+                        event.mapping_snapshot = snapshot
+                except Exception as exc:
+                    logger.warning(
+                        "Could not resolve Meta form name during NEEDS_MAPPING for page=%s form=%s: %s",
+                        event.page_id, event.form_id, exc,
+                    )
+
             event.status = 'NEEDS_MAPPING'
             event.error_code = 'MAPPING_MISSING'
             event.error_message = f"No active mapping matches Page '{event.page_id}' and Form '{event.form_id}'. Configure and activate mapping to import."
@@ -335,7 +397,9 @@ def process_live_import(organization, event_id, actor_user=None, graph_client=No
         event.mapping_snapshot.update(
             branch_id=str(mapping.branch_id) if mapping.branch_id else None,
             fallback_branch_id=str(mapping.fallback_branch_id) if getattr(mapping, 'fallback_branch_id', None) else None,
+            assigned_role_id=str(mapping.assigned_role_id) if getattr(mapping, 'assigned_role_id', None) else None,
             assigned_sales_user_id=str(mapping.assigned_sales_user_id) if getattr(mapping, 'assigned_sales_user_id', None) else None,
+            assigned_sales_users=getattr(mapping, 'assigned_sales_users', []) or [],
             lead_source_id=str(mapping.lead_source_id))
 
         # 4. Ingest into CRM within isolated savepoint
@@ -420,14 +484,41 @@ def _apply_mapping(event, mapping, alias, actor_user, is_live: bool = False):
         mapped['first_name'] = 'Meta Test'
         mapped['last_name'] = 'Lead'
 
-    email = validate_lead_email(raw_email, required=False)
-    phone = validate_lead_phone(raw_phone, required=False)
+    email = None
+    if raw_email:
+        try:
+            email = validate_lead_email(raw_email, required=False)
+        except Exception:
+            email = None
+
+    phone = None
+    if raw_phone:
+        try:
+            phone = validate_lead_phone(raw_phone, required=False)
+        except (ValueError, ValidationError, DjangoValidationError):
+            # If phone validation failed (e.g. 11+ digits like +9144443332211 or test number),
+            # attempt extracting the last 10 digits as national mobile number
+            import re
+            digits = re.sub(r'\D', '', str(raw_phone))
+            if len(digits) >= 10:
+                try:
+                    phone = validate_lead_phone(digits[-10:], required=False)
+                except Exception:
+                    phone = None
+            else:
+                phone = None
+
+    if not phone and not email:
+        event.status, event.error_code = 'FAILED', 'INVALID_LEAD_DATA'
+        event.error_message = 'Mapped lead data was rejected: Either a valid 10-digit mobile number or email address is required.'
+        return
+
     contact = Q()
     if email:
         contact |= Q(email_normalized=email)
     if phone:
         contact |= Q(phone_normalized=phone)
-    if mapping.repeat_policy == 'REVIEW' and Lead.objects.using(alias).filter(organization_id=event.organization_id).filter(contact).exists():
+    if (email or phone) and mapping.repeat_policy == 'REVIEW' and Lead.objects.using(alias).filter(organization_id=event.organization_id).filter(contact).exists():
         event.status, event.error_code, event.error_message = 'NEEDS_REVIEW', 'EXISTING_CONTACT', 'This contact already has a lead. The new enquiry is retained here. Review it before changing the repeat-enquiry policy and retrying.'
         return
 
@@ -501,10 +592,63 @@ def _apply_mapping(event, mapping, alias, actor_user, is_live: bool = False):
                 raise ValueError(f'Mapped answer for {key} exceeds CRM field length of {maximum}.')
     # --- FIX: EXTRACT VOICE CONSENT AND RESOLVE INTERESTED PROGRAM END ---
 
-    # Assigned sales user preference
+    # Assigned sales user / team member preference
     assigned_sales_user = None
-    if getattr(mapping, 'assignment_mode', 'TENANT_POLICY') == 'SPECIFIC_USER' and getattr(mapping, 'assigned_sales_user_id', None):
-        assigned_sales_user = mapping.assigned_sales_user
+    if getattr(mapping, 'assignment_mode', 'TENANT_POLICY') == 'SPECIFIC_USER':
+        raw_users = getattr(mapping, 'assigned_sales_users', None) or []
+        if isinstance(raw_users, list) and len(raw_users) > 1:
+            active_candidates = list(TenantUser.objects.using(alias).filter(
+                id__in=raw_users,
+                organization=event.organization,
+                status='ACTIVE',
+                is_login_allowed=True,
+            ).order_by('first_name', 'last_name', 'id'))
+            if active_candidates:
+                import_count = MetaLeadImport.objects.using(alias).filter(
+                    organization=event.organization,
+                    form_id=event.form_id,
+                    status='IMPORTED',
+                ).count()
+                assigned_sales_user = active_candidates[import_count % len(active_candidates)]
+            elif getattr(mapping, 'assigned_sales_user_id', None):
+                assigned_sales_user = mapping.assigned_sales_user
+        elif getattr(mapping, 'assigned_sales_user_id', None):
+            assigned_sales_user = mapping.assigned_sales_user
+        elif isinstance(raw_users, list) and len(raw_users) == 1:
+            assigned_sales_user = TenantUser.objects.using(alias).filter(
+                id=raw_users[0], organization=event.organization, status='ACTIVE', is_login_allowed=True
+            ).first()
+
+    # Resolve human-readable Facebook Page name and structured Q&A answers for zero-data-loss timeline logging
+    page_name = None
+    if getattr(event, 'page_id', None):
+        try:
+            page_conn = MetaPageConnection.objects.using(alias).filter(
+                organization_id=event.organization_id,
+                page_id=event.page_id,
+            ).first()
+            if page_conn and page_conn.page_name:
+                page_name = page_conn.page_name
+        except Exception as exc:
+            logger.warning("Failed to resolve MetaPageConnection name for page_id=%s: %s", event.page_id, exc)
+
+    form_answers = []
+    if isinstance(event.field_data, list):
+        for item in event.field_data:
+            if not isinstance(item, dict):
+                continue
+            q_name = str(item.get('name') or '').strip()
+            vals = item.get('values') or []
+            if isinstance(vals, list):
+                a_val = ', '.join(str(v).strip() for v in vals if str(v).strip())
+            else:
+                a_val = str(vals).strip()
+            if q_name and a_val:
+                form_answers.append({
+                    'question': q_name.replace('_', ' ').strip(),
+                    'raw_key': q_name,
+                    'answer': a_val,
+                })
 
     if is_live:
         attribution_data = {
@@ -526,7 +670,11 @@ def _apply_mapping(event, mapping, alias, actor_user, is_live: bool = False):
                 'adset_name': event.adset_name,
                 'campaign_name': event.campaign_name,
                 'page_id': event.page_id,
+                'page_name': page_name,
+                'form_id': event.form_id,
+                'form_name': getattr(mapping, 'name', None),
                 'is_organic': event.is_organic,
+                'form_answers': form_answers,
             },
         }
     else:
@@ -534,7 +682,16 @@ def _apply_mapping(event, mapping, alias, actor_user, is_live: bool = False):
             'platform': 'META',
             'external_lead_id': f'simulation:{event.id}',
             'form_external_id': event.form_id,
-            'raw_metadata': {'is_test': True, 'import_id': str(event.id)},
+            'form_name': getattr(mapping, 'name', None),
+            'raw_metadata': {
+                'is_test': True,
+                'import_id': str(event.id),
+                'page_id': event.page_id,
+                'page_name': page_name,
+                'form_id': event.form_id,
+                'form_name': getattr(mapping, 'name', None),
+                'form_answers': form_answers,
+            },
         }
 
     allow_dedup = (mapping.repeat_policy != 'CREATE_NEW')
@@ -592,9 +749,9 @@ def _apply_mapping(event, mapping, alias, actor_user, is_live: bool = False):
         delattr(lead, '_cached_voice_consent')
     # --- FIX: RECORD SARVAM VOICE CONSENT AND COMPLIANCE RECORD END ---
 
-    # Initial pipeline stage transition if configured beyond NEW_LEAD
+    # Initial pipeline stage transition if configured beyond NEW_LEAD (skip for repeat enquiries to preserve existing lead stage)
     initial_stage = getattr(mapping, 'initial_stage', 'NEW_LEAD')
-    if initial_stage and initial_stage != 'NEW_LEAD':
+    if initial_stage and initial_stage != 'NEW_LEAD' and not getattr(lead, 'is_duplicate_intake', False):
         CRMLeadService.transition_lead_status(
             lead=lead,
             new_status=initial_stage,

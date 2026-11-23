@@ -23,6 +23,7 @@ from .views_voice_agent import (
     VoiceAgentTransferCallView,
     VoiceAgentStudioFaqView,
 )
+from .views_activity_audit import ActivityAuditLogViewSet
 from .views_storage import (
     FileViewSet,
     StorageConfirmUploadView,
@@ -37,8 +38,10 @@ from .views_privacy import (
 from .views_integrations import TenantIntegrationViewSet
 from .views_security_policy import SecurityPolicyView
 from . import views_telephony
+from . import views_telephony_dial_events
 from . import views_public_trial
 from . import views_pos
+from . import views_mobile
 from .views_audit_outbox import (
     BusinessAuditEventViewSet,
     IdempotencyRecordViewSet,
@@ -82,6 +85,7 @@ from .views_crm import (
     CRMCampaignPerformanceViewSet,
     CRMDashboardViewSet,
     InAppNotificationViewSet,
+    LeadTransferViewSet,
 )
 from .views_automation import (
     AutomationWorkflowViewSet,
@@ -303,6 +307,7 @@ router.register(r'crm/stage-automation-rules', CRMStageAutomationRuleViewSet, ba
 router.register(r'crm/trial-reminder-policy', CRMTrialReminderPolicyViewSet, basename='crm-trial-reminder-policy')
 router.register(r'crm/attention-policy', CRMAttentionPolicyViewSet, basename='crm-attention-policy')
 router.register(r'crm/agent-assignment-config', CRMAgentAssignmentConfigViewSet, basename='crm-agent-assignment-config')
+router.register(r'crm/lead-transfers', LeadTransferViewSet, basename='crm-lead-transfer')
 router.register(r'crm/channels', CRMCommunicationChannelsViewSet, basename='crm-channel')
 router.register(r'crm/whatsapp-policy', WhatsAppAutomationPolicyViewSet, basename='crm-whatsapp-policy')
 router.register(r'crm/communications', CommunicationMessageViewSet, basename='crm-communication')
@@ -331,6 +336,7 @@ router.register(r'branch-working-hours', BranchWorkingHoursViewSet, basename='br
 router.register(r'branch-operating-exceptions', BranchOperatingExceptionViewSet, basename='branch-operating-exceptions')
 router.register(r'notification-templates', NotificationTemplateViewSet, basename='notification-template')
 router.register(r'audit-events', TenantAuditEventViewSet, basename='audit-event')
+router.register(r'activity-logs', ActivityAuditLogViewSet, basename='activity-log')
 router.register(r'files', FileViewSet, basename='file')
 router.register(r'processing-purposes', ProcessingPurposeViewSet, basename='processing-purpose')
 router.register(r'consent-records', ConsentRecordViewSet, basename='consent-record')
@@ -371,6 +377,8 @@ router.register(r'cms/categories', views_cms.ProgramCategoryMediaViewSet, basena
 router.register(r'cms/media', views_cms.CMSMediaAssetViewSet, basename='cms-media')
 
 app_name = 'tenant_core'
+
+from .views_invoice import WebOrderInvoiceView, WebInvoiceRenderView
 
 urlpatterns = [
     path('database-health/', TenantDatabaseHealthView.as_view(), name='tenant-database-health'),
@@ -413,6 +421,7 @@ urlpatterns = [
     # Vobiz & Sales CRM Telephony Routes
     path('telephony/inbound/', views_telephony.VobizInboundWebhookView.as_view(), name='telephony-inbound'),
     path('telephony/dial-fallback/', views_telephony.VobizInboundFallbackWebhookView.as_view(), name='telephony-dial-fallback'),
+    path('telephony/dial-events/', views_telephony_dial_events.VobizDialEventView.as_view(), name='telephony-dial-events'),
     path('telephony/hangup/', views_telephony.VobizHangupWebhookView.as_view(), name='telephony-hangup'),
     path('telephony/recording/', views_telephony.VobizRecordingWebhookView.as_view(), name='telephony-recording'),
     path('telephony/agent-answer-bridge/', views_telephony.AgentAnswerBridgeXmlView.as_view(), name='telephony-agent-answer-bridge'),
@@ -442,7 +451,10 @@ urlpatterns = [
     path('pos/status/<str:external_ref_id>/', views_pos.POSPaymentStatusView.as_view(), name='pos-payment-status'),
     path('pos/cancel/<str:external_ref_id>/', views_pos.CancelPOSPaymentView.as_view(), name='pos-cancel-payment'),
 
-    
+    # Unified Quotation Engine
+    path('pricing/quote/', views_mobile.MobilePricingQuoteView.as_view(), name='tenant-pricing-quote'),
 
+    path('invoice/order/<uuid:order_id>/', WebOrderInvoiceView.as_view(), name='web-order-invoice'),
+    path('invoice/<uuid:invoice_id>/', WebInvoiceRenderView.as_view(), name='web-invoice-render'),
     path('', include(router.urls)),
 ]

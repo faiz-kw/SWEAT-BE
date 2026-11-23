@@ -85,6 +85,25 @@ from .permissions import RequireActiveTenantAndOrg, TenantRBACPermission
 logger = logging.getLogger(__name__)
 
 
+def format_program_package_name(prog_name: str, pkg_name: str) -> str:
+    """
+    Standardizes program and package display across all platforms:
+    Format: Program Name – Package Name
+    """
+    pkg = (pkg_name or '').strip()
+    prog = (prog_name or '').strip()
+    if not pkg and not prog:
+        return 'Standard Plan'
+    if not prog or prog.lower() in ('standard', 'none', 'unassigned'):
+        return pkg or 'Standard Plan'
+    if not pkg or pkg.lower() in ('none', 'plan'):
+        return prog
+    if pkg.lower().startswith(prog.lower()):
+        clean_pkg = pkg[len(prog):].lstrip(' -–—:·')
+        return f"{prog} – {clean_pkg}" if clean_pkg else prog
+    return f"{prog} – {pkg}"
+
+
 def _get_db(request):
     alias = (
         get_tenant_db_alias()
@@ -151,13 +170,25 @@ def get_primary_membership(profile: UserProfile, alias: str = 'default'):
     3. If neither, the latest membership by end_date and created_at.
     """
     today = timezone.now().date()
-    # 1. Currently active and unexpired
+    # 1a. Currently RUNNING (started and unexpired) -- running-first-fix
+    m = (
+        Membership.objects.using(alias)
+        .filter(user_profile=profile, status='ACTIVE')
+        .filter(Q(end_date__gte=today) | Q(end_date__isnull=True))
+        .filter(Q(start_date__lte=today) | Q(start_date__isnull=True))
+        .select_related('package', 'package__program', 'package_version', 'package_price', 'home_branch', 'purchase_branch')
+        .order_by('end_date', '-created_at')
+        .first()
+    )
+    if m:
+        return m
+    # 1b. Active & unexpired but not yet started (future renewal) -- earliest to start
     m = (
         Membership.objects.using(alias)
         .filter(user_profile=profile, status='ACTIVE')
         .filter(Q(end_date__gte=today) | Q(end_date__isnull=True))
         .select_related('package', 'package__program', 'package_version', 'package_price', 'home_branch', 'purchase_branch')
-        .order_by('-end_date', '-created_at')
+        .order_by('start_date', '-end_date', '-created_at')
         .first()
     )
     if m:
@@ -184,7 +215,7 @@ def get_primary_membership(profile: UserProfile, alias: str = 'default'):
     )
 
 
-def get_member_sessions_summary(profile: UserProfile, active_m: Membership = None, alias: str = 'default'):
+def get_member_sessions_summary(profile: UserProfile, active_m: Membership = None, alias: str = 'default', single_membership_only: bool = False):
     """
     Computes remaining sessions & credits breakdown across the member's ACTIVE package(s).
     Supports members with simultaneous active packages (e.g. Session Package + Elite Credit Package).
@@ -192,6 +223,8 @@ def get_member_sessions_summary(profile: UserProfile, active_m: Membership = Non
     """
     home_sessions = 0
     cross_sessions = 0
+    home_unlimited = False
+    cross_unlimited = False
     detailed_balances = []
 
     today = timezone.now().date()
@@ -199,17 +232,18 @@ def get_member_sessions_summary(profile: UserProfile, active_m: Membership = Non
     if active_m is not None and active_m.status in ('ACTIVE', 'FROZEN') and (active_m.end_date is None or active_m.end_date >= today):
         active_memberships.append(active_m)
 
-    # Query all active or frozen memberships to support members holding multiple simultaneous active packs
-    all_actives = list(Membership.objects.using(alias).filter(
-        user_profile=profile,
-        status__in=('ACTIVE', 'FROZEN')
-    ).filter(
-        Q(end_date__isnull=True) | Q(end_date__gte=today)
-    ).order_by('-start_date', '-created_at'))
+    if not single_membership_only:
+        # Query all active or frozen memberships to support members holding multiple simultaneous active packs
+        all_actives = list(Membership.objects.using(alias).filter(
+            user_profile=profile,
+            status__in=('ACTIVE', 'FROZEN')
+        ).filter(
+            Q(end_date__isnull=True) | Q(end_date__gte=today)
+        ).order_by('-start_date', '-created_at'))
 
-    for am in all_actives:
-        if am.id not in [m.id for m in active_memberships]:
-            active_memberships.append(am)
+        for am in all_actives:
+            if am.id not in [m.id for m in active_memberships]:
+                active_memberships.append(am)
 
     seen_categories = set()
     for m_obj in active_memberships:
@@ -242,7 +276,7 @@ def get_member_sessions_summary(profile: UserProfile, active_m: Membership = Non
             seen_categories.add(cat_key)
 
             rem = ent.remaining_units
-            rem_val = float(rem) if rem is not None else 999.0
+            rem_val = float(rem) if rem is not None else (999.0 if ent.is_unlimited else 0.0)
             detailed_balances.append({
                 'id': str(ent.id),
                 'membership_id': str(m_obj.id),
@@ -258,14 +292,25 @@ def get_member_sessions_summary(profile: UserProfile, active_m: Membership = Non
             })
 
             if category == 'CROSS_BRANCH':
-                cross_sessions = max(cross_sessions, int(rem_val) if not ent.is_unlimited else 999)
+                if ent.is_unlimited:
+                    cross_unlimited = True
+                else:
+                    cross_sessions += int(rem_val)
             elif category == 'HOME_SESSION':
-                home_sessions = max(home_sessions, int(rem_val) if not ent.is_unlimited else 999)
+                if ent.is_unlimited:
+                    home_unlimited = True
+                else:
+                    home_sessions += int(rem_val)
+
+    if cross_unlimited:
+        cross_sessions = 999
+    if home_unlimited:
+        home_sessions = 999
 
     return home_sessions, cross_sessions, detailed_balances
 
 
-def serialize_member(profile: UserProfile, alias: str = 'default', compact: bool = False, request=None) -> dict:
+def serialize_member(profile: UserProfile, alias: str = 'default', compact: bool = False, request=None, requesting_user=None) -> dict:
     user = profile.user
     first_name = profile.first_name_snapshot or getattr(user, 'first_name', '')
     last_name = profile.last_name_snapshot or getattr(user, 'last_name', '')
@@ -333,6 +378,8 @@ def serialize_member(profile: UserProfile, alias: str = 'default', compact: bool
     else:
         membership_status = 'INACTIVE'
 
+    display_package_name = format_program_package_name(program_name, package_name)
+
     # Resolve home branch: prioritize home_branch (where the member trains),
     # falling back to purchase_branch, then profile.preferred_branch or user.home_branch
     branch = (
@@ -341,18 +388,36 @@ def serialize_member(profile: UserProfile, alias: str = 'default', compact: bool
         else (profile.preferred_branch or getattr(user, 'home_branch', None))
     )
 
-    # Emergency contact string
+    # Emergency contact string (mask phone component if caller lacks phone visibility permission)
     emergency_contact = ""
     if profile.emergency_contact_json:
         if isinstance(profile.emergency_contact_json, dict):
-            emergency_contact = (
-                profile.emergency_contact_json.get('name')
-                or profile.emergency_contact_json.get('phone')
-                or profile.emergency_contact_json.get('contact')
-                or str(profile.emergency_contact_json)
-            )
+            ec_name = profile.emergency_contact_json.get('name')
+            ec_phone = profile.emergency_contact_json.get('phone') or profile.emergency_contact_json.get('contact')
+            if ec_name:
+                emergency_contact = ec_name
+            elif ec_phone:
+                emergency_contact = mask_phone_if_restricted(
+                    request,
+                    str(ec_phone),
+                    target_user_id=getattr(user, 'id', None),
+                    user=requesting_user,
+                    db_alias=alias,
+                )
+            else:
+                emergency_contact = str(profile.emergency_contact_json)
         else:
-            emergency_contact = str(profile.emergency_contact_json)
+            ec_str = str(profile.emergency_contact_json)
+            if sum(c.isdigit() for c in ec_str) >= 7:
+                emergency_contact = mask_phone_if_restricted(
+                    request,
+                    ec_str,
+                    target_user_id=getattr(user, 'id', None),
+                    user=requesting_user,
+                    db_alias=alias,
+                )
+            else:
+                emergency_contact = ec_str
 
     if compact:
         home_sessions, cross_sessions = 0, 0
@@ -430,7 +495,13 @@ def serialize_member(profile: UserProfile, alias: str = 'default', compact: bool
         'name': full_name,
         'first_name': first_name,
         'last_name': last_name,
-        'phone': mask_phone_if_restricted(request, getattr(user, 'phone', '') or '') if request else (getattr(user, 'phone', '') or ''),
+        'phone': mask_phone_if_restricted(
+            request,
+            getattr(user, 'phone', '') or '',
+            target_user_id=getattr(user, 'id', None),
+            user=requesting_user,
+            db_alias=alias,
+        ),
         'email': getattr(user, 'email', '') or '',
         'alternate_email': (profile.address_json or {}).get('alternate_email') if profile.address_json else None,
         'avatar_url': getattr(user, 'avatar_url', '') or (profile.address_json or {}).get('avatar_url', '') or '',
@@ -447,6 +518,8 @@ def serialize_member(profile: UserProfile, alias: str = 'default', compact: bool
         'program_name': program_name,
         'package_id': package_id,
         'package_name': package_name,
+        'display_package_name': display_package_name,
+        'display_name': display_package_name,
         'package_version_name': package_version_name,
         'start_date': start_date,
         'expiry_date': expiry_date,
@@ -809,6 +882,65 @@ def build_member_timeline(profile: UserProfile, alias: str = 'default', limit: i
     except Exception as _call_err:
         logger.warning("build_member_timeline: call session query failed: %s", _call_err)
 
+    # 9. Canonical Activity Audit Logs (Membership changes, freezes, turnstiles, bookings, orders, profile edits)
+    try:
+        from .models_activity_audit import ActivityAuditLog
+        related_entity_ids = [str(profile.id)]
+        if user:
+            related_entity_ids.append(str(user.id))
+
+        member_membership_ids = [
+            str(mid) for mid in Membership.objects.using(alias)
+            .filter(user_profile=profile).values_list('id', flat=True)[:50]
+        ]
+        member_booking_ids = [
+            str(bid) for bid in Booking.objects.using(alias)
+            .filter(user_profile=profile).values_list('id', flat=True)[:50]
+        ]
+        member_order_ids = [
+            str(oid) for oid in Order.objects.using(alias)
+            .filter(user_profile=profile).values_list('id', flat=True)[:50]
+        ]
+        related_entity_ids.extend(member_membership_ids)
+        related_entity_ids.extend(member_booking_ids)
+        related_entity_ids.extend(member_order_ids)
+
+        audit_filters = Q(entity_id__in=related_entity_ids)
+        if user:
+            audit_filters |= Q(actor_id=str(user.id))
+
+        audit_logs = ActivityAuditLog.objects.using(alias).filter(audit_filters).order_by('-occurred_at')[:40]
+        for log in audit_logs:
+            cat = 'AUDIT'
+            mod_upper = (log.module or '').upper()
+            if mod_upper in ('MEMBERSHIPS', 'MEMBERSHIP'):
+                cat = 'MEMBERSHIP'
+            elif mod_upper in ('BOOKINGS', 'OPERATIONS', 'CLASSES'):
+                cat = 'BOOKING' if 'BOOKING' in (log.action_code or '') else 'ATTENDANCE'
+            elif mod_upper in ('COMMERCE', 'PAYMENTS'):
+                cat = 'COMMERCE'
+
+            badge_col = 'emerald' if log.result == 'SUCCESS' else ('rose' if log.result == 'FAILURE' else 'amber')
+
+            events.append({
+                'id': f"audit-{log.id}",
+                'category': cat,
+                'event_type': log.action_code,
+                'title': f"{(log.action_verb or log.action_code or 'Activity').title()} ({(log.module or 'CRM').title()})",
+                'description': log.event_description,
+                'occurred_at': log.occurred_at.isoformat() if log.occurred_at else timezone.now().isoformat(),
+                'actor': log.actor_display or log.actor_name or 'Staff',
+                'badge_color': badge_col,
+                'metadata': {
+                    'audit_log_id': str(log.id),
+                    'field_changes': log.field_changes,
+                    'result': log.result,
+                    'channel': log.source_channel,
+                },
+            })
+    except Exception as _audit_err:
+        logger.warning("build_member_timeline: audit log query failed: %s", _audit_err)
+
     # Sort all events chronologically descending
     events.sort(key=lambda x: x['occurred_at'], reverse=True)
     return events[:limit]
@@ -819,7 +951,7 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
     Builds the complete authoritative 6-section Member 360 payload with sensitive health data protection.
     """
     user = profile.user
-    base_member = serialize_member(profile, alias)
+    base_member = serialize_member(profile, alias, request=request, requesting_user=requesting_user)
 
     active_m = get_primary_membership(profile, alias)
     outstanding = Decimal(str(base_member['outstanding_balance']))
@@ -879,6 +1011,7 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         'home_branch_id': base_member['home_branch_id'],
         'current_program': base_member['program_name'],
         'current_package': base_member['package_name'],
+        'current_package_display': base_member.get('display_package_name', base_member['package_name']),
         'current_package_version': base_member['package_version_name'],
         'expiry_date': base_member['expiry_date'],
         'home_sessions_remaining': base_member['home_sessions_remaining'],
@@ -1006,9 +1139,16 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
                 branch_label = m.purchase_branch.name if m.purchase_branch else 'Branch'
                 discount_label = f"Offline Branch Authorized Rate ({branch_label} POS Staff)"
 
+            c_prog = m.program or (m.package.program if m.package else None)
+            c_prog_name = c_prog.name if c_prog else None
+            c_disp = format_program_package_name(c_prog_name, contract.package_name_snapshot)
+
             contract_data = {
                 'id': str(contract.id),
                 'package_name': contract.package_name_snapshot,
+                'display_package_name': c_disp,
+                'display_name': c_disp,
+                'program_name': c_prog_name or '',
                 'catalog_price': catalog_price or float(contract.purchase_price),
                 'purchase_price': float(contract.purchase_price),
                 'discount_amount': eff_discount,
@@ -1029,8 +1169,9 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
 
         prog_name = (m.program.name if m.program else (m.package.program.name if (m.package and m.package.program) else 'Standard'))
         pkg_name = m.package.name if m.package else 'Plan'
+        disp_name = format_program_package_name(prog_name, pkg_name)
 
-        m_home_s, m_cross_s, _ = get_member_sessions_summary(profile, m, alias)
+        m_home_s, m_cross_s, _ = get_member_sessions_summary(profile, m, alias, single_membership_only=True)
 
         actual_purchase_price = float(contract.purchase_price) if contract else (float(m.package_price.base_price) if m.package_price else 0)
         eff_discount = (contract_data.get('discount_amount') if contract_data else 0)
@@ -1043,8 +1184,6 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         base_consumed = 0
         passport_alloc = 0
         passport_consumed = 0
-
-
 
         seen_m_cats = set()
         for ent in sorted(ents, key=lambda x: (x.consumed_units or 0), reverse=True):
@@ -1061,7 +1200,6 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             else:
                 base_alloc = alloc
                 base_consumed = cons
-
 
         if not ents and m.package_version:
             base_alloc = int(getattr(m.package_version, 'session_count', 0) or 0)
@@ -1080,6 +1218,9 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         sessions_left = max(0, base_alloc - base_consumed)
         passport_left = min(max(0, passport_alloc - passport_consumed), sessions_left)
 
+        # Expiry status flags per membership contract card
+        _rf_today = timezone.now().date()
+        _m_days_left = (m.end_date - _rf_today).days if m.end_date else None
         m_obj = {
             'id': str(m.id),
             'membership_number': m.membership_number,
@@ -1087,12 +1228,17 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             'package_version_id': str(m.package_version_id) if m.package_version_id else None,
             'program_id': str(m.program_id) if m.program_id else (str(m.package.program_id) if m.package and m.package.program_id else None),
             'package_name': pkg_name,
-            'plan_name': pkg_name,
+            'plan_name': disp_name,
+            'display_name': disp_name,
+            'display_package_name': disp_name,
             'package_version_name': f"v{m.package_version.version_number}" if m.package_version else 'v1',
             'program_name': prog_name,
             'status': m.status,
             'start_date': str(m.start_date),
             'end_date': str(m.end_date),
+            'days_until_expiry': _m_days_left,
+            'near_expiry': _m_days_left is not None and _m_days_left <= 15 and _m_days_left >= 0,
+            'is_expired': _m_days_left is not None and _m_days_left < 0,
             'home_branch': m.home_branch.name if m.home_branch else 'Branch',
             'branch_name': m.home_branch.name if m.home_branch else (m.purchase_branch.name if m.purchase_branch else 'Sweat Pilates Malad West'),
             'purchase_branch': m.purchase_branch.name if m.purchase_branch else 'Branch',
@@ -1108,8 +1254,8 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             'sold_by': contract_data.get('sold_by') if contract_data else 'Sweat Front Desk POS',
             'coupon_code': contract_data.get('coupon_code') if contract_data else '',
             'campaign_name': contract_data.get('campaign_name') if contract_data else '',
-            'home_sessions_remaining': m_home_s,
-            'cross_branch_sessions_remaining': m_cross_s,
+            'home_sessions_remaining': sessions_left,
+            'cross_branch_sessions_remaining': passport_left,
             'sessions_used': base_consumed,
             'sessions_total': base_alloc,
             'sessions_left': sessions_left,
@@ -1118,10 +1264,12 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             'passport_sessions_left': passport_left,
         }
 
-        # Check if membership is currently active or frozen
-        is_active_or_frozen = m.status in ('ACTIVE', 'FROZEN') and (not m.end_date or m.end_date >= timezone.now().date())
+        # Check if membership is currently RUNNING (started and unexpired) -- running-first-fix
+        is_active_or_frozen = m.status in ('ACTIVE', 'FROZEN') and (not m.end_date or m.end_date >= _rf_today) and (not m.start_date or m.start_date <= _rf_today)
         if is_active_or_frozen or (m.id == getattr(active_m, 'id', None) and m.status in ('ACTIVE', 'FROZEN')):
-            if not active_membership_data:
+            if m.id == getattr(active_m, 'id', None):
+                active_membership_data = m_obj
+            elif not active_membership_data:
                 active_membership_data = m_obj
             active_memberships_list.append(m_obj)
             active_programs_list.append({
@@ -1129,6 +1277,8 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
                 'membership_number': m.membership_number,
                 'program_name': prog_name,
                 'package_name': pkg_name,
+                'display_name': disp_name,
+                'display_package_name': disp_name,
                 'status': m.status,
                 'start_date': str(m.start_date) if m.start_date else None,
                 'expiry_date': str(m.end_date) if m.end_date else None,
@@ -1148,6 +1298,8 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             'membership_number': base_member.get('membership_number', ''),
             'program_name': base_member.get('program_name', 'Standard'),
             'package_name': base_member.get('package_name', 'Plan'),
+            'display_name': base_member.get('display_package_name', 'Standard Plan'),
+            'display_package_name': base_member.get('display_package_name', 'Standard Plan'),
             'status': base_member.get('membership_status', 'ACTIVE'),
             'start_date': base_member.get('start_date'),
             'expiry_date': base_member.get('expiry_date'),
@@ -1157,6 +1309,58 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         })
 
     header['active_programs'] = active_programs_list
+    if active_memberships_list:
+        header['home_sessions_remaining'] = sum(int(m.get('sessions_left', 0) or 0) for m in active_memberships_list)
+
+    # --- Item 2: Multi-contract expiry date logic ---
+    # When a member has multiple active contracts with different end dates,
+    # surface the EARLIEST expiring contract so staff/member can act on it.
+    # Also add per-contract near_expiry flag in active_programs_list.
+    _today_expiry = timezone.now().date()
+    if active_programs_list:
+        _dated = [
+            (p['expiry_date'], p.get('display_name') or p.get('display_package_name') or p.get('package_name', ''))
+            for p in active_programs_list
+            if p.get('expiry_date')
+        ]
+        if _dated:
+            _dated_sorted = sorted(_dated, key=lambda x: x[0])  # ascending = earliest first
+            _earliest_date_str, _earliest_pkg = _dated_sorted[0]
+            _latest_date_str = _dated_sorted[-1][0]
+            _is_multi = len(_dated) > 1
+
+            header['earliest_expiry_date'] = _earliest_date_str
+            header['latest_expiry_date'] = _latest_date_str
+            header['earliest_expiry_package'] = _earliest_pkg
+            header['multi_contract_expiry'] = _is_multi
+
+            # Override the top-level expiry_date to always show the EARLIEST expiry
+            header['expiry_date'] = _earliest_date_str
+        else:
+            header['earliest_expiry_date'] = header.get('expiry_date')
+            header['latest_expiry_date'] = header.get('expiry_date')
+            header['earliest_expiry_package'] = header.get('current_package_display', '')
+            header['multi_contract_expiry'] = False
+
+        # Add near_expiry flag per active_programs entry
+        for _p in active_programs_list:
+            if _p.get('expiry_date'):
+                try:
+                    from datetime import date as _date
+                    _exp = _date.fromisoformat(_p['expiry_date'])
+                    _days_left = (_exp - _today_expiry).days
+                    _p['days_until_expiry'] = _days_left
+                    _p['near_expiry'] = _days_left <= 15
+                    _p['is_expired'] = _days_left < 0
+                except (ValueError, TypeError):
+                    _p['days_until_expiry'] = None
+                    _p['near_expiry'] = False
+                    _p['is_expired'] = False
+            else:
+                _p['days_until_expiry'] = None
+                _p['near_expiry'] = False
+                _p['is_expired'] = False
+    # --- End Item 2 ---
 
     # Freezes & history
     freezes = [
@@ -1445,6 +1649,7 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             total_paid += paid_for_order
 
         is_ext = ('extension' in (ord_obj.notes or '').lower() or any('extension' in (it.item_name_snapshot or '').lower() for it in ord_obj.items.all()))
+        is_frz = ('freeze' in (ord_obj.notes or '').lower() or any('freeze' in (it.item_name_snapshot or '').lower() for it in ord_obj.items.all()))
         c_info = redemption_by_order.get(str(ord_obj.id)) or {}
         sold_by_display = (ord_obj.sold_by_user.display_name or ord_obj.sold_by_user.email) if ord_obj.sold_by_user else 'Sweat Front Desk POS'
 
@@ -1486,7 +1691,8 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         orders_data.append({
             'id': str(ord_obj.id),
             'order_number': ord_obj.order_number,
-            'order_type': 'EXTENSION' if is_ext else ord_obj.order_type,
+            'order_type': 'FREEZE' if is_frz else ('EXTENSION' if is_ext else ord_obj.order_type),
+            'is_freeze': is_frz,
             'is_extension': is_ext,
             'notes': ord_obj.notes or '',
             'sold_by': sold_by_display,
@@ -1757,12 +1963,15 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
     for m in mem_records:
         p_name = m.program.name if m.program else (m.package.program.name if m.package and m.package.program else 'General')
         pkg_name = m.package.name if m.package else 'Membership'
+        disp_pkg = format_program_package_name(p_name, pkg_name)
         form_title = m.parq_form.name if m.parq_form else 'PAR-Q Form'
         parq_requirements.append({
             'membership_id': str(m.id),
             'membership_number': m.membership_number,
             'program_name': p_name,
             'package_name': pkg_name,
+            'display_package_name': disp_pkg,
+            'display_name': disp_pkg,
             'membership_status': m.status,
             'parq_status': getattr(m, 'parq_status', 'PENDING'),
             'parq_completed_at': m.parq_completed_at.isoformat() if getattr(m, 'parq_completed_at', None) else None,
@@ -1822,25 +2031,37 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
     }
     header['available_reward_coins'] = pts_balance
 
-    # Passport / Cross-Branch Sessions
-    passport_allowed = 0
-    if active_m and active_m.package_version:
-        pdef = PackageEntitlementDefinition.objects.using(alias).filter(
-            package_version=active_m.package_version
-        ).first()
-        if pdef and isinstance(pdef.configuration, dict):
-            passport_allowed = int(pdef.configuration.get('max_passport_sessions') or 0)
-    
-    if passport_allowed == 0 and active_m:
-        for ent in active_m.entitlements.using(alias).filter(status='ACTIVE').order_by('-consumed_units', '-updated_at'):
-            et_name = (ent.entitlement_type or '').lower()
-            if 'cross' in et_name or 'passport' in et_name:
-                passport_allowed = int(ent.allocated_units or 0)
-                break
+    # Passport / Cross-Branch Sessions aggregated across active memberships
+    agg_passport_allowed = 0
+    agg_passport_consumed = 0
+    agg_passport_remaining = 0
+    if active_memberships_list:
+        for am_data in active_memberships_list:
+            agg_passport_allowed += int(am_data.get('passport_sessions_total') or 0)
+            agg_passport_consumed += int(am_data.get('passport_sessions_used') or 0)
+            agg_passport_remaining += int(am_data.get('passport_sessions_left') or 0)
 
+    passport_allowed = agg_passport_allowed
+    passport_consumed = agg_passport_consumed
+    passport_remaining = agg_passport_remaining
 
     if passport_allowed == 0:
-        passport_allowed = int(base_member.get('cross_branch_sessions_remaining') or 0)
+        if active_m and active_m.package_version:
+            pdef = PackageEntitlementDefinition.objects.using(alias).filter(
+                package_version=active_m.package_version
+            ).first()
+            if pdef and isinstance(pdef.configuration, dict):
+                passport_allowed = int(pdef.configuration.get('max_passport_sessions') or 0)
+        
+        if passport_allowed == 0 and active_m:
+            for ent in active_m.entitlements.using(alias).filter(status='ACTIVE').order_by('-consumed_units', '-updated_at'):
+                et_name = (ent.entitlement_type or '').lower()
+                if 'cross' in et_name or 'passport' in et_name:
+                    passport_allowed = int(ent.allocated_units or 0)
+                    break
+
+        if passport_allowed == 0:
+            passport_allowed = int(base_member.get('cross_branch_sessions_remaining') or 0)
 
     cross_bookings = []
     if active_m and active_m.home_branch_id:
@@ -1863,17 +2084,17 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
                 'status': cb.status,
             })
 
-    passport_consumed = len(cross_bookings)
-    cross_rem = int(m_cross_s if 'm_cross_s' in locals() else (base_member.get('cross_branch_sessions_remaining') or 0))
-    if passport_allowed > 0:
-        passport_remaining = max(0, passport_allowed - passport_consumed)
-    elif cross_rem > 0:
-        passport_allowed = cross_rem + passport_consumed
-        passport_remaining = cross_rem
-    else:
-        passport_remaining = 0
+    if cross_bookings:
+        cb_count = len(cross_bookings)
+        if cb_count > passport_consumed:
+            passport_consumed = cb_count
+            if passport_allowed > 0:
+                passport_remaining = max(0, passport_allowed - passport_consumed)
 
-    eff_home_remaining = int(base_member.get('home_sessions_remaining') or 0)
+    if passport_remaining == 0 and passport_allowed > 0 and passport_consumed < passport_allowed:
+        passport_remaining = max(0, passport_allowed - passport_consumed)
+
+    eff_home_remaining = int(header.get('home_sessions_remaining') or 0)
     passport_remaining = min(passport_remaining, eff_home_remaining)
     header['cross_branch_sessions_remaining'] = passport_remaining
 
@@ -2111,6 +2332,41 @@ class MemberViewSet(viewsets.ViewSet):
         alias = _get_db(request)
         org = _get_org(request)
         qs = self.get_member_queryset(alias, org)
+        # Trainer branch scoping: a plain Trainer sees only members of their home branch;
+        # admins / managers / front-desk / super-admin / ORG-scoped roles are NEVER restricted here.
+        # (Client-360 can still look up any individual member across branches.)
+        _roles = {str(r).upper() for r in (get_user_role_codes(request) or set())}
+        is_org_scoped = False
+        try:
+            from .models_rbac import RoleAssignment
+            is_org_scoped = RoleAssignment.objects.using(alias).filter(
+                user=request.user, is_active=True, role__is_active=True, role__scope__in=['ORG', 'ORGANIZATION']
+            ).exists()
+        except Exception:
+            pass
+
+        is_trainer = any('TRAINER' in r for r in _roles)
+        if is_trainer and not is_org_scoped and not (_roles & {'ORG_ADMIN', 'SUPER_ADMIN', 'BRANCH_MANAGER', 'FINANCE_ADMIN', 'FRONT_DESK'}):
+            from .models_users import UserBranch
+            from .models_rbac import RoleAssignment
+            permitted_branches = set()
+            if getattr(request.user, 'home_branch_id', None):
+                permitted_branches.add(str(request.user.home_branch_id))
+            for b in UserBranch.objects.using(alias).filter(user=request.user, is_active=True).values_list('branch_id', flat=True):
+                if b:
+                    permitted_branches.add(str(b))
+            for b in RoleAssignment.objects.using(alias).filter(user=request.user, is_active=True, branch_id__isnull=False).values_list('branch_id', flat=True):
+                if b:
+                    permitted_branches.add(str(b))
+
+            if permitted_branches:
+                qs = qs.filter(
+                    Q(preferred_branch_id__in=permitted_branches)
+                    | Q(memberships__home_branch_id__in=permitted_branches)
+                    | Q(memberships__purchase_branch_id__in=permitted_branches)
+                ).distinct()
+            else:
+                qs = qs.none()
         today = timezone.now().date()
 
         # Branch / Location filter: current / home member branch
@@ -2219,7 +2475,18 @@ class MemberViewSet(viewsets.ViewSet):
             elif st == 'CANCELLED':
                 qs = qs.filter(memberships__status='CANCELLED')
             elif st == 'INACTIVE':
-                qs = qs.filter(Q(member_status='INACTIVE') | Q(user__status='INACTIVE'))
+                act_ids = _get_active_profile_ids()
+                frozen_ids = set(Membership.objects.using(alias).filter(
+                    Q(status='FROZEN') | Q(id__in=active_freeze_mem_ids)
+                ).values_list('user_profile_id', flat=True))
+                exp_profile_ids = set(Membership.objects.using(alias).filter(
+                    Q(status='EXPIRED') | (Q(status='ACTIVE') & Q(end_date__lt=today))
+                ).values_list('user_profile_id', flat=True))
+                has_active_or_expired = act_ids | frozen_ids | exp_profile_ids
+
+                qs = qs.filter(
+                    Q(member_status='INACTIVE') | Q(user__status='INACTIVE') | ~Q(id__in=has_active_or_expired)
+                )
             else:
                 qs = qs.filter(Q(member_status__iexact=status_param) | Q(memberships__status__iexact=status_param))
 
@@ -2567,7 +2834,7 @@ class MemberViewSet(viewsets.ViewSet):
                         }
                     )
 
-        return Response(serialize_member(profile, alias), status=status.HTTP_201_CREATED)
+        return Response(serialize_member(profile, alias, request=request), status=status.HTTP_201_CREATED)
 
     def partial_update(self, request, pk=None):
         alias = _get_db(request)
@@ -2575,6 +2842,18 @@ class MemberViewSet(viewsets.ViewSet):
         profile = self.get_member_profile(alias, org, pk)
         if not profile:
             return Response({'detail': 'Member not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Before state snapshot for granular audit comparison
+        user = profile.user
+        before_state = {
+            'name': f"{profile.first_name_snapshot or ''} {profile.last_name_snapshot or ''}".strip(),
+            'phone': user.phone if user else '',
+            'email': user.email if user else '',
+            'gender': profile.gender or (user.gender if user else ''),
+            'date_of_birth': str(profile.date_of_birth or (user.date_of_birth if user else '') or ''),
+            'status': profile.member_status,
+            'home_branch': profile.preferred_branch.name if profile.preferred_branch else '',
+        }
 
         data = request.data
         if 'name' in data:
@@ -2592,7 +2871,8 @@ class MemberViewSet(viewsets.ViewSet):
                     sync_tenant_user_identity(profile.user, tenant_id=org.id, db=alias)
                 except Exception as ex:
                     logger.warning("Failed to sync identity for member user %s: %s", profile.user.id, ex)
-        if 'phone' in data and profile.user:
+        from .security_utils import is_masked_phone
+        if 'phone' in data and profile.user and not is_masked_phone(data['phone']):
             profile.user.phone = data['phone']
             profile.user.save(using=alias)
         if 'email' in data and profile.user:
@@ -2629,7 +2909,45 @@ class MemberViewSet(viewsets.ViewSet):
             profile.emergency_contact_json = {'contact': c}
 
         profile.save(using=alias)
-        return Response(serialize_member(profile, alias), status=status.HTTP_200_OK)
+
+        # After state snapshot & Granular Audit Log
+        after_state = {
+            'name': f"{profile.first_name_snapshot or ''} {profile.last_name_snapshot or ''}".strip(),
+            'phone': profile.user.phone if profile.user else '',
+            'email': profile.user.email if profile.user else '',
+            'gender': profile.gender or (profile.user.gender if profile.user else ''),
+            'date_of_birth': str(profile.date_of_birth or (profile.user.date_of_birth if profile.user else '') or ''),
+            'status': profile.member_status,
+            'home_branch': profile.preferred_branch.name if profile.preferred_branch else '',
+        }
+
+        try:
+            from .audit_engine import UnifiedAuditEngine
+            actor = getattr(request, 'user', None)
+            member_display = after_state['name'] or after_state['email'] or str(profile.id)
+            UnifiedAuditEngine.record_activity(
+                action_code='MEMBER.PROFILE_UPDATED',
+                action_category='MEMBERSHIP',
+                action_verb='UPDATED',
+                module='MEMBERS',
+                submodule='DIRECTORY',
+                entity_type='Member',
+                entity_id=str(profile.id),
+                entity_name=member_display,
+                actor_user=actor if isinstance(actor, TenantUser) else None,
+                actor_type='STAFF' if actor else 'SYSTEM',
+                request=request,
+                branch=profile.preferred_branch,
+                organization=org,
+                before_state=before_state,
+                after_state=after_state,
+                reason=data.get('reason', '') or 'Staff updated member profile',
+                db_alias=alias,
+            )
+        except Exception as log_err:
+            logger.warning(f"Failed to record member update audit: {log_err}")
+
+        return Response(serialize_member(profile, alias, request=request), status=status.HTTP_200_OK)
 
     def destroy(self, request, pk=None):
         alias = _get_db(request)
@@ -2637,6 +2955,9 @@ class MemberViewSet(viewsets.ViewSet):
         profile = self.get_member_profile(alias, org, pk)
         if not profile:
             return Response({'detail': 'Member not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        member_name = f"{profile.first_name_snapshot or ''} {profile.last_name_snapshot or ''}".strip() or (profile.user.email if profile.user else str(profile.id))
+        old_status = profile.member_status
 
         # If profile belongs to a staff/admin user, remove member identity without deleting the staff user
         if profile.user and getattr(profile.user, 'user_type', None) == 'STAFF':
@@ -2652,6 +2973,32 @@ class MemberViewSet(viewsets.ViewSet):
             profile.member_status = 'INACTIVE'
             profile.save(using=alias)
             Membership.objects.using(alias).filter(user_profile=profile).delete()
+
+        try:
+            from .audit_engine import UnifiedAuditEngine
+            actor = getattr(request, 'user', None)
+            UnifiedAuditEngine.record_activity(
+                action_code='MEMBER.DEACTIVATED',
+                action_category='MEMBERSHIP',
+                action_verb='DEACTIVATED',
+                module='MEMBERS',
+                submodule='DIRECTORY',
+                entity_type='Member',
+                entity_id=str(profile.id),
+                entity_name=member_name,
+                actor_user=actor if isinstance(actor, TenantUser) else None,
+                actor_type='STAFF' if actor else 'SYSTEM',
+                request=request,
+                branch=profile.preferred_branch,
+                organization=org,
+                before_state={'status': old_status},
+                after_state={'status': 'INACTIVE'},
+                reason=request.data.get('reason', '') or 'Staff deactivated member account',
+                event_description=f"Member account '{member_name}' was deactivated by staff.",
+                db_alias=alias,
+            )
+        except Exception as log_err:
+            logger.warning(f"Failed to record member deactivation audit: {log_err}")
 
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -2754,6 +3101,15 @@ class MemberViewSet(viewsets.ViewSet):
         else:
             renewal_start = today
 
+        # Renewal coupon (web/CRM) - order-type gated to RENEWAL
+        renew_coupon_code = (request.data.get('coupon_code') or '').strip()
+        renew_discount = Decimal('0.00')
+        if renew_coupon_code:
+            from .services_discounts import DiscountCouponEngineService as _CPN
+            _cv = _CPN.validate_coupon(code_str=renew_coupon_code, user_profile=profile, order_subtotal=unit_price, package=package, branch=branch, db_alias=alias, order_type='RENEWAL')
+            if _cv.get('is_valid'):
+                renew_discount = Decimal(str(_cv.get('discount_amount') or 0))
+
         with transaction.atomic(using=alias):
             # 1. Create canonical renewal Order
             order = CommerceService.create_order(
@@ -2766,7 +3122,7 @@ class MemberViewSet(viewsets.ViewSet):
                     'item_name_snapshot': f"{package.name} (v{package_version.version_number}) - Renewal",
                     'quantity': Decimal('1.00'),
                     'unit_price': unit_price,
-                    'discount_amount': Decimal('0.00'),
+                    'discount_amount': renew_discount,
                     'tax_percent': Decimal('0.000'),
                 }],
                 user_profile=profile,
@@ -2817,10 +3173,23 @@ class MemberViewSet(viewsets.ViewSet):
                     'amount': str(order.total_amount),
                     'old_membership_id': str(active_m.id),
                     'new_membership_id': str(new_membership.id),
-                    'member': serialize_member(profile, alias),
+                    'member': serialize_member(profile, alias, request=request),
                 }, status=status.HTTP_201_CREATED)
 
-            if is_cash and pay_amt > Decimal('0.00'):
+            explicit_approval_req = request.data.get('require_approval')
+            is_front_desk_note = 'front desk' in str(request.data.get('reason', '')).lower()
+            from .services_payment_policy import PaymentPolicyService
+            if explicit_approval_req is True or (explicit_approval_req is None and is_front_desk_note and not request.data.get('auto_activate')):
+                requires_cash_approval = True
+            else:
+                requires_cash_approval = is_cash and PaymentPolicyService.is_cash_approval_required(
+                    user=request.user,
+                    organization=org,
+                    branch=branch,
+                    db_alias=alias,
+                )
+
+            if is_cash and pay_amt > Decimal('0.00') and requires_cash_approval:
                 txn = PaymentTransaction.objects.using(alias).create(
                     id=uuid.uuid4(),
                     order=order,
@@ -2899,7 +3268,7 @@ class MemberViewSet(viewsets.ViewSet):
                     'new_membership_id': str(new_membership.id),
                     'approval_request_id': str(approval_req.id),
                     'order_id': str(order.id),
-                    'member': serialize_member(profile, alias),
+                    'member': serialize_member(profile, alias, request=request),
                 }, status=status.HTTP_202_ACCEPTED)
 
             elif pay_amt == Decimal('0.00'):
@@ -2936,16 +3305,25 @@ class MemberViewSet(viewsets.ViewSet):
                     'old_membership_id': str(active_m.id),
                     'new_membership_id': str(new_membership.id),
                     'order_id': str(order.id),
-                    'member': serialize_member(profile, alias),
+                    'member': serialize_member(profile, alias, request=request),
                 }, status=status.HTTP_201_CREATED)
 
             else:
-                CommerceService.record_payment(
+                pay_prov = 'CASH' if is_cash else payment_provider
+                pay_meth = 'CASH' if is_cash else payment_method
+                txn, invoice = CommerceService.record_payment(
                     order_id=str(order.id),
                     amount=pay_amt,
-                    provider=payment_provider,
-                    payment_method=payment_method,
+                    provider=pay_prov,
+                    payment_method=pay_meth,
                     actor=request.user,
+                    metadata={
+                        'collected_via': 'MEMBERSHIP_RENEWAL',
+                        'collected_by_user_id': str(request.user.id),
+                        'collected_by_name': getattr(request.user, 'display_name', 'Staff'),
+                        'member_profile_id': str(profile.id),
+                        'direct_activation': True,
+                    },
                     db_alias=alias,
                 )
                 order_item = order.items.first()
@@ -2956,6 +3334,9 @@ class MemberViewSet(viewsets.ViewSet):
                     db_alias=alias,
                     created_by_user=request.user,
                 )
+                if is_cash:
+                    new_membership.legacy_reference = 'CASH_VERIFIED'
+                    new_membership.save(using=alias, update_fields=['legacy_reference', 'updated_at'])
                 # PAR-Q Lifecycle Inheritance / Reuse for Renewal
                 parq_decision = str(request.data.get('parq_decision', 'REUSE')).upper().strip()
                 if parq_decision == 'REUSE':
@@ -3029,7 +3410,7 @@ class MemberViewSet(viewsets.ViewSet):
                     'start_date': str(new_membership.start_date),
                     'end_date': str(new_membership.end_date),
                     'order_id': str(order.id),
-                    'member': serialize_member(profile, alias),
+                    'member': serialize_member(profile, alias, request=request),
                 }, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['post'], url_path='purchase-package')
@@ -3108,6 +3489,15 @@ class MemberViewSet(viewsets.ViewSet):
         else:
             start_date = today
 
+        # New-purchase coupon (web/CRM) - order-type gated to NEW_MEMBERSHIP
+        purchase_coupon_code = (request.data.get('coupon_code') or '').strip()
+        purchase_discount = Decimal('0.00')
+        if purchase_coupon_code:
+            from .services_discounts import DiscountCouponEngineService as _CPN
+            _cv = _CPN.validate_coupon(code_str=purchase_coupon_code, user_profile=profile, order_subtotal=unit_price, package=package, branch=branch, db_alias=alias, order_type='NEW_MEMBERSHIP')
+            if _cv.get('is_valid'):
+                purchase_discount = Decimal(str(_cv.get('discount_amount') or 0))
+
         with transaction.atomic(using=alias):
             order = CommerceService.create_order(
                 branch=branch,
@@ -3119,7 +3509,7 @@ class MemberViewSet(viewsets.ViewSet):
                     'item_name_snapshot': f"{package.name} (v{package_version.version_number})",
                     'quantity': Decimal('1.00'),
                     'unit_price': unit_price,
-                    'discount_amount': Decimal('0.00'),
+                    'discount_amount': purchase_discount,
                     'tax_percent': Decimal('0.000'),
                 }],
                 user_profile=profile,
@@ -3178,42 +3568,123 @@ class MemberViewSet(viewsets.ViewSet):
                     'order_number': order.order_number,
                     'amount': str(order.total_amount),
                     'new_membership_id': str(new_membership.id),
-                    'member': serialize_member(profile, alias),
+                    'member': serialize_member(profile, alias, request=request),
                 }, status=status.HTTP_201_CREATED)
 
             elif is_cash:
-                txn = PaymentTransaction.objects.using(alias).create(
-                    id=uuid.uuid4(),
-                    order=order,
-                    user_profile=profile,
-                    amount=pay_amt,
-                    currency=order.currency or 'INR',
-                    provider='CASH',
-                    payment_method='CASH',
-                    status='SUCCESS',
-                    idempotency_key=f"CASH-PURCHASE-{uuid.uuid4().hex[:12]}",
-                    metadata={
-                        'collected_via': 'PACKAGE_PURCHASE',
-                        'collected_by_user_id': str(request.user.id),
-                        'collected_by_name': getattr(request.user, 'display_name', getattr(request.user, 'email', 'Staff')),
-                        'member_profile_id': str(profile.id),
-                    }
-                )
-                new_membership = MembershipLifecycleService.activate_membership_from_order(
-                    order=order,
-                    order_item=order_item,
-                    start_date=start_date,
+                from .services_payment_policy import PaymentPolicyService
+                policy = PaymentPolicyService.get_effective_policy(org, branch=branch, db_alias=alias)
+                requires_cash_approval = PaymentPolicyService.is_cash_approval_required(
+                    user=request.user,
+                    organization=org,
+                    branch=branch,
+                    policy=policy,
                     db_alias=alias,
-                    created_by_user=request.user,
                 )
-                MembershipStatusHistory.objects.using(alias).create(
-                    membership=new_membership,
-                    from_status=None,
-                    to_status='ACTIVE',
-                    reason_code='NEW_PROGRAM_PACKAGE_PURCHASE_CASH',
-                    reason_text=f"Purchased {package.name} ({package.program.name if package.program else ''}) via Cash recorded by {getattr(request.user, 'email', 'Staff')}",
-                    changed_by_user=request.user,
-                )
+                if requires_cash_approval:
+                    txn = PaymentTransaction.objects.using(alias).create(
+                        id=uuid.uuid4(),
+                        order=order,
+                        user_profile=profile,
+                        amount=pay_amt,
+                        currency=order.currency or 'INR',
+                        provider='CASH',
+                        payment_method='CASH',
+                        status='PENDING',
+                        idempotency_key=f"CASH-PURCHASE-{uuid.uuid4().hex[:12]}",
+                        metadata={
+                            'collected_via': 'PACKAGE_PURCHASE',
+                            'collected_by_user_id': str(request.user.id),
+                            'collected_by_name': getattr(request.user, 'display_name', getattr(request.user, 'email', 'Staff')),
+                            'member_profile_id': str(profile.id),
+                        }
+                    )
+                    new_membership = MembershipLifecycleService.activate_membership_from_order(
+                        order=order,
+                        order_item=order_item,
+                        start_date=start_date,
+                        db_alias=alias,
+                        created_by_user=request.user,
+                    )
+                    from .services_approvals import AdminApprovalService
+                    approval_req = AdminApprovalService.create_approval_request(
+                        organization=org,
+                        request_type='CASH_PAYMENT_APPROVAL',
+                        entity_type='PaymentTransaction',
+                        entity_id=txn.id,
+                        requested_by_user=request.user,
+                        requested_payload={
+                            'order_id': str(order.id),
+                            'order_number': order.order_number,
+                            'member_id': str(profile.id),
+                            'member_name': f"{profile.first_name_snapshot} {profile.last_name_snapshot}".strip() or profile.user.display_name,
+                            'amount': str(pay_amt),
+                            'currency': order.currency,
+                            'branch_id': str(branch.id if branch else ''),
+                            'branch_name': branch.name if branch else '',
+                            'recorded_by': getattr(request.user, 'display_name', getattr(request.user, 'email', 'Staff')),
+                            'recorded_by_id': str(request.user.id),
+                            'source': 'PACKAGE_PURCHASE',
+                            'new_membership_id': str(new_membership.id),
+                        },
+                        db_alias=alias,
+                    )
+                    txn.metadata['approval_request_id'] = str(approval_req.id)
+                    txn.save(using=alias, update_fields=['metadata'])
+
+                    new_membership.status = 'PENDING_PAYMENT'
+                    new_membership.legacy_reference = f"CASH_APPROVAL:{approval_req.id}"
+                    new_membership.save(using=alias, update_fields=['status', 'legacy_reference', 'updated_at'])
+                    new_membership.entitlements.using(alias).update(status='INACTIVE')
+
+                    MembershipStatusHistory.objects.using(alias).create(
+                        membership=new_membership,
+                        from_status=None,
+                        to_status='PENDING_PAYMENT',
+                        reason_code='CASH_COLLECTION_PENDING_APPROVAL',
+                        reason_text=f"Awaiting cash payment approval #{approval_req.id} recorded by {getattr(request.user, 'email', 'Staff')}",
+                        changed_by_user=request.user,
+                    )
+
+                    return Response({
+                        'success': True,
+                        'status': 'PENDING_APPROVAL',
+                        'message': f"Cash payment of ₹{pay_amt} recorded and submitted for manager approval (Approval Req: {approval_req.id}).",
+                        'order_id': str(order.id),
+                        'order_number': order.order_number,
+                        'new_membership_id': str(new_membership.id),
+                        'approval_request_id': str(approval_req.id),
+                        'member': serialize_member(profile, alias, request=request),
+                    }, status=status.HTTP_202_ACCEPTED)
+                else:
+                    CommerceService.record_payment(
+                        order_id=str(order.id),
+                        amount=pay_amt,
+                        provider='CASH',
+                        payment_method='CASH',
+                        actor=request.user,
+                        db_alias=alias,
+                    )
+                    new_membership = MembershipLifecycleService.activate_membership_from_order(
+                        order=order,
+                        order_item=order_item,
+                        start_date=start_date,
+                        db_alias=alias,
+                        created_by_user=request.user,
+                    )
+                    new_membership.status = 'ACTIVE'
+                    new_membership.legacy_reference = 'CASH_VERIFIED'
+                    new_membership.save(using=alias, update_fields=['status', 'legacy_reference', 'updated_at'])
+                    new_membership.entitlements.using(alias).update(status='ACTIVE')
+
+                    MembershipStatusHistory.objects.using(alias).create(
+                        membership=new_membership,
+                        from_status=None,
+                        to_status='ACTIVE',
+                        reason_code='NEW_PROGRAM_PACKAGE_PURCHASE_CASH',
+                        reason_text=f"Purchased {package.name} ({package.program.name if package.program else ''}) via Cash verified by {getattr(request.user, 'email', 'Staff')}",
+                        changed_by_user=request.user,
+                    )
             else:
                 CommerceService.record_payment(
                     order_id=str(order.id),
@@ -3262,7 +3733,7 @@ class MemberViewSet(viewsets.ViewSet):
                 'start_date': str(new_membership.start_date),
                 'end_date': str(new_membership.end_date),
                 'order_id': str(order.id),
-                'member': serialize_member(profile, alias),
+                'member': serialize_member(profile, alias, request=request),
             }, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['get'], url_path='upgrade-options')
@@ -3496,6 +3967,17 @@ class MemberViewSet(viewsets.ViewSet):
                 }
             )
 
+        # Upgrade coupon (order-type gated to UPGRADE) - discounts the target package
+        upg_coupon_code = (request.data.get('coupon_code') or '').strip()
+        upg_discount = Decimal('0.00')
+        if upg_coupon_code:
+            from .services_discounts import DiscountCouponEngineService as _CPN
+            _tp = target_ver.prices.using(alias).filter(status='ACTIVE').first() if target_ver else None
+            _tbase = _tp.base_price if _tp else Decimal('0.00')
+            _cv = _CPN.validate_coupon(code_str=upg_coupon_code, user_profile=profile, order_subtotal=_tbase, package=target_pkg, db_alias=alias, order_type='UPGRADE')
+            if _cv.get('is_valid'):
+                upg_discount = Decimal(str(_cv.get('discount_amount') or 0))
+
         with transaction.atomic(using=alias):
             change_req = MembershipLifecycleService.quote_and_apply_change(
                 membership=active_m,
@@ -3505,6 +3987,7 @@ class MemberViewSet(viewsets.ViewSet):
                 reason=reason,
                 actor_user=request.user,
                 db_alias=alias,
+                coupon_discount=upg_discount,
             )
 
             # Record business audit
@@ -3525,7 +4008,7 @@ class MemberViewSet(viewsets.ViewSet):
             'message': f"Upgraded to {target_pkg.name} ({target_ver.version_number})",
             'change_request_id': str(change_req.id),
             'additional_amount': float(change_req.additional_amount),
-            'member': serialize_member(profile, alias),
+            'member': serialize_member(profile, alias, request=request),
         }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'], url_path='extend')
@@ -3657,7 +4140,7 @@ class MemberViewSet(viewsets.ViewSet):
                 'message': f"Extended until {mem.end_date}",
                 'payment_mode': payment_mode,
                 'payment': payment_info,
-                'member': serialize_member(profile, alias),
+                'member': serialize_member(profile, alias, request=request),
             }, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -3716,7 +4199,7 @@ class MemberViewSet(viewsets.ViewSet):
             'old_start_date': str(old_start), 'new_start_date': str(new_start),
             'old_end_date': str(old_end), 'new_end_date': str(new_end),
             'reason': reason,
-            'member': serialize_member(profile, alias),
+            'member': serialize_member(profile, alias, request=request),
         }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'], url_path='freeze')
@@ -3759,12 +4242,135 @@ class MemberViewSet(viewsets.ViewSet):
                 approved_by_user=request.user,
                 db_alias=alias,
             )
-            profile.member_status = 'FROZEN'
+
+            # Check if member still has other active contracts running; if so, keep member_status ACTIVE
+            other_active = Membership.objects.using(alias).filter(
+                user_profile=profile,
+                status='ACTIVE'
+            ).exclude(id=active_m.id).exists()
+            profile.member_status = 'ACTIVE' if other_active else 'FROZEN'
             profile.save(using=alias, update_fields=['member_status'])
+
+            # Financial Recording: If a freeze fee was collected or a payment link requested
+            charge_fee = request.data.get('charge_fee', True)
+            raw_fee = request.data.get('fee_amount')
+            payment_method = request.data.get('payment_method', 'CASH')
+
+            order_id = None
+            order_num = None
+            payment_url = None
+
+            fee_val = Decimal('0.00')
+            if raw_fee is not None:
+                try:
+                    fee_val = Decimal(str(raw_fee))
+                except Exception:
+                    fee_val = Decimal('0.00')
+
+            if charge_fee and fee_val > Decimal('0.00'):
+                from .models_commerce import Order, OrderItem, PaymentTransaction, PaymentLink
+                from .models_workforce import Branch
+                import uuid
+
+                order_num = f"FRZ-{uuid.uuid4().hex[:8].upper()}"
+                is_link = (payment_method == 'PAYMENT_LINK')
+                order_status = 'PENDING_PAYMENT' if is_link else 'PAID'
+
+                order_branch = (
+                    active_m.home_branch
+                    or active_m.purchase_branch
+                    or getattr(profile, 'preferred_branch', None)
+                    or getattr(request.user, 'home_branch', None)
+                    or Branch.objects.using(alias).filter(status='ACTIVE').first()
+                )
+
+                order = Order.objects.using(alias).create(
+                    user_profile=profile,
+                    branch=order_branch,
+                    order_number=order_num,
+                    order_type='OTHER',
+                    source='FRONT_DESK',
+                    status=order_status,
+                    subtotal=fee_val,
+                    tax_amount=Decimal('0.00'),
+                    discount_amount=Decimal('0.00'),
+                    total_amount=fee_val,
+                    currency='INR',
+                    notes=f"Membership Freeze Fee ({from_d} to {until_d}) - {active_m.package.name if active_m.package else 'Plan'} [Membership: {active_m.id}]",
+                    sold_by_user=request.user,
+                )
+                order_id = str(order.id)
+
+                OrderItem.objects.using(alias).create(
+                    order=order,
+                    item_type='ADJUSTMENT',
+                    item_name_snapshot=f"Membership Freeze Fee ({from_d} to {until_d})",
+                    quantity=Decimal('1.00'),
+                    unit_price_snapshot=fee_val,
+                    total_amount=fee_val,
+                )
+
+                if not is_link:
+                    PaymentTransaction.objects.using(alias).create(
+                        order=order,
+                        user_profile=profile,
+                        amount=fee_val,
+                        currency='INR',
+                        provider='MANUAL_POS',
+                        payment_method=payment_method,
+                        status='SUCCESS',
+                        paid_at=timezone.now(),
+                        notes=f"Collected by {request.user.first_name or 'Staff'} at front desk ({payment_method})",
+                    )
+                else:
+                    # Generate live Razorpay payment link
+                    from .services_razorpay import RazorpayService
+                    try:
+                        amount_paise = RazorpayService.convert_inr_to_paise(fee_val)
+                        u = profile.user
+                        cust_name = f"{u.first_name} {u.last_name}".strip() if u else (profile.name or "Member")
+                        cust_phone = u.phone if u else getattr(profile, 'phone', '')
+                        cust_email = u.email if u else getattr(profile, 'email', '')
+                        link_res = RazorpayService.create_payment_link(
+                            amount_paise=amount_paise,
+                            description=f"Membership Freeze Fee ({from_d} to {until_d})",
+                            customer_name=cust_name,
+                            customer_phone=cust_phone,
+                            customer_email=cust_email,
+                            reference_id=order_num,
+                            notes={
+                                'order_id': str(order.id),
+                                'order_number': order_num,
+                                'member_id': str(profile.id),
+                                'membership_id': str(active_m.id),
+                            },
+                            db_alias=alias,
+                        )
+                        payment_url = link_res.get('short_url')
+                    except Exception as ex:
+                        logger.warning(f"Could not create Razorpay payment link: {ex}")
+                        payment_url = f"https://rzp.io/i/{order_num}"
+
+                    PaymentLink.objects.using(alias).create(
+                        order=order,
+                        user_profile=profile,
+                        provider='RAZORPAY',
+                        external_reference=order_num,
+                        payment_url=payment_url,
+                        amount=fee_val,
+                    )
+
+            msg = f"Membership frozen from {from_d} to {until_d}."
+            if fee_val > 0:
+                msg += f" Fee of ₹{fee_val} recorded via {payment_method}."
+
             return Response({
                 'success': True,
-                'message': f"Membership frozen from {from_d} to {until_d}",
-                'member': serialize_member(profile, alias),
+                'message': msg,
+                'order_id': order_id,
+                'order_number': order_num,
+                'payment_url': payment_url,
+                'member': serialize_member(profile, alias, request=request),
             }, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -3780,7 +4386,12 @@ class MemberViewSet(viewsets.ViewSet):
         if not profile:
             return Response({'detail': 'Member not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        mem = Membership.objects.using(alias).filter(user_profile=profile, status='FROZEN').order_by('-created_at').first()
+        target_m_id = request.data.get('membership_id')
+        mem = None
+        if target_m_id:
+            mem = Membership.objects.using(alias).filter(id=target_m_id, user_profile=profile).first()
+        if not mem:
+            mem = Membership.objects.using(alias).filter(user_profile=profile, status='FROZEN').order_by('-created_at').first()
         if not mem:
             mem = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
 
@@ -3796,7 +4407,7 @@ class MemberViewSet(viewsets.ViewSet):
             return Response({
                 'success': True,
                 'message': "Membership unfreezed and restored to Active status",
-                'member': serialize_member(profile, alias),
+                'member': serialize_member(profile, alias, request=request),
             }, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -3825,7 +4436,7 @@ class MemberViewSet(viewsets.ViewSet):
         if getattr(target_branch, 'status', 'ACTIVE') != 'ACTIVE':
             return Response({'error': f"Target branch '{target_branch.name}' is inactive and cannot receive membership transfers."}, status=status.HTTP_400_BAD_REQUEST)
 
-        active_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('-created_at').first()
+        active_m = Membership.objects.using(alias).filter(user_profile=profile).exclude(status='CANCELLED').order_by('-created_at').first()
         if active_m:
             if active_m.home_branch_id == target_branch.id:
                 return Response({'error': f"Member is already assigned to '{target_branch.name}' as home branch."}, status=status.HTTP_400_BAD_REQUEST)
@@ -3858,7 +4469,7 @@ class MemberViewSet(viewsets.ViewSet):
         return Response({
             'success': True,
             'message': f"Home branch transferred to {target_branch.name}",
-            'member': serialize_member(profile, alias),
+            'member': serialize_member(profile, alias, request=request),
         }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'], url_path='cancel')
@@ -3898,7 +4509,7 @@ class MemberViewSet(viewsets.ViewSet):
         return Response({
             'success': True,
             'message': "Membership has been cancelled.",
-            'member': serialize_member(profile, alias),
+            'member': serialize_member(profile, alias, request=request),
         }, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'], url_path='adjust-entitlement')
@@ -4050,7 +4661,7 @@ class MemberViewSet(viewsets.ViewSet):
                     'success': True,
                     'message': f"Adjusted {units_delta:+f} {entitlement_type} units (Balance: {ledger.balance_after})",
                     'balance_after': float(ledger.balance_after) if ledger.balance_after is not None else None,
-                    'member': serialize_member(profile, alias),
+                    'member': serialize_member(profile, alias, request=request),
                 }
 
                 if idempotency_key:
@@ -4113,6 +4724,17 @@ class MemberViewSet(viewsets.ViewSet):
         if not branch and org:
             branch = Branch.objects.using(alias).filter(organization=org).first()
 
+        # Rejoin coupon (web/CRM) - order-type gated to RENEWAL or NEW_MEMBERSHIP
+        rejoin_coupon_code = (request.data.get('coupon_code') or '').strip()
+        rejoin_discount = Decimal('0.00')
+        if rejoin_coupon_code:
+            from .services_discounts import DiscountCouponEngineService as _CPN
+            _cv = _CPN.validate_coupon(code_str=rejoin_coupon_code, user_profile=profile, order_subtotal=unit_price, package=package, branch=branch, db_alias=alias, order_type='RENEWAL')
+            if not _cv.get('is_valid'):
+                _cv = _CPN.validate_coupon(code_str=rejoin_coupon_code, user_profile=profile, order_subtotal=unit_price, package=package, branch=branch, db_alias=alias, order_type='NEW_MEMBERSHIP')
+            if _cv.get('is_valid'):
+                rejoin_discount = Decimal(str(_cv.get('discount_amount') or 0))
+
         with transaction.atomic(using=alias):
             old_status = profile.member_status
             profile.member_status = 'ACTIVE'
@@ -4131,14 +4753,14 @@ class MemberViewSet(viewsets.ViewSet):
                     'item_name_snapshot': f"{package.name} (v{package_version.version_number})",
                     'quantity': Decimal('1.00'),
                     'unit_price': unit_price,
-                    'discount_amount': Decimal('0.00'),
+                    'discount_amount': rejoin_discount,
                     'tax_percent': Decimal('0.000'),
                 }],
                 user_profile=profile,
                 order_type='REJOIN',
                 source='FRONT_DESK',
                 currency='INR',
-                notes=reason,
+                notes=f"{reason} | Coupon: {rejoin_coupon_code}" if rejoin_coupon_code else reason,
                 created_by=request.user,
                 db_alias=alias,
             )
@@ -4176,7 +4798,7 @@ class MemberViewSet(viewsets.ViewSet):
                     'order_number': order.order_number,
                     'amount': str(order.total_amount),
                     'membership_id': str(membership.id),
-                    'member': serialize_member(profile, alias),
+                    'member': serialize_member(profile, alias, request=request),
                 }, status=status.HTTP_201_CREATED)
 
             # Record payment if provided
@@ -4228,7 +4850,7 @@ class MemberViewSet(viewsets.ViewSet):
             'message': f"Member successfully rejoined under {package.name}.",
             'membership_id': str(membership.id),
             'order_id': str(order.id),
-            'member': serialize_member(profile, alias),
+            'member': serialize_member(profile, alias, request=request),
         }, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['post'], url_path='collect-outstanding')
@@ -4318,12 +4940,24 @@ class MemberViewSet(viewsets.ViewSet):
                     'message': f"Payment of ₹{existing_txn.amount} already recorded (idempotent replay).",
                     'transaction_id': str(existing_txn.id),
                     'invoice_id': str(invoice.id) if invoice else None,
-                    'member': serialize_member(profile, alias),
+                    'member': serialize_member(profile, alias, request=request),
                 }, status=status.HTTP_200_OK)
 
-        # Route CASH payment through managerial approval workflow to prevent approval bypass
+        # Route CASH payment through managerial approval workflow to prevent approval bypass if required by policy/role
         is_cash = str(provider).upper() == 'CASH' or str(payment_method).upper() == 'CASH'
+        requires_cash_approval = False
         if is_cash:
+            from .services_payment_policy import PaymentPolicyService
+            policy = PaymentPolicyService.get_effective_policy(org, branch=order.branch or profile.preferred_branch, db_alias=alias)
+            requires_cash_approval = PaymentPolicyService.is_cash_approval_required(
+                user=request.user,
+                organization=org,
+                branch=order.branch or profile.preferred_branch,
+                policy=policy,
+                db_alias=alias,
+            )
+
+        if is_cash and requires_cash_approval:
             # Check for existing pending cash collections to prevent duplicate collections
             pending_cash_sum = PaymentTransaction.objects.using(alias).filter(
                 order=order, status='PENDING', payment_method='CASH'
@@ -4385,7 +5019,7 @@ class MemberViewSet(viewsets.ViewSet):
                 'message': f"Cash payment of ₹{amt} recorded and submitted for manager approval (Approval Req: {approval_req.id}).",
                 'transaction_id': str(txn.id),
                 'approval_request_id': str(approval_req.id),
-                'member': serialize_member(profile, alias),
+                'member': serialize_member(profile, alias, request=request),
             }, status=status.HTTP_202_ACCEPTED)
 
         try:
@@ -4403,7 +5037,7 @@ class MemberViewSet(viewsets.ViewSet):
                 'message': f"Payment of ₹{amt} recorded successfully via {provider}.",
                 'transaction_id': str(txn.id),
                 'invoice_id': str(invoice.id) if invoice else None,
-                'member': serialize_member(profile, alias),
+                'member': serialize_member(profile, alias, request=request),
             }, status=status.HTTP_201_CREATED)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -4552,7 +5186,7 @@ class MemberViewSet(viewsets.ViewSet):
                 'booking_id': str(booking.id) if booking else None,
                 'type': 'CLASS' if (booking or consume_session or record_type == 'CLASS') else 'FACILITY',
             },
-            'member': serialize_member(profile, alias),
+            'member': serialize_member(profile, alias, request=request),
         }, status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=['get'], url_path='payment-methods')
@@ -4601,16 +5235,24 @@ class MemberViewSet(viewsets.ViewSet):
         import re
         for pkg in packages.order_by('name'):
             pv = pkg.versions.using(alias).filter(status='ACTIVE').order_by('-version_number').first()
-            price_val = 5000.0
+            price_val = 0.0
             currency = 'INR'
             duration_months = 1
             validity_days = 30
             total_sessions = None
+            # Resolve the real price: prefer the current version's active price, else fall back
+            # to any active price on this package (e.g. one left on a retired/older version after
+            # a migration created price-less new versions). Never fabricate a 5000 placeholder.
+            pr = pv.prices.using(alias).filter(status='ACTIVE').first() if pv else None
+            if not pr:
+                from .models_catalog import PackagePrice as _PPref
+                pr = _PPref.objects.using(alias).filter(
+                    package_version__package=pkg, status='ACTIVE'
+                ).order_by('-package_version__version_number').first()
+            if pr:
+                price_val = float(pr.display_price if pr.display_price else pr.base_price)
+                currency = pr.currency
             if pv:
-                pr = pv.prices.using(alias).filter(status='ACTIVE').first()
-                if pr:
-                    price_val = float(pr.base_price)
-                    currency = pr.currency
                 if getattr(pv, 'duration_unit', '') == 'MONTH':
                     duration_months = pv.duration_value or 1
                 elif getattr(pv, 'duration_unit', '') == 'YEAR':
@@ -4676,7 +5318,15 @@ class MemberViewSet(viewsets.ViewSet):
         from .services_legacy_live_sync import search_legacy_members
         try:
             results = search_legacy_members(query)
-            return Response({'results': results, 'count': len(results)}, status=status.HTTP_200_OK)
+            sanitized_results = []
+            for row in results:
+                if isinstance(row, dict) and row.get('phone'):
+                    copied = dict(row)
+                    copied['phone'] = mask_phone_if_restricted(request, copied['phone'])
+                    sanitized_results.append(copied)
+                else:
+                    sanitized_results.append(row)
+            return Response({'results': sanitized_results, 'count': len(sanitized_results)}, status=status.HTTP_200_OK)
         except Exception as e:
             logger.error(f"Legacy search failed: {e}", exc_info=True)
             return Response({'error': str(e), 'results': [], 'count': 0}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -4707,7 +5357,7 @@ class MemberViewSet(viewsets.ViewSet):
                 return Response({'error': 'primary_uid or valid query is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
             profile = sync_live_legacy_member_to_tenant(int(primary_uid), alias, org_id)
-            serialized = serialize_member(profile, alias)
+            serialized = serialize_member(profile, alias, request=request)
 
             return Response({
                 'message': f"Successfully synced {profile.first_name_snapshot} {profile.last_name_snapshot} ({profile.member_number}) with all packages, sessions, transactions, and bookings.",
