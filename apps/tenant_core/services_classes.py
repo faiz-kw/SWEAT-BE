@@ -469,6 +469,19 @@ class ClassSchedulingService:
                         f"Trainer {trainer.trainer_code} does not have required specialty credentials for {occ.class_template.name}."
                     )
 
+            # 2b. Class Category Assignment check
+            if occ.class_template.category_id and not trainer.can_teach_all_specialties:
+                from .models_workforce import TrainerClassCategoryAssignment
+                has_cat = TrainerClassCategoryAssignment.objects.using(alias).filter(
+                    trainer_profile=trainer,
+                    class_category_id=occ.class_template.category_id,
+                ).exists()
+                if not has_cat:
+                    cat_name = occ.class_template.category.name if occ.class_template.category else "required category"
+                    raise ValidationError(
+                        f"Trainer {trainer.trainer_code} is not qualified or assigned to conduct '{cat_name}' classes."
+                    )
+
             # 3. Schedule shift and leave check (Admins/Managers can schedule/assign outside strict shifts)
             is_admin_override = True
             if actor:
@@ -512,6 +525,7 @@ class ClassSchedulingService:
                     start_datetime=occ.start_at,
                     duration_minutes=duration,
                     delivery_mode='GROUP',
+                    category_id=str(occ.class_template.category_id) if occ.class_template.category_id else None,
                     db_alias=alias,
                 )
                 if not is_avail:

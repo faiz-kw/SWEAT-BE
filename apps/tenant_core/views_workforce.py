@@ -220,8 +220,7 @@ class TrainerProfileViewSet(viewsets.ModelViewSet):
 
         return users.filter(
             Q(id__in=assignments.values('user_id')) |
-            Q(user_type__in=['TRAINER', 'COACH', 'INSTRUCTOR', 'trainer', 'coach', 'instructor']) |
-            Q(id__in=existing_trainer_user_ids)
+            Q(user_type__in=['TRAINER', 'COACH', 'INSTRUCTOR', 'trainer', 'coach', 'instructor'])
         )
 
     @classmethod
@@ -298,6 +297,8 @@ class TrainerProfileViewSet(viewsets.ModelViewSet):
         ).prefetch_related(
             'specialty_assignments',
             'specialty_assignments__trainer_specialty',
+            'category_assignments',
+            'category_assignments__class_category',
             'employee_profile__user_profile__user__branch_assignments',
             'employee_profile__user_profile__user__branch_assignments__branch',
         )
@@ -333,6 +334,13 @@ class TrainerProfileViewSet(viewsets.ModelViewSet):
                 Q(employee_profile__user_profile__user_id__in=org_scoped_user_ids) |
                 Q(employee_profile__user_profile__user__branch_assignments__scope_type='ALL') |
                 Q(employee_profile__user_profile__preferred_branch__isnull=True)
+            ).distinct()
+
+        category_id = params.get('category_id')
+        if category_id:
+            qs = qs.filter(
+                Q(category_assignments__class_category_id=category_id) |
+                Q(can_teach_all_specialties=True)
             ).distinct()
 
         return qs
@@ -450,6 +458,7 @@ class TrainerProfileViewSet(viewsets.ModelViewSet):
         delivery_mode = request.query_params.get('delivery_mode', 'GROUP')
         specialty_code = request.query_params.get('specialty_code')
         min_proficiency = request.query_params.get('min_proficiency', 'BASIC')
+        category_id = request.query_params.get('category_id')
 
         available, reason, details = TrainerAvailabilityService.is_trainer_available(
             trainer=trainer,
@@ -459,6 +468,7 @@ class TrainerProfileViewSet(viewsets.ModelViewSet):
             delivery_mode=delivery_mode,
             specialty_code=specialty_code,
             min_proficiency=min_proficiency,
+            category_id=category_id,
             db_alias=alias,
         )
         return Response({
@@ -497,6 +507,7 @@ class TrainerProfileViewSet(viewsets.ModelViewSet):
         delivery_mode = request.query_params.get('delivery_mode', 'GROUP')
         specialty_code = request.query_params.get('specialty_code')
         min_proficiency = request.query_params.get('min_proficiency', 'BASIC')
+        category_id = request.query_params.get('category_id')
 
         eligible = TrainerAvailabilityService.find_eligible_trainers(
             organization=org,
@@ -506,6 +517,7 @@ class TrainerProfileViewSet(viewsets.ModelViewSet):
             delivery_mode=delivery_mode,
             specialty_code=specialty_code,
             min_proficiency=min_proficiency,
+            category_id=category_id,
             db_alias=alias,
         )
         return Response({'count': len(eligible), 'results': eligible})

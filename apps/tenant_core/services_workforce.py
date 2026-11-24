@@ -58,6 +58,7 @@ class TrainerAvailabilityService:
         delivery_mode: str = 'GROUP',
         specialty_code: Optional[str] = None,
         min_proficiency: str = 'BASIC',
+        category_id: Optional[str] = None,
         db_alias: Optional[str] = None,
     ) -> Tuple[bool, str, Dict[str, Any]]:
         """
@@ -94,7 +95,20 @@ class TrainerAvailabilityService:
         if branch.status != 'ACTIVE':
             return False, f"Branch {branch.name} is {branch.status}.", {'code': 'BRANCH_INACTIVE'}
 
-        # 2. Specialty Qualification Check
+        # 2. Class Category Assignment Check
+        if category_id and not trainer.can_teach_all_specialties:
+            from .models_workforce import TrainerClassCategoryAssignment
+            has_cat = TrainerClassCategoryAssignment.objects.using(alias).filter(
+                trainer_profile=trainer,
+                class_category_id=category_id,
+            ).exists()
+            if not has_cat:
+                from .models_classes import ClassCategory
+                cat = ClassCategory.objects.using(alias).filter(id=category_id).first()
+                cat_name = cat.name if cat else "the required category"
+                return False, f"Trainer {trainer.trainer_code} is not qualified/assigned for class category '{cat_name}'.", {'code': 'CATEGORY_NOT_ASSIGNED'}
+
+        # 3. Specialty Qualification Check
         if specialty_code and not trainer.can_teach_all_specialties:
             specialty_qs = TrainerSpecialtyAssignment.objects.using(alias).filter(
                 trainer_profile=trainer,
@@ -204,6 +218,7 @@ class TrainerAvailabilityService:
         delivery_mode: str = 'GROUP',
         specialty_code: Optional[str] = None,
         min_proficiency: str = 'BASIC',
+        category_id: Optional[str] = None,
         db_alias: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
@@ -226,6 +241,7 @@ class TrainerAvailabilityService:
                 delivery_mode=delivery_mode,
                 specialty_code=specialty_code,
                 min_proficiency=min_proficiency,
+                category_id=category_id,
                 db_alias=alias,
             )
             if available:

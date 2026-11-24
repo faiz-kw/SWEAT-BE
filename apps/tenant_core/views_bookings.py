@@ -169,19 +169,6 @@ class BookingViewSet(viewsets.ModelViewSet):
         from .models_crm import IntakeSubmission
         alias = _get_db(self.request)
 
-        # Trigger automatic attendance lifecycle reconciliation for past occurrences
-        if getattr(self, 'action', 'list') == 'list':
-            try:
-                b_id = self.request.query_params.get('branch_id')
-                BookingWaitlistAttendanceService.reconcile_past_occurrences_attendance(
-                    branch=b_id if b_id and b_id != 'all' else None,
-                    occurrence_id=self.request.query_params.get('occurrence_id'),
-                    target_date=self.request.query_params.get('occurrence_date'),
-                    db_alias=alias,
-                )
-            except Exception:
-                pass
-
         base_select = [
             'user_profile', 'user_profile__user', 'occurrence',
             'occurrence__class_template', 'occurrence__class_template__program',
@@ -272,16 +259,8 @@ class BookingViewSet(viewsets.ModelViewSet):
         if to_date:
             qs = qs.filter(occurrence__occurrence_date__lte=to_date)
 
-        # Compute KPI summary on branch/date-scoped queryset before status/search filters
-        if getattr(self, 'action', 'list') == 'list' and getattr(self, 'paginator', None) is not None and not occurrence_id:
-            self.paginator._bookings_summary = qs.aggregate(
-                total_count=models.Count('id'),
-                confirmed_count=models.Count('id', filter=models.Q(status='CONFIRMED')),
-                waitlisted_count=models.Count('id', filter=models.Q(status='WAITLISTED')),
-                attended_count=models.Count('id', filter=models.Q(status__in=['ATTENDED', 'COMPLETED', 'LATE', 'LATE_ENTRY'])),
-                no_show_count=models.Count('id', filter=models.Q(status='NO_SHOW')),
-                cancelled_count=models.Count('id', filter=models.Q(status__in=['CANCELLED', 'LATE_CANCELLED'])),
-            )
+        # Preserve base queryset for summary computation before status and search filters
+        self._base_summary_qs = qs
 
         status_filter = self.request.query_params.get('status')
         if status_filter:
@@ -324,6 +303,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                     models.Q(booking_number__icontains=token) |
                     models.Q(user_profile__first_name_snapshot__icontains=token) |
                     models.Q(user_profile__last_name_snapshot__icontains=token) |
+                    models.Q(user_profile__member_number__icontains=token) |
                     models.Q(user_profile__user__email__icontains=token) |
                     models.Q(user_profile__user__phone__icontains=token) |
                     models.Q(occurrence__class_template__name__icontains=token) |
@@ -506,6 +486,18 @@ class BookingViewSet(viewsets.ModelViewSet):
 
         page = self.paginate_queryset(queryset)
         if page is not None:
+            if getattr(self, 'paginator', None) is not None and not request.query_params.get('occurrence_id'):
+                base_sum_qs = getattr(self, '_base_summary_qs', None)
+                if base_sum_qs is not None:
+                    self.paginator._bookings_summary = base_sum_qs.aggregate(
+                        total_count=models.Count('id'),
+                        confirmed_count=models.Count('id', filter=models.Q(status='CONFIRMED')),
+                        waitlisted_count=models.Count('id', filter=models.Q(status='WAITLISTED')),
+                        attended_count=models.Count('id', filter=models.Q(status__in=['ATTENDED', 'COMPLETED', 'LATE', 'LATE_ENTRY', 'LATE_SHOW'])),
+                        no_show_count=models.Count('id', filter=models.Q(status='NO_SHOW')),
+                        cancelled_count=models.Count('id', filter=models.Q(status__in=['CANCELLED', 'LATE_CANCELLED'])),
+                    )
+
             serializer = self.get_serializer(page, many=True)
             results = list(serializer.data)
             if trial_items:

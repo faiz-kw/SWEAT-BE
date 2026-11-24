@@ -205,6 +205,12 @@ class TrainerProfile(models.Model):
     trainer_status = models.CharField(max_length=20, choices=TRAINER_STATUSES, default='ACTIVE')
     can_teach_all_specialties = models.BooleanField(default=False)
     minimum_schedule_buffer_minutes = models.IntegerField(default=0)
+    class_categories = models.ManyToManyField(
+        'ClassCategory',
+        through='TrainerClassCategoryAssignment',
+        related_name='trainer_profiles',
+        blank=True,
+    )
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -470,3 +476,38 @@ class TrainerSpecialtyAssignment(models.Model):
 
     def __str__(self):
         return f"SpecialtyAssignment(Trainer:{self.trainer_profile.trainer_code} -> {self.trainer_specialty.code})"
+
+
+class TrainerClassCategoryAssignment(models.Model):
+    """
+    Direct relational assignment of Class Categories to a TrainerProfile.
+    Indicates which class categories a trainer is qualified or suitable to conduct.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    trainer_profile = models.ForeignKey(
+        TrainerProfile,
+        on_delete=models.CASCADE,
+        related_name='category_assignments',
+        db_column='trainer_profile_id',
+    )
+    class_category = models.ForeignKey(
+        'ClassCategory',
+        on_delete=models.CASCADE,
+        related_name='trainer_assignments',
+        db_column='class_category_id',
+    )
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        app_label = 'tenant_core'
+        db_table = 'trainer_class_category_assignments'
+        constraints = [
+            models.UniqueConstraint(fields=['trainer_profile', 'class_category'], name='uq_trainer_class_cat'),
+        ]
+        indexes = [
+            models.Index(fields=['trainer_profile'], name='idx_trcat_prof'),
+            models.Index(fields=['class_category'], name='idx_trcat_cat'),
+        ]
+
+    def __str__(self):
+        return f"{self.trainer_profile.trainer_code} -> {self.class_category.name}"

@@ -75,6 +75,14 @@ class TrainerProfileSerializer(serializers.ModelSerializer):
     branch_ids = serializers.SerializerMethodField()
     branch_names = serializers.SerializerMethodField()
 
+    category_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        write_only=False,
+    )
+    categories = serializers.SerializerMethodField()
+    category_names = serializers.SerializerMethodField()
+
     class Meta:
         model = TrainerProfile
         fields = '__all__'
@@ -172,6 +180,74 @@ class TrainerProfileSerializer(serializers.ModelSerializer):
             }
             for a in assignments
         ]
+
+    def get_categories(self, obj):
+        alias = obj._state.db or 'default'
+        prefetched = getattr(obj, '_prefetched_objects_cache', {}).get('category_assignments')
+        if prefetched is not None:
+            assignments = prefetched
+        else:
+            assignments = obj.category_assignments.using(alias).select_related('class_category')
+        return [
+            {
+                'id': str(a.class_category.id),
+                'name': a.class_category.name,
+                'code': a.class_category.code,
+                'status': a.class_category.status,
+                'display_order': a.class_category.display_order,
+            }
+            for a in assignments
+            if a.class_category
+        ]
+
+    def get_category_names(self, obj):
+        alias = obj._state.db or 'default'
+        prefetched = getattr(obj, '_prefetched_objects_cache', {}).get('category_assignments')
+        if prefetched is not None:
+            return [a.class_category.name for a in prefetched if a.class_category]
+        return list(
+            obj.category_assignments.using(alias)
+            .filter(class_category__isnull=False)
+            .values_list('class_category__name', flat=True)
+        )
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret['category_ids'] = [str(c['id']) for c in ret.get('categories', [])]
+        return ret
+
+    def create(self, validated_data):
+        category_ids = validated_data.pop('category_ids', None)
+        instance = super().create(validated_data)
+        if category_ids is not None:
+            self._sync_categories(instance, category_ids)
+        return instance
+
+    def update(self, instance, validated_data):
+        category_ids = validated_data.pop('category_ids', None)
+        instance = super().update(instance, validated_data)
+        if category_ids is not None:
+            self._sync_categories(instance, category_ids)
+        return instance
+
+    def _sync_categories(self, instance, category_ids):
+        from django.db import transaction
+        from .models_workforce import TrainerClassCategoryAssignment
+        alias = instance._state.db or 'default'
+        with transaction.atomic(using=alias):
+            # Exclude and delete categories not in the new list
+            instance.category_assignments.using(alias).exclude(class_category_id__in=category_ids).delete()
+            # Fetch already linked category IDs
+            existing_cids = set(
+                instance.category_assignments.using(alias).values_list('class_category_id', flat=True)
+            )
+            to_add = [
+                TrainerClassCategoryAssignment(trainer_profile=instance, class_category_id=cid)
+                for cid in category_ids
+                if cid not in existing_cids
+            ]
+            if to_add:
+                TrainerClassCategoryAssignment.objects.using(alias).bulk_create(to_add)
 
 
 class SalesProfileSerializer(serializers.ModelSerializer):
