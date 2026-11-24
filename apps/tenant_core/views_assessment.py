@@ -6,36 +6,52 @@ Endpoints:
 2. POST /api/v1/tenant/assessments/               — Coach starts intake & health screening
 3. GET  /api/v1/tenant/assessments/<id>/          — Detail view with all 17-section assessment data
 4. PATCH /api/v1/tenant/assessments/<id>/         — Saves vitals, movement tests, and coach notes
-5. POST /api/v1/tenant/assessments/<id>/capture/  — Uploads baseline photos + computes CV posture metrics
-6. POST /api/v1/tenant/assessments/<id>/approve-and-send/ — Coach approval gate (unlocks display screen)
-7. GET  /api/v1/tenant/assessments/pair/          — Connects Studio TV Display Screen (mirror mode)
+5. POST /api/v1/tenant/assessments/<id>/capture/  — Uploads baseline photos (zero fake CV constants)
+6. POST /api/v1/tenant/assessments/<id>/approve-and-send/ — Coach approval gate (RBAC enforced)
+7. GET  /api/v1/tenant/assessments/<id>/comparison/ — Longitudinal like-for-like comparison
+8. POST /api/v1/tenant/assessments/pair/          — Connects Studio TV Display Screen (mirror mode)
+9. CRUD /api/v1/tenant/assessment-progressions/   — Exercise progression tracking & approval
 """
 
 import logging
-import uuid
 from datetime import date
 from decimal import Decimal
+from typing import Optional
+
 from django.conf import settings as djsettings
-from django.utils import timezone
+from django.db.models import Q
 from rest_framework import status, viewsets
+from rest_framework.pagination import PageNumberPagination
+from rest_framework.decorators import action
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
-from rest_framework.pagination import PageNumberPagination
-from django.db.models import Q
-from typing import Optional
+from rest_framework.throttling import SimpleRateThrottle
+from django.utils import timezone
 
-from config.routers import set_tenant_db_alias, get_tenant_db_alias
-from .models_assessment import MemberAssessment
+from config.routers import get_tenant_db_alias
+from .models_assessment import MemberAssessment, AssessmentTestProgression
 from .models_org import Organization, Branch
-from .models_users import TenantUser
-from .models_crm import UserProfile, Lead
+from .models_crm import UserProfile
 from .models_catalog import Package
+from .serializers_assessment import (
+    MemberAssessmentDetailSerializer, MemberAssessmentWriteSerializer,
+    AssessmentApprovalSerializer, AssessmentTestProgressionSerializer,
+    ProgressionApprovalSerializer,
+)
 from .services_assessment import AssessmentEngineService
-from .services_reliability import record_business_audit
+from .services_assessment_screening import evaluate_safety_readiness
+from .services_assessment_metrics import calculate_metabolic_nutrition_plan
+from .services_assessment_progress import compare_assessments, approve_progression
+
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_db_and_org(request):
+    alias = get_tenant_db_alias() or 'default'
+    return alias, Organization.objects.using(alias).first()
 
 
 def _image_url(field) -> Optional[str]:
@@ -48,16 +64,6 @@ def _image_url(field) -> Optional[str]:
         return None
 
 
-def _scan_provider_ready() -> bool:
-    """True when the configured scan provider can actually run on this server."""
-    try:
-        from .services_body_scan import get_scan_client
-        return bool(get_scan_client().is_configured)
-    except Exception:
-        logger.warning("Could not determine body scan provider readiness.", exc_info=True)
-        return False
-
-
 def _derive_age(dob) -> Optional[int]:
     """Whole years between a date of birth and today."""
     if not dob:
@@ -66,32 +72,26 @@ def _derive_age(dob) -> Optional[int]:
     return today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
 
 
-def _resolve_db_and_org(request):
-    alias = get_tenant_db_alias() or 'default'
-    org = Organization.objects.using(alias).first()
-    return alias, org
+def _scan_provider_ready() -> bool:
+    """True when the configured body-scan provider can actually run on this server."""
+    try:
+        from .services_body_scan import get_scan_client
+        return bool(get_scan_client().is_configured)
+    except Exception:
+        logger.warning("Could not determine body scan provider readiness.", exc_info=True)
+        return False
 
 
 class AssessmentEligibilityMobileView(APIView):
-    """
-    GET /api/v1/mobile/assessment/eligibility/
-    """
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         alias, org = _resolve_db_and_org(request)
         profile = UserProfile.objects.using(alias).filter(user=request.user).first()
         if not profile:
-            return Response(
-                {'eligible': True, 'reason': 'Assessment unlocked for studio trial.', 'remaining_credits': 1},
-                status=status.HTTP_200_OK
-            )
-
+            return Response({'eligible': True, 'reason': 'Assessment unlocked for studio trial.', 'remaining_credits': 1})
         branch_id = request.query_params.get('branch_id')
-        eligibility = AssessmentEngineService.check_member_eligibility(
-            user_profile=profile, branch_id=branch_id, db_alias=alias
-        )
-        return Response(eligibility, status=status.HTTP_200_OK)
+        return Response(AssessmentEngineService.check_member_eligibility(user_profile=profile, branch_id=branch_id, db_alias=alias))
 
 
 class AssessmentPagination(PageNumberPagination):
@@ -102,11 +102,9 @@ class AssessmentPagination(PageNumberPagination):
 
 
 class AssessmentSessionViewSet(viewsets.ModelViewSet):
-    """
-    CRUD and operational workflow actions for Functional Fitness Assessments.
-    """
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
+    serializer_class = MemberAssessmentDetailSerializer
     pagination_class = AssessmentPagination
 
     # Status groupings the register filters by. `needs_review` is the approval inbox: the
@@ -121,7 +119,7 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
         """
         The register queryset.
 
-        Split out from `get_queryset` so the filter-chip counts can be computed against the
+        Split out from `get_queryset` so the filter-chip counts can be computed under the
         same visibility rules with the status filters lifted, without mutating the request.
         """
         alias, org = _resolve_db_and_org(self.request)
@@ -130,11 +128,11 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
         )
 
         user = self.request.user
-        if hasattr(user, 'user_type') and user.user_type == 'MEMBER':
-            # A member only ever sees their own assessments.
-            return qs.filter(user_profile__user=user).order_by('-created_at')
+        if getattr(user, 'user_type', None) == 'MEMBER':
+            # A member only ever sees their own approved assessments.
+            return qs.filter(user_profile__user=user, status='APPROVED').order_by('-created_at')
 
-        # Branch scope: honour the staff member's permitted branches, then any explicit filter.
+        # Branch scope: honour the staff member's permitted branches before any explicit filter.
         try:
             from .views_crm import get_user_effective_branch_ids
             permitted = get_user_effective_branch_ids(user, alias)
@@ -158,11 +156,11 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
 
             status_param = (params.get('status') or '').strip().upper()
             if status_param and status_param not in ('ALL', 'ANY'):
-                qs = qs.filter(status__in=[s.strip() for s in status_param.split(',') if s.strip()])
+                qs = qs.filter(status__in=[v.strip() for v in status_param.split(',') if v.strip()])
 
         scan_status = (params.get('scan_status') or '').strip().upper()
         if scan_status and scan_status not in ('ALL', 'ANY'):
-            qs = qs.filter(scan_status__in=[s.strip() for s in scan_status.split(',') if s.strip()])
+            qs = qs.filter(scan_status__in=[v.strip() for v in scan_status.split(',') if v.strip()])
 
         assessment_type = (params.get('assessment_type') or '').strip().upper()
         if assessment_type and assessment_type not in ('ALL', 'ANY'):
@@ -205,7 +203,7 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
 
         The assessment register: newest first, paged server-side, with search and filters.
         Rows are deliberately compact — the full seventeen-section payload is only built on
-        retrieve, so listing a thousand assessments does not mean a thousand SLA computations.
+        retrieve, so listing a thousand assessments does not mean a thousand detail builds.
         """
         queryset = self.filter_queryset(self.get_queryset())
 
@@ -221,7 +219,7 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
         return response
 
     def _register_summary(self, request) -> dict:
-        """Counts for the register's filter chips, computed under the same visibility rules."""
+        """Counts for the register's filter chips, under the same visibility rules."""
         try:
             scoped = self._filtered_queryset(request.query_params, apply_status_filters=False)
             return {
@@ -262,6 +260,7 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
             'member_phone': mask_phone_if_restricted(getattr(self, 'request', None), instance.member_phone),
             'member_id': str(instance.user_profile_id) if instance.user_profile_id else None,
             'lead_id': str(instance.lead_id) if instance.lead_id else None,
+            'previous_assessment_id': str(instance.previous_assessment_id) if instance.previous_assessment_id else None,
             'assessment_type': instance.assessment_type,
             'assessment_type_display': instance.get_assessment_type_display(),
             'status': instance.status,
@@ -274,300 +273,124 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
             'conducted_by': trainer_name,
             'recommended_package': instance.recommended_package.name if instance.recommended_package else None,
             'reviewed_at': instance.reviewed_at.isoformat() if instance.reviewed_at else None,
+            'reassessment_due_date': instance.reassessment_due_date.isoformat() if instance.reassessment_due_date else None,
             'created_at': instance.created_at.isoformat() if instance.created_at else None,
             'updated_at': instance.updated_at.isoformat() if instance.updated_at else None,
         }
 
     def create(self, request, *args, **kwargs):
-        """
-        POST /api/v1/tenant/assessments/
-        Initializes an assessment session with Profile, Health Screening (PAR-Q), and Goals.
-        """
         alias, org = _resolve_db_and_org(request)
-        data = request.data
+        write_ser = MemberAssessmentWriteSerializer(data=request.data)
+        write_ser.is_valid(raise_exception=True)
+        val = write_ser.validated_data
 
-        # 1. Subject (Member Profile or Lead)
         user_profile = None
-        lead = None
-        phone = data.get('member_phone') or ''
-        name = data.get('member_name') or ''
-
-        user_profile_id = data.get('user_profile_id')
-        if user_profile_id:
-            user_profile = UserProfile.objects.using(alias).filter(id=user_profile_id).first()
-        elif hasattr(request.user, 'user_type') and request.user.user_type == 'MEMBER':
+        if val.get('user_profile_id'):
+            user_profile = UserProfile.objects.using(alias).filter(id=val['user_profile_id']).first()
+        elif getattr(request.user, 'user_type', None) == 'MEMBER':
             user_profile = UserProfile.objects.using(alias).filter(user=request.user).first()
 
-        if user_profile:
-            name = name or user_profile.full_name
-            phone = phone or user_profile.phone
+        user_name = ''
+        user_phone = ''
+        if user_profile and getattr(user_profile, 'user', None):
+            user_name = f"{user_profile.user.first_name} {user_profile.user.last_name}".strip()
+            user_phone = user_profile.user.phone or ''
+        name = val.get('member_name') or user_name
+        phone = val.get('member_phone') or user_phone
 
-        # 2. Branch
-        branch_id = data.get('branch_id')
         branch = None
-        if branch_id:
-            branch = Branch.objects.using(alias).filter(id=branch_id).first()
-        if not branch and user_profile and user_profile.preferred_branch:
+        if val.get('branch_id'):
+            branch = Branch.objects.using(alias).filter(id=val['branch_id']).first()
+        if not branch and user_profile:
             branch = user_profile.preferred_branch
         if not branch:
             branch = Branch.objects.using(alias).filter(organization=org, status='ACTIVE').first()
 
-        # 3. Profile & Baseline Fields
-        assessment_type = data.get('assessment_type', 'INITIAL')
-        training_experience = data.get('training_experience', 'BEGINNER')
-        current_activity_level = data.get('current_activity_level', 'MODERATELY_ACTIVE')
-        preferred_training_style = data.get('preferred_training_style', 'PILATES')
+        prev_assessment = MemberAssessment.objects.using(alias).filter(id=val['previous_assessment_id']).first() if val.get('previous_assessment_id') else None
 
-        target_goal = data.get('target_goal', 'POSTURE_ALIGNMENT')
-        stated_goal_outcome = data.get('stated_goal_outcome', data.get('user_notes', ''))
-        timeline_months = int(data.get('target_timeline_months', 3))
-        timeline_weeks = int(data.get('target_timeline_weeks', timeline_months * 4))
-        weekly_frequency = int(data.get('weekly_frequency_days', 3))
-        perceived_barrier = data.get('perceived_barrier', '')
-        confidence_score = int(data.get('member_confidence_score', 8))
+        # Safety Gate Evaluation
+        health_screening = val.get('health_screening') or {}
+        gate_res = evaluate_safety_readiness(health_screening, user_profile)
+        initial_status = gate_res['recommended_status'] if not gate_res['cleared_for_testing'] else 'DRAFT'
 
-        # 3b. Demographics. Mifflin-St Jeor takes age and sex; without them the equation
-        # silently returns someone else's resting metabolic rate, so resolve them from the
-        # payload first, then the member profile, then the lead.
-        dob = data.get('member_date_of_birth') or data.get('date_of_birth')
-        if not dob and user_profile:
-            dob = getattr(user_profile, 'date_of_birth', None)
-        if isinstance(dob, str):
-            try:
-                dob = date.fromisoformat(dob.strip()[:10])
-            except ValueError:
-                dob = None
+        # Real Metabolic Calculations
+        ht, wt = val.get('measured_height_cm'), val.get('measured_weight_kg')
+        goal = val.get('target_goal', 'POSTURE_ALIGNMENT')
+        act = val.get('current_activity_level', 'MODERATELY_ACTIVE')
+        calc_bmi, rmr, tdee, target_cal, macros = None, None, None, None, {}
+        if ht and wt:
+            calc_bmi = Decimal(str(round(float(wt) / ((float(ht) / 100.0) ** 2), 1)))
+            plan = calculate_metabolic_nutrition_plan(weight_kg=float(wt), height_cm=float(ht), user_profile=user_profile, activity_level=act, goal=goal)
+            rmr, tdee, target_cal, macros = plan['rmr_kcal'], plan['tdee_kcal'], plan['daily_calorie_target'], plan['macros']
 
-        member_sex = (data.get('member_sex') or data.get('sex') or data.get('gender') or '').strip().upper()
-        if not member_sex and user_profile:
-            member_sex = (getattr(user_profile, 'gender', '') or '').strip().upper()
-        if member_sex in ('F', 'WOMAN', 'W'):
-            member_sex = 'FEMALE'
-        elif member_sex in ('M', 'MAN'):
-            member_sex = 'MALE'
-        if member_sex not in ('FEMALE', 'MALE', 'OTHER', 'UNDISCLOSED'):
-            member_sex = ''
-
-        member_age = data.get('member_age_years') or _derive_age(dob)
-        try:
-            member_age = int(member_age) if member_age else None
-        except (TypeError, ValueError):
-            member_age = None
-
-        # 4. Health Screening (PAR-Q)
-        health_screening = data.get('health_screening', {})
-        screening_outcome = data.get('screening_outcome', 'CLEARED')
-        screening_coach_notes = data.get('screening_coach_notes', '')
-
-        # 5. Vitals & Body Measurements (if provided)
-        height_cm = Decimal(str(data.get('measured_height_cm'))) if data.get('measured_height_cm') else None
-        weight_kg = Decimal(str(data.get('measured_weight_kg'))) if data.get('measured_weight_kg') else None
-        waist_cm = Decimal(str(data.get('waist_circumference_cm'))) if data.get('waist_circumference_cm') else None
-        resting_hr = int(data.get('resting_heart_rate_bpm')) if data.get('resting_heart_rate_bpm') else None
-        resting_bp = data.get('resting_blood_pressure', '')
-
-        # Calculate BMI, RMR, TDEE if height & weight available
-        calc_bmi = None
-        rmr_val = None
-        tdee_val = None
-        cal_target = None
-        macros_payload = {}
-        if height_cm and weight_kg:
-            h_m = float(height_cm) / 100.0
-            calc_bmi = Decimal(str(round(float(weight_kg) / (h_m * h_m), 1)))
-            meta_plan = AssessmentEngineService.calculate_metabolic_nutrition_plan(
-                weight_kg=float(weight_kg),
-                height_cm=float(height_cm),
-                age=member_age,
-                sex=member_sex,
-                activity_level=current_activity_level,
-                goal=target_goal,
-            )
-            rmr_val = meta_plan['rmr_kcal']
-            tdee_val = meta_plan['tdee_kcal']
-            cal_target = meta_plan['daily_calorie_target']
-            macros_payload = meta_plan['macros']
-
-        # 6. Functional Movement Tests
-        functional_tests = data.get('functional_tests_payload', {})
-        capability_matrix = AssessmentEngineService.calculate_capability_matrix(functional_tests)
-
-        # 7. Match Database Packages
-        match_result = AssessmentEngineService.match_system_packages(
-            organization=org,
-            branch=branch,
-            goal=target_goal,
-            timeline_months=timeline_months,
-            weekly_frequency=weekly_frequency,
-            db_alias=alias,
+        func_tests = val.get('functional_tests_payload') or {}
+        timeline_m = int(val.get('target_timeline_months', 3))
+        freq = int(val.get('weekly_frequency_days', 3))
+        match_res = AssessmentEngineService.match_system_packages(
+            organization=org, branch=branch, goal=goal, timeline_months=timeline_m, weekly_frequency=freq, db_alias=alias
         )
-
-        selected_pkg_id = data.get('package_id') or data.get('recommended_package_id')
-        if selected_pkg_id:
-            custom_pkg = Package.objects.using(alias).filter(id=selected_pkg_id).first()
+        rec_pkg = match_res.get('recommended_package')
+        rec_ver = match_res.get('recommended_package_version')
+        if val.get('package_id'):
+            custom_pkg = Package.objects.using(alias).filter(id=val['package_id']).first()
             if custom_pkg:
-                match_result['recommended_package'] = custom_pkg
-                match_result['recommended_program'] = custom_pkg.program
-                active_v = custom_pkg.get_active_version()
-                match_result['recommended_package_version'] = active_v
+                rec_pkg, rec_ver = custom_pkg, custom_pkg.get_active_version()
 
-        trainer_user = request.user if hasattr(request.user, 'user_type') and request.user.user_type != 'MEMBER' else None
-
+        trainer = request.user if getattr(request.user, 'user_type', None) != 'MEMBER' else None
         assessment = MemberAssessment.objects.using(alias).create(
-            organization=org,
-            branch=branch,
-            user_profile=user_profile,
-            lead=lead,
-            member_name=name,
-            member_phone=phone,
-            conducted_by_trainer=trainer_user,
-            member_date_of_birth=dob or None,
-            member_age_years=member_age,
-            member_sex=member_sex,
-            assessment_type=assessment_type,
-            training_experience=training_experience,
-            current_activity_level=current_activity_level,
-            preferred_training_style=preferred_training_style,
-            target_goal=target_goal,
-            stated_goal_outcome=stated_goal_outcome,
-            target_timeline_months=timeline_months,
-            target_timeline_weeks=timeline_weeks,
-            weekly_frequency_days=weekly_frequency,
-            perceived_barrier=perceived_barrier,
-            member_confidence_score=confidence_score,
-            user_notes=data.get('user_notes', ''),
-            health_screening=health_screening,
-            screening_outcome=screening_outcome,
-            screening_coach_notes=screening_coach_notes,
-            measured_height_cm=height_cm,
-            measured_weight_kg=weight_kg,
-            waist_circumference_cm=waist_cm,
-            resting_heart_rate_bpm=resting_hr,
-            resting_blood_pressure=resting_bp,
-            calculated_bmi=calc_bmi,
-            bmr_rmr_kcal=rmr_val,
-            tdee_kcal=tdee_val,
-            daily_calorie_target=cal_target,
-            nutrition_macros=macros_payload,
-            functional_tests_payload=functional_tests,
-            capability_matrix=capability_matrix,
-            recommended_program=match_result.get('recommended_program'),
-            recommended_package=match_result.get('recommended_package'),
-            recommended_package_version=match_result.get('recommended_package_version'),
-            recommendation_reason=match_result.get('recommendation_reason'),
-            alternative_packages_payload=match_result.get('alternatives', []),
-            status='DRAFT',
+            organization=org, branch=branch, user_profile=user_profile, previous_assessment=prev_assessment,
+            member_name=name, member_phone=phone, conducted_by_trainer=trainer, assessment_type=val.get('assessment_type', 'INITIAL'),
+            training_experience=val.get('training_experience', 'BEGINNER'), current_activity_level=act,
+            preferred_training_style=val.get('preferred_training_style', 'PILATES'), target_goal=goal,
+            stated_goal_outcome=val.get('stated_goal_outcome', ''), target_timeline_months=timeline_m,
+            target_timeline_weeks=val.get('target_timeline_weeks', timeline_m * 4), weekly_frequency_days=freq,
+            perceived_barrier=val.get('perceived_barrier', ''), member_confidence_score=int(val.get('member_confidence_score', 8)),
+            user_notes=val.get('user_notes', ''), health_screening=health_screening,
+            screening_outcome=val.get('screening_outcome') or gate_res['screening_outcome'],
+            screening_coach_notes=val.get('screening_coach_notes', ''), measured_height_cm=ht, measured_weight_kg=wt,
+            waist_circumference_cm=val.get('waist_circumference_cm'), resting_heart_rate_bpm=val.get('resting_heart_rate_bpm'),
+            resting_blood_pressure=val.get('resting_blood_pressure', ''), calculated_bmi=calc_bmi, bmr_rmr_kcal=rmr,
+            tdee_kcal=tdee, daily_calorie_target=target_cal, nutrition_macros=macros, functional_tests_payload=func_tests,
+            symptoms_and_safety_events=val.get('symptoms_and_safety_events') or {},
+            capability_matrix=AssessmentEngineService.calculate_capability_matrix(func_tests),
+            recommended_program=rec_pkg.program if rec_pkg else None, recommended_package=rec_pkg,
+            recommended_package_version=rec_ver, recommendation_reason=match_res.get('recommendation_reason'),
+            alternative_packages_payload=match_res.get('alternatives', []),
+            consent_body_measurements=val.get('consent_body_measurements', False),
+            consent_movement_photos=val.get('consent_movement_photos', False),
+            consent_ai_analysis=val.get('consent_ai_analysis', False),
+            consent_secondary_use=val.get('consent_secondary_use', False),
+            consent_notice_version=val.get('consent_notice_version', 'v1.0'),
+            status=initial_status,
         )
-
-        return Response(self._serialize_assessment(assessment, match_result), status=status.HTTP_201_CREATED)
+        return Response(MemberAssessmentDetailSerializer(assessment, context={'request': request}).data, status=status.HTTP_201_CREATED)
 
     def partial_update(self, request, pk=None):
-        """
-        PATCH /api/v1/tenant/assessments/<id>/
-        Updates assessment sections (vitals, functional tests, goals, notes).
-        """
         alias, org = _resolve_db_and_org(request)
         instance = self.get_object()
-        data = request.data
+        write_ser = MemberAssessmentWriteSerializer(instance, data=request.data, partial=True)
+        write_ser.is_valid(raise_exception=True)
+        write_ser.save()
 
-        # Update basic profile & goals
-        if 'stated_goal_outcome' in data:
-            instance.stated_goal_outcome = data['stated_goal_outcome']
-        if 'target_goal' in data:
-            instance.target_goal = data['target_goal']
-        if 'target_timeline_weeks' in data:
-            instance.target_timeline_weeks = int(data['target_timeline_weeks'])
-            instance.target_timeline_months = max(1, round(instance.target_timeline_weeks / 4.33))
-        if 'weekly_frequency_days' in data:
-            instance.weekly_frequency_days = int(data['weekly_frequency_days'])
-        if 'preferred_training_style' in data:
-            instance.preferred_training_style = data['preferred_training_style']
-        if 'member_date_of_birth' in data and data['member_date_of_birth']:
-            try:
-                instance.member_date_of_birth = date.fromisoformat(str(data['member_date_of_birth']).strip()[:10])
-                instance.member_age_years = _derive_age(instance.member_date_of_birth)
-            except ValueError:
-                pass
-        if 'member_age_years' in data and data['member_age_years']:
-            try:
-                instance.member_age_years = int(data['member_age_years'])
-            except (TypeError, ValueError):
-                pass
-        if 'member_sex' in data and data['member_sex']:
-            candidate = str(data['member_sex']).strip().upper()
-            if candidate in ('FEMALE', 'MALE', 'OTHER', 'UNDISCLOSED'):
-                instance.member_sex = candidate
-
-        # Update health screening
-        if 'health_screening' in data:
-            instance.health_screening = data['health_screening']
-        if 'screening_outcome' in data:
-            instance.screening_outcome = data['screening_outcome']
-        if 'screening_coach_notes' in data:
-            instance.screening_coach_notes = data['screening_coach_notes']
-
-        # Update vitals
-        if 'measured_height_cm' in data and data['measured_height_cm']:
-            instance.measured_height_cm = Decimal(str(data['measured_height_cm']))
-        if 'measured_weight_kg' in data and data['measured_weight_kg']:
-            instance.measured_weight_kg = Decimal(str(data['measured_weight_kg']))
-        if 'waist_circumference_cm' in data and data['waist_circumference_cm']:
-            instance.waist_circumference_cm = Decimal(str(data['waist_circumference_cm']))
-        if 'resting_heart_rate_bpm' in data and data['resting_heart_rate_bpm']:
-            instance.resting_heart_rate_bpm = int(data['resting_heart_rate_bpm'])
-        if 'resting_blood_pressure' in data:
-            instance.resting_blood_pressure = data['resting_blood_pressure']
-
-        # Recompute BMI & Metabolic Targets
         if instance.measured_height_cm and instance.measured_weight_kg:
-            h_m = float(instance.measured_height_cm) / 100.0
-            instance.calculated_bmi = Decimal(str(round(float(instance.measured_weight_kg) / (h_m * h_m), 1)))
-            meta_plan = AssessmentEngineService.calculate_metabolic_nutrition_plan(
-                weight_kg=float(instance.measured_weight_kg),
-                height_cm=float(instance.measured_height_cm),
-                age=instance.member_age_years or _derive_age(instance.member_date_of_birth),
-                sex=instance.member_sex,
-                activity_level=instance.current_activity_level,
-                goal=instance.target_goal,
+            instance.calculated_bmi = Decimal(str(round(float(instance.measured_weight_kg) / ((float(instance.measured_height_cm) / 100.0) ** 2), 1)))
+            plan = calculate_metabolic_nutrition_plan(
+                weight_kg=float(instance.measured_weight_kg), height_cm=float(instance.measured_height_cm),
+                user_profile=instance.user_profile, activity_level=instance.current_activity_level, goal=instance.target_goal,
             )
-            instance.bmr_rmr_kcal = meta_plan['rmr_kcal']
-            instance.tdee_kcal = meta_plan['tdee_kcal']
-            instance.daily_calorie_target = meta_plan['daily_calorie_target']
-            instance.nutrition_macros = meta_plan['macros']
+            instance.bmr_rmr_kcal, instance.tdee_kcal = plan['rmr_kcal'], plan['tdee_kcal']
+            instance.daily_calorie_target, instance.nutrition_macros = plan['daily_calorie_target'], plan['macros']
 
-        # Update Functional Tests
-        if 'functional_tests_payload' in data:
-            instance.functional_tests_payload = data['functional_tests_payload']
+        if instance.functional_tests_payload:
             instance.capability_matrix = AssessmentEngineService.calculate_capability_matrix(instance.functional_tests_payload)
-
-        # Update Package selection
-        selected_pkg_id = data.get('package_id') or data.get('recommended_package_id')
-        if selected_pkg_id:
-            custom_pkg = Package.objects.using(alias).filter(id=selected_pkg_id).first()
-            if custom_pkg:
-                instance.recommended_package = custom_pkg
-                instance.recommended_program = custom_pkg.program
-                instance.recommended_package_version = custom_pkg.get_active_version()
-
-        # Coach Prescriptions
-        if 'coach_strengths' in data:
-            instance.coach_strengths = data['coach_strengths']
-        if 'coach_areas_to_develop' in data:
-            instance.coach_areas_to_develop = data['coach_areas_to_develop']
-        if 'workout_prescription' in data:
-            instance.workout_prescription = data['workout_prescription']
-        if 'diet_prescription' in data:
-            instance.diet_prescription = data['diet_prescription']
-
-        if instance.status == 'DRAFT':
-            instance.status = 'TESTING'
+            if instance.status == 'DRAFT':
+                instance.status = 'TESTING'
 
         instance.save(using=alias)
-        return Response(self._serialize_assessment(instance), status=status.HTTP_200_OK)
+        return Response(MemberAssessmentDetailSerializer(instance, context={'request': request}).data)
 
     def retrieve(self, request, pk=None):
-        instance = self.get_object()
-        return Response(self._serialize_assessment(instance), status=status.HTTP_200_OK)
+        return Response(MemberAssessmentDetailSerializer(self.get_object(), context={'request': request}).data)
 
     # Field name on the request -> model attribute. The studio captures four standardised
     # views; `photo_side` stays accepted so older clients keep working, landing on the right
@@ -605,9 +428,9 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Consent gate. The specification treats movement photography as a separate, optional
-        # consent, so a member who declined it gets their assessment without a scan rather
-        # than having their images analysed anyway.
+        # Consent gate. Movement photography and automated analysis are separate, opt-in
+        # consents, so a member who declined gets their assessment without a scan rather than
+        # having their images analysed anyway.
         consent_param = request.data.get('consent_movement_photos')
         if consent_param is not None:
             assessment.consent_movement_photos = str(consent_param).lower() in ('true', '1', 'yes')
@@ -655,11 +478,23 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
         if assessment.scan_status == 'QUEUED':
             queued = self._enqueue_scan(request, assessment, alias)
 
-        body = self._serialize_assessment(assessment)
+        body = MemberAssessmentDetailSerializer(assessment, context={'request': request}).data
         body['scan'] = self._serialize_scan(assessment)
         body['scan']['queued'] = queued
         body['views_received'] = received
+        body['photos'] = self._photo_urls(assessment)
         return Response(body, status=status.HTTP_202_ACCEPTED if queued else status.HTTP_200_OK)
+
+    @staticmethod
+    def _photo_urls(assessment) -> dict:
+        """The four capture URLs. A view with no image is null, never a stand-in."""
+        return {
+            'front': _image_url(assessment.photo_front) or assessment.photo_front_url,
+            'back': _image_url(assessment.photo_back) or assessment.photo_back_url,
+            'left': _image_url(assessment.photo_side_left) or assessment.photo_side_left_url,
+            'right': (_image_url(assessment.photo_side_right) or _image_url(assessment.photo_side)
+                      or assessment.photo_side_right_url or assessment.photo_side_url),
+        }
 
     def _enqueue_scan(self, request, assessment, alias: str) -> bool:
         """
@@ -703,15 +538,14 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
 
         Poll target while the analysis runs, and the record of what it concluded afterwards.
         """
-        assessment = self.get_object()
-        return Response(self._serialize_scan(assessment), status=status.HTTP_200_OK)
+        return Response(self._serialize_scan(self.get_object()), status=status.HTTP_200_OK)
 
     def rescan(self, request, pk=None):
         """
         POST /api/v1/tenant/assessments/<id>/rescan/
 
         Re-runs the analysis against the captures already on file, for when a transient
-        provider failure is the only thing standing between the coach and a result.
+        provider failure is the only thing between the coach and a result.
         """
         alias, org = _resolve_db_and_org(request)
         assessment = self.get_object()
@@ -781,243 +615,126 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
             'measurement_metadata': assessment.measurement_metadata or {},
         }
 
-        return Response(self._serialize_assessment(assessment), status=status.HTTP_200_OK)
-
     def approve_and_send(self, request, pk=None):
-        """
-        POST /api/v1/tenant/assessments/<id>/approve-and-send/
-        Coach/Admin Approval Gate. Marks assessment as APPROVED and UNLOCKS the Studio Screen.
-        (WhatsApp dispatch is disabled per configuration — displayed directly on screen).
-        """
+        user_type = getattr(request.user, 'user_type', None)
+        is_staff = getattr(request.user, 'is_staff', False)
+        if user_type == 'MEMBER' and not is_staff:
+            return Response(
+                {'error': 'Permission denied. Only certified coaches, trainers, or studio admins can approve assessments.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         alias, org = _resolve_db_and_org(request)
         assessment = self.get_object()
-
-        coach_notes = request.data.get('coach_notes')
-        workout_prescription = request.data.get('workout_prescription')
-        diet_prescription = request.data.get('diet_prescription')
-        # WhatsApp dispatch is false by default per studio requirement
-        send_whatsapp = str(request.data.get('send_whatsapp', 'false')).lower() in ['true', '1', 'yes']
-
+        app_ser = AssessmentApprovalSerializer(data=request.data)
+        app_ser.is_valid(raise_exception=True)
+        val = app_ser.validated_data
         approved = AssessmentEngineService.approve_and_dispatch(
-            assessment=assessment,
-            reviewer_user=request.user,
-            coach_notes=coach_notes,
-            workout_prescription=workout_prescription,
-            diet_prescription=diet_prescription,
-            send_whatsapp=send_whatsapp,
+            assessment=assessment, reviewer_user=request.user, coach_notes=val.get('coach_notes'),
+            workout_prescription=val.get('workout_prescription'), diet_prescription=val.get('diet_prescription'),
+            reassessment_interval_weeks=val.get('reassessment_interval_weeks', 6), send_whatsapp=val.get('send_whatsapp', False),
             db_alias=alias,
         )
+        return Response(MemberAssessmentDetailSerializer(approved, context={'request': request}).data)
 
-        return Response(self._serialize_assessment(approved), status=status.HTTP_200_OK)
+    @action(detail=True, methods=['get'])
+    def comparison(self, request, pk=None):
+        return Response(compare_assessments(self.get_object()))
 
-    def _serialize_assessment(self, instance: MemberAssessment, match_result=None):
-        rec_pkg = instance.recommended_package
-        rec_price = None
-        rec_sessions = None
-        if rec_pkg:
-            ver = instance.recommended_package_version or rec_pkg.get_active_version()
-            if ver:
-                p = ver.prices.filter(status='ACTIVE').first()
-                if p:
-                    rec_price = float(p.total_price)
-                for e in ver.entitlement_definitions.filter(status='ACTIVE'):
-                    if e.entitlement_type in ['HOME_BRANCH_SESSION', 'CLASS_SESSION', 'PERSONAL_TRAINING_SESSION', 'OPEN_ACCESS']:
-                        rec_sessions = 365 if e.is_unlimited else int(e.allocated_units or 0)
 
-        ret_pkg_payload = {
-            'id': str(rec_pkg.id) if rec_pkg else None,
-            'name': rec_pkg.name if rec_pkg else 'Studio Program',
-            'session_units': rec_sessions or 72,
-            'price': rec_price or 0,
-            'reason': instance.recommendation_reason,
-        }
+class AssessmentProgressionViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsAuthenticated]
+    serializer_class = AssessmentTestProgressionSerializer
 
-        from .security_utils import mask_phone_if_restricted
-        req = getattr(self, 'request', None)
-        return {
-            'id': str(instance.id),
-            'pairing_code': instance.pairing_code,
-            'status': instance.status,
-            'member_name': instance.member_name,
-            'member_phone': mask_phone_if_restricted(req, instance.member_phone),
-            'branch': {
-                'id': str(instance.branch.id),
-                'name': instance.branch.name,
-            } if instance.branch else None,
-            'assessment_type': instance.assessment_type,
-            'training_experience': instance.training_experience,
-            'current_activity_level': instance.current_activity_level,
-            'preferred_training_style': instance.preferred_training_style,
-            'target_goal': instance.target_goal,
-            'target_goal_display': instance.get_target_goal_display(),
-            'stated_goal_outcome': instance.stated_goal_outcome,
-            'timeline_months': instance.target_timeline_months,
-            'timeline_weeks': instance.target_timeline_weeks,
-            'weekly_frequency': instance.weekly_frequency_days,
-            'perceived_barrier': instance.perceived_barrier,
-            'member_confidence_score': instance.member_confidence_score,
-            'user_notes': instance.user_notes,
+    def get_queryset(self):
+        alias, org = _resolve_db_and_org(self.request)
+        qs = AssessmentTestProgression.objects.using(alias).filter(organization=org)
+        uid = self.request.query_params.get('user_profile_id')
+        if uid:
+            qs = qs.filter(user_profile_id=uid)
+        if getattr(self.request.user, 'user_type', None) == 'MEMBER':
+            qs = qs.filter(user_profile__user=self.request.user)
+        return qs.order_by('-created_at')
 
-            # Section 2: Health Screening
-            'health_screening': instance.health_screening,
-            'screening_outcome': instance.screening_outcome,
-            'screening_coach_notes': instance.screening_coach_notes,
+    def perform_create(self, serializer):
+        alias, org = _resolve_db_and_org(self.request)
+        serializer.save(organization=org)
 
-            # Section 3: Vitals & Body Composition
-            'vitals': {
-                'height_cm': float(instance.measured_height_cm) if instance.measured_height_cm else None,
-                'weight_kg': float(instance.measured_weight_kg) if instance.measured_weight_kg else None,
-                'waist_cm': float(instance.waist_circumference_cm) if instance.waist_circumference_cm else None,
-                'resting_hr': instance.resting_heart_rate_bpm,
-                'resting_bp': instance.resting_blood_pressure,
-                'bmi': float(instance.calculated_bmi) if instance.calculated_bmi else None,
-                'rmr_kcal': instance.bmr_rmr_kcal,
-                'tdee_kcal': instance.tdee_kcal,
-                'daily_calorie_target': instance.daily_calorie_target,
-                'macros': instance.nutrition_macros,
-                'estimated_body_fat_pct': float(instance.estimated_body_fat_pct) if instance.estimated_body_fat_pct is not None else None,
-                'waist_to_hip_ratio': float(instance.waist_to_hip_ratio) if instance.waist_to_hip_ratio is not None else None,
-            },
+    @action(detail=True, methods=['post'], url_path='approve')
+    def approve(self, request, pk=None):
+        user_type = getattr(request.user, 'user_type', None)
+        is_staff = getattr(request.user, 'is_staff', False)
+        if user_type == 'MEMBER' and not is_staff:
+            return Response({'error': 'Permission denied.'}, status=status.HTTP_403_FORBIDDEN)
+        alias, org = _resolve_db_and_org(request)
+        progression = self.get_object()
+        app_ser = ProgressionApprovalSerializer(data=request.data)
+        app_ser.is_valid(raise_exception=True)
+        val = app_ser.validated_data
+        approved = approve_progression(
+            progression=progression, coach_user=request.user, criteria_met_notes=val.get('criteria_met_notes', ''),
+            next_variation=val['next_variation'], db_alias=alias,
+        )
+        return Response(AssessmentTestProgressionSerializer(approved).data)
 
-            # Sections 4-11: Movement Tests & Capability Matrix
-            'functional_tests': instance.functional_tests_payload,
-            'capability_matrix': instance.capability_matrix,
 
-            # Four standardised captures. A view with no image returns null rather than a
-            # stand-in, so the studio screen can show it as outstanding.
-            'photos': {
-                'front': _image_url(instance.photo_front) or instance.photo_front_url,
-                'back': _image_url(instance.photo_back) or instance.photo_back_url,
-                'left': _image_url(instance.photo_side_left) or instance.photo_side_left_url,
-                'right': _image_url(instance.photo_side_right) or _image_url(instance.photo_side)
-                         or instance.photo_side_right_url or instance.photo_side_url,
-            },
-            'photo_front_url': _image_url(instance.photo_front) or instance.photo_front_url,
-            'photo_side_url': _image_url(instance.photo_side_right) or _image_url(instance.photo_side) or instance.photo_side_url,
+class PairingRedeemThrottle(SimpleRateThrottle):
+    scope = 'assessment_pairing'
+    rate = '10/minute'
 
-            # Measured posture geometry. These stay null until a scan succeeds — there is no
-            # placeholder value, so "not assessed" is distinguishable from "assessed as 0".
-            'metrics': {
-                'posture_score': float(instance.posture_score) if instance.posture_score is not None else None,
-                'shoulder_tilt_degrees': float(instance.shoulder_tilt_degrees) if instance.shoulder_tilt_degrees is not None else None,
-                'hip_tilt_degrees': float(instance.hip_tilt_degrees) if instance.hip_tilt_degrees is not None else None,
-                'forward_head_angle_degrees': float(instance.forward_head_angle_degrees) if instance.forward_head_angle_degrees is not None else None,
-                'lateral_shift_degrees': float(instance.lateral_shift_degrees) if instance.lateral_shift_degrees is not None else None,
-            },
-            'scan': {
-                'status': instance.scan_status,
-                'provider': instance.scan_provider or None,
-                'model': instance.scan_model or None,
-                'error': instance.scan_error,
-                'views_usable': (instance.scan_raw_payload or {}).get('views_usable') or [],
-                'capture_quality': instance.scan_capture_quality or {},
-            },
-            'estimated_measurements': {
-                'waist_cm': float(instance.estimated_waist_cm) if instance.estimated_waist_cm is not None else None,
-                'hip_cm': float(instance.estimated_hip_cm) if instance.estimated_hip_cm is not None else None,
-                'chest_cm': float(instance.estimated_chest_cm) if instance.estimated_chest_cm is not None else None,
-                'shoulder_width_cm': float(instance.estimated_shoulder_width_cm) if instance.estimated_shoulder_width_cm is not None else None,
-                'disclaimer': 'Estimated from capture geometry. Tape measurements remain authoritative.',
-            },
-            'measurement_metadata': instance.measurement_metadata or {},
-
-            # Program & Package Recommendation (Revealed upon approval)
-            'recommended_package': ret_pkg_payload,
-            'alternatives': instance.alternative_packages_payload,
-
-            # Milestones
-            'milestones': {
-                'month_1': instance.month_1_image_url,
-                'month_2': instance.month_2_image_url,
-                'month_3': instance.month_3_image_url,
-            },
-
-            # Coach Prescriptions
-            'coach_strengths': instance.coach_strengths,
-            'coach_areas_to_develop': instance.coach_areas_to_develop,
-            'workout_prescription': instance.workout_prescription,
-            'diet_prescription': instance.diet_prescription,
-            'reassessment_interval_weeks': instance.reassessment_interval_weeks,
-            'reviewed_at': instance.reviewed_at.isoformat() if instance.reviewed_at else None,
-            'created_at': instance.created_at.isoformat(),
-        }
+    def get_cache_key(self, request, view):
+        return self.cache_format % {'scope': self.scope, 'ident': self.get_ident(request)}
 
 
 class StudioScreenPairingView(APIView):
-    """
-    GET /api/v1/tenant/assessments/pair/?code=123456
-    Pairing endpoint for the Studio TV Screen Mirror.
-    If the assessment is not yet approved, keeps the screen in locked standby / framing mode.
-    Once approved by the coach, unlocks the full visual transformation & roadmap reveal.
-    """
     permission_classes = [AllowAny]
+    throttle_classes = [PairingRedeemThrottle]
 
-    def get(self, request):
-        code = request.query_params.get('code')
+    def post(self, request):
+        code = str(request.data.get('code') or '').strip()
         if not code:
             return Response({'error': 'Pairing code is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
         alias, org = _resolve_db_and_org(request)
-        assessment = MemberAssessment.objects.using(alias).filter(pairing_code=code.strip()).first()
+        now = timezone.now()
+        assessment = (
+            MemberAssessment.objects.using(alias)
+            .filter(organization=org, pairing_code=code, pairing_code_used_at__isnull=True, pairing_code_expires_at__gt=now)
+            .order_by('-created_at').first()
+        )
         if not assessment:
             return Response({'error': 'Invalid or expired pairing code.'}, status=status.HTTP_404_NOT_FOUND)
 
-        assessment.display_screen_connected = True
-        assessment.save(using=alias, update_fields=['display_screen_connected'])
+        if not assessment.display_screen_connected:
+            MemberAssessment.objects.using(alias).filter(pk=assessment.pk).update(display_screen_connected=True)
 
-        is_approved = (assessment.status == 'APPROVED')
+        if assessment.status != 'APPROVED':
+            return Response({'id': str(assessment.id), 'status': assessment.status, 'member_name': assessment.member_name, 'is_approved': False, 'connected': True})
 
-        response_data = {
-            'id': str(assessment.id),
-            'status': assessment.status,
-            'member_name': assessment.member_name,
-            'is_approved': is_approved,
-            'connected': True,
+        consumed = MemberAssessment.objects.using(alias).filter(pk=assessment.pk, pairing_code_used_at__isnull=True).update(pairing_code_used_at=now)
+        if not consumed:
+            return Response({'error': 'Invalid or expired pairing code.'}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response(self._approved_summary(assessment))
+
+    @staticmethod
+    def _approved_summary(assessment: MemberAssessment) -> dict:
+        rec_pkg = assessment.recommended_package
+        price, sessions = None, None
+        if rec_pkg:
+            ver = assessment.recommended_package_version or rec_pkg.get_active_version()
+            if ver:
+                p = ver.prices.filter(status='ACTIVE').first()
+                if p:
+                    price = float(p.total_price)
+                for e in ver.entitlement_definitions.filter(status='ACTIVE'):
+                    if e.entitlement_type in ['HOME_BRANCH_SESSION', 'CLASS_SESSION', 'PERSONAL_TRAINING_SESSION', 'OPEN_ACCESS']:
+                        sessions = 365 if e.is_unlimited else int(e.allocated_units or 0)
+
+        return {
+            'id': str(assessment.id), 'status': assessment.status, 'member_name': assessment.member_name,
+            'is_approved': True, 'connected': True, 'target_goal': assessment.get_target_goal_display(),
+            'stated_goal_outcome': assessment.stated_goal_outcome, 'timeline_weeks': assessment.target_timeline_weeks,
+            'timeline_months': assessment.target_timeline_months, 'posture_score': float(assessment.posture_score or 0),
+            'capability_matrix': assessment.capability_matrix or {},
+            'recommended_package': {'name': rec_pkg.name if rec_pkg else 'Tailored Studio Plan', 'session_units': sessions or 72, 'price': price or 0, 'reason': assessment.recommendation_reason},
         }
-
-        # If approved, reveal the full presentation to the studio screen
-        if is_approved:
-            rec_pkg = assessment.recommended_package
-            rec_price = None
-            rec_sessions = None
-            if rec_pkg:
-                ver = assessment.recommended_package_version or rec_pkg.get_active_version()
-                if ver:
-                    p = ver.prices.filter(status='ACTIVE').first()
-                    if p:
-                        rec_price = float(p.total_price)
-                    for e in ver.entitlement_definitions.filter(status='ACTIVE'):
-                        if e.entitlement_type in ['HOME_BRANCH_SESSION', 'CLASS_SESSION', 'PERSONAL_TRAINING_SESSION', 'OPEN_ACCESS']:
-                            rec_sessions = 365 if e.is_unlimited else int(e.allocated_units or 0)
-
-            response_data.update({
-                'target_goal': assessment.get_target_goal_display(),
-                'stated_goal_outcome': assessment.stated_goal_outcome,
-                'timeline_weeks': assessment.target_timeline_weeks,
-                'timeline_months': assessment.target_timeline_months,
-                'posture_score': float(assessment.posture_score),
-                'shoulder_tilt_degrees': float(assessment.shoulder_tilt_degrees or 0),
-                'vitals': {
-                    'bmi': float(assessment.calculated_bmi) if assessment.calculated_bmi else None,
-                    'rmr_kcal': assessment.bmr_rmr_kcal,
-                    'tdee_kcal': assessment.tdee_kcal,
-                    'daily_calorie_target': assessment.daily_calorie_target,
-                    'macros': assessment.nutrition_macros,
-                },
-                'capability_matrix': assessment.capability_matrix,
-                'recommended_package': {
-                    'name': rec_pkg.name if rec_pkg else 'Tailored Studio Plan',
-                    'session_units': rec_sessions or 72,
-                    'price': rec_price or 0,
-                    'reason': assessment.recommendation_reason,
-                },
-                'workout_prescription': assessment.workout_prescription,
-                'diet_prescription': assessment.diet_prescription,
-                'milestones': {
-                    'month_1': assessment.month_1_image_url,
-                    'month_2': assessment.month_2_image_url,
-                    'month_3': assessment.month_3_image_url,
-                },
-            })
-
-        return Response(response_data, status=status.HTTP_200_OK)

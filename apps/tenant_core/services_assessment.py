@@ -2,28 +2,31 @@
 apps/tenant_core/services_assessment.py — Core Business Service for Assessment & Transformation Engine.
 
 Key Rules & Capabilities:
-1. Gated Access: Only members with an active ASSESSMENT entitlement or package opt-in can access the assessment.
-2. Dynamic Catalog Recommendation: Recommends real, active programs & packages from the SWEAT database (e.g. 72, 144, 365 session packs).
-3. Realistic Scientific Progression: Enforces safe physiological recomposition limits.
-4. Manual Admin Approval Gate: No automatic WhatsApp dispatch — reports are held until an Admin/Coach explicitly approves.
+1. Gated Access: Only members with an active ASSESSMENT entitlement or package credit can access assessments.
+2. Dynamic Catalog Recommendation: Recommends real active programs & packages from the SWEAT database.
+3. Realistic Scientific Progression: Delegates metabolic & safety calculations to dedicated sub-services.
+4. Manual Admin Approval Gate: Coach/Admin explicitly approves; updates sign-off timestamps and due dates.
 """
 
 import uuid
-import math
 import logging
+from datetime import timedelta
 from decimal import Decimal
 from typing import Dict, Any, Optional, List
 from django.db import transaction, models
 from django.utils import timezone
 from django.core.exceptions import ValidationError
 
-from .models_assessment import MemberAssessment
+from .models_assessment import MemberAssessment, AssessmentTestProgression
 from .models_catalog import Program, Package, PackageVersion, PackagePrice
 from .models_memberships import Membership, MembershipEntitlement
-from .models_crm import UserProfile, Lead
+from .models_crm import UserProfile
 from .models_org import Organization, Branch
 from .models_users import TenantUser
 from .services_reliability import record_business_audit
+from .services_assessment_screening import evaluate_safety_readiness
+from .services_assessment_metrics import calculate_metabolic_nutrition_plan, calculate_bmi
+from .services_assessment_progress import compare_assessments, approve_progression
 
 logger = logging.getLogger(__name__)
 
@@ -44,24 +47,13 @@ def _get_alias(db_alias=None, obj=None):
 
 
 class AssessmentEngineService:
-    """
-    Core orchestrator for Member Assessments.
-    """
-
     @classmethod
     def check_member_eligibility(
-        cls,
-        user_profile: UserProfile,
-        branch_id: Optional[str] = None,
-        db_alias: Optional[str] = None
+        cls, user_profile: UserProfile, branch_id: Optional[str] = None, db_alias: Optional[str] = None
     ) -> Dict[str, Any]:
-        """
-        Verifies if a member has an active ASSESSMENT entitlement or opted-in package credit.
-        """
         alias = _get_alias(db_alias, user_profile)
         now = timezone.now()
 
-        # 1. Search for active MembershipEntitlement of type ASSESSMENT
         entitlements = (
             MembershipEntitlement.objects.using(alias)
             .filter(
@@ -70,12 +62,9 @@ class AssessmentEngineService:
                 status='ACTIVE',
                 entitlement_type__in=['ASSESSMENT', 'ASSESSMENT_SESSION'],
             )
-            .filter(
-                models.Q(valid_until__isnull=True) | models.Q(valid_until__gte=now)
-            )
+            .filter(models.Q(valid_until__isnull=True) | models.Q(valid_until__gte=now))
             .select_related('membership', 'membership__package')
         )
-
         for ent in entitlements:
             if ent.is_unlimited or (ent.allocated_units and (ent.allocated_units - ent.consumed_units) > 0):
                 remaining = None if ent.is_unlimited else float(ent.allocated_units - ent.consumed_units)
@@ -88,14 +77,11 @@ class AssessmentEngineService:
                     'is_unlimited': ent.is_unlimited,
                 }
 
-        # 2. Check if user has an active membership whose package includes assessment in metadata
         active_memberships = (
             Membership.objects.using(alias)
-            .filter(user_profile=user_profile, status='ACTIVE')
-            .filter(end_date__gte=now.date())
+            .filter(user_profile=user_profile, status='ACTIVE', end_date__gte=now.date())
             .select_related('package')
         )
-
         for mb in active_memberships:
             pkg_name = (mb.package.name or '').lower()
             if any(term in pkg_name for term in ['transformation', 'vip', 'annual', '365', 'assessment']):
@@ -110,7 +96,7 @@ class AssessmentEngineService:
 
         return {
             'eligible': False,
-            'reason': 'No active assessment credit found. Please purchase the Assessment Pack or upgrade to an eligible membership plan.',
+            'reason': 'No active assessment credit found. Please purchase an assessment package.',
             'remaining_credits': 0,
         }
 
@@ -124,334 +110,119 @@ class AssessmentEngineService:
         weekly_frequency: int = 3,
         db_alias: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Dynamically pairs user's goal + commitment to actual active packages in SWEAT database.
-        """
         alias = _get_alias(db_alias, organization)
         now = timezone.now()
-
-        # Estimated session requirement
         total_estimated_sessions = int(weekly_frequency * 4.33 * timeline_months)
 
-        # 1. Query active sellable packages
         packages_qs = (
             Package.objects.using(alias)
             .filter(organization=organization, status='ACTIVE')
             .select_related('program')
             .prefetch_related('versions__prices', 'versions__entitlement_definitions')
         )
-
         if branch:
             packages_qs = packages_qs.filter(
                 models.Q(branch_availabilities__branch=branch, branch_availabilities__status='ENABLED')
                 | models.Q(branch_availabilities__isnull=True)
             ).distinct()
 
-        all_active_packages = list(packages_qs)
-
-        # Fallback if no specific packages found
-        if not all_active_packages:
-            all_active_packages = list(Package.objects.using(alias).filter(status='ACTIVE')[:5])
-
-        # Score & Rank packages based on goal & session allowance
-        scored_packages = []
-        for pkg in all_active_packages:
-            active_ver = pkg.get_active_version(as_of=now)
-            if not active_ver:
+        all_pkgs = list(packages_qs) or list(Package.objects.using(alias).filter(status='ACTIVE')[:5])
+        scored = []
+        for pkg in all_pkgs:
+            ver = pkg.get_active_version(as_of=now)
+            if not ver:
                 continue
-
-            # Extract included sessions
-            ents = list(active_ver.entitlement_definitions.filter(status='ACTIVE'))
-            session_units = 0
+            ents = list(ver.entitlement_definitions.filter(status='ACTIVE'))
+            sessions = 0
             for e in ents:
                 if e.entitlement_type in ['HOME_BRANCH_SESSION', 'CLASS_SESSION', 'PERSONAL_TRAINING_SESSION', 'OPEN_ACCESS']:
-                    if e.is_unlimited:
-                        session_units = 365
-                    elif e.allocated_units:
-                        session_units = int(e.allocated_units)
-
-            # Fallback: Extract session count from package name if not explicitly set in entitlements
-            if session_units == 0:
+                    sessions = 365 if e.is_unlimited else int(e.allocated_units or 0)
+            if sessions == 0:
                 import re
-                digit_match = re.search(r'\b(\d{2,3})\b', pkg.name or '')
-                if digit_match:
-                    session_units = int(digit_match.group(1))
+                m = re.search(r'\b(\d{2,3})\b', pkg.name or '')
+                sessions = int(m.group(1)) if m else 0
 
-            first_price = active_ver.prices.filter(status='ACTIVE').first()
-            price_val = float(first_price.total_price) if first_price else 0.0
-
-            pkg_name_lower = (pkg.name or '').lower()
-            prog_name_lower = (pkg.program.name or '').lower() if pkg.program else ''
+            p = ver.prices.filter(status='ACTIVE').first()
+            price = float(p.total_price) if p else 0.0
+            name_low = (pkg.name or '').lower()
 
             score = 100
+            if goal in ['POSTURE_ALIGNMENT'] and ('pilates' in name_low or '1:1' in name_low):
+                score += 50
+            elif goal in ['FAT_LOSS', 'STRENGTH_CONDITIONING'] and ('bootcamp' in name_low or 'hiit' in name_low):
+                score += 50
+            if sessions > 0:
+                score -= min(abs(sessions - total_estimated_sessions), 60)
 
-            # Match Modality with Goal
-            if goal in ['POSTURE_ALIGNMENT']:
-                if 'pilates' in pkg_name_lower or 'pilates' in prog_name_lower:
-                    score += 50
-                if '1:1' in pkg_name_lower or 'personal' in pkg_name_lower:
-                    score += 20
-            elif goal in ['FAT_LOSS', 'STRENGTH_CONDITIONING', 'ATHLETIC_PERFORMANCE']:
-                if 'bootcamp' in pkg_name_lower or 'bootcamp' in prog_name_lower or 'hiit' in pkg_name_lower:
-                    score += 50
-            elif goal in ['HYPERTROPHY_GLUTES']:
-                if 'glute' in pkg_name_lower or 'pilates' in pkg_name_lower:
-                    score += 45
+            scored.append({'package': pkg, 'ver': ver, 'sessions': sessions, 'price': price, 'score': score})
 
-            # Match Session Allowance (e.g. closest to 72, 144, 365)
-            if session_units > 0:
-                diff = abs(session_units - total_estimated_sessions)
-                score -= min(diff, 60)
+        scored.sort(key=lambda x: x['score'], reverse=True)
+        if not scored:
+            return {'recommended_package': None, 'recommendation_reason': 'No matching package.', 'alternatives': []}
 
-            scored_packages.append({
-                'package': pkg,
-                'package_version': active_ver,
-                'session_units': session_units,
-                'total_price': price_val,
-                'score': score,
-            })
-
-        scored_packages.sort(key=lambda x: x['score'], reverse=True)
-
-        if not scored_packages:
-            return {
-                'recommended_package': None,
-                'recommended_package_version': None,
-                'recommendation_reason': 'No matching active package found in the catalog.',
-                'alternatives': [],
-            }
-
-        primary = scored_packages[0]
-        alternatives = scored_packages[1:4]
-
+        top = scored[0]
+        alts = scored[1:4]
         goal_labels = dict(MemberAssessment.GOAL_CHOICES)
         reason = (
-            f"Based on your commitment of {weekly_frequency} days/week over {timeline_months} months "
-            f"for {goal_labels.get(goal, goal)}, we recommend {primary['package'].name} "
-            f"({primary['session_units']} sessions) to achieve continuous physiological progression."
+            f"Based on {weekly_frequency} days/week for {timeline_months} months for {goal_labels.get(goal, goal)}, "
+            f"we recommend {top['package'].name} ({top['sessions']} sessions)."
         )
-
         return {
-            'recommended_package': primary['package'],
-            'recommended_package_version': primary['package_version'],
-            'recommended_program': primary['package'].program,
-            'session_units': primary['session_units'],
-            'price': primary['total_price'],
+            'recommended_package': top['package'],
+            'recommended_package_version': top['ver'],
+            'recommended_program': top['package'].program,
+            'session_units': top['sessions'],
+            'price': top['price'],
             'recommendation_reason': reason,
-            'alternatives': [
-                {
-                    'id': str(alt['package'].id),
-                    'name': alt['package'].name,
-                    'sessions': alt['session_units'],
-                    'price': alt['total_price'],
-                }
-                for alt in alternatives
-            ],
+            'alternatives': [{'id': str(a['package'].id), 'name': a['package'].name, 'sessions': a['sessions'], 'price': a['price']} for a in alts],
         }
 
     @classmethod
-    def calculate_metabolic_nutrition_plan(
-        cls,
-        weight_kg: float,
-        height_cm: float,
-        age: Optional[int] = None,
-        sex: Optional[str] = None,
-        activity_level: str = 'MODERATELY_ACTIVE',
-        goal: str = 'POSTURE_ALIGNMENT',
-    ) -> Dict[str, Any]:
-        """
-        Calculates RMR (Mifflin-St Jeor), TDEE, Calorie Target, and Macro Targets.
-
-        Age and sex are genuine inputs to the equation, not decoration: a missing value moves
-        the resting rate by hundreds of kilocalories. When either is unknown the calculation
-        still runs so the coach is not blocked, but the substitution is recorded in
-        `inputs` and the result is flagged `inputs_complete: False` so the interface can say
-        the figure is provisional until the profile is completed.
-        """
-        w = float(weight_kg)
-        h = float(height_cm)
-
-        ASSUMED_AGE = 30
-        assumptions = []
-
-        if age is None:
-            a = ASSUMED_AGE
-            assumptions.append(f"Age was unknown; {ASSUMED_AGE} years assumed for the equation.")
-        else:
-            a = int(age)
-
-        sex_norm = str(sex or '').strip().upper()
-        if sex_norm in ('MALE', 'M'):
-            is_male = True
-        elif sex_norm in ('FEMALE', 'F'):
-            is_male = False
-        else:
-            is_male = False
-            assumptions.append(
-                "Sex was not recorded or was self-described; the female coefficient was used, "
-                "which yields the more conservative resting rate."
-            )
-
-        # 1. RMR / BMR via Mifflin-St Jeor
-        if is_male:
-            rmr = (10.0 * w) + (6.25 * h) - (5.0 * a) + 5.0
-        else:
-            rmr = (10.0 * w) + (6.25 * h) - (5.0 * a) - 161.0
-        rmr_val = int(round(rmr))
-
-        # 2. Activity Multiplier for TDEE
-        multipliers = {
-            'SEDENTARY': 1.20,
-            'LIGHTLY_ACTIVE': 1.375,
-            'MODERATELY_ACTIVE': 1.55,
-            'HIGHLY_ACTIVE': 1.725,
-        }
-        mult = multipliers.get(str(activity_level).upper(), 1.50)
-        tdee_val = int(round(rmr * mult))
-
-        # 3. Goal-directed Daily Calorie Target
-        goal_norm = str(goal).upper()
-        if 'FAT_LOSS' in goal_norm or 'LEAN' in goal_norm:
-            calorie_target = max(1200, tdee_val - 400)
-            goal_strategy = "Moderate 400 kcal deficit for safe fat loss with muscle retention."
-        elif 'HYPERTROPHY' in goal_norm or 'MUSCLE' in goal_norm or 'STRENGTH' in goal_norm:
-            calorie_target = tdee_val + 250
-            goal_strategy = "Controlled 250 kcal surplus to fuel progressive overload and lean mass growth."
-        else:
-            calorie_target = tdee_val
-            goal_strategy = "Maintenance calories to optimize energy, posture de-rotation, and neuromuscular adaptation."
-
-        # 4. Macronutrient Targets
-        # Protein: 1.8g per kg bodyweight
-        protein_g = int(round(w * 1.8))
-        protein_kcal = protein_g * 4
-
-        # Fat: 25% of total calories (9 kcal/g)
-        fat_kcal = calorie_target * 0.25
-        fat_g = int(round(fat_kcal / 9.0))
-
-        # Carbohydrates: remaining calories (4 kcal/g)
-        carb_kcal = max(0, calorie_target - protein_kcal - int(fat_kcal))
-        carb_g = int(round(carb_kcal / 4.0))
-
-        # Daily Hydration: ~35-40 ml per kg
-        hydration_l = round(w * 0.038, 1)
-
-        return {
-            'rmr_kcal': rmr_val,
-            'tdee_kcal': tdee_val,
-            'daily_calorie_target': calorie_target,
-            'goal_strategy': goal_strategy,
-            'method': 'mifflin_st_jeor',
-            'is_estimate': True,
-            'inputs_complete': not assumptions,
-            'inputs': {
-                'age_years': age,
-                'sex': sex_norm or None,
-                'weight_kg': w,
-                'height_cm': h,
-                'activity_level': activity_level,
-            },
-            'assumptions': assumptions,
-            'disclosure': (
-                'Resting metabolic rate is estimated from a validated equation, not measured by '
-                'indirect calorimetry. Daily energy expenditure is a starting point for planning '
-                'and should be calibrated against the observed weight trend.'
-            ),
-            'macros': {
-                'protein_g': protein_g,
-                'carbs_g': carb_g,
-                'fat_g': fat_g,
-                'fiber_g': 28,
-                'hydration_liters': hydration_l,
-                'meal_guidance': f"Prioritize {protein_g}g daily protein split across 3-4 meals. Drink ~{hydration_l}L water daily for optimal fascia and muscle recovery.",
-            },
-        }
+    def calculate_metabolic_nutrition_plan(cls, **kwargs) -> Dict[str, Any]:
+        return calculate_metabolic_nutrition_plan(**kwargs)
 
     @classmethod
     def calculate_capability_matrix(cls, tests_payload: Dict[str, Any]) -> Dict[str, str]:
-        """
-        Evaluates domain capabilities (Beginner, Developing, Established) from logged test data.
-        Supports Option B multi-test battery (assessed_tests list) as well as single test format.
-        """
         matrix = {
-            'lower_body': 'Developing',
-            'upper_body': 'Developing',
-            'core': 'Developing',
-            'balance': 'Developing',
-            'mobility': 'Within Protocol',
-            'cardiovascular': 'Establishing Baseline',
+            'lower_body': 'Developing', 'upper_body': 'Developing', 'core': 'Developing',
+            'balance': 'Developing', 'mobility': 'Within Protocol', 'cardiovascular': 'Establishing Baseline',
             'functional_movement': 'Independent',
         }
+        if not isinstance(tests_payload, dict):
+            return matrix
 
-        # Lower body evaluation
+        # Lower body
         lb = tests_payload.get('lower_body', {})
-        assessed_lb = []
-        if isinstance(lb, dict):
-            if isinstance(lb.get('assessed_tests'), list):
-                assessed_lb = [t for t in lb['assessed_tests'] if t.get('active')]
-            if not assessed_lb and (lb.get('reps') is not None or lb.get('variation')):
-                assessed_lb = [lb]
-
+        assessed_lb = lb.get('assessed_tests') if isinstance(lb, dict) and isinstance(lb.get('assessed_tests'), list) else ([lb] if isinstance(lb, dict) and lb else [])
+        assessed_lb = [t for t in assessed_lb if isinstance(t, dict)]
         if assessed_lb:
-            has_established = any(
-                (int(t.get('reps') or 0) >= 15 or 'goblet' in str(t.get('name') or t.get('variation') or '').lower())
-                and t.get('movement_quality') == 'Meets criteria'
-                for t in assessed_lb
-            )
-            has_beginner = any(
-                'box' in str(t.get('name') or t.get('variation') or '').lower() or int(t.get('reps') or 0) < 8
-                for t in assessed_lb
-            )
-            if has_established:
+            if any((int(t.get('reps') or 0) >= 15 or 'goblet' in str(t.get('name') or t.get('variation') or '').lower()) and t.get('movement_quality') == 'Meets criteria' for t in assessed_lb):
                 matrix['lower_body'] = 'Established'
-            elif has_beginner and not any(int(t.get('reps') or 0) >= 12 for t in assessed_lb):
+            elif any('box' in str(t.get('name') or t.get('variation') or '').lower() or int(t.get('reps') or 0) < 8 for t in assessed_lb):
                 matrix['lower_body'] = 'Beginner'
-            else:
-                matrix['lower_body'] = 'Developing'
 
-        # Upper body evaluation
+        # Upper body
         ub = tests_payload.get('upper_body', {})
-        assessed_ub = []
-        if isinstance(ub, dict):
-            if isinstance(ub.get('assessed_tests'), list):
-                assessed_ub = [t for t in ub['assessed_tests'] if t.get('active')]
-            if not assessed_ub and (ub.get('pushup_reps') is not None or ub.get('pushup_variation')):
-                assessed_ub = [ub]
-
+        assessed_ub = ub.get('assessed_tests') if isinstance(ub, dict) and isinstance(ub.get('assessed_tests'), list) else ([ub] if isinstance(ub, dict) and ub else [])
+        assessed_ub = [t for t in assessed_ub if isinstance(t, dict)]
         if assessed_ub:
-            has_established_ub = any(
-                (('floor' in str(t.get('name') or t.get('pushup_variation') or '').lower() and int(t.get('pushup_reps') or t.get('reps') or 0) >= 12)
-                 or ('pull' in str(t.get('name') or '').lower() and int(t.get('reps') or 0) >= 8))
-                for t in assessed_ub
-            )
-            has_beginner_ub = any(
-                'wall' in str(t.get('name') or t.get('pushup_variation') or '').lower() or int(t.get('pushup_reps') or t.get('reps') or 0) < 6
-                for t in assessed_ub
-            )
-            if has_established_ub:
+            if any(('floor' in str(t.get('name') or t.get('pushup_variation') or '').lower() and int(t.get('pushup_reps') or t.get('reps') or 0) >= 12) for t in assessed_ub):
                 matrix['upper_body'] = 'Established'
-            elif has_beginner_ub and not any(int(t.get('pushup_reps') or t.get('reps') or 0) >= 10 for t in assessed_ub):
+            elif any('wall' in str(t.get('name') or t.get('pushup_variation') or '').lower() or int(t.get('pushup_reps') or t.get('reps') or 0) < 6 for t in assessed_ub):
                 matrix['upper_body'] = 'Beginner'
-            else:
-                matrix['upper_body'] = 'Developing'
 
-        # Core evaluation
+        # Core
         core = tests_payload.get('core', {})
-        hold_sec = int(core.get('hold_seconds') or 0)
-        if hold_sec < 25:
-            matrix['core'] = 'Beginner'
-        elif hold_sec >= 60:
-            matrix['core'] = 'Established'
+        if isinstance(core, dict) and int(core.get('hold_seconds') or 0) > 0:
+            h = int(core['hold_seconds'])
+            matrix['core'] = 'Beginner' if h < 25 else ('Established' if h >= 60 else 'Developing')
 
-        # Balance evaluation
+        # Balance
         bal = tests_payload.get('balance', {})
-        bal_l = int(bal.get('single_leg_left_sec') or 0)
-        bal_r = int(bal.get('single_leg_right_sec') or 0)
-        if min(bal_l, bal_r) < 15:
-            matrix['balance'] = 'Needs Support'
-        elif min(bal_l, bal_r) >= 30:
-            matrix['balance'] = 'Established'
+        if isinstance(bal, dict):
+            min_bal = min(int(bal.get('single_leg_left_sec') or 0), int(bal.get('single_leg_right_sec') or 0))
+            if min_bal > 0:
+                matrix['balance'] = 'Needs Support' if min_bal < 15 else ('Established' if min_bal >= 30 else 'Developing')
 
         return matrix
 
@@ -471,20 +242,26 @@ class AssessmentEngineService:
         coach_notes: Optional[str] = None,
         workout_prescription: Optional[str] = None,
         diet_prescription: Optional[str] = None,
+        reassessment_interval_weeks: int = 6,
         send_whatsapp: bool = False,
         db_alias: Optional[str] = None,
     ) -> MemberAssessment:
-        """
-        Coach / Admin Approval Gate.
-        Marks assessment as APPROVED, unlocking the high-definition studio screen display.
-        (WhatsApp sharing is disabled by default; only shown on screen upon approval).
-        """
         alias = _get_alias(db_alias, assessment)
         now = timezone.now()
+
+        user_type = getattr(reviewer_user, 'user_type', None)
+        is_staff = getattr(reviewer_user, 'is_staff', False)
+        if user_type == 'MEMBER' and not is_staff:
+            raise ValidationError("Permission Denied: Only coaches or admins can approve assessments.")
 
         assessment.status = 'APPROVED'
         assessment.reviewed_by_user = reviewer_user
         assessment.reviewed_at = now
+        assessment.coach_signed_off_at = now
+        assessment.coach_signed_off_by = reviewer_user
+        assessment.reassessment_interval_weeks = reassessment_interval_weeks
+        assessment.reassessment_due_date = now.date() + timedelta(weeks=reassessment_interval_weeks)
+
         if coach_notes:
             assessment.coach_notes = coach_notes.strip()
         if workout_prescription:
@@ -492,50 +269,23 @@ class AssessmentEngineService:
         if diet_prescription:
             assessment.diet_prescription = diet_prescription.strip()
 
-        # Dispatch via Gupshup WhatsApp if member has phone number
         phone = assessment.member_phone or (
-            assessment.user_profile.phone if assessment.user_profile else None
+            assessment.user_profile.user.phone if assessment.user_profile and getattr(assessment.user_profile, 'user', None) else None
         )
-
         if send_whatsapp and phone:
             try:
                 from .communication.whatsapp_gupshup import GupshupWhatsAppAdapter
-                # Construct friendly message
-                member_first = assessment.member_name or "Member"
-                pkg_name = assessment.recommended_package.name if assessment.recommended_package else "your tailored plan"
-
-                message_text = (
-                    f"Hi {member_first}! 🌟 Your SWEAT Assessment & Transformation Roadmap is approved!\n\n"
-                    f"📊 Posture Score: {assessment.posture_score}/100\n"
-                    f"🎯 Goal: {assessment.get_target_goal_display()}\n"
-                    f"🏋️ Recommended Program: {pkg_name}\n"
-                    f"💬 Coach Advice: {assessment.coach_notes or 'Stay consistent 3x a week!'}\n\n"
-                    f"Open your SWEAT Member App to view your Month 1, 2, and 3 Visual Milestones!"
-                )
-
-                # Attempt Gupshup dispatch
                 adapter = GupshupWhatsAppAdapter(organization=assessment.organization, db_alias=alias)
-                dispatch_res = adapter.send_text_message(
-                    destination_phone=phone,
-                    message_text=message_text,
-                )
-
-                if dispatch_res.get('success'):
-                    assessment.status = 'DISPATCHED'
-                    assessment.whatsapp_dispatch_status = 'SENT'
-                    assessment.whatsapp_message_id = dispatch_res.get('message_id')
-                    assessment.whatsapp_dispatched_at = now
-                else:
-                    logger.warning("Gupshup WhatsApp dispatch returned unconfirmed status: %s", dispatch_res)
-                    assessment.whatsapp_dispatch_status = 'SENT'
-                    assessment.whatsapp_dispatched_at = now
+                msg = f"Hi {assessment.member_name or 'Member'}! Your SWEAT Assessment has been approved! Goal: {assessment.get_target_goal_display()}"
+                res = adapter.send_text_message(destination_phone=phone, message_text=msg)
+                assessment.whatsapp_dispatch_status = 'SENT' if res.get('success') else 'FAILED'
+                assessment.whatsapp_dispatched_at = now
             except Exception as e:
-                logger.error("Error dispatching assessment report to WhatsApp: %s", str(e), exc_info=True)
+                logger.error("WhatsApp dispatch error: %s", str(e), exc_info=True)
                 assessment.whatsapp_dispatch_status = 'FAILED'
 
         assessment.save(using=alias)
 
-        # Consume entitlement unit if linked
         if assessment.assessment_entitlement:
             ent = assessment.assessment_entitlement
             if not ent.is_unlimited and ent.allocated_units:
@@ -551,13 +301,8 @@ class AssessmentEngineService:
             entity_type='MemberAssessment',
             entity_id=assessment.id,
             actor_user=reviewer_user,
-            event_description=f"Approved assessment for {assessment.member_name} and dispatched report.",
-            after_data={
-                'status': assessment.status,
-                'recommended_package': str(assessment.recommended_package_id),
-                'whatsapp_status': assessment.whatsapp_dispatch_status,
-            },
+            event_description=f"Approved assessment for {assessment.member_name}",
+            after_data={'status': assessment.status, 'reassessment_due_date': assessment.reassessment_due_date.isoformat()},
             db_alias=alias,
         )
-
         return assessment

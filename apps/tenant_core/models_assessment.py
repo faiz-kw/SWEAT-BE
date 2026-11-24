@@ -16,6 +16,7 @@ mobility, balance and strength, then personalize training, nutrition targets, an
 
 import uuid
 import secrets
+from datetime import timedelta
 from decimal import Decimal
 from django.db import models
 from django.utils import timezone
@@ -29,6 +30,14 @@ from .models_memberships import Membership, MembershipEntitlement
 def _generate_session_code():
     """Generates a friendly 6-digit numeric pairing code for studio screen casting."""
     return str(secrets.randbelow(900000) + 100000)
+
+
+PAIRING_CODE_TTL = timedelta(hours=4)
+
+
+def _default_pairing_code_expiry():
+    """Expiry for a new pairing code; the code stops working after this time."""
+    return timezone.now() + PAIRING_CODE_TTL
 
 
 class MemberAssessment(models.Model):
@@ -86,8 +95,10 @@ class MemberAssessment(models.Model):
         ('DRAFT', 'Draft / Intake In Progress'),
         ('TESTING', 'Physical Testing In Progress'),
         ('PENDING_REVIEW', 'Pending Coach / Admin Approval'),
-        ('APPROVED', 'Approved by Coach (Unlocked for Studio Screen Display)'),
+        ('APPROVED', 'Approved by Coach (Completed)'),
         ('REJECTED', 'Reshoot / Reassessment Requested'),
+        ('DEFERRED', 'Deferred Pending Medical Clearance / Clarification'),
+        ('CANCELLED', 'Cancelled Due to Symptoms or Safety Concerns'),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -109,6 +120,10 @@ class MemberAssessment(models.Model):
     membership = models.ForeignKey(Membership, on_delete=models.SET_NULL, null=True, blank=True, related_name='assessments')
     assessment_entitlement = models.ForeignKey(
         MembershipEntitlement, on_delete=models.SET_NULL, null=True, blank=True, related_name='assessments'
+    )
+    previous_assessment = models.ForeignKey(
+        'self', on_delete=models.SET_NULL, null=True, blank=True, related_name='follow_up_assessments',
+        help_text="Link to previous baseline or reassessment for like-for-like comparison"
     )
 
     # =========================================================================
@@ -187,6 +202,11 @@ class MemberAssessment(models.Model):
         default=dict,
         blank=True,
         help_text="Results across Lower Body, Upper Body, Core, Balance, Mobility, and Cardio test batteries"
+    )
+    symptoms_and_safety_events = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Decoupled adverse symptoms: pain location/severity, dizziness, dyspnea, stopping reason"
     )
 
     # Capability Matrix Summary (Section 13)
@@ -288,13 +308,25 @@ class MemberAssessment(models.Model):
     whatsapp_dispatch_status = models.CharField(max_length=30, default='NOT_REQUESTED')
     reassessment_interval_weeks = models.PositiveIntegerField(default=6)
 
-    # Consents (Section 16)
-    consent_body_measurements = models.BooleanField(default=True)
-    consent_movement_photos = models.BooleanField(default=True)
-    consent_ai_analysis = models.BooleanField(default=True)
+    # Consents (Section 16 - Opt-in defaults to False)
+    consent_body_measurements = models.BooleanField(default=False)
+    consent_movement_photos = models.BooleanField(default=False)
+    consent_ai_analysis = models.BooleanField(default=False)
+    consent_secondary_use = models.BooleanField(default=False)
+    consent_notice_version = models.CharField(max_length=50, blank=True, default='')
+
+    # Governance & Sign-Offs (Section 16)
+    member_acknowledged_at = models.DateTimeField(null=True, blank=True)
+    coach_signed_off_at = models.DateTimeField(null=True, blank=True)
+    coach_signed_off_by = models.ForeignKey(
+        TenantUser, on_delete=models.SET_NULL, null=True, blank=True, related_name='signed_off_assessments'
+    )
+    reassessment_due_date = models.DateField(null=True, blank=True)
 
     # Studio Screen Pairing
     pairing_code = models.CharField(max_length=10, default=_generate_session_code)
+    pairing_code_expires_at = models.DateTimeField(default=_default_pairing_code_expiry)
+    pairing_code_used_at = models.DateTimeField(null=True, blank=True)
     display_screen_connected = models.BooleanField(default=False)
 
     created_at = models.DateTimeField(default=timezone.now)
@@ -312,3 +344,42 @@ class MemberAssessment(models.Model):
     def __str__(self):
         name = self.member_name or (self.user_profile.full_name if self.user_profile else 'Guest')
         return f"Functional Assessment for {name} ({self.get_status_display()})"
+
+
+class AssessmentTestProgression(models.Model):
+    """
+    Section 14: Individual test progression record per movement pattern.
+    Tracks difficulty variation, quality, symptoms, and coach advancement criteria.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    organization = models.ForeignKey(Organization, on_delete=models.PROTECT, null=True, blank=True, related_name='assessment_progressions')
+    branch = models.ForeignKey(Branch, on_delete=models.PROTECT, null=True, blank=True, related_name='assessment_progressions')
+    user_profile = models.ForeignKey(UserProfile, on_delete=models.CASCADE, related_name='assessment_progressions')
+    assessment = models.ForeignKey(MemberAssessment, on_delete=models.SET_NULL, null=True, blank=True, related_name='progressions')
+
+    exercise_name = models.CharField(max_length=100, help_text="e.g. Push-up, Squat, Plank, Single-leg balance")
+    current_variation = models.CharField(max_length=100, help_text="e.g. Wall push-up, High-incline push-up")
+    current_load_kg = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    current_assistance = models.CharField(max_length=100, blank=True, default='', help_text="e.g. Band tension or hands support")
+    current_reps_or_duration = models.CharField(max_length=50, blank=True, default='', help_text="e.g. 12 reps, 45 seconds")
+    movement_quality = models.CharField(max_length=50, blank=True, default='', help_text="e.g. Meets criteria, Needs cueing, Modified")
+    reported_symptoms = models.TextField(blank=True, default='', help_text="Pain, discomfort, or adverse sensations")
+    next_progression_target = models.CharField(max_length=100, blank=True, default='', help_text="Target variation to work toward")
+    progression_criteria = models.TextField(blank=True, default='', help_text="Criteria required before advancement is approved")
+    review_date = models.DateField(null=True, blank=True)
+    coach_approved_by = models.ForeignKey(TenantUser, on_delete=models.SET_NULL, null=True, blank=True, related_name='approved_progressions')
+
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'assessment_test_progressions'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['organization', 'user_profile'], name='idx_prog_org_user'),
+            models.Index(fields=['assessment', 'exercise_name'], name='idx_prog_asmnt_ex'),
+        ]
+
+    def __str__(self):
+        user_display = self.user_profile.full_name if self.user_profile else 'Member'
+        return f"Progression for {user_display} - {self.exercise_name} ({self.current_variation})"
