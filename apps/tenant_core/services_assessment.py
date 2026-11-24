@@ -26,6 +26,7 @@ from .models_users import TenantUser
 from .services_reliability import record_business_audit
 from .services_assessment_screening import evaluate_safety_readiness
 from .services_assessment_metrics import calculate_metabolic_nutrition_plan, calculate_bmi
+from .services_assessment_capability import evaluate_capability_matrix
 from .services_assessment_progress import compare_assessments, approve_progression
 
 logger = logging.getLogger(__name__)
@@ -183,48 +184,15 @@ class AssessmentEngineService:
 
     @classmethod
     def calculate_capability_matrix(cls, tests_payload: Dict[str, Any]) -> Dict[str, str]:
-        matrix = {
-            'lower_body': 'Developing', 'upper_body': 'Developing', 'core': 'Developing',
-            'balance': 'Developing', 'mobility': 'Within Protocol', 'cardiovascular': 'Establishing Baseline',
-            'functional_movement': 'Independent',
-        }
-        if not isinstance(tests_payload, dict):
-            return matrix
+        """
+        Section 13 capability matrix.
 
-        # Lower body
-        lb = tests_payload.get('lower_body', {})
-        assessed_lb = lb.get('assessed_tests') if isinstance(lb, dict) and isinstance(lb.get('assessed_tests'), list) else ([lb] if isinstance(lb, dict) and lb else [])
-        assessed_lb = [t for t in assessed_lb if isinstance(t, dict)]
-        if assessed_lb:
-            if any((int(t.get('reps') or 0) >= 15 or 'goblet' in str(t.get('name') or t.get('variation') or '').lower()) and t.get('movement_quality') == 'Meets criteria' for t in assessed_lb):
-                matrix['lower_body'] = 'Established'
-            elif any('box' in str(t.get('name') or t.get('variation') or '').lower() or int(t.get('reps') or 0) < 8 for t in assessed_lb):
-                matrix['lower_body'] = 'Beginner'
-
-        # Upper body
-        ub = tests_payload.get('upper_body', {})
-        assessed_ub = ub.get('assessed_tests') if isinstance(ub, dict) and isinstance(ub.get('assessed_tests'), list) else ([ub] if isinstance(ub, dict) and ub else [])
-        assessed_ub = [t for t in assessed_ub if isinstance(t, dict)]
-        if assessed_ub:
-            if any(('floor' in str(t.get('name') or t.get('pushup_variation') or '').lower() and int(t.get('pushup_reps') or t.get('reps') or 0) >= 12) for t in assessed_ub):
-                matrix['upper_body'] = 'Established'
-            elif any('wall' in str(t.get('name') or t.get('pushup_variation') or '').lower() or int(t.get('pushup_reps') or t.get('reps') or 0) < 6 for t in assessed_ub):
-                matrix['upper_body'] = 'Beginner'
-
-        # Core
-        core = tests_payload.get('core', {})
-        if isinstance(core, dict) and int(core.get('hold_seconds') or 0) > 0:
-            h = int(core['hold_seconds'])
-            matrix['core'] = 'Beginner' if h < 25 else ('Established' if h >= 60 else 'Developing')
-
-        # Balance
-        bal = tests_payload.get('balance', {})
-        if isinstance(bal, dict):
-            min_bal = min(int(bal.get('single_leg_left_sec') or 0), int(bal.get('single_leg_right_sec') or 0))
-            if min_bal > 0:
-                matrix['balance'] = 'Needs Support' if min_bal < 15 else ('Established' if min_bal >= 30 else 'Developing')
-
-        return matrix
+        Delegates to `services_assessment_capability`, which evaluates all seven domains and
+        reports NOT_ASSESSED where no usable data exists. Mobility, cardiovascular and
+        functional movement used to be hardcoded here to flattering constants because nothing
+        collected them; they are now driven by the battery like every other domain.
+        """
+        return evaluate_capability_matrix(tests_payload)
 
     # NOTE: `calculate_computer_vision_metrics` used to live here and returned fixed
     # constants (posture 84.50, shoulder tilt 1.8°, a body-fat figure derived from BMI) that
