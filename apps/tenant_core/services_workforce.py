@@ -198,15 +198,23 @@ class TrainerAvailabilityService:
                 return False, (
                     f"Trainer {trainer.trainer_code} does not have an active work shift covering "
                     f"{target_start_time}-{target_end_time} on weekday {iso_day} at branch {branch.name}."
-                ), {'code': 'NO_MATCHING_SHIFT'}
+                ), {'code': 'NO_MATCHING_SHIFT', 'is_on_duty': False}
 
-        return True, "Trainer is qualified and available.", {
+        details: Dict[str, Any] = {
             'code': 'AVAILABLE',
             'trainer_id': str(trainer.id),
             'trainer_code': trainer.trainer_code,
             'branch_id': str(branch.id),
             'buffer_minutes': trainer.minimum_schedule_buffer_minutes,
+            'is_on_duty': True,
         }
+        if covering_shift:
+            details['shift_id'] = str(covering_shift.id)
+            details['shift_start'] = str(covering_shift.start_time)
+            details['shift_end'] = str(covering_shift.end_time)
+            details['shift_pool'] = 'MORNING' if covering_shift.start_time.hour < 14 else 'EVENING'
+
+        return True, "Trainer is qualified and available.", details
 
     @classmethod
     def find_eligible_trainers(
@@ -219,10 +227,14 @@ class TrainerAvailabilityService:
         specialty_code: Optional[str] = None,
         min_proficiency: str = 'BASIC',
         category_id: Optional[str] = None,
+        include_off_duty: bool = False,
         db_alias: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Scan all active trainers within the organization and return qualified, available trainers.
+        Scan all active trainers within the organization and return qualified trainers.
+        If include_off_duty is True, trainers qualified for the class/category who are
+        not currently on-duty are also included with is_on_duty=False so scheduling
+        can prioritize on-duty trainers.
         """
         alias = db_alias or get_tenant_db_alias() or 'default'
         trainers = TrainerProfile.objects.using(alias).filter(
@@ -244,15 +256,27 @@ class TrainerAvailabilityService:
                 category_id=category_id,
                 db_alias=alias,
             )
+            user_prof = trainer.employee_profile.user_profile
+            trainer_data = {
+                'trainer_id': str(trainer.id),
+                'trainer_code': trainer.trainer_code,
+                'full_name': f"{user_prof.first_name_snapshot or ''} {user_prof.last_name_snapshot or ''}".strip(),
+                'email': user_prof.user.email if hasattr(user_prof, 'user') else '',
+                'buffer_minutes': trainer.minimum_schedule_buffer_minutes,
+                'is_available': available,
+                'is_on_duty': details.get('is_on_duty', False),
+                'shift_pool': details.get('shift_pool'),
+                'shift_start': details.get('shift_start'),
+                'shift_end': details.get('shift_end'),
+                'reason': reason,
+                'details': details,
+            }
             if available:
-                user_prof = trainer.employee_profile.user_profile
-                eligible.append({
-                    'trainer_id': str(trainer.id),
-                    'trainer_code': trainer.trainer_code,
-                    'full_name': f"{user_prof.first_name_snapshot or ''} {user_prof.last_name_snapshot or ''}".strip(),
-                    'email': user_prof.user.email if hasattr(user_prof, 'user') else '',
-                    'buffer_minutes': trainer.minimum_schedule_buffer_minutes,
-                    'details': details,
-                })
+                eligible.append(trainer_data)
+            elif include_off_duty and details.get('code') == 'NO_MATCHING_SHIFT':
+                # Qualified for category, but currently off-duty at this branch/time
+                eligible.append(trainer_data)
 
+        # Sort: On-duty trainers first, then alphabetical by full name
+        eligible.sort(key=lambda t: (not t['is_on_duty'], t['full_name'].lower()))
         return eligible

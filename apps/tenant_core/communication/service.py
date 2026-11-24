@@ -127,7 +127,7 @@ class CommunicationService:
                 organization=organization,
                 idempotency_key=idempotency_key,
             ).first()
-            if existing:
+            if existing and existing.status != 'FAILED':
                 return existing
 
         # 2. Consent Check
@@ -157,43 +157,73 @@ class CommunicationService:
             sender_id = integration.configuration.get('sender_id') or integration.configuration.get('from_number') or ''
 
         # 5. Persist CommunicationMessage in QUEUED state
-        msg = CommunicationMessage(
-            organization=organization,
-            lead=lead,
-            resolution_status='RESOLVED' if lead else 'UNRESOLVED',
-            sender_identifier=sender_id,
-            channel=channel.upper(),
-            direction='OUTBOUND',
-            purpose=purpose,
-            recipient=recipient,
-            sender=sender_id,
-            template=template,
-            template_reference=template_reference,
-            subject=final_subject,
-            body_snapshot=final_body,
-            provider=provider_name,
-            status='QUEUED',
-            idempotency_key=idempotency_key,
-            trigger_type=trigger_type,
-            related_trial=related_trial,
-            related_followup=related_followup,
-            in_reply_to=in_reply_to,
-            created_by_user=created_by_user,
-            queued_at=timezone.now(),
-        )
+        existing_failed = None
+        if idempotency_key:
+            existing_failed = CommunicationMessage.objects.filter(
+                organization=organization,
+                idempotency_key=idempotency_key,
+                status='FAILED',
+            ).first()
 
-        try:
-            with transaction.atomic():
-                msg.save()
-        except IntegrityError:
-            if idempotency_key:
-                existing = CommunicationMessage.objects.filter(
-                    organization=organization,
-                    idempotency_key=idempotency_key,
-                ).first()
-                if existing:
-                    return existing
-            raise
+        if existing_failed:
+            msg = existing_failed
+            msg.status = 'QUEUED'
+            msg.failure_code = ''
+            msg.failure_reason = ''
+            msg.failed_at = None
+            msg.queued_at = timezone.now()
+            msg.recipient = recipient
+            msg.sender_identifier = sender_id
+            msg.sender = sender_id
+            msg.provider = provider_name
+            msg.template = template
+            msg.template_reference = template_reference
+            msg.subject = final_subject
+            msg.body_snapshot = final_body
+            msg.context_data = context_data or {}
+            msg.save(update_fields=[
+                'status', 'failure_code', 'failure_reason', 'failed_at', 'queued_at',
+                'recipient', 'sender_identifier', 'sender', 'provider', 'template',
+                'template_reference', 'subject', 'body_snapshot', 'context_data',
+            ])
+        else:
+            msg = CommunicationMessage(
+                organization=organization,
+                lead=lead,
+                resolution_status='RESOLVED' if lead else 'UNRESOLVED',
+                sender_identifier=sender_id,
+                channel=channel.upper(),
+                direction='OUTBOUND',
+                purpose=purpose,
+                recipient=recipient,
+                sender=sender_id,
+                template=template,
+                template_reference=template_reference,
+                subject=final_subject,
+                body_snapshot=final_body,
+                provider=provider_name,
+                status='QUEUED',
+                idempotency_key=idempotency_key,
+                trigger_type=trigger_type,
+                related_trial=related_trial,
+                related_followup=related_followup,
+                in_reply_to=in_reply_to,
+                created_by_user=created_by_user,
+                queued_at=timezone.now(),
+            )
+
+            try:
+                with transaction.atomic():
+                    msg.save()
+            except IntegrityError:
+                if idempotency_key:
+                    existing = CommunicationMessage.objects.filter(
+                        organization=organization,
+                        idempotency_key=idempotency_key,
+                    ).first()
+                    if existing and existing.status != 'FAILED':
+                        return existing
+                raise
 
         # 6. Execute Provider Dispatch (Graceful Fail-Safe)
         if not adapter or not adapter.is_configured():

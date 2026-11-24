@@ -1360,7 +1360,11 @@ class LeadViewSet(viewsets.ModelViewSet):
                 actor_user=request.user,
                 db_alias=alias,
             )
-            return Response(TrialBookingSerializer(trial).data, status=status.HTTP_201_CREATED)
+            resp_data = TrialBookingSerializer(trial).data
+            resp_data['whatsapp_sent'] = getattr(trial, '_whatsapp_sent', False)
+            resp_data['whatsapp_error'] = getattr(trial, '_whatsapp_error', None)
+            resp_data['whatsapp_message_id'] = getattr(trial, '_whatsapp_message_id', None)
+            return Response(resp_data, status=status.HTTP_201_CREATED)
         except (ValueError, ValidationError) as exc:
             msg = exc.message if hasattr(exc, 'message') else str(exc)
             return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)
@@ -2976,7 +2980,11 @@ class TrialBookingViewSet(viewsets.ModelViewSet):
                 confirm_upfront=confirm_upfront,
                 db_alias=alias,
             )
-            return Response(TrialBookingSerializer(trial).data, status=status.HTTP_201_CREATED)
+            resp_data = TrialBookingSerializer(trial).data
+            resp_data['whatsapp_sent'] = getattr(trial, '_whatsapp_sent', False)
+            resp_data['whatsapp_error'] = getattr(trial, '_whatsapp_error', None)
+            resp_data['whatsapp_message_id'] = getattr(trial, '_whatsapp_message_id', None)
+            return Response(resp_data, status=status.HTTP_201_CREATED)
         except (ValueError, ValidationError) as exc:
             msg = exc.message if hasattr(exc, 'message') else str(exc)
             return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)

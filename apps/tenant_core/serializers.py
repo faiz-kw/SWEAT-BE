@@ -1015,7 +1015,19 @@ class RoleSerializer(serializers.ModelSerializer):
         db = obj._state.db or 'default'
         try:
             from .models_rbac import RoleAssignment
-            return RoleAssignment.objects.using(db).filter(role=obj, is_active=True).count()
+            return (
+                RoleAssignment.objects.using(db)
+                .filter(
+                    role=obj,
+                    is_active=True,
+                    status='ACTIVE',
+                    user__status='ACTIVE',
+                    user__is_login_allowed=True,
+                )
+                .values('user_id')
+                .distinct()
+                .count()
+            )
         except Exception:
             return 0
 

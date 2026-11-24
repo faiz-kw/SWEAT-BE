@@ -508,6 +508,7 @@ class TrainerProfileViewSet(viewsets.ModelViewSet):
         specialty_code = request.query_params.get('specialty_code')
         min_proficiency = request.query_params.get('min_proficiency', 'BASIC')
         category_id = request.query_params.get('category_id')
+        include_off_duty = request.query_params.get('include_off_duty') in ('true', 'True', '1')
 
         eligible = TrainerAvailabilityService.find_eligible_trainers(
             organization=org,
@@ -518,6 +519,7 @@ class TrainerProfileViewSet(viewsets.ModelViewSet):
             specialty_code=specialty_code,
             min_proficiency=min_proficiency,
             category_id=category_id,
+            include_off_duty=include_off_duty,
             db_alias=alias,
         )
         return Response({'count': len(eligible), 'results': eligible})
@@ -570,7 +572,12 @@ class EmployeeWorkScheduleViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         alias = _get_db(self.request)
         org = getattr(self.request, 'organization', None)
-        qs = EmployeeWorkSchedule.objects.using(alias).select_related('employee_profile', 'branch')
+        qs = EmployeeWorkSchedule.objects.using(alias).select_related(
+            'employee_profile',
+            'employee_profile__user_profile',
+            'employee_profile__user_profile__user',
+            'branch'
+        )
         if org:
             qs = qs.filter(employee_profile__organization=org)
         emp_id = self.request.query_params.get('employee_profile_id')

@@ -9,6 +9,7 @@ Unit and integration tests for Class Category Assignment on Trainer Profiles:
 - Integration with ClassSchedulingService.assign_trainer_to_occurrence
 """
 
+import datetime
 from types import SimpleNamespace
 from django.test import TestCase
 from django.utils import timezone
@@ -270,3 +271,91 @@ class TrainerClassCategoryAssignmentTests(TestCase):
                 db_alias='tenant_test',
             )
         self.assertIn("not qualified or assigned to conduct 'Sweat Bootcamp' classes", str(ctx.exception))
+
+    def test_split_shift_availability_and_midday_break(self):
+        """Verify that split shifts cover peak hours and protect the midday break."""
+        # Clear existing schedules and setup split shift on Monday (day 1)
+        emp = self.trainer.employee_profile
+        EmployeeWorkSchedule.objects.filter(employee_profile=emp).delete()
+        # Shift 1: 06:30 - 11:30 (Morning peak)
+        EmployeeWorkSchedule.objects.create(
+            employee_profile=emp,
+            branch=self.branch,
+            day_of_week=1,
+            start_time='06:30:00',
+            end_time='11:30:00',
+            valid_from=datetime.date(2026, 1, 1),
+            schedule_type='REGULAR',
+            status='ACTIVE',
+        )
+        # Shift 2: 17:00 - 21:30 (Evening peak)
+        EmployeeWorkSchedule.objects.create(
+            employee_profile=emp,
+            branch=self.branch,
+            day_of_week=1,
+            start_time='17:00:00',
+            end_time='21:30:00',
+            valid_from=datetime.date(2026, 1, 1),
+            schedule_type='REGULAR',
+            status='ACTIVE',
+        )
+
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo('Asia/Kolkata')
+
+        # 1. Morning peak test (07:00 AM local time on Monday)
+        monday_morning = datetime.datetime(2026, 12, 7, 7, 0, 0, tzinfo=tz) # Dec 7, 2026 is a Monday
+        avail, reason, details = TrainerAvailabilityService.is_trainer_available(
+            trainer=self.trainer,
+            branch=self.branch,
+            start_datetime=monday_morning,
+            duration_minutes=50,
+            db_alias='tenant_test',
+        )
+        self.assertTrue(avail, reason)
+        self.assertTrue(details.get('is_on_duty'))
+        self.assertEqual(details.get('shift_pool'), 'MORNING')
+
+        # 2. Midday break test (02:00 PM / 14:00 local time on Monday)
+        monday_afternoon = datetime.datetime(2026, 12, 7, 14, 0, 0, tzinfo=tz)
+        avail, reason, details = TrainerAvailabilityService.is_trainer_available(
+            trainer=self.trainer,
+            branch=self.branch,
+            start_datetime=monday_afternoon,
+            duration_minutes=50,
+            db_alias='tenant_test',
+        )
+        self.assertFalse(avail)
+        self.assertEqual(details.get('code'), 'NO_MATCHING_SHIFT')
+        self.assertFalse(details.get('is_on_duty'))
+
+        # 3. Evening peak test (06:00 PM / 18:00 local time on Monday)
+        monday_evening = datetime.datetime(2026, 12, 7, 18, 0, 0, tzinfo=tz)
+        avail, reason, details = TrainerAvailabilityService.is_trainer_available(
+            trainer=self.trainer,
+            branch=self.branch,
+            start_datetime=monday_evening,
+            duration_minutes=50,
+            db_alias='tenant_test',
+        )
+        self.assertTrue(avail, reason)
+        self.assertTrue(details.get('is_on_duty'))
+        self.assertEqual(details.get('shift_pool'), 'EVENING')
+
+    def test_find_eligible_trainers_on_duty_prioritization(self):
+        """Verify find_eligible_trainers returns and prioritizes on-duty status."""
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo('Asia/Kolkata')
+        monday_morning = datetime.datetime(2026, 12, 7, 7, 0, 0, tzinfo=tz)
+        eligible = TrainerAvailabilityService.find_eligible_trainers(
+            organization=self.org,
+            branch=self.branch,
+            start_datetime=monday_morning,
+            duration_minutes=50,
+            include_off_duty=True,
+            db_alias='tenant_test',
+        )
+        self.assertTrue(len(eligible) >= 1)
+        # Should have is_on_duty flag
+        on_duty_flags = [t['is_on_duty'] for t in eligible]
+        self.assertIn(True, on_duty_flags)

@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta
 from typing import Dict, Any, List, Optional
 from django.utils import timezone
 from django.db import transaction
+from config.routers import get_tenant_db_alias
 
 from apps.tenant_core.models_org import Organization
 from apps.tenant_core.models_govern import WhatsAppAutomationPolicy, InAppNotification
@@ -25,7 +26,8 @@ logger = logging.getLogger(__name__)
 class WhatsAppAutomationService:
     @classmethod
     def get_policy(cls, organization: Organization, db_alias: Optional[str] = None) -> WhatsAppAutomationPolicy:
-        manager = WhatsAppAutomationPolicy.objects.using(db_alias) if db_alias else WhatsAppAutomationPolicy.objects
+        target_alias = db_alias if (db_alias and db_alias != 'default') else (get_tenant_db_alias() or None)
+        manager = WhatsAppAutomationPolicy.objects.using(target_alias) if target_alias else WhatsAppAutomationPolicy.objects
         defaults = {
             'booking_confirmation_variable_map': ['member_name', 'class_name', 'start_datetime', 'trainer_name'],
             'booking_reminder_variable_map': ['start_datetime'],
@@ -33,11 +35,15 @@ class WhatsAppAutomationService:
             'lead_welcome_variable_map': ['lead_name'],
             'trial_confirmation_variable_map': ['lead_name', 'class_name', 'start_datetime', 'trainer_name'],
         }
-        policy, _ = manager.get_or_create(
-            organization=organization,
-            defaults=defaults,
-        )
-        return policy
+        try:
+            policy, _ = manager.get_or_create(
+                organization=organization,
+                defaults=defaults,
+            )
+            return policy
+        except Exception as exc:
+            logger.warning("Could not get or create WhatsAppAutomationPolicy: %s", exc)
+            return WhatsAppAutomationPolicy(organization=organization, whatsapp_enabled=True)
 
     @classmethod
     def send_class_booking_confirmation(
@@ -258,7 +264,7 @@ class WhatsAppAutomationService:
     @classmethod
     def process_scheduled_reminders(cls, db_alias: Optional[str] = None) -> List[CommunicationMessage]:
         now = timezone.now()
-        alias = db_alias or 'default'
+        alias = db_alias or get_tenant_db_alias() or 'default'
         dispatched_messages: List[CommunicationMessage] = []
 
         active_bookings = Booking.objects.using(alias).filter(
@@ -406,7 +412,7 @@ class WhatsAppAutomationService:
             return {'action': 'NONE', 'reason': 'NO_ORG'}
 
         policy = cls.get_policy(org, db_alias=db_alias)
-        alias = db_alias or 'default'
+        alias = db_alias or get_tenant_db_alias() or 'default'
         if body_text is None:
             body_text = getattr(inbound_message, 'body_snapshot', '') or ''
         clean_text = (body_text or '').strip().upper()
@@ -546,17 +552,42 @@ class WhatsAppAutomationService:
         """
         from .whatsapp_variables import fmt_ist_datetime
         from apps.tenant_core.models_crm import LeadActivity
+        from config.routers import set_tenant_db_alias
 
-        org = trial.lead.organization if trial.lead else (trial.branch.organization if trial.branch else None)
+        alias = db_alias or get_tenant_db_alias() or 'default'
+        set_tenant_db_alias(alias)
+
+        lead = trial.lead if hasattr(trial, 'lead') and trial.lead else None
+        if not lead and getattr(trial, 'lead_id', None):
+            try:
+                from apps.tenant_core.models_crm import Lead
+                lead = Lead.objects.using(alias).filter(id=trial.lead_id).first()
+            except Exception:
+                pass
+
+        branch = trial.branch if hasattr(trial, 'branch') and trial.branch else None
+        if not branch and getattr(trial, 'branch_id', None):
+            try:
+                from apps.tenant_core.models_org import Branch
+                branch = Branch.objects.using(alias).filter(id=trial.branch_id).first()
+            except Exception:
+                pass
+
+        org = getattr(lead, 'organization', None) or getattr(branch, 'organization', None) or getattr(trial, 'organization', None)
+        if not org:
+            try:
+                from apps.tenant_core.models_org import Organization
+                org = Organization.objects.using(alias).first()
+            except Exception:
+                pass
         if not org:
             return None
 
-        policy = cls.get_policy(org, db_alias=db_alias)
+        policy = cls.get_policy(org, db_alias=alias)
         if not force and not policy.whatsapp_enabled:
             return None
 
-        lead = trial.lead
-        recipient = (lead.phone_normalized or lead.phone_raw or '') if lead else ''
+        recipient = (getattr(lead, 'phone_normalized', None) or getattr(lead, 'phone_raw', None) or '') if lead else ''
         if not recipient:
             return None
 
@@ -568,7 +599,7 @@ class WhatsAppAutomationService:
         if not occ and getattr(trial, 'class_occurrence_id', None):
             try:
                 from apps.tenant_core.models_classes import ClassOccurrence
-                occ = ClassOccurrence.objects.using(db_alias or 'default').select_related('class_template__program').filter(id=trial.class_occurrence_id).first()
+                occ = ClassOccurrence.objects.using(alias).select_related('class_template__program').filter(id=trial.class_occurrence_id).first()
             except Exception:
                 pass
 
@@ -588,7 +619,7 @@ class WhatsAppAutomationService:
         # Lifecycle-aware idempotency key:
         # Incorporates the slot timestamp and cancellation cycle so that a trial that is cancelled
         # and subsequently rebooked correctly dispatches a new booking confirmation while safely deduping retries.
-        prior_cancels = CommunicationMessage.objects.using(db_alias or 'default').filter(
+        prior_cancels = CommunicationMessage.objects.using(alias).filter(
             organization=org,
             related_trial=trial,
             trigger_type='SARVAM_TRIAL_CANCELLATION',
@@ -619,10 +650,10 @@ class WhatsAppAutomationService:
 
             # Record in Lead 360 Timeline (LeadActivity)
             try:
-                LeadActivity.objects.using(db_alias or 'default').create(
+                LeadActivity.objects.using(alias).create(
                     lead=lead,
                     activity_type='WHATSAPP',
-                    outcome='SENT' if msg.status in ('SENT', 'SUBMITTED', 'QUEUED') else 'FAILED',
+                    outcome='SENT' if msg.status in ('SENT', 'SUBMITTED', 'QUEUED', 'DELIVERED') else 'FAILED',
                     notes=f"WhatsApp Trial Confirmation ({template_name}): {body_preview[:200]}",
                     external_reference=f"MSG:{msg.id}",
                     activity_at=timezone.now(),
@@ -646,7 +677,7 @@ class WhatsAppAutomationService:
                     'params': params,
                     'status': msg.status,
                 },
-                db_alias=db_alias,
+                db_alias=alias,
             )
             return msg
         except Exception as exc:
@@ -672,17 +703,42 @@ class WhatsAppAutomationService:
         """
         from .whatsapp_variables import fmt_ist_datetime
         from apps.tenant_core.models_crm import LeadActivity
+        from config.routers import set_tenant_db_alias
 
-        org = trial.lead.organization if trial.lead else (trial.branch.organization if trial.branch else None)
+        alias = db_alias or get_tenant_db_alias() or 'default'
+        set_tenant_db_alias(alias)
+
+        lead = trial.lead if hasattr(trial, 'lead') and trial.lead else None
+        if not lead and getattr(trial, 'lead_id', None):
+            try:
+                from apps.tenant_core.models_crm import Lead
+                lead = Lead.objects.using(alias).filter(id=trial.lead_id).first()
+            except Exception:
+                pass
+
+        branch = trial.branch if hasattr(trial, 'branch') and trial.branch else None
+        if not branch and getattr(trial, 'branch_id', None):
+            try:
+                from apps.tenant_core.models_org import Branch
+                branch = Branch.objects.using(alias).filter(id=trial.branch_id).first()
+            except Exception:
+                pass
+
+        org = getattr(lead, 'organization', None) or getattr(branch, 'organization', None) or getattr(trial, 'organization', None)
+        if not org:
+            try:
+                from apps.tenant_core.models_org import Organization
+                org = Organization.objects.using(alias).first()
+            except Exception:
+                pass
         if not org:
             return None
 
-        policy = cls.get_policy(org, db_alias=db_alias)
+        policy = cls.get_policy(org, db_alias=alias)
         if not force and not policy.whatsapp_enabled:
             return None
 
-        lead = trial.lead
-        recipient = (lead.phone_normalized or lead.phone_raw or '') if lead else ''
+        recipient = (getattr(lead, 'phone_normalized', None) or getattr(lead, 'phone_raw', None) or '') if lead else ''
         if not recipient:
             return None
 
@@ -694,7 +750,7 @@ class WhatsAppAutomationService:
         if not occ and getattr(trial, 'class_occurrence_id', None):
             try:
                 from apps.tenant_core.models_classes import ClassOccurrence
-                occ = ClassOccurrence.objects.using(db_alias or 'default').select_related('class_template__program').filter(id=trial.class_occurrence_id).first()
+                occ = ClassOccurrence.objects.using(alias).select_related('class_template__program').filter(id=trial.class_occurrence_id).first()
             except Exception:
                 pass
 
@@ -734,10 +790,10 @@ class WhatsAppAutomationService:
             )
 
             try:
-                LeadActivity.objects.using(db_alias or 'default').create(
+                LeadActivity.objects.using(alias).create(
                     lead=lead,
                     activity_type='WHATSAPP',
-                    outcome='SENT' if msg.status in ('SENT', 'SUBMITTED', 'QUEUED') else 'FAILED',
+                    outcome='SENT' if msg.status in ('SENT', 'SUBMITTED', 'QUEUED', 'DELIVERED') else 'FAILED',
                     notes=f"WhatsApp Trial Reschedule ({template_name}): {body_preview[:200]}",
                     external_reference=f"MSG:{msg.id}",
                     activity_at=timezone.now(),
@@ -761,7 +817,7 @@ class WhatsAppAutomationService:
                     'params': params,
                     'status': msg.status,
                 },
-                db_alias=db_alias,
+                db_alias=alias,
             )
             return msg
         except Exception as exc:
@@ -787,17 +843,42 @@ class WhatsAppAutomationService:
         """
         from .whatsapp_variables import fmt_ist_datetime
         from apps.tenant_core.models_crm import LeadActivity
+        from config.routers import set_tenant_db_alias
 
-        org = trial.lead.organization if trial.lead else (trial.branch.organization if trial.branch else None)
+        alias = db_alias or get_tenant_db_alias() or 'default'
+        set_tenant_db_alias(alias)
+
+        lead = trial.lead if hasattr(trial, 'lead') and trial.lead else None
+        if not lead and getattr(trial, 'lead_id', None):
+            try:
+                from apps.tenant_core.models_crm import Lead
+                lead = Lead.objects.using(alias).filter(id=trial.lead_id).first()
+            except Exception:
+                pass
+
+        branch = trial.branch if hasattr(trial, 'branch') and trial.branch else None
+        if not branch and getattr(trial, 'branch_id', None):
+            try:
+                from apps.tenant_core.models_org import Branch
+                branch = Branch.objects.using(alias).filter(id=trial.branch_id).first()
+            except Exception:
+                pass
+
+        org = getattr(lead, 'organization', None) or getattr(branch, 'organization', None) or getattr(trial, 'organization', None)
+        if not org:
+            try:
+                from apps.tenant_core.models_org import Organization
+                org = Organization.objects.using(alias).first()
+            except Exception:
+                pass
         if not org:
             return None
 
-        policy = cls.get_policy(org, db_alias=db_alias)
+        policy = cls.get_policy(org, db_alias=alias)
         if not force and not policy.whatsapp_enabled:
             return None
 
-        lead = trial.lead
-        recipient = (lead.phone_normalized or lead.phone_raw or '') if lead else ''
+        recipient = (getattr(lead, 'phone_normalized', None) or getattr(lead, 'phone_raw', None) or '') if lead else ''
         if not recipient:
             return None
 
@@ -809,7 +890,7 @@ class WhatsAppAutomationService:
         if not occ and getattr(trial, 'class_occurrence_id', None):
             try:
                 from apps.tenant_core.models_classes import ClassOccurrence
-                occ = ClassOccurrence.objects.using(db_alias or 'default').select_related('class_template__program').filter(id=trial.class_occurrence_id).first()
+                occ = ClassOccurrence.objects.using(alias).select_related('class_template__program').filter(id=trial.class_occurrence_id).first()
             except Exception:
                 pass
 
@@ -826,7 +907,7 @@ class WhatsAppAutomationService:
         params = [lead_name, program_name, branch_name, class_dt_str]
         template_name = 'sweat_trial_cancel_confirm'
         
-        prior_bookings = CommunicationMessage.objects.using(db_alias or 'default').filter(
+        prior_bookings = CommunicationMessage.objects.using(alias).filter(
             organization=org,
             related_trial=trial,
             trigger_type='SARVAM_TRIAL_CONFIRMATION',
@@ -856,10 +937,10 @@ class WhatsAppAutomationService:
             )
 
             try:
-                LeadActivity.objects.using(db_alias or 'default').create(
+                LeadActivity.objects.using(alias).create(
                     lead=lead,
                     activity_type='WHATSAPP',
-                    outcome='SENT' if msg.status in ('SENT', 'SUBMITTED', 'QUEUED') else 'FAILED',
+                    outcome='SENT' if msg.status in ('SENT', 'SUBMITTED', 'QUEUED', 'DELIVERED') else 'FAILED',
                     notes=f"WhatsApp Trial Cancellation ({template_name}): {body_preview[:200]}",
                     external_reference=f"MSG:{msg.id}",
                     activity_at=timezone.now(),
@@ -883,7 +964,7 @@ class WhatsAppAutomationService:
                     'params': params,
                     'status': msg.status,
                 },
-                db_alias=db_alias,
+                db_alias=alias,
             )
             return msg
         except Exception as exc:
@@ -1000,7 +1081,7 @@ class WhatsAppAutomationService:
                 LeadActivity.objects.using(db_alias or 'default').create(
                     lead=lead,
                     activity_type='WHATSAPP',
-                    outcome='SENT' if msg.status in ('SENT', 'SUBMITTED', 'QUEUED') else 'FAILED',
+                    outcome='SENT' if msg.status in ('SENT', 'SUBMITTED', 'QUEUED', 'DELIVERED') else 'FAILED',
                     notes=f"WhatsApp Trial Reminder ({template_name}): {body_preview[:200]}",
                     external_reference=f"MSG:{msg.id}",
                     activity_at=timezone.now(),
@@ -1119,20 +1200,27 @@ class WhatsAppAutomationService:
         message_text: Optional[str] = None,
         actor_user: Optional[TenantUser] = None,
         db_alias: Optional[str] = None,
+        force: bool = True,
     ) -> Optional[CommunicationMessage]:
         """
         Dispatches an automated or 1-click WhatsApp follow-up to a lead after an unanswered / busy call.
-        Uses the approved Gupshup / Meta template 'sweat_call_missed_followup' with fallback to custom body.
+        Uses approved Gupshup / Meta template 'when_user_misses_the_call_from_telecmi_01' (or policy template)
+        with single variable parameter matching Meta template specification.
         Guaranteed idempotent by call session ID.
         """
         from typing import Any
-        alias = db_alias or 'default'
+        alias = db_alias or get_tenant_db_alias() or 'default'
         target_lead = lead or getattr(session, 'lead', None)
         if not target_lead:
             logger.warning("send_unanswered_call_followup: No lead attached to session %s", getattr(session, 'id', None))
             return None
 
-        recipient = target_lead.phone or getattr(session, 'user_phone_number', '') or ''
+        recipient = (
+            getattr(target_lead, 'phone_normalized', None)
+            or getattr(target_lead, 'phone_raw', None)
+            or getattr(session, 'user_phone_number', '')
+            or ''
+        )
         if not recipient:
             logger.warning("send_unanswered_call_followup: No phone for lead %s", target_lead.id)
             return None
@@ -1141,22 +1229,30 @@ class WhatsAppAutomationService:
         if not org:
             return None
 
+        policy = cls.get_policy(org, db_alias=alias)
+        if not force and not policy.whatsapp_enabled:
+            logger.info("send_unanswered_call_followup: policy.whatsapp_enabled is False and force=False; skipping.")
+            return None
+
         # Build template parameters
-        first_name = target_lead.first_name or 'there'
+        first_name = (target_lead.first_name or '').strip()
+        if not first_name or first_name.lower().startswith('prospect'):
+            first_name = 'there'
         rep_name = f"{actor_user.first_name} {actor_user.last_name}".strip() if actor_user else 'Sales Team'
 
         default_body = f"Hi {first_name}, I tried reaching you from SWEAT Elite regarding your fitness inquiry. When is a convenient time to speak?"
         final_body = (message_text or '').strip() or default_body
 
-        template_name = 'when_user_misses_the_call_from_telecmi_01'
-        params = {
-            '1': first_name,
-            'name': first_name,
-            'lead_name': first_name,
-            'rep_name': rep_name,
-        }
+        template_name = (
+            getattr(policy, 'call_missed_template_name', None)
+            or 'when_user_misses_the_call_from_telecmi_01'
+        )
 
-        idempotency_key = f"WHATSAPP_CALL_MISSED_{session.id}"
+        # Meta template expects exactly 1 variable parameter: {{1}} for lead's first name
+        params = {'1': first_name}
+
+        sess_id = getattr(session, 'id', None) or f"{target_lead.id}_{int(timezone.now().timestamp())}"
+        idempotency_key = f"WHATSAPP_CALL_MISSED_{sess_id}"
 
         try:
             msg = CommunicationService.send_communication(
@@ -1174,19 +1270,38 @@ class WhatsAppAutomationService:
                 created_by_user=actor_user,
             )
 
-            # Record verified LeadActivity on lead timeline
+            is_dispatched = bool(msg and msg.status in ('SENT', 'SUBMITTED', 'DELIVERED'))
             from apps.tenant_core.models_crm import LeadActivity
-            LeadActivity.objects.using(alias).create(
-                lead=target_lead,
-                activity_type='WHATSAPP',
-                outcome='SENT',
-                notes=f"💬 WhatsApp follow-up dispatched (Disposition: {session.disposition or 'Unanswered'}):\n\"{final_body}\"",
-                performed_by_user=actor_user,
-                external_reference=str(session.id),
-                activity_at=timezone.now(),
-            )
+            if is_dispatched:
+                LeadActivity.objects.using(alias).create(
+                    lead=target_lead,
+                    activity_type='WHATSAPP',
+                    outcome='SENT',
+                    notes=f"💬 WhatsApp follow-up dispatched (Disposition: {getattr(session, 'disposition', None) or 'Unanswered'}):\n\"{final_body}\"",
+                    performed_by_user=actor_user,
+                    external_reference=str(sess_id),
+                    activity_at=timezone.now(),
+                )
+                logger.info(
+                    "send_unanswered_call_followup: Successfully dispatched WhatsApp to %s for session %s (msg_id: %s)",
+                    recipient, sess_id, msg.provider_message_id,
+                )
+            else:
+                failure_reason = getattr(msg, 'failure_reason', 'Provider failed to accept message')
+                LeadActivity.objects.using(alias).create(
+                    lead=target_lead,
+                    activity_type='WHATSAPP',
+                    outcome='FAILED',
+                    notes=f"❌ WhatsApp follow-up failed (Disposition: {getattr(session, 'disposition', None) or 'Unanswered'}): {failure_reason}",
+                    performed_by_user=actor_user,
+                    external_reference=str(sess_id),
+                    activity_at=timezone.now(),
+                )
+                logger.warning(
+                    "send_unanswered_call_followup: WhatsApp delivery failed for %s (session %s): %s",
+                    recipient, sess_id, failure_reason,
+                )
 
-            logger.info("send_unanswered_call_followup: Successfully dispatched WhatsApp to %s for session %s", recipient, session.id)
             return msg
 
         except Exception as exc:
@@ -1272,7 +1387,7 @@ class WhatsAppAutomationService:
                 LeadActivity.objects.using(db_alias or 'default').create(
                     lead=lead,
                     activity_type='WHATSAPP',
-                    outcome='SENT' if msg.status in ('SENT', 'SUBMITTED', 'QUEUED') else 'FAILED',
+                    outcome='SENT' if msg.status in ('SENT', 'SUBMITTED', 'QUEUED', 'DELIVERED') else 'FAILED',
                     notes=f"WhatsApp Attendance Confirmation Request ({template_name}): {preview_body[:200]}",
                     external_reference=f"MSG:{msg.id}",
                     activity_at=timezone.now(),
@@ -1373,7 +1488,7 @@ class WhatsAppAutomationService:
                 LeadActivity.objects.using(db_alias or 'default').create(
                     lead=lead,
                     activity_type='WHATSAPP',
-                    outcome='SENT' if msg.status in ('SENT', 'SUBMITTED', 'QUEUED') else 'FAILED',
+                    outcome='SENT' if msg.status in ('SENT', 'SUBMITTED', 'QUEUED', 'DELIVERED') else 'FAILED',
                     notes=f"WhatsApp Pre-Class Reminder & Entry Pass ({template_name})",
                     external_reference=f"MSG:{msg.id}",
                     activity_at=timezone.now(),
@@ -1464,7 +1579,7 @@ class WhatsAppAutomationService:
                 LeadActivity.objects.using(db_alias or 'default').create(
                     lead=lead,
                     activity_type='WHATSAPP',
-                    outcome='SENT' if msg.status in ('SENT', 'SUBMITTED', 'QUEUED') else 'FAILED',
+                    outcome='SENT' if msg.status in ('SENT', 'SUBMITTED', 'QUEUED', 'DELIVERED') else 'FAILED',
                     notes=f"WhatsApp Auto-Cancel Notice ({template_name})",
                     external_reference=f"MSG:{msg.id}",
                     activity_at=timezone.now(),
@@ -1623,7 +1738,7 @@ class WhatsAppAutomationService:
                 LeadActivity.objects.using(db_alias or 'default').create(
                     lead=lead,
                     activity_type='WHATSAPP',
-                    outcome='SENT' if msg.status in ('SENT', 'SUBMITTED', 'QUEUED') else 'FAILED',
+                    outcome='SENT' if msg.status in ('SENT', 'SUBMITTED', 'QUEUED', 'DELIVERED') else 'FAILED',
                     notes=f"WhatsApp Post-Trial Review Request ({template_name})",
                     external_reference=f"MSG:{msg.id}",
                     activity_at=timezone.now(),
@@ -1724,7 +1839,7 @@ class WhatsAppAutomationService:
         5. Dispatches Late Rebook Window Reminders (+24h after cancellation).
         """
         now = timezone.now()
-        alias = db_alias or 'default'
+        alias = db_alias or get_tenant_db_alias() or 'default'
         results = {
             'confirm_requests_sent': 0,
             'pre_class_passes_sent': 0,

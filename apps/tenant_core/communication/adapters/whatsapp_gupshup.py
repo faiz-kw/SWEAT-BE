@@ -87,10 +87,15 @@ class GupshupWhatsAppAdapter(BaseCommunicationAdapter):
         return self._normalize_phone(raw_source)
 
     def _normalize_phone(self, phone: Any) -> str:
-        """Strip non-digits, return E.164 digits without +."""
+        """Strip non-digits, ensure E.164 digits without + (normalizes 10-digit Indian numbers with 91 prefix)."""
         if not phone:
             return ''
-        return re.sub(r'\D', '', str(phone).strip())
+        digits = re.sub(r'\D', '', str(phone).strip())
+        if len(digits) == 10:
+            digits = '91' + digits
+        elif len(digits) == 11 and digits.startswith('0'):
+            digits = '91' + digits[1:]
+        return digits
 
     def _mask_phone(self, phone: str) -> str:
         """Mask phone for safe logging."""

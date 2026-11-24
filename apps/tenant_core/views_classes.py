@@ -520,31 +520,77 @@ class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
         if not branches:
             return Response({'branch': 'Please select at least one branch.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        raw_time_slots = request.data.get('time_slots')
-        if not isinstance(raw_time_slots, list) or len(raw_time_slots) == 0:
-            if request.data.get('start_time') and request.data.get('end_time'):
-                raw_time_slots = [{
-                    'start_time': request.data.get('start_time'),
-                    'end_time': request.data.get('end_time')
-                }]
-            else:
-                return Response({'time_slots': 'Please configure at least one valid time slot.'}, status=status.HTTP_400_BAD_REQUEST)
+        # Multi-template support: support either 'templates' / 'template_blocks' array or single template fields
+        raw_templates = request.data.get('templates') or request.data.get('template_blocks')
+        if isinstance(raw_templates, list) and len(raw_templates) > 0:
+            template_blocks = raw_templates
+        else:
+            raw_time_slots = request.data.get('time_slots')
+            if not isinstance(raw_time_slots, list) or len(raw_time_slots) == 0:
+                if request.data.get('start_time') and request.data.get('end_time'):
+                    raw_time_slots = [{
+                        'start_time': request.data.get('start_time'),
+                        'end_time': request.data.get('end_time')
+                    }]
+                else:
+                    raw_time_slots = []
+            template_blocks = [{
+                'class_template': request.data.get('class_template'),
+                'days_of_week': request.data.get('days_of_week', [1, 2, 3, 4, 5]),
+                'time_slots': raw_time_slots,
+                'default_trainer': request.data.get('default_trainer') or request.data.get('default_trainer_id'),
+            }]
 
-        # Intra-request validation for time slots
-        validated_slots = []
-        seen_slots = set()
-        for idx, slot in enumerate(raw_time_slots, start=1):
-            st = str(slot.get('start_time') or '').strip()
-            et = str(slot.get('end_time') or '').strip()
-            if not st or not et:
-                return Response({'time_slots': f"Slot #{idx} is missing start time or end time."}, status=status.HTTP_400_BAD_REQUEST)
-            if et <= st:
-                return Response({'time_slots': f"Slot #{idx} ({st} – {et}): End time must be strictly greater than start time."}, status=status.HTTP_400_BAD_REQUEST)
-            key = (st[:5], et[:5])
-            if key in seen_slots:
-                return Response({'time_slots': f"Duplicate time slot ({key[0]} – {key[1]}) found in submission."}, status=status.HTTP_400_BAD_REQUEST)
-            seen_slots.add(key)
-            validated_slots.append({'start_time': st, 'end_time': et})
+        # Validate template blocks
+        parsed_blocks = []
+        for b_idx, block in enumerate(template_blocks, start=1):
+            tpl_id = block.get('class_template') or block.get('class_template_id')
+            if not tpl_id:
+                return Response({'class_template': f"Template block #{b_idx} is missing a selected class template."}, status=status.HTTP_400_BAD_REQUEST)
+
+            days = block.get('days_of_week')
+            if not isinstance(days, list) or len(days) == 0:
+                return Response({'days_of_week': f"Template block #{b_idx} must have at least one active day of week."}, status=status.HTTP_400_BAD_REQUEST)
+
+            b_slots = block.get('time_slots')
+            if not isinstance(b_slots, list) or len(b_slots) == 0:
+                return Response({'time_slots': f"Template block #{b_idx} must have at least one valid time slot."}, status=status.HTTP_400_BAD_REQUEST)
+
+            validated_slots = []
+            seen_slots = set()
+            for s_idx, slot in enumerate(b_slots, start=1):
+                st = str(slot.get('start_time') or '').strip()
+                et = str(slot.get('end_time') or '').strip()
+                if not st or not et:
+                    return Response({'time_slots': f"Template #{b_idx}, Slot #{s_idx} is missing start time or end time."}, status=status.HTTP_400_BAD_REQUEST)
+                if et <= st:
+                    return Response({'time_slots': f"Template #{b_idx}, Slot #{s_idx} ({st} – {et}): End time must be strictly greater than start time."}, status=status.HTTP_400_BAD_REQUEST)
+                key = (st[:5], et[:5])
+                if key in seen_slots:
+                    return Response({'time_slots': f"Template #{b_idx}: Duplicate time slot ({key[0]} – {key[1]}) found in submission."}, status=status.HTTP_400_BAD_REQUEST)
+                seen_slots.add(key)
+                validated_slots.append({'start_time': st, 'end_time': et})
+
+            parsed_blocks.append({
+                'class_template': tpl_id,
+                'days_of_week': days,
+                'time_slots': validated_slots,
+                'default_trainer': block.get('default_trainer') or block.get('default_trainer_id'),
+            })
+
+        # Process optional trainer assignments from Step 2 Preview
+        trainer_lookup = {}
+        raw_assignments = request.data.get('trainer_assignments') or []
+        if isinstance(raw_assignments, list):
+            for ta in raw_assignments:
+                t_date = str(ta.get('date') or '').strip()
+                t_time = str(ta.get('start_time') or '').strip()[:5]
+                t_branch = str(ta.get('branch') or ta.get('branch_id') or '').strip()
+                t_tpl = str(ta.get('class_template') or ta.get('class_template_id') or '').strip()
+                t_id = ta.get('trainer') or ta.get('trainer_id') or ta.get('trainer_profile_id')
+                if t_id and t_date and t_time:
+                    trainer_lookup[(t_date, t_time, t_branch, t_tpl)] = str(t_id)
+                    trainer_lookup[(t_date, t_time, t_branch)] = str(t_id)
 
         auto_generate = request.data.get('generate_slots', True)
         gen_from = request.data.get('generate_from_date') or request.data.get('valid_from')
@@ -559,77 +605,116 @@ class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
 
         created_rules = []
         total_occurrences_count = 0
+        total_trainers_assigned = 0
         duplicate_rules = []
         partial_errors = []
 
+        total_attempts = 0
         with transaction.atomic(using=alias):
-            for branch_id in branches:
-                for s in validated_slots:
-                    sid = transaction.savepoint(using=alias)
-                    data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
-                    data['branch'] = branch_id
-                    data['start_time'] = s['start_time']
-                    data['end_time'] = s['end_time']
-                    data.pop('branches', None)
-                    data.pop('time_slots', None)
-                    data.pop('generate_slots', None)
-                    data.pop('generate_from_date', None)
-                    data.pop('generate_to_date', None)
+            for block in parsed_blocks:
+                tpl_id = block['class_template']
+                days = block['days_of_week']
+                b_def_trainer = block.get('default_trainer')
 
-                    serializer = self.get_serializer(data=data)
-                    if not serializer.is_valid():
-                        transaction.savepoint_rollback(sid, using=alias)
-                        err_dict = serializer.errors
-                        err_msg = '; '.join([f"{k}: {v[0] if isinstance(v, list) else v}" for k, v in err_dict.items()])
-                        if 'already exists' in err_msg.lower():
-                            duplicate_rules.append(err_msg)
-                        else:
-                            partial_errors.append(f"Branch {branch_id} ({s['start_time']}–{s['end_time']}): {err_msg}")
-                        continue
+                for branch_id in branches:
+                    for s in block['time_slots']:
+                        total_attempts += 1
+                        sid = transaction.savepoint(using=alias)
+                        data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
+                        data['class_template'] = tpl_id
+                        data['days_of_week'] = days
+                        data['branch'] = branch_id
+                        data['start_time'] = s['start_time']
+                        data['end_time'] = s['end_time']
+                        data.setdefault('delivery_mode', 'OFFLINE')
+                        data.setdefault('status', 'ACTIVE')
 
-                    try:
-                        rule = serializer.save()
-                        record_business_audit(
-                            organization=rule.branch.organization,
-                            branch=rule.branch,
-                            module='classes',
-                            action_code='SCHEDULE_RULE_CREATED',
-                            entity_type='ClassScheduleRule',
-                            entity_id=rule.id,
-                            actor_user=request.user,
-                            event_description=f"Created recurring schedule rule for {rule.class_template.name} at {rule.branch.name} ({s['start_time']}–{s['end_time']})",
-                            after_data={
-                                'template_name': rule.class_template.name,
-                                'branch_name': rule.branch.name,
-                                'days': rule.days_of_week,
-                                'time_window': f"{s['start_time']} – {s['end_time']}",
-                                'status': rule.status,
-                            },
-                            db_alias=alias,
-                        )
-                        created_rules.append(rule)
+                        data.pop('branches', None)
+                        data.pop('time_slots', None)
+                        data.pop('templates', None)
+                        data.pop('template_blocks', None)
+                        data.pop('trainer_assignments', None)
+                        data.pop('default_trainer', None)
+                        data.pop('default_trainer_id', None)
+                        data.pop('generate_slots', None)
+                        data.pop('generate_from_date', None)
+                        data.pop('generate_to_date', None)
 
-                        if auto_generate and gen_from and gen_to:
-                            try:
-                                from_d = date.fromisoformat(str(gen_from))
-                                to_d = date.fromisoformat(str(gen_to))
-                                occs = ClassSchedulingService.generate_occurrences_from_rule(
-                                    rule=rule,
-                                    from_date=from_d,
-                                    to_date=to_d,
-                                    actor=request.user,
-                                    db_alias=alias,
-                                )
-                                total_occurrences_count += len(occs)
-                            except Exception as exc:
-                                logger.warning(f"Failed to generate occurrences for rule {rule.id}: {exc}")
+                        serializer = self.get_serializer(data=data)
+                        if not serializer.is_valid():
+                            transaction.savepoint_rollback(sid, using=alias)
+                            err_dict = serializer.errors
+                            err_msg = '; '.join([f"{k}: {v[0] if isinstance(v, list) else v}" for k, v in err_dict.items()])
+                            if 'already exists' in err_msg.lower():
+                                duplicate_rules.append(err_msg)
+                            else:
+                                partial_errors.append(f"Branch {branch_id} ({s['start_time']}–{s['end_time']}): {err_msg}")
+                            continue
 
-                        transaction.savepoint_commit(sid, using=alias)
-                    except Exception as exc:
-                        transaction.savepoint_rollback(sid, using=alias)
-                        partial_errors.append(f"Branch {branch_id} ({s['start_time']}–{s['end_time']}): {str(exc)}")
+                        try:
+                            rule = serializer.save()
+                            record_business_audit(
+                                organization=rule.branch.organization,
+                                branch=rule.branch,
+                                module='classes',
+                                action_code='SCHEDULE_RULE_CREATED',
+                                entity_type='ClassScheduleRule',
+                                entity_id=rule.id,
+                                actor_user=request.user,
+                                event_description=f"Created recurring schedule rule for {rule.class_template.name} at {rule.branch.name} ({s['start_time']}–{s['end_time']})",
+                                after_data={
+                                    'template_name': rule.class_template.name,
+                                    'branch_name': rule.branch.name,
+                                    'days': rule.days_of_week,
+                                    'time_window': f"{s['start_time']} – {s['end_time']}",
+                                    'status': rule.status,
+                                },
+                                db_alias=alias,
+                            )
+                            created_rules.append(rule)
 
-        total_attempts = len(branches) * len(validated_slots)
+                            if auto_generate and gen_from and gen_to:
+                                try:
+                                    from_d = date.fromisoformat(str(gen_from))
+                                    to_d = date.fromisoformat(str(gen_to))
+                                    occs = ClassSchedulingService.generate_occurrences_from_rule(
+                                        rule=rule,
+                                        from_date=from_d,
+                                        to_date=to_d,
+                                        actor=request.user,
+                                        db_alias=alias,
+                                    )
+                                    total_occurrences_count += len(occs)
+
+                                    # Auto-assign trainer if configured via Preview or default
+                                    for occ in occs:
+                                        occ_d_str = occ.date.isoformat()
+                                        occ_t_str = occ.start_time.strftime('%H:%M') if hasattr(occ.start_time, 'strftime') else str(occ.start_time)[:5]
+                                        assigned_tr_id = (
+                                            trainer_lookup.get((occ_d_str, occ_t_str, str(occ.branch_id), str(occ.class_template_id)))
+                                            or trainer_lookup.get((occ_d_str, occ_t_str, str(occ.branch_id)))
+                                            or b_def_trainer
+                                        )
+                                        if assigned_tr_id:
+                                            try:
+                                                ClassSchedulingService.assign_trainer_to_occurrence(
+                                                    occurrence_id=str(occ.id),
+                                                    trainer_profile_id=str(assigned_tr_id),
+                                                    trainer_role='LEAD',
+                                                    actor=request.user,
+                                                    db_alias=alias,
+                                                )
+                                                total_trainers_assigned += 1
+                                            except Exception as tr_err:
+                                                logger.warning(f"Could not assign trainer {assigned_tr_id} to occurrence {occ.id}: {tr_err}")
+                                except Exception as exc:
+                                    logger.warning(f"Failed to generate occurrences for rule {rule.id}: {exc}")
+
+                            transaction.savepoint_commit(sid, using=alias)
+                        except Exception as exc:
+                            transaction.savepoint_rollback(sid, using=alias)
+                            partial_errors.append(f"Branch {branch_id} ({s['start_time']}–{s['end_time']}): {str(exc)}")
+
         if not created_rules:
             if duplicate_rules and len(duplicate_rules) == total_attempts:
                 return Response({
@@ -646,7 +731,10 @@ class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
         serialized = self.get_serializer(created_rules, many=True).data
         message = f"Successfully created {len(created_rules)} recurring schedule rule(s) across {len(branches)} branch(es)"
         if total_occurrences_count > 0:
-            message += f" and generated {total_occurrences_count} class slot(s)."
+            message += f" and generated {total_occurrences_count} class slot(s)"
+            if total_trainers_assigned > 0:
+                message += f" with {total_trainers_assigned} trainer assignment(s)"
+            message += "."
         else:
             message += "."
         if duplicate_rules:
@@ -658,6 +746,7 @@ class ClassScheduleRuleViewSet(viewsets.ModelViewSet):
             'rules': serialized,
             'count': len(created_rules),
             'occurrences_generated': total_occurrences_count,
+            'trainers_assigned': total_trainers_assigned,
             'duplicates_skipped': len(duplicate_rules),
             'partial_errors': partial_errors,
             'message': message,

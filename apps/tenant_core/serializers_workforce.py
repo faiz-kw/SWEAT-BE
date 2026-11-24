@@ -272,6 +272,8 @@ class SalesProfileSerializer(serializers.ModelSerializer):
 class EmployeeWorkScheduleSerializer(serializers.ModelSerializer):
     branch_name = serializers.CharField(source='branch.name', read_only=True)
     employee_name = serializers.SerializerMethodField()
+    trainer_id = serializers.SerializerMethodField()
+    trainer_code = serializers.SerializerMethodField()
 
     class Meta:
         model = EmployeeWorkSchedule
@@ -283,6 +285,20 @@ class EmployeeWorkScheduleSerializer(serializers.ModelSerializer):
         first = up.first_name_snapshot or getattr(up.user, 'first_name', '')
         last = up.last_name_snapshot or getattr(up.user, 'last_name', '')
         return f"{first} {last}".strip()
+
+    def get_trainer_id(self, obj):
+        try:
+            tp = getattr(obj.employee_profile, 'trainer_profile', None)
+            return str(tp.id) if tp else None
+        except Exception:
+            return None
+
+    def get_trainer_code(self, obj):
+        try:
+            tp = getattr(obj.employee_profile, 'trainer_profile', None)
+            return tp.trainer_code if tp else None
+        except Exception:
+            return None
 
 
 class EmployeeScheduleExceptionSerializer(serializers.ModelSerializer):

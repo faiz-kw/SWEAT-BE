@@ -1210,18 +1210,14 @@ class VoiceAgentBookTrialView(View):
                         f"⏰ *Arrival:* Please arrive 15 minutes early for your biometric check-in & tour.\n\n"
                         f"Questions or need to reschedule? Simply reply to this chat!"
                     )
-                    CommunicationService.send_communication(
-                        organization=lead.organization,
-                        channel='WHATSAPP',
-                        recipient=lead.phone_normalized,
-                        lead=lead,
-                        body=wa_body,
-                        purpose='TRANSACTIONAL',
-                        idempotency_key=f"VOICE_TRIAL_CONFIRM_WA_{trial.id}",
-                        trigger_type='SYSTEM',
+                    from apps.tenant_core.communication.whatsapp_automation import WhatsAppAutomationService
+                    wa_msg = WhatsAppAutomationService.send_sarvam_trial_booking_confirmation(
+                        trial=trial,
+                        db_alias=alias,
+                        force=True,
                     )
-                    wa_sent = True
-                    logger.info("Dispatched WhatsApp booking confirmation to %s for trial %s", lead.phone_normalized, trial.id)
+                    wa_sent = bool(wa_msg and wa_msg.status in ('SENT', 'SUBMITTED', 'DELIVERED', 'QUEUED'))
+                    logger.info("Dispatched WhatsApp booking confirmation to %s for trial %s (msg: %s)", lead.phone_normalized, trial.id, getattr(wa_msg, 'id', None))
                 except Exception as wa_err:
                     logger.warning("Could not dispatch automated WhatsApp booking confirmation: %s", wa_err)
 

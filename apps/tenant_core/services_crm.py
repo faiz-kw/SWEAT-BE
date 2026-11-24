@@ -2158,7 +2158,59 @@ class CRMLeadService:
                 db_alias=alias,
             )
 
-            return trial
+        # Fail-safe synchronous WhatsApp confirmation dispatch outside the atomic block
+        cls._dispatch_trial_booking_whatsapp(trial, db_alias=alias)
+
+        return trial
+
+    @classmethod
+    def _dispatch_trial_booking_whatsapp(cls, trial: TrialBooking, db_alias: Optional[str] = None):
+        """Dispatches automated trial booking confirmation via WhatsApp (fail-safe side-effect)."""
+        try:
+            from apps.tenant_core.communication.whatsapp_automation import WhatsAppAutomationService
+            wa_msg = WhatsAppAutomationService.send_sarvam_trial_booking_confirmation(
+                trial=trial,
+                db_alias=db_alias,
+                force=True,
+            )
+            if wa_msg and wa_msg.status in ('SENT', 'SUBMITTED', 'DELIVERED', 'QUEUED'):
+                trial._whatsapp_sent = True
+                trial._whatsapp_message_id = wa_msg.provider_message_id
+            elif wa_msg and wa_msg.status == 'FAILED':
+                trial._whatsapp_sent = False
+                trial._whatsapp_error = wa_msg.failure_reason or 'WhatsApp delivery failed at provider'
+            else:
+                trial._whatsapp_sent = False
+                trial._whatsapp_error = 'WhatsApp message could not be sent (check lead phone or provider configuration)'
+            return wa_msg
+        except Exception as exc:
+            logger.error("Failed to dispatch automated WhatsApp trial confirmation for trial %s: %s", getattr(trial, 'id', None), exc, exc_info=True)
+            trial._whatsapp_sent = False
+            trial._whatsapp_error = str(exc)
+            return None
+
+    @classmethod
+    def _dispatch_trial_reschedule_whatsapp(cls, trial: TrialBooking, db_alias: Optional[str] = None):
+        """Dispatches automated trial reschedule confirmation via WhatsApp (fail-safe side-effect)."""
+        try:
+            from apps.tenant_core.communication.whatsapp_automation import WhatsAppAutomationService
+            wa_msg = WhatsAppAutomationService.send_sarvam_trial_reschedule_confirmation(
+                trial=trial,
+                db_alias=db_alias,
+                force=True,
+            )
+            if wa_msg and wa_msg.status in ('SENT', 'SUBMITTED', 'DELIVERED', 'QUEUED'):
+                trial._whatsapp_sent = True
+                trial._whatsapp_message_id = wa_msg.provider_message_id
+            elif wa_msg and wa_msg.status == 'FAILED':
+                trial._whatsapp_sent = False
+                trial._whatsapp_error = wa_msg.failure_reason or 'WhatsApp delivery failed at provider'
+            return wa_msg
+        except Exception as exc:
+            logger.error("Failed to dispatch automated WhatsApp trial reschedule for trial %s: %s", getattr(trial, 'id', None), exc, exc_info=True)
+            trial._whatsapp_sent = False
+            trial._whatsapp_error = str(exc)
+            return None
 
     @classmethod
     def confirm_trial(
@@ -2484,7 +2536,10 @@ class CRMLeadService:
                 db_alias=alias,
             )
 
-            return trial
+        # Fail-safe synchronous WhatsApp reschedule confirmation dispatch outside the atomic block
+        cls._dispatch_trial_reschedule_whatsapp(trial, db_alias=alias)
+
+        return trial
 
     @classmethod
     def get_canonical_active_trial(

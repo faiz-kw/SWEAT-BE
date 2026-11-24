@@ -14,6 +14,7 @@ Exposes:
 
 import os
 import json
+import re
 import time
 import logging
 import zoneinfo
@@ -931,12 +932,6 @@ class CallDispositionView(APIView):
             if not session:
                 session = CallSession.objects.filter(provider_attempt_id=session_id).first()
 
-            if not session and user:
-                session = CallSession.objects.filter(
-                    sales_rep=user,
-                    created_at__gte=timezone.now() - timedelta(minutes=15)
-                ).order_by('-created_at').first()
-
             from .security_utils import is_masked_phone
             raw_caller_phone = str(request.data.get('caller_phone', '')).strip()
             caller_phone = '' if is_masked_phone(raw_caller_phone) else raw_caller_phone
@@ -948,25 +943,38 @@ class CallDispositionView(APIView):
                 except Exception:
                     resolved_lead = None
 
+            if not session and user and caller_phone:
+                clean_caller = re.sub(r'\D', '', caller_phone)
+                last10_caller = clean_caller[-10:] if len(clean_caller) >= 10 else clean_caller
+                session = CallSession.objects.filter(
+                    sales_rep=user,
+                    user_phone_number__icontains=last10_caller,
+                    created_at__gte=timezone.now() - timedelta(minutes=15)
+                ).order_by('-created_at').first()
+
             if not session:
                 # Ensure the call session is captured so the agent's logged work is NEVER lost
                 org = (resolved_lead.organization if resolved_lead else None) or getattr(user, 'organization', None) or Organization.objects.first()
                 branch = (resolved_lead.branch if resolved_lead else None) or getattr(user, 'home_branch', None) or Branch.objects.filter(organization=org).first()
-                session = CallSession.objects.create(
-                    organization=org,
-                    lead=resolved_lead,
-                    sales_rep=user if getattr(user, 'is_authenticated', False) else None,
-                    branch=branch,
-                    provider='VOBIZ',
-                    direction=request.data.get('direction', 'OUTBOUND'),
-                    call_mode='HUMAN_MANUAL',
-                    status='COMPLETED',
-                    user_phone_number=caller_phone or (resolved_lead.phone_normalized if resolved_lead else ''),
-                    duration_seconds=float(request.data.get('duration_seconds', 0.0) or 0.0),
-                    disposition=disposition,
-                    disposition_notes=notes,
-                    disposition_submitted_at=timezone.now(),
-                )
+                create_kwargs = {
+                    'organization': org,
+                    'lead': resolved_lead,
+                    'sales_rep': user if getattr(user, 'is_authenticated', False) else None,
+                    'branch': branch,
+                    'provider': 'VOBIZ',
+                    'direction': request.data.get('direction', 'OUTBOUND'),
+                    'call_mode': 'HUMAN_MANUAL',
+                    'status': 'COMPLETED',
+                    'user_phone_number': caller_phone or (resolved_lead.phone_normalized if resolved_lead else ''),
+                    'duration_seconds': float(request.data.get('duration_seconds', 0.0) or 0.0),
+                    'disposition': disposition,
+                    'disposition_notes': notes,
+                    'disposition_submitted_at': timezone.now(),
+                    'provider_attempt_id': str(session_id),
+                }
+                if val:
+                    create_kwargs['id'] = val
+                session = CallSession.objects.create(**create_kwargs)
 
             # Update CallSession
             session.disposition = disposition
@@ -994,14 +1002,20 @@ class CallDispositionView(APIView):
                     )
                     if not is_member:
                         lead = Lead.objects.filter(phone_normalized__icontains=last10).first()
-                        if not lead and disposition in ('TRIAL_BOOKED', 'INTERESTED', 'CALLBACK_REQUESTED', 'FOLLOW_UP_NEEDED'):
+                        if not lead and hasattr(Lead, 'phone_raw'):
+                            lead = Lead.objects.filter(phone_raw__icontains=last10).first()
+
+                        if not lead:
+                            req_lead_name = str(request.data.get('lead_name', '')).strip()
+                            first_name = req_lead_name.split()[0] if req_lead_name else f"Prospect {last10[-4:]}"
+                            last_name = " ".join(req_lead_name.split()[1:]) if req_lead_name and len(req_lead_name.split()) > 1 else ""
                             org = session.organization or getattr(user, 'organization', None) or Organization.objects.first()
                             branch = session.branch or getattr(user, 'home_branch', None) or Branch.objects.filter(organization=org).first()
                             lead = Lead.objects.create(
                                 organization=org,
                                 branch=branch,
-                                first_name=f"Prospect {last10[-4:]}",
-                                last_name="",
+                                first_name=first_name,
+                                last_name=last_name,
                                 phone_normalized=phone_to_check if phone_to_check.startswith('+') else f"+91{last10}",
                                 current_status='TRIAL_BOOKED' if disposition == 'TRIAL_BOOKED' else ('INTERESTED' if disposition == 'INTERESTED' else 'NEW_LEAD'),
                                 first_touch_source='OUTBOUND_CALL',
@@ -1064,8 +1078,10 @@ class CallDispositionView(APIView):
             send_whatsapp = bool(request.data.get('send_whatsapp', False))
             whatsapp_msg_override = request.data.get('whatsapp_message', '').strip()
             whatsapp_dispatched = False
+            whatsapp_error = None
+            wa_message_id = None
 
-            unanswered_dispositions = ('NO_ANSWER', 'RINGING_NO_ANSWER', 'BUSY', 'BUSY_CALLBACK', 'SWITCHED_OFF')
+            unanswered_dispositions = ('NO_ANSWER', 'RINGING_NO_ANSWER', 'BUSY', 'BUSY_CALLBACK', 'SWITCHED_OFF', 'CALLBACK_REQUESTED')
             should_send_wa = send_whatsapp or (
                 request.data.get('send_whatsapp') is None and disposition in unanswered_dispositions
             )
@@ -1079,10 +1095,24 @@ class CallDispositionView(APIView):
                         message_text=whatsapp_msg_override or None,
                         actor_user=user if getattr(user, 'is_authenticated', False) else None,
                         db_alias=get_tenant_db_alias() or 'default',
+                        force=True,
                     )
-                    whatsapp_dispatched = bool(wa_msg)
+                    if wa_msg and wa_msg.status in ('SENT', 'SUBMITTED', 'DELIVERED'):
+                        whatsapp_dispatched = True
+                        wa_message_id = wa_msg.provider_message_id
+                    elif wa_msg and wa_msg.status == 'FAILED':
+                        whatsapp_dispatched = False
+                        whatsapp_error = wa_msg.failure_reason or 'WhatsApp delivery failed at provider'
+                    else:
+                        whatsapp_dispatched = False
+                        whatsapp_error = 'WhatsApp message could not be sent (check lead phone or provider configuration)'
                 except Exception as wa_err:
-                    logger.warning("Automated WhatsApp follow-up dispatch error: %s", wa_err)
+                    logger.error("Automated WhatsApp follow-up dispatch error: %s", wa_err, exc_info=True)
+                    whatsapp_dispatched = False
+                    whatsapp_error = str(wa_err)
+            elif should_send_wa and not lead:
+                whatsapp_dispatched = False
+                whatsapp_error = 'Could not resolve lead or phone number for WhatsApp outreach'
 
             # Reset Agent Presence to AVAILABLE
             AgentPresence.objects.filter(user=user).update(
@@ -1095,6 +1125,8 @@ class CallDispositionView(APIView):
                 'message': 'Disposition recorded and agent status updated to AVAILABLE.',
                 'lead_status': lead.current_status if lead else None,
                 'whatsapp_sent': whatsapp_dispatched,
+                'whatsapp_error': whatsapp_error,
+                'whatsapp_message_id': wa_message_id,
             }, status=status.HTTP_200_OK)
 
         return Response({
@@ -2129,7 +2161,7 @@ class TelephonyAnalyticsView(APIView):
 class TelephonyExportView(APIView):
     """
     GET /api/v1/tenant/crm/telephony/export/
-    Exports filtered CallSession records as a CSV download matching active filters.
+    Exports filtered CallSession records and Sales Dialler Analytics as a formatted Excel (.xlsx) workbook.
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -2137,7 +2169,7 @@ class TelephonyExportView(APIView):
         user = request.user
         with resolve_telephony_tenant_context():
             from django.db.models import Q
-            import csv
+            from .services_telephony_export import export_telephony_to_excel_buffer
             alias = get_tenant_db_alias() or 'default'
             org = getattr(user, 'organization', None)
             if not org:
@@ -2153,6 +2185,7 @@ class TelephonyExportView(APIView):
             status_filter = request.query_params.get('status')
             disposition_filter = request.query_params.get('disposition')
             search_query = request.query_params.get('search', '').strip()
+            export_type = request.query_params.get('export_type', 'all').lower()
 
             try:
                 tz = zoneinfo.ZoneInfo('Asia/Kolkata')
@@ -2221,42 +2254,42 @@ class TelephonyExportView(APIView):
                     Q(disposition_notes__icontains=search_query)
                 )
 
-            labels_map = dict(CallSession.DISPOSITION_CHOICES)
-            filename = f"sales_calling_report_{timeframe}_{now_ist.strftime('%Y%m%d_%H%M%S')}.csv"
-            response = HttpResponse(content_type='text/csv; charset=utf-8')
+            filter_summary = {
+                'Branch Filter': branch_id if branch_id and branch_id != 'ALL' else 'All Branches',
+                'Representative Filter': rep_id if rep_id and rep_id != 'ALL' else 'All Representatives',
+                'Direction Filter': direction_filter if direction_filter and direction_filter != 'ALL' else 'All Directions',
+                'Status Filter': status_filter if status_filter and status_filter != 'ALL' else 'All Statuses',
+                'Disposition Filter': disposition_filter if disposition_filter and disposition_filter != 'ALL' else 'All Outcomes',
+                'Search Query': search_query if search_query else None,
+            }
+
+            # Cap export to the most recent 10,000 records to ensure fast Excel compilation & memory stability
+            qs_ordered = qs.order_by('-created_at')[:10000]
+
+            excel_bytes = export_telephony_to_excel_buffer(
+                qs=qs_ordered,
+                db_alias=alias,
+                request=request,
+                org=org,
+                timeframe=timeframe,
+                filter_summary=filter_summary,
+                export_type=export_type
+            )
+
+            if export_type == 'call_logs':
+                file_prefix = "call_logs_export"
+            elif export_type == 'dialer_summary':
+                file_prefix = "sales_dialer_report"
+            else:
+                file_prefix = "sales_telephony_dialer_report"
+
+            date_tag = now_ist.strftime('%Y%m%d_%H%M%S')
+            filename = f"{file_prefix}_{timeframe}_{date_tag}.xlsx"
+
+            response = HttpResponse(
+                excel_bytes,
+                content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            )
             response['Content-Disposition'] = f'attachment; filename="{filename}"'
-
-            writer = csv.writer(response)
-            writer.writerow([
-                'Call ID', 'Timestamp (IST)', 'Lead Name', 'Phone Number',
-                'Sales Rep', 'Direction', 'Status', 'Duration (Seconds)',
-                'Talk Time Formatted', 'Meaningful (>=30s)', 'Disposition',
-                'Disposition Notes', 'Recording Available'
-            ])
-
-            from .security_utils import mask_phone_if_restricted
-            for cs in qs.order_by('-created_at'):
-                dur = int(cs.duration_seconds or 0)
-                dur_fmt = f"{dur // 60}m {dur % 60}s"
-                time_str = cs.created_at.astimezone(tz).strftime('%Y-%m-%d %H:%M:%S')
-                rep_name = f"{cs.sales_rep.first_name} {cs.sales_rep.last_name}".strip() if cs.sales_rep else "Automated / Pool"
-                lead_name = f"{cs.lead.first_name} {cs.lead.last_name}".strip() if cs.lead else "Unknown Lead"
-                disp_lbl = labels_map.get(cs.disposition, cs.disposition) if cs.disposition else 'Pending'
-
-                writer.writerow([
-                    str(cs.id),
-                    time_str,
-                    lead_name,
-                    mask_phone_if_restricted(request, cs.user_phone_number or ''),
-                    rep_name,
-                    cs.direction,
-                    cs.status,
-                    dur,
-                    dur_fmt,
-                    'YES' if cs.is_meaningful else 'NO',
-                    disp_lbl,
-                    cs.disposition_notes or '',
-                    'YES' if bool(cs.recording_url) else 'NO'
-                ])
-
+            response['Access-Control-Expose-Headers'] = 'Content-Disposition'
             return response

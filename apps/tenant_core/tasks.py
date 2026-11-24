@@ -363,12 +363,12 @@ def process_domain_outbox_events_task(self, tenant_id: str, limit: int = 50, **k
                         from apps.tenant_core.models_crm import TrialBooking
                         trial_id = event.aggregate_id or event.payload.get('trial_id')
                         if trial_id:
-                            tb = TrialBooking.objects.using(db_alias).filter(id=trial_id).first()
+                            tb = TrialBooking.objects.using(db_alias).select_related('lead', 'branch', 'branch__organization').filter(id=trial_id).first()
                             if tb:
                                 can_dispatch, override_dt = _resolve_outbox_timestamp(event, 'scheduled_start')
                                 if can_dispatch:
                                     WhatsAppAutomationService.send_sarvam_trial_booking_confirmation(
-                                        tb, db_alias=db_alias, scheduled_start_override=override_dt
+                                        tb, db_alias=db_alias, scheduled_start_override=override_dt, force=True
                                     )
                                 else:
                                     logger.warning("Suppressed CRM_TRIAL_BOOKED dispatch for event %s due to malformed timestamp.", event.id)
@@ -377,12 +377,12 @@ def process_domain_outbox_events_task(self, tenant_id: str, limit: int = 50, **k
                         from apps.tenant_core.models_crm import TrialBooking
                         trial_id = event.aggregate_id or event.payload.get('trial_id')
                         if trial_id:
-                            tb = TrialBooking.objects.using(db_alias).filter(id=trial_id).first()
+                            tb = TrialBooking.objects.using(db_alias).select_related('lead', 'branch', 'branch__organization').filter(id=trial_id).first()
                             if tb:
                                 can_dispatch, override_dt = _resolve_outbox_timestamp(event, 'new_start', 'scheduled_start')
                                 if can_dispatch:
                                     WhatsAppAutomationService.send_sarvam_trial_reschedule_confirmation(
-                                        tb, db_alias=db_alias, scheduled_start_override=override_dt
+                                        tb, db_alias=db_alias, scheduled_start_override=override_dt, force=True
                                     )
                                 else:
                                     logger.warning("Suppressed CRM_TRIAL_RESCHEDULED dispatch for event %s due to malformed timestamp.", event.id)
@@ -391,12 +391,12 @@ def process_domain_outbox_events_task(self, tenant_id: str, limit: int = 50, **k
                         from apps.tenant_core.models_crm import TrialBooking
                         trial_id = event.aggregate_id or event.payload.get('trial_id')
                         if trial_id:
-                            tb = TrialBooking.objects.using(db_alias).filter(id=trial_id).first()
+                            tb = TrialBooking.objects.using(db_alias).select_related('lead', 'branch', 'branch__organization').filter(id=trial_id).first()
                             if tb:
                                 can_dispatch, override_dt = _resolve_outbox_timestamp(event, 'cancelled_start', 'scheduled_start')
                                 if can_dispatch:
                                     WhatsAppAutomationService.send_sarvam_trial_cancellation(
-                                        tb, db_alias=db_alias, scheduled_start_override=override_dt
+                                        tb, db_alias=db_alias, scheduled_start_override=override_dt, force=True
                                     )
                                 else:
                                     logger.warning("Suppressed CRM_TRIAL_CANCELLED dispatch for event %s due to malformed timestamp.", event.id)
