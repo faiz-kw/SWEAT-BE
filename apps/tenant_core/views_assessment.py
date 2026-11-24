@@ -40,6 +40,7 @@ from .serializers_assessment import (
     AssessmentApprovalSerializer, AssessmentTestProgressionSerializer,
     ProgressionApprovalSerializer,
 )
+from .permissions import RequireActiveTenantAndOrg, TenantRBACPermission
 from .services_assessment import AssessmentEngineService
 from .services_assessment_screening import evaluate_safety_readiness
 from .services_assessment_metrics import calculate_metabolic_nutrition_plan
@@ -102,7 +103,37 @@ class AssessmentPagination(PageNumberPagination):
 
 
 class AssessmentSessionViewSet(viewsets.ModelViewSet):
+    # Assessments hold health screening answers, body measurements and photographs, and the
+    # register makes them enumerable, so access is tenant-scoped and branch-scoped.
+    #
+    # NOT yet enforced by TenantRBACPermission: the finer-grained codes below exist in
+    # rbac_defaults but are not provisioned to any role in a live tenant — verified against
+    # this database, where not even performance.assessments.view is attached to a role.
+    # Turning the engine on now would deny every trainer and front-desk user and leave only
+    # org admins (who pass via the super-admin bypass) able to run an assessment.
+    #
+    # To enable: provision these codes to the coaching roles, run the tenant RBAC sync, then
+    # swap permission_classes for [RequireActiveTenantAndOrg, TenantRBACPermission]. The map
+    # is kept here so that switch is a one-line change.
+    #
+    # Note for whoever makes that switch: RequireActiveTenantAndOrg reads tenant context set
+    # by the middleware, so the existing API tests (which build requests with
+    # APIRequestFactory) return 401 under it and need that context stubbed first.
     permission_classes = [IsAuthenticated]
+    required_module = 'performance'
+    required_submodule = 'assessments'
+    action_permission_map = {
+        'list': 'performance.assessments.view',
+        'retrieve': 'performance.assessments.view',
+        'scan_status_view': 'performance.assessments.view',
+        'comparison': 'performance.assessments.view',
+        'create': 'performance.assessments.create',
+        'update': 'performance.assessments.edit',
+        'partial_update': 'performance.assessments.edit',
+        'capture_photos': 'performance.assessments.edit',
+        'rescan': 'performance.assessments.edit',
+        'approve_and_send': 'performance.assessments.approve',
+    }
     parser_classes = [MultiPartParser, FormParser, JSONParser]
     serializer_class = MemberAssessmentDetailSerializer
     pagination_class = AssessmentPagination
