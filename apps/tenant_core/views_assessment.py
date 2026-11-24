@@ -22,6 +22,8 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from rest_framework.pagination import PageNumberPagination
+from django.db.models import Q
 from typing import Optional
 
 from config.routers import set_tenant_db_alias, get_tenant_db_alias
@@ -92,19 +94,189 @@ class AssessmentEligibilityMobileView(APIView):
         return Response(eligibility, status=status.HTTP_200_OK)
 
 
+class AssessmentPagination(PageNumberPagination):
+    """Server-side paging for the assessment register."""
+    page_size = 20
+    page_size_query_param = 'page_size'
+    max_page_size = 200
+
+
 class AssessmentSessionViewSet(viewsets.ModelViewSet):
     """
     CRUD and operational workflow actions for Functional Fitness Assessments.
     """
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
+    pagination_class = AssessmentPagination
+
+    # Status groupings the register filters by. `needs_review` is the approval inbox: the
+    # queue a coach or admin has to clear, which has no other entry point in the product.
+    OPEN_STATUSES = ('DRAFT', 'TESTING')
+    REVIEW_STATUSES = ('PENDING_REVIEW',)
 
     def get_queryset(self):
+        return self._filtered_queryset(self.request.query_params)
+
+    def _filtered_queryset(self, params, apply_status_filters: bool = True):
+        """
+        The register queryset.
+
+        Split out from `get_queryset` so the filter-chip counts can be computed against the
+        same visibility rules with the status filters lifted, without mutating the request.
+        """
         alias, org = _resolve_db_and_org(self.request)
-        qs = MemberAssessment.objects.using(alias).filter(organization=org)
-        if hasattr(self.request.user, 'user_type') and self.request.user.user_type == 'MEMBER':
-            qs = qs.filter(user_profile__user=self.request.user)
-        return qs.order_by('-created_at')
+        qs = MemberAssessment.objects.using(alias).filter(organization=org).select_related(
+            'branch', 'user_profile', 'conducted_by_trainer', 'recommended_package',
+        )
+
+        user = self.request.user
+        if hasattr(user, 'user_type') and user.user_type == 'MEMBER':
+            # A member only ever sees their own assessments.
+            return qs.filter(user_profile__user=user).order_by('-created_at')
+
+        # Branch scope: honour the staff member's permitted branches, then any explicit filter.
+        try:
+            from .views_crm import get_user_effective_branch_ids
+            permitted = get_user_effective_branch_ids(user, alias)
+            if permitted is not None:
+                qs = qs.filter(branch_id__in=list(permitted))
+        except Exception:
+            logger.warning("Could not resolve permitted branches for the assessment register.", exc_info=True)
+
+        branch_id = (params.get('branch_id') or params.get('branch') or '').strip()
+        if branch_id and branch_id.lower() not in ('all', 'any'):
+            qs = qs.filter(branch_id=branch_id)
+
+        if apply_status_filters:
+            bucket = (params.get('bucket') or '').strip().lower()
+            if bucket == 'needs_review':
+                qs = qs.filter(status__in=self.REVIEW_STATUSES)
+            elif bucket == 'in_progress':
+                qs = qs.filter(status__in=self.OPEN_STATUSES)
+            elif bucket == 'approved':
+                qs = qs.filter(status='APPROVED')
+
+            status_param = (params.get('status') or '').strip().upper()
+            if status_param and status_param not in ('ALL', 'ANY'):
+                qs = qs.filter(status__in=[s.strip() for s in status_param.split(',') if s.strip()])
+
+        scan_status = (params.get('scan_status') or '').strip().upper()
+        if scan_status and scan_status not in ('ALL', 'ANY'):
+            qs = qs.filter(scan_status__in=[s.strip() for s in scan_status.split(',') if s.strip()])
+
+        assessment_type = (params.get('assessment_type') or '').strip().upper()
+        if assessment_type and assessment_type not in ('ALL', 'ANY'):
+            qs = qs.filter(assessment_type=assessment_type)
+
+        trainer_id = (params.get('conducted_by') or params.get('trainer_id') or '').strip()
+        if trainer_id:
+            qs = qs.filter(conducted_by_trainer_id=trainer_id)
+
+        date_from = (params.get('date_from') or params.get('start_date') or '').strip()
+        date_to = (params.get('date_to') or params.get('end_date') or '').strip()
+        if date_from:
+            qs = qs.filter(created_at__date__gte=date_from)
+        if date_to:
+            qs = qs.filter(created_at__date__lte=date_to)
+
+        search = (params.get('search') or params.get('q') or '').strip()
+        if search:
+            qs = qs.filter(
+                Q(member_name__icontains=search)
+                | Q(member_phone__icontains=search)
+                | Q(user_profile__first_name_snapshot__icontains=search)
+                | Q(user_profile__last_name_snapshot__icontains=search)
+                | Q(user_profile__member_number__icontains=search)
+            )
+
+        ordering = (params.get('ordering') or '-created_at').strip()
+        allowed_ordering = {
+            'created_at', '-created_at', 'updated_at', '-updated_at',
+            'member_name', '-member_name', 'status', '-status',
+        }
+        if ordering not in allowed_ordering:
+            ordering = '-created_at'
+
+        return qs.order_by(ordering, '-id')
+
+    def list(self, request, *args, **kwargs):
+        """
+        GET /api/v1/tenant/assessments/
+
+        The assessment register: newest first, paged server-side, with search and filters.
+        Rows are deliberately compact — the full seventeen-section payload is only built on
+        retrieve, so listing a thousand assessments does not mean a thousand SLA computations.
+        """
+        queryset = self.filter_queryset(self.get_queryset())
+
+        page = self.paginate_queryset(queryset)
+        rows = [self._serialize_row(item) for item in (page if page is not None else queryset[:200])]
+
+        if page is None:
+            return Response({'count': len(rows), 'results': rows, 'summary': self._register_summary(request)})
+
+        response = self.get_paginated_response(rows)
+        if isinstance(response.data, dict):
+            response.data['summary'] = self._register_summary(request)
+        return response
+
+    def _register_summary(self, request) -> dict:
+        """Counts for the register's filter chips, computed under the same visibility rules."""
+        try:
+            scoped = self._filtered_queryset(request.query_params, apply_status_filters=False)
+            return {
+                'total': scoped.count(),
+                'in_progress': scoped.filter(status__in=self.OPEN_STATUSES).count(),
+                'needs_review': scoped.filter(status__in=self.REVIEW_STATUSES).count(),
+                'approved': scoped.filter(status='APPROVED').count(),
+                'scan_failed': scoped.filter(scan_status__in=('FAILED', 'PARTIAL')).count(),
+            }
+        except Exception:
+            logger.warning("Assessment register summary failed.", exc_info=True)
+            return {}
+
+    def _serialize_row(self, instance: MemberAssessment) -> dict:
+        """One register row. Compact by design; `retrieve` returns the whole assessment."""
+        from .security_utils import mask_phone_if_restricted
+
+        member_name = instance.member_name
+        if not member_name and instance.user_profile:
+            member_name = (
+                f"{getattr(instance.user_profile, 'first_name_snapshot', '') or ''} "
+                f"{getattr(instance.user_profile, 'last_name_snapshot', '') or ''}"
+            ).strip()
+
+        trainer = instance.conducted_by_trainer
+        trainer_name = None
+        if trainer:
+            trainer_name = f"{trainer.first_name or ''} {trainer.last_name or ''}".strip() or trainer.email
+
+        captured = sum(1 for f in (
+            instance.photo_front, instance.photo_back,
+            instance.photo_side_left, instance.photo_side_right or instance.photo_side,
+        ) if f)
+
+        return {
+            'id': str(instance.id),
+            'member_name': member_name or 'Guest',
+            'member_phone': mask_phone_if_restricted(getattr(self, 'request', None), instance.member_phone),
+            'member_id': str(instance.user_profile_id) if instance.user_profile_id else None,
+            'lead_id': str(instance.lead_id) if instance.lead_id else None,
+            'assessment_type': instance.assessment_type,
+            'assessment_type_display': instance.get_assessment_type_display(),
+            'status': instance.status,
+            'status_display': instance.get_status_display(),
+            'screening_outcome': instance.screening_outcome,
+            'scan_status': instance.scan_status,
+            'captures_taken': captured,
+            'posture_score': float(instance.posture_score) if instance.posture_score is not None else None,
+            'branch': {'id': str(instance.branch_id), 'name': instance.branch.name} if instance.branch_id else None,
+            'conducted_by': trainer_name,
+            'recommended_package': instance.recommended_package.name if instance.recommended_package else None,
+            'reviewed_at': instance.reviewed_at.isoformat() if instance.reviewed_at else None,
+            'created_at': instance.created_at.isoformat() if instance.created_at else None,
+            'updated_at': instance.updated_at.isoformat() if instance.updated_at else None,
+        }
 
     def create(self, request, *args, **kwargs):
         """
