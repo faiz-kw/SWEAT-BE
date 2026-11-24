@@ -94,6 +94,133 @@ def _primary_entitlements(entitlements):
     return [v for k, v in by_type.items() if k not in PASSPORT and k not in CREDIT]
 
 
+def _push_qr_to_studio_terminals(pass_id: str, display_name: str, qr_token: str, branch=None):
+    """
+    Registers the QR token as a 'card' in the Dahua TrueFace3000 terminal's local
+    user database so that the camera scan fires an AccessControl event that the
+    malad_turnstile_daemon.py can receive and process.
+
+    Runs in a background thread — does NOT block the mobile API response.
+    Safe to call even when terminals are offline (errors are logged, not raised).
+
+    Terminal config:
+      ENTRY: 192.168.0.114  EXIT: 192.168.0.152
+    Only pushes to Malad-branch terminals for now. Extend via branch lookup as
+    more studios go live.
+    """
+    import threading
+    import hashlib
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    # Studio terminal map keyed by branch name fragment (case-insensitive)
+    STUDIO_TERMINALS = {
+        'malad': [
+            {'name': 'ENTRY', 'ip': '192.168.0.114'},
+            {'name': 'EXIT',  'ip': '192.168.0.152'},
+        ],
+    }
+
+    # Identify which studio terminals to push to
+    terminals_to_push = []
+    if branch:
+        branch_name_lower = (getattr(branch, 'name', '') or '').lower()
+        for studio_key, terminals in STUDIO_TERMINALS.items():
+            if studio_key in branch_name_lower:
+                terminals_to_push = terminals
+                break
+    # Default: push to Malad if branch not matched (single-studio deployment)
+    if not terminals_to_push:
+        terminals_to_push = STUDIO_TERMINALS['malad']
+
+    def _do_push():
+        try:
+            import requests as _req
+
+            admin_user = 'admin'
+            admin_pass = 'tipl9910'
+
+            # UserID for the terminal: use first 8 hex chars of pass UUID (stays within 32-char limit)
+            # Prefix with 'P' to avoid collision with management user IDs (which are numeric)
+            user_id_for_terminal = 'P' + pass_id.replace('-', '')[:7]
+
+            for terminal in terminals_to_push:
+                ip = terminal['ip']
+                tname = terminal['name']
+                try:
+                    # 1. Login
+                    sess = _req.Session()
+                    r1 = sess.post(
+                        f'http://{ip}/RPC2_Login',
+                        json={'method': 'global.login',
+                              'params': {'userName': admin_user, 'password': '', 'clientType': 'Web3.0'},
+                              'id': 1},
+                        timeout=4
+                    )
+                    d1 = r1.json()
+                    rand  = d1['params']['random']
+                    realm = d1['params']['realm']
+                    sid0  = d1['session']
+                    p1 = hashlib.md5(f'{admin_user}:{realm}:{admin_pass}'.encode()).hexdigest().upper()
+                    p2 = hashlib.md5(f'{admin_user}:{rand}:{p1}'.encode()).hexdigest().upper()
+                    r2 = sess.post(
+                        f'http://{ip}/RPC2_Login',
+                        json={'method': 'global.login',
+                              'params': {'userName': admin_user, 'password': p2,
+                                         'clientType': 'Web3.0', 'authorityType': 'Default'},
+                              'id': 2, 'session': sid0},
+                        timeout=4
+                    )
+                    sid = r2.json().get('session')
+                    if not r2.json().get('result') or not sid:
+                        logger.warning('Terminal %s %s login failed', tname, ip)
+                        continue
+
+                    # 2. Register user (idempotent — terminal returns True if already exists)
+                    sess.post(
+                        f'http://{ip}/RPC2',
+                        json={'method': 'AccessUser.insertMulti',
+                              'params': {'UserList': [{
+                                  'UserID': user_id_for_terminal,
+                                  'UserName': display_name[:31],  # 32-char terminal limit
+                                  'UserType': 0,
+                                  'TimeSections': [255],
+                                  'Doors': [0],
+                                  'UseTime': 0,
+                              }]},
+                              'id': 10, 'session': sid},
+                        timeout=5
+                    )
+
+                    # 3. Register QR token as a card (idempotent)
+                    r_card = sess.post(
+                        f'http://{ip}/RPC2',
+                        json={'method': 'AccessCard.insertMulti',
+                              'params': {'CardList': [{
+                                  'CardNo': qr_token,       # 22-char Base62 token
+                                  'UserID': user_id_for_terminal,
+                                  'CardType': 1,            # normal card
+                                  'UseTime': 0,             # unlimited
+                                  'ValidDateStart': '2026-01-01 00:00:00',
+                                  'ValidDateEnd':   '2099-12-31 23:59:59',
+                              }]},
+                              'id': 11, 'session': sid},
+                        timeout=5
+                    )
+                    ok = r_card.json().get('result', False)
+                    logger.info('Terminal push %s %s card=%s result=%s', tname, ip, qr_token[:8], ok)
+
+                except Exception as terminal_err:
+                    logger.warning('Terminal push failed %s %s: %s', tname, ip, terminal_err)
+
+        except Exception as e:
+            logger.error('_push_qr_to_studio_terminals thread error: %s', e)
+
+    thread = threading.Thread(target=_do_push, daemon=True, name=f'qr-push-{pass_id[:8]}')
+    thread.start()
+
+
 def _resolve_mobile_tenant_and_db(request):
     """
     Resolves the tenant and registers/returns the active tenant DB alias.
@@ -3076,6 +3203,17 @@ class MobileQRPassView(APIView):
                 'status': 'ACTIVE',
                 'updated_at': now,
             }
+        )
+
+        # Push the QR token to the physical turnstile terminals so the camera
+        # scan fires an AccessControl event that the daemon can receive.
+        # This runs in a background thread to keep API response fast (<100ms).
+        # Only runs when studio terminals are reachable (studio Wi-Fi).
+        _push_qr_to_studio_terminals(
+            pass_id=str(pass_obj.id),
+            display_name=f"{user.first_name} {user.last_name}".strip() or profile.member_number or "SWEAT Member",
+            qr_token=qr_display_token,
+            branch=booking.branch,
         )
 
         # Construct legacy signed payload for backwards compatibility
