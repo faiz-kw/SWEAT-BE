@@ -538,9 +538,16 @@ class LeadViewSet(viewsets.ModelViewSet):
         # Staff/Sales/HR reps without supervisor roles can ONLY view leads assigned to them.
         from apps.tenant_core.security_utils import get_user_role_codes
         user_roles = get_user_role_codes(self.request)
+        # Full branch-lead visibility: supervisors PLUS the shared sales/front-desk/trainer team.
+        # The operating team must all see every lead in their branch so anyone can cover (book
+        # trials, follow up) when a colleague is absent. Still branch-scoped via permitted_branches above.
+        FULL_LEAD_VISIBILITY_ROLES = (
+            'ORG_ADMIN', 'SUPER_ADMIN', 'TENANT_ADMIN', 'BRANCH_MANAGER', 'SALES_MANAGER',
+            'SALES_REP', 'TRAINER', 'HYBRID_TRAINERS',
+        )
         is_lead_supervisor = (
             getattr(self.request.user, 'is_superuser', False)
-            or any(r in ('ORG_ADMIN', 'SUPER_ADMIN', 'TENANT_ADMIN', 'BRANCH_MANAGER', 'SALES_MANAGER') for r in user_roles)
+            or any(r in FULL_LEAD_VISIBILITY_ROLES for r in user_roles)
         )
         if not is_lead_supervisor:
             try:
