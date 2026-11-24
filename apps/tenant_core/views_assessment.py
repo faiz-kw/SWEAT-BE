@@ -46,6 +46,16 @@ def _image_url(field) -> Optional[str]:
         return None
 
 
+def _scan_provider_ready() -> bool:
+    """True when the configured scan provider can actually run on this server."""
+    try:
+        from .services_body_scan import get_scan_client
+        return bool(get_scan_client().is_configured)
+    except Exception:
+        logger.warning("Could not determine body scan provider readiness.", exc_info=True)
+        return False
+
+
 def _derive_age(dob) -> Optional[int]:
     """Whole years between a date of birth and today."""
     if not dob:
@@ -452,7 +462,7 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
         elif not getattr(djsettings, 'BODY_SCAN_ENABLED', True):
             assessment.scan_status = 'UNAVAILABLE'
             assessment.scan_error = 'Body scanning is switched off on this server.'
-        elif not (getattr(djsettings, 'FAL_KEY', '') or '').strip():
+        elif not _scan_provider_ready():
             assessment.scan_status = 'UNAVAILABLE'
             assessment.scan_error = (
                 'Body scanning is not configured on this server. The captures were stored and no '
@@ -502,10 +512,10 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
             )
 
         try:
-            from .services_body_scan import BodyScanService, FalBodyScanClient
+            from .services_body_scan import BodyScanService, get_scan_client
             assessment.scan_status = 'PROCESSING'
             assessment.save(using=alias, update_fields=['scan_status', 'updated_at'])
-            result = BodyScanService.analyse(assessment, client=FalBodyScanClient())
+            result = BodyScanService.analyse(assessment, client=get_scan_client())
             BodyScanService.apply_to_assessment(assessment, result, db_alias=alias)
         except Exception as exc:
             logger.exception("Inline body scan failed for assessment %s", assessment.id)

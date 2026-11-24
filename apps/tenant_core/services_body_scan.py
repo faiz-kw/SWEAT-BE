@@ -27,6 +27,7 @@ Design rules, taken from the studio's assessment specification:
 import io
 import logging
 import math
+from pathlib import Path
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -53,6 +54,33 @@ SOURCE_UNAVAILABLE = 'unavailable'
 
 DEFAULT_MODEL = 'fal-ai/sam-3/3d-body'
 
+# BlazePose's 33 landmarks, in the order MediaPipe returns them. Pinned here because the
+# `mediapipe.solutions` package that used to expose this enum was removed in mediapipe 1.x,
+# and the Tasks API returns a bare list with no names attached.
+BLAZEPOSE_LANDMARK_NAMES = [
+    'nose',
+    'left_eye_inner', 'left_eye', 'left_eye_outer',
+    'right_eye_inner', 'right_eye', 'right_eye_outer',
+    'left_ear', 'right_ear',
+    'mouth_left', 'mouth_right',
+    'left_shoulder', 'right_shoulder',
+    'left_elbow', 'right_elbow',
+    'left_wrist', 'right_wrist',
+    'left_pinky', 'right_pinky',
+    'left_index', 'right_index',
+    'left_thumb', 'right_thumb',
+    'left_hip', 'right_hip',
+    'left_knee', 'right_knee',
+    'left_ankle', 'right_ankle',
+    'left_heel', 'right_heel',
+    'left_foot_index', 'right_foot_index',
+]
+
+# A landmark the model cannot actually see is worse than a missing one, because it still
+# carries plausible coordinates. Below this visibility we discard it, and the geometry that
+# depended on it reports "not assessed" rather than a guess.
+MIN_LANDMARK_VISIBILITY = 0.5
+
 # Minimum share of the frame height the subject's bounding box must cover for the geometry to
 # be worth computing. Below this the keypoints are too coarse to resolve a 2-degree tilt.
 MIN_SUBJECT_FRAME_COVERAGE = 0.45
@@ -78,6 +106,8 @@ class FalBodyScanClient:
     to be public), then run the model and hand the raw response back. All interpretation of the
     response happens in this module, not in the caller.
     """
+
+    provider_name = 'fal.ai'
 
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None, timeout: Optional[int] = None):
         self.api_key = (api_key if api_key is not None else getattr(settings, 'FAL_KEY', '') or '').strip()
@@ -177,6 +207,139 @@ class FalBodyScanClient:
         return result
 
 
+class LocalPoseScanClient:
+    """
+    On-device pose detection with MediaPipe BlazePose. No account, no per-call cost, and the
+    member's photographs never leave the server — which is the stronger position for images
+    of this kind.
+
+    It emits the same response shape as the fal client so everything downstream (quality
+    gate, geometry, scoring, provenance) is identical regardless of which provider ran.
+
+    The trade against a hosted 3D model is honest: BlazePose is a single-person 2D detector,
+    so it copes less well with occlusion and crowded frames, and it cannot produce a body
+    surface. Since this module only ever consumed 2D joint positions, neither limitation
+    affects the numbers we publish.
+    """
+
+    provider_name = 'mediapipe'
+
+    def __init__(self, model_path: Optional[str] = None):
+        self.model_path = (
+            model_path
+            or getattr(settings, 'BODY_SCAN_LOCAL_MODEL_PATH', '')
+            or ''
+        ).strip()
+        self.model = f'mediapipe/{Path(self.model_path).stem}' if self.model_path else 'mediapipe/pose_landmarker'
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.model_path and Path(self.model_path).is_file())
+
+    def _landmarker(self):
+        if not self.model_path:
+            raise BodyScanNotConfigured(
+                "BODY_SCAN_LOCAL_MODEL_PATH is not set. Download a MediaPipe pose_landmarker "
+                "task file and point the setting at it."
+            )
+        if not Path(self.model_path).is_file():
+            raise BodyScanNotConfigured(
+                f"The pose model file was not found at {self.model_path}."
+            )
+        try:
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python import vision
+        except ImportError as exc:  # pragma: no cover - depends on deployment
+            raise BodyScanNotConfigured(
+                "The 'mediapipe' package is not installed on this server "
+                "(pip install -r requirements-bodyscan.txt)."
+            ) from exc
+
+        options = vision.PoseLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=self.model_path),
+            running_mode=vision.RunningMode.IMAGE,
+            num_poses=2,  # detect a second person so the quality gate can reject the frame
+        )
+        return vision.PoseLandmarker.create_from_options(options)
+
+    def analyse_image(self, image_bytes: bytes, content_type: str = 'image/jpeg') -> Dict[str, Any]:
+        """Runs pose detection locally and returns a fal-shaped response."""
+        try:
+            import mediapipe as mp
+            import numpy as np
+            from PIL import Image
+        except ImportError as exc:  # pragma: no cover - depends on deployment
+            raise BodyScanNotConfigured(
+                "Local scanning needs mediapipe, numpy and Pillow installed on this server."
+            ) from exc
+
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as pil_image:
+                rgb = pil_image.convert('RGB')
+                frame = np.asarray(rgb)
+                width, height = rgb.size
+        except Exception as exc:
+            raise BodyScanError(f"The capture could not be decoded as an image: {exc}") from exc
+
+        try:
+            with self._landmarker() as landmarker:
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
+                detection = landmarker.detect(mp_image)
+        except BodyScanNotConfigured:
+            raise
+        except Exception as exc:
+            raise BodyScanError(f"Local pose detection failed: {exc}") from exc
+
+        people = []
+        for person_index, landmarks in enumerate(detection.pose_landmarks or []):
+            keypoints: List[Any] = []
+            visible_points: List[Tuple[float, float]] = []
+            for landmark in landmarks:
+                visibility = getattr(landmark, 'visibility', 1.0)
+                if visibility is not None and visibility < MIN_LANDMARK_VISIBILITY:
+                    keypoints.append(None)
+                    continue
+                point = (float(landmark.x) * width, float(landmark.y) * height)
+                keypoints.append([point[0], point[1]])
+                visible_points.append(point)
+
+            if not visible_points:
+                continue
+
+            xs = [p[0] for p in visible_points]
+            ys = [p[1] for p in visible_points]
+            people.append({
+                'person_id': person_index,
+                'bbox': [min(xs), min(ys), max(xs), max(ys)],
+                'focal_length': None,
+                'keypoints_2d': keypoints,
+                'visible_landmark_count': len(visible_points),
+            })
+
+        return {
+            'metadata': {
+                'num_people': len(people),
+                'keypoint_names': list(BLAZEPOSE_LANDMARK_NAMES),
+                'people': people,
+            },
+            'visualization': None,
+        }
+
+
+def get_scan_client():
+    """
+    Returns the configured provider.
+
+    `local` keeps the photographs on this server and costs nothing; `fal` sends them to a
+    hosted 3D model. The setting decides, and the choice is recorded on every assessment so a
+    later reader knows which one produced the numbers.
+    """
+    provider = (getattr(settings, 'BODY_SCAN_PROVIDER', '') or 'local').strip().lower()
+    if provider in ('fal', 'fal.ai', 'remote'):
+        return FalBodyScanClient()
+    return LocalPoseScanClient()
+
+
 # ---------------------------------------------------------------------------
 # Keypoint helpers
 # ---------------------------------------------------------------------------
@@ -232,19 +395,28 @@ def distance(a: Optional[Tuple[float, float]], b: Optional[Tuple[float, float]])
 
 def angle_from_horizontal(a: Optional[Tuple[float, float]], b: Optional[Tuple[float, float]]) -> Optional[float]:
     """
-    Signed angle in degrees of the line a→b relative to horizontal.
+    Tilt in degrees of the line between two paired joints, relative to horizontal.
 
-    Image coordinates run with y increasing downwards. Callers pass (left_joint, right_joint),
-    so a POSITIVE result means the left side sits higher than the right — the reading a coach
-    expects from "left shoulder is up". Negative means the right side is higher.
+    Callers pass (left_joint, right_joint), named anatomically — the subject's own left and
+    right. Which one appears on which SIDE of the image depends on where the camera is: in a
+    front view the subject's left shoulder sits on the right of the frame, in a back view it
+    sits on the left. So the magnitude is taken from the absolute run and rise, and the sign
+    comes from which joint is physically higher. A naive atan2 of the raw deltas reports a
+    4-degree drop as 176 degrees on exactly half the captures.
+
+    POSITIVE means the subject's left side sits higher; negative means the right side does.
+    The result is always within [-90, 90].
     """
     if not a or not b:
         return None
-    dx = b[0] - a[0]
-    dy = b[1] - a[1]
-    if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+    dx = abs(b[0] - a[0])
+    dy = abs(b[1] - a[1])
+    if dx < 1e-6 and dy < 1e-6:
         return None
-    return math.degrees(math.atan2(dy, dx))
+    magnitude = math.degrees(math.atan2(dy, dx))
+    # Smaller y is higher in image space.
+    sign = 1.0 if a[1] < b[1] else -1.0
+    return sign * magnitude
 
 
 def angle_from_vertical(lower: Optional[Tuple[float, float]], upper: Optional[Tuple[float, float]]) -> Optional[float]:
@@ -581,11 +753,11 @@ class BodyScanService:
         Returns a result dict; it does not save. `apply_to_assessment` persists it, so the
         analysis is testable without a database write.
         """
-        client = client or FalBodyScanClient()
+        client = client or get_scan_client()
         views = cls.collect_views(assessment)
 
         result: Dict[str, Any] = {
-            'provider': 'fal.ai',
+            'provider': getattr(client, 'provider_name', 'unknown'),
             'model': client.model,
             'views_submitted': sorted(views.keys()),
             'quality': {},
@@ -602,8 +774,8 @@ class BodyScanService:
         if not client.is_configured:
             result['status'] = 'UNAVAILABLE'
             result['error'] = (
-                'Body scanning is not configured on this server (FAL_KEY missing). '
-                'Captures were stored; no measurements were produced.'
+                f"The configured scan provider ({getattr(client, 'provider_name', 'unknown')}) is not "
+                'ready on this server. Captures were stored; no measurements were produced.'
             )
             return result
 

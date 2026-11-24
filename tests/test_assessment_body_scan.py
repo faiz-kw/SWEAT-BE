@@ -91,6 +91,34 @@ class FrontalGeometryTests(unittest.TestCase):
             [800, 600], [1200, 600 + 2 * drop], [860, 1400], [1140, 1400], [880, 2400], [1120, 2400]))
         self.assertAlmostEqual(near['shoulder_tilt_degrees'], far['shoulder_tilt_degrees'], places=2)
 
+    def test_mirrored_front_view_reports_the_same_tilt(self):
+        """
+        Joints are named anatomically, so the subject's left shoulder appears on the RIGHT of
+        a front-facing frame and on the LEFT of a back-facing one. The same 10-degree drop
+        must read the same either way. Before this was handled, one of the two orientations
+        reported 170 degrees instead of 10.
+        """
+        drop = 200 * math.tan(math.radians(10))
+        # Back view: subject's left is on the image left.
+        back = analyse_frontal_view(NAMES, frontal_keypoints(
+            [400, 300], [600, 300 + drop], [430, 700], [570, 700], [440, 1200], [560, 1200]))
+        # Front view: subject's left is on the image right, same body, same drop.
+        front = analyse_frontal_view(NAMES, frontal_keypoints(
+            [600, 300], [400, 300 + drop], [570, 700], [430, 700], [560, 1200], [440, 1200]))
+        self.assertAlmostEqual(back['shoulder_tilt_degrees'], 10.0, places=1)
+        self.assertAlmostEqual(front['shoulder_tilt_degrees'], 10.0, places=1)
+
+    def test_tilt_never_exceeds_ninety_degrees(self):
+        """A tilt is a deviation from horizontal; 176 degrees is a sign error, not a posture."""
+        for layout in (
+            frontal_keypoints([400, 300], [600, 340], [430, 700], [570, 700], [440, 1200], [560, 1200]),
+            frontal_keypoints([600, 300], [400, 340], [570, 700], [430, 700], [560, 1200], [440, 1200]),
+        ):
+            out = analyse_frontal_view(NAMES, layout)
+            for key in ('shoulder_tilt_degrees', 'hip_tilt_degrees'):
+                if out.get(key) is not None:
+                    self.assertLessEqual(abs(out[key]), 90.0)
+
     def test_missing_joints_yield_no_metric_rather_than_zero(self):
         out = analyse_frontal_view(['nose'] * len(NAMES), [[0, 0]] * len(NAMES))
         self.assertNotIn('shoulder_tilt_degrees', out)

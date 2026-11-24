@@ -229,6 +229,17 @@ PRIVACY_CONTACT_EMAIL = os.getenv('PRIVACY_CONTACT_EMAIL', '').strip()
 # fal.ai hosts the pose model used to derive posture geometry from the four baseline
 # captures. With no key configured the assessment flow still stores the photos and records
 # the scan as UNAVAILABLE — it never falls back to placeholder measurements.
+# Provider for the assessment body scan:
+#   'local' — MediaPipe BlazePose on this server. Free, unlimited, and the member's
+#             photographs never leave the machine. Needs requirements-bodyscan.txt and a
+#             pose_landmarker .task file.
+#   'fal'   — fal.ai hosted SAM 3D Body. Costs per call and uploads the capture.
+BODY_SCAN_PROVIDER = os.getenv('BODY_SCAN_PROVIDER', 'local').strip().lower()
+BODY_SCAN_LOCAL_MODEL_PATH = os.getenv(
+    'BODY_SCAN_LOCAL_MODEL_PATH',
+    str(BASE_DIR / 'models' / 'pose_landmarker_lite.task'),
+).strip()
+
 FAL_KEY = os.getenv('FAL_KEY', '').strip()
 FAL_BODY_SCAN_MODEL = os.getenv('FAL_BODY_SCAN_MODEL', 'fal-ai/sam-3/3d-body').strip()
 FAL_BODY_SCAN_TIMEOUT_SECONDS = int(os.getenv('FAL_BODY_SCAN_TIMEOUT_SECONDS', '180'))

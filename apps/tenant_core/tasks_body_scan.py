@@ -36,7 +36,7 @@ def run_assessment_body_scan(self, tenant_id: str = None, assessment_id: str = N
         return {'status': 'FAILED', 'error': 'tenant_id and assessment_id are required'}
 
     from .models_assessment import MemberAssessment
-    from .services_body_scan import BodyScanService, FalBodyScanClient
+    from .services_body_scan import BodyScanService, get_scan_client
 
     try:
         with tenant_database_context(tenant_id):
@@ -55,7 +55,7 @@ def run_assessment_body_scan(self, tenant_id: str = None, assessment_id: str = N
             assessment.save(using=alias, update_fields=['scan_status', 'scan_started_at', 'updated_at'])
 
             try:
-                result = BodyScanService.analyse(assessment, client=FalBodyScanClient())
+                result = BodyScanService.analyse(assessment, client=get_scan_client())
                 BodyScanService.apply_to_assessment(assessment, result, db_alias=alias)
             except Exception as exc:  # provider or parsing failure
                 logger.exception("Body scan failed for assessment %s", assessment_id)

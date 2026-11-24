@@ -45,6 +45,8 @@ def load_scan_module():
                 FAL_KEY = os.environ.get('FAL_KEY', '')
                 FAL_BODY_SCAN_MODEL = os.environ.get('FAL_BODY_SCAN_MODEL', 'fal-ai/sam-3/3d-body')
                 FAL_BODY_SCAN_TIMEOUT_SECONDS = 180
+                BODY_SCAN_PROVIDER = os.environ.get('BODY_SCAN_PROVIDER', 'local')
+                BODY_SCAN_LOCAL_MODEL_PATH = os.environ.get('BODY_SCAN_LOCAL_MODEL_PATH', '')
 
             conf_mod.settings = _Settings()
             django_mod.conf = conf_mod
@@ -99,6 +101,10 @@ def main() -> int:
     parser.add_argument('--right', help='Path to the right profile capture')
     parser.add_argument('--height', type=float, default=None,
                         help='Measured standing height in cm. Without it, girth estimates are skipped by design.')
+    parser.add_argument('--provider', choices=('local', 'fal'), default=None,
+                        help='Override BODY_SCAN_PROVIDER for this run')
+    parser.add_argument('--model-path', default=None,
+                        help='Path to the MediaPipe pose_landmarker .task file (local provider)')
     parser.add_argument('--dry-run', action='store_true', help='Use a canned provider response; no key or network needed')
     parser.add_argument('--json', action='store_true', help='Print the full result as JSON')
     args = parser.parse_args()
@@ -121,13 +127,24 @@ def main() -> int:
         views = {'front': None, 'left': None}
 
     if not args.dry_run:
-        key = os.environ.get('FAL_KEY', '').strip()
-        if not key:
-            print("error: FAL_KEY is not set in the environment.", file=sys.stderr)
-            print("       export FAL_KEY=... (or use --dry-run to test the geometry only)", file=sys.stderr)
-            return 2
-        client = bs.FalBodyScanClient(api_key=key)
-        print(f"provider : fal.ai\nmodel    : {client.model}\n")
+        provider = (args.provider or os.environ.get('BODY_SCAN_PROVIDER') or 'local').lower()
+        if provider == 'fal':
+            key = os.environ.get('FAL_KEY', '').strip()
+            if not key:
+                print("error: FAL_KEY is not set in the environment.", file=sys.stderr)
+                print("       export FAL_KEY=... (or use --provider local / --dry-run)", file=sys.stderr)
+                return 2
+            client = bs.FalBodyScanClient(api_key=key)
+        else:
+            model_path = args.model_path or os.environ.get('BODY_SCAN_LOCAL_MODEL_PATH', '')
+            client = bs.LocalPoseScanClient(model_path=model_path)
+            if not client.is_configured:
+                print("error: the MediaPipe pose model was not found.", file=sys.stderr)
+                print("       pass --model-path /path/to/pose_landmarker_lite.task", file=sys.stderr)
+                print("       download: https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+                      "pose_landmarker_lite/float16/1/pose_landmarker_lite.task", file=sys.stderr)
+                return 2
+        print(f"provider : {client.provider_name}\nmodel    : {client.model}\n")
 
     per_view, quality = {}, {}
 
