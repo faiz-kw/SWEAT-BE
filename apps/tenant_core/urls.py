@@ -360,8 +360,9 @@ router.register(r'retail-orders', RetailOrderViewSet, basename='retail-order')
 router.register(r'inventory-movements', InventoryMovementViewSet, basename='inventory-movement')
 router.register(r'suppliers', SupplierViewSet, basename='supplier')
 
-from .views_assessment import AssessmentSessionViewSet, StudioScreenPairingView
+from .views_assessment import AssessmentSessionViewSet, AssessmentProgressionViewSet, StudioScreenPairingView
 router.register(r'assessments', AssessmentSessionViewSet, basename='assessment')
+router.register(r'assessment-progressions', AssessmentProgressionViewSet, basename='assessment-progression')
 
 from .views_tickets import SupportTicketViewSet
 router.register(r'tickets', SupportTicketViewSet, basename='ticket')
