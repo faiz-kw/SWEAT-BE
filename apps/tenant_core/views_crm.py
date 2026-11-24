@@ -516,6 +516,16 @@ class LeadViewSet(viewsets.ModelViewSet):
             'organization', 'branch', 'lead_source', 'assigned_sales_user', 'assigned_trainer_user',
             'interested_program', 'referred_by_user', 'commercial_profile', 'converted_user_profile'
         ).prefetch_related('attributions')
+        # Surface each lead's most recent call outcome (disposition) in the list without N+1.
+        from django.db.models import OuterRef, Subquery
+        from .models_crm import CallSession
+        _latest_call = CallSession.objects.filter(lead=OuterRef('pk')).exclude(
+            disposition=''
+        ).exclude(disposition__isnull=True).order_by('-disposition_submitted_at', '-started_at', '-id')
+        qs = qs.annotate(
+            _last_call_disposition=Subquery(_latest_call.values('disposition')[:1]),
+            _last_call_at=Subquery(_latest_call.values('disposition_submitted_at')[:1]),
+        )
         if org:
             qs = qs.filter(organization=org)
 
