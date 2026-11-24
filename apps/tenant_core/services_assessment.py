@@ -254,20 +254,46 @@ class AssessmentEngineService:
         cls,
         weight_kg: float,
         height_cm: float,
-        age: int = 30,
-        sex: str = 'FEMALE',
+        age: Optional[int] = None,
+        sex: Optional[str] = None,
         activity_level: str = 'MODERATELY_ACTIVE',
         goal: str = 'POSTURE_ALIGNMENT',
     ) -> Dict[str, Any]:
         """
         Calculates RMR (Mifflin-St Jeor), TDEE, Calorie Target, and Macro Targets.
+
+        Age and sex are genuine inputs to the equation, not decoration: a missing value moves
+        the resting rate by hundreds of kilocalories. When either is unknown the calculation
+        still runs so the coach is not blocked, but the substitution is recorded in
+        `inputs` and the result is flagged `inputs_complete: False` so the interface can say
+        the figure is provisional until the profile is completed.
         """
         w = float(weight_kg)
         h = float(height_cm)
-        a = int(age)
+
+        ASSUMED_AGE = 30
+        assumptions = []
+
+        if age is None:
+            a = ASSUMED_AGE
+            assumptions.append(f"Age was unknown; {ASSUMED_AGE} years assumed for the equation.")
+        else:
+            a = int(age)
+
+        sex_norm = str(sex or '').strip().upper()
+        if sex_norm in ('MALE', 'M'):
+            is_male = True
+        elif sex_norm in ('FEMALE', 'F'):
+            is_male = False
+        else:
+            is_male = False
+            assumptions.append(
+                "Sex was not recorded or was self-described; the female coefficient was used, "
+                "which yields the more conservative resting rate."
+            )
 
         # 1. RMR / BMR via Mifflin-St Jeor
-        if str(sex).upper() in ['MALE', 'M']:
+        if is_male:
             rmr = (10.0 * w) + (6.25 * h) - (5.0 * a) + 5.0
         else:
             rmr = (10.0 * w) + (6.25 * h) - (5.0 * a) - 161.0
@@ -316,6 +342,22 @@ class AssessmentEngineService:
             'tdee_kcal': tdee_val,
             'daily_calorie_target': calorie_target,
             'goal_strategy': goal_strategy,
+            'method': 'mifflin_st_jeor',
+            'is_estimate': True,
+            'inputs_complete': not assumptions,
+            'inputs': {
+                'age_years': age,
+                'sex': sex_norm or None,
+                'weight_kg': w,
+                'height_cm': h,
+                'activity_level': activity_level,
+            },
+            'assumptions': assumptions,
+            'disclosure': (
+                'Resting metabolic rate is estimated from a validated equation, not measured by '
+                'indirect calorimetry. Daily energy expenditure is a starting point for planning '
+                'and should be calibrated against the observed weight trend.'
+            ),
             'macros': {
                 'protein_g': protein_g,
                 'carbs_g': carb_g,
@@ -413,39 +455,12 @@ class AssessmentEngineService:
 
         return matrix
 
-    @classmethod
-    def calculate_computer_vision_metrics(
-        cls,
-        front_photo_url: Optional[str] = None,
-        side_photo_url: Optional[str] = None,
-        height_cm: Optional[float] = None,
-        weight_kg: Optional[float] = None,
-    ) -> Dict[str, Any]:
-        """
-        Computes posture alignment angles, estimated body fat %, and waist-to-hip ratio.
-        """
-        # Sensible baselines with slight realistic variance
-        shoulder_tilt = Decimal('1.8')  # degrees
-        hip_tilt = Decimal('1.2')       # degrees
-        forward_head = Decimal('4.5')   # degrees
-
-        posture_score = Decimal('84.50')
-        estimated_bf = Decimal('24.2')
-        wh_ratio = Decimal('0.78')
-
-        if height_cm and weight_kg:
-            bmi = float(weight_kg) / ((float(height_cm) / 100.0) ** 2)
-            estimated_bf = Decimal(str(round(max(14.0, min(38.0, (1.20 * bmi) + 4.0)), 1)))
-
-        return {
-            'posture_score': posture_score,
-            'shoulder_tilt_degrees': shoulder_tilt,
-            'hip_tilt_degrees': hip_tilt,
-            'forward_head_angle_degrees': forward_head,
-            'estimated_body_fat_pct': estimated_bf,
-            'waist_to_hip_ratio': wh_ratio,
-            'analysis_notes': 'Slight right shoulder elevation detected. Neutral pelvic tilt within healthy range.',
-        }
+    # NOTE: `calculate_computer_vision_metrics` used to live here and returned fixed
+    # constants (posture 84.50, shoulder tilt 1.8°, a body-fat figure derived from BMI) that
+    # were presented to members as scan results. It has been removed rather than deprecated,
+    # so nothing can call it by accident. Real posture geometry now comes from
+    # `services_body_scan.BodyScanService`, which measures angles from detected joints and
+    # returns nothing at all when a capture is unusable.
 
     @classmethod
     @transaction.atomic

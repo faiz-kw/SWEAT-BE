@@ -415,6 +415,8 @@ urlpatterns = [
     path('community/audit-logs/', views_community.CommunityAdminAuditLogsView.as_view(), name='admin-community-audit-logs'),
 
     path('assessments/<uuid:pk>/capture/', AssessmentSessionViewSet.as_view({'post': 'capture_photos'}), name='assessment-capture'),
+    path('assessments/<uuid:pk>/scan/', AssessmentSessionViewSet.as_view({'get': 'scan_status_view'}), name='assessment-scan-status'),
+    path('assessments/<uuid:pk>/rescan/', AssessmentSessionViewSet.as_view({'post': 'rescan'}), name='assessment-rescan'),
     path('assessments/<uuid:pk>/approve-and-send/', AssessmentSessionViewSet.as_view({'post': 'approve_and_send'}), name='assessment-approve'),
     path('assessments/pair/', StudioScreenPairingView.as_view(), name='assessment-pair'),
 

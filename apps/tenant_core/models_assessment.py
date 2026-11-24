@@ -114,6 +114,20 @@ class MemberAssessment(models.Model):
     # =========================================================================
     # SECTION 1: MEMBER PROFILE & BASELINE CLASSIFICATION
     # =========================================================================
+    # Section 1 demographics. Age and sex are not cosmetic here: the Mifflin-St Jeor equation
+    # that produces RMR/TDEE takes both, so a missing value changes the calorie target.
+    SEX_CHOICES = [
+        ('FEMALE', 'Female'),
+        ('MALE', 'Male'),
+        ('OTHER', 'Other / self-described'),
+        ('UNDISCLOSED', 'Prefer not to say'),
+    ]
+
+    member_date_of_birth = models.DateField(null=True, blank=True)
+    member_age_years = models.PositiveIntegerField(null=True, blank=True, help_text="Derived from date of birth at assessment time")
+    member_sex = models.CharField(max_length=20, choices=SEX_CHOICES, blank=True, default='', help_text="Used only for the metabolic estimation equation")
+    assessment_date = models.DateField(null=True, blank=True, help_text="Date the assessment was conducted, if backdated from created_at")
+
     assessment_type = models.CharField(max_length=30, choices=ASSESSMENT_TYPE_CHOICES, default='INITIAL')
     training_experience = models.CharField(max_length=30, choices=TRAINING_EXPERIENCE_CHOICES, default='BEGINNER')
     current_activity_level = models.CharField(max_length=30, choices=ACTIVITY_LEVEL_CHOICES, default='MODERATELY_ACTIVE')
@@ -185,16 +199,58 @@ class MemberAssessment(models.Model):
     # =========================================================================
     # CAMERA POSTURE & COMPUTER VISION
     # =========================================================================
+    # Four standardised capture views (front, back, left profile, right profile).
+    # `photo_side` is the legacy single-profile field, retained so historical rows keep
+    # their image; new captures write the explicit left/right fields.
     photo_front = models.ImageField(upload_to='assessments/baseline/%Y/%m/', null=True, blank=True)
     photo_side = models.ImageField(upload_to='assessments/baseline/%Y/%m/', null=True, blank=True)
+    photo_back = models.ImageField(upload_to='assessments/baseline/%Y/%m/', null=True, blank=True)
+    photo_side_left = models.ImageField(upload_to='assessments/baseline/%Y/%m/', null=True, blank=True)
+    photo_side_right = models.ImageField(upload_to='assessments/baseline/%Y/%m/', null=True, blank=True)
     photo_front_url = models.CharField(max_length=500, null=True, blank=True)
     photo_side_url = models.CharField(max_length=500, null=True, blank=True)
+    photo_back_url = models.CharField(max_length=500, null=True, blank=True)
+    photo_side_left_url = models.CharField(max_length=500, null=True, blank=True)
+    photo_side_right_url = models.CharField(max_length=500, null=True, blank=True)
 
-    posture_score = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('85.00'), help_text="0-100 posture score")
+    # Posture metrics are computed from real pose keypoints. They stay NULL until a scan
+    # succeeds — never pre-filled with a placeholder, so the UI can show "not assessed".
+    posture_score = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True, help_text="0-100 posture score, derived from measured joint angles")
     shoulder_tilt_degrees = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
     hip_tilt_degrees = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
     forward_head_angle_degrees = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
-    cv_analysis_payload = models.JSONField(default=dict, blank=True, help_text="Pose landmarks and symmetry vectors")
+    lateral_shift_degrees = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True, help_text="Frontal-plane deviation of the body midline")
+    cv_analysis_payload = models.JSONField(default=dict, blank=True, help_text="Per-view keypoints, derived angles and the assumptions behind them")
+
+    # =========================================================================
+    # BODY SCAN JOB (fal.ai SAM 3D Body)
+    # =========================================================================
+    SCAN_STATUS_CHOICES = [
+        ('NOT_STARTED', 'No scan requested yet'),
+        ('QUEUED', 'Queued for analysis'),
+        ('PROCESSING', 'Analysis in progress'),
+        ('COMPLETED', 'Analysis complete'),
+        ('PARTIAL', 'Completed with some views unusable'),
+        ('FAILED', 'Analysis failed'),
+        ('UNAVAILABLE', 'Scan provider not configured'),
+        ('SKIPPED_NO_CONSENT', 'Member did not consent to image analysis'),
+    ]
+
+    scan_status = models.CharField(max_length=30, choices=SCAN_STATUS_CHOICES, default='NOT_STARTED', db_index=True)
+    scan_provider = models.CharField(max_length=50, blank=True, default='', help_text="e.g. fal.ai")
+    scan_model = models.CharField(max_length=120, blank=True, default='', help_text="Exact model id used, recorded for reproducibility")
+    scan_started_at = models.DateTimeField(null=True, blank=True)
+    scan_completed_at = models.DateTimeField(null=True, blank=True)
+    scan_error = models.TextField(null=True, blank=True)
+    scan_capture_quality = models.JSONField(default=dict, blank=True, help_text="Per-view quality verdict: usable, warnings, reason when rejected")
+    scan_raw_payload = models.JSONField(default=dict, blank=True, help_text="Provider response per view, minus large binaries")
+
+    # Circumference estimates derived from the scan. Always estimates — tape measurements
+    # live in the Section 3 fields and take precedence wherever both exist.
+    estimated_waist_cm = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    estimated_hip_cm = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    estimated_chest_cm = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    estimated_shoulder_width_cm = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
 
     # =========================================================================
     # REVEALED AFTER APPROVAL: PROGRAM, PACKAGE & NUTRITION PLAN

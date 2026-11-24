@@ -641,6 +641,9 @@ from .tasks_meta_leads import (  # noqa: F401
     process_meta_lead_import_task,
     recover_meta_imports_periodic_task,
 )
+from .tasks_body_scan import (  # noqa: F401
+    run_assessment_body_scan,
+)
 
 
 @shared_task(

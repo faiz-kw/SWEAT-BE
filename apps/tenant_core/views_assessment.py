@@ -11,13 +11,18 @@ Endpoints:
 7. GET  /api/v1/tenant/assessments/pair/          — Connects Studio TV Display Screen (mirror mode)
 """
 
+import logging
 import uuid
+from datetime import date
 from decimal import Decimal
+from django.conf import settings as djsettings
+from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from typing import Optional
 
 from config.routers import set_tenant_db_alias, get_tenant_db_alias
 from .models_assessment import MemberAssessment
@@ -27,6 +32,26 @@ from .models_crm import UserProfile, Lead
 from .models_catalog import Package
 from .services_assessment import AssessmentEngineService
 from .services_reliability import record_business_audit
+
+logger = logging.getLogger(__name__)
+
+
+def _image_url(field) -> Optional[str]:
+    """Returns a stored image's URL, or None when the field is empty or unreadable."""
+    if not field:
+        return None
+    try:
+        return field.url
+    except Exception:
+        return None
+
+
+def _derive_age(dob) -> Optional[int]:
+    """Whole years between a date of birth and today."""
+    if not dob:
+        return None
+    today = date.today()
+    return today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
 
 
 def _resolve_db_and_org(request):
@@ -119,6 +144,34 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
         perceived_barrier = data.get('perceived_barrier', '')
         confidence_score = int(data.get('member_confidence_score', 8))
 
+        # 3b. Demographics. Mifflin-St Jeor takes age and sex; without them the equation
+        # silently returns someone else's resting metabolic rate, so resolve them from the
+        # payload first, then the member profile, then the lead.
+        dob = data.get('member_date_of_birth') or data.get('date_of_birth')
+        if not dob and user_profile:
+            dob = getattr(user_profile, 'date_of_birth', None)
+        if isinstance(dob, str):
+            try:
+                dob = date.fromisoformat(dob.strip()[:10])
+            except ValueError:
+                dob = None
+
+        member_sex = (data.get('member_sex') or data.get('sex') or data.get('gender') or '').strip().upper()
+        if not member_sex and user_profile:
+            member_sex = (getattr(user_profile, 'gender', '') or '').strip().upper()
+        if member_sex in ('F', 'WOMAN', 'W'):
+            member_sex = 'FEMALE'
+        elif member_sex in ('M', 'MAN'):
+            member_sex = 'MALE'
+        if member_sex not in ('FEMALE', 'MALE', 'OTHER', 'UNDISCLOSED'):
+            member_sex = ''
+
+        member_age = data.get('member_age_years') or _derive_age(dob)
+        try:
+            member_age = int(member_age) if member_age else None
+        except (TypeError, ValueError):
+            member_age = None
+
         # 4. Health Screening (PAR-Q)
         health_screening = data.get('health_screening', {})
         screening_outcome = data.get('screening_outcome', 'CLEARED')
@@ -143,6 +196,8 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
             meta_plan = AssessmentEngineService.calculate_metabolic_nutrition_plan(
                 weight_kg=float(weight_kg),
                 height_cm=float(height_cm),
+                age=member_age,
+                sex=member_sex,
                 activity_level=current_activity_level,
                 goal=target_goal,
             )
@@ -184,6 +239,9 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
             member_name=name,
             member_phone=phone,
             conducted_by_trainer=trainer_user,
+            member_date_of_birth=dob or None,
+            member_age_years=member_age,
+            member_sex=member_sex,
             assessment_type=assessment_type,
             training_experience=training_experience,
             current_activity_level=current_activity_level,
@@ -242,6 +300,21 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
             instance.weekly_frequency_days = int(data['weekly_frequency_days'])
         if 'preferred_training_style' in data:
             instance.preferred_training_style = data['preferred_training_style']
+        if 'member_date_of_birth' in data and data['member_date_of_birth']:
+            try:
+                instance.member_date_of_birth = date.fromisoformat(str(data['member_date_of_birth']).strip()[:10])
+                instance.member_age_years = _derive_age(instance.member_date_of_birth)
+            except ValueError:
+                pass
+        if 'member_age_years' in data and data['member_age_years']:
+            try:
+                instance.member_age_years = int(data['member_age_years'])
+            except (TypeError, ValueError):
+                pass
+        if 'member_sex' in data and data['member_sex']:
+            candidate = str(data['member_sex']).strip().upper()
+            if candidate in ('FEMALE', 'MALE', 'OTHER', 'UNDISCLOSED'):
+                instance.member_sex = candidate
 
         # Update health screening
         if 'health_screening' in data:
@@ -270,6 +343,8 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
             meta_plan = AssessmentEngineService.calculate_metabolic_nutrition_plan(
                 weight_kg=float(instance.measured_weight_kg),
                 height_cm=float(instance.measured_height_cm),
+                age=instance.member_age_years or _derive_age(instance.member_date_of_birth),
+                sex=instance.member_sex,
                 activity_level=instance.current_activity_level,
                 goal=instance.target_goal,
             )
@@ -312,43 +387,217 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
         instance = self.get_object()
         return Response(self._serialize_assessment(instance), status=status.HTTP_200_OK)
 
+    # Field name on the request -> model attribute. The studio captures four standardised
+    # views; `photo_side` stays accepted so older clients keep working, landing on the right
+    # profile rather than being silently dropped.
+    CAPTURE_FIELDS = {
+        'photo_front': 'photo_front',
+        'photo_back': 'photo_back',
+        'photo_side_left': 'photo_side_left',
+        'photo_side_right': 'photo_side_right',
+        'photo_side': 'photo_side_right',
+    }
+
     def capture_photos(self, request, pk=None):
         """
         POST /api/v1/tenant/assessments/<id>/capture/
-        Uploads baseline standing photos and triggers computer vision posture extraction.
+
+        Stores the four standardised baseline captures (front, back, left profile, right
+        profile) and queues the pose analysis. No measurement is produced here: the response
+        reports that the scan is queued, and the client polls `/scan/` for the result.
         """
         alias, org = _resolve_db_and_org(request)
         assessment = self.get_object()
 
-        front_file = request.FILES.get('photo_front')
-        side_file = request.FILES.get('photo_side')
-        if front_file:
-            assessment.photo_front = front_file
-        if side_file:
-            assessment.photo_side = side_file
+        received = []
+        for field_name, attr in self.CAPTURE_FIELDS.items():
+            uploaded = request.FILES.get(field_name)
+            if uploaded:
+                setattr(assessment, attr, uploaded)
+                if attr not in received:
+                    received.append(attr)
 
-        height = request.data.get('height_cm') or assessment.measured_height_cm
-        weight = request.data.get('weight_kg') or assessment.measured_weight_kg
-        metrics = AssessmentEngineService.calculate_computer_vision_metrics(
-            height_cm=float(height) if height else None,
-            weight_kg=float(weight) if weight else None,
+        if not received:
+            return Response(
+                {'error': 'At least one capture is required. Expected any of: photo_front, photo_back, photo_side_left, photo_side_right.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Consent gate. The specification treats movement photography as a separate, optional
+        # consent, so a member who declined it gets their assessment without a scan rather
+        # than having their images analysed anyway.
+        consent_param = request.data.get('consent_movement_photos')
+        if consent_param is not None:
+            assessment.consent_movement_photos = str(consent_param).lower() in ('true', '1', 'yes')
+        consent_ai_param = request.data.get('consent_ai_analysis')
+        if consent_ai_param is not None:
+            assessment.consent_ai_analysis = str(consent_ai_param).lower() in ('true', '1', 'yes')
+
+        # Capture conditions the camera cannot infer, recorded by the coach so a later reader
+        # knows how comparable two assessments are.
+        conditions = {}
+        for key in ('clothing_fit', 'capture_mode', 'lighting', 'footwear', 'camera_distance_m'):
+            value = request.data.get(key)
+            if value not in (None, ''):
+                conditions[key] = value
+        if conditions:
+            payload = dict(assessment.cv_analysis_payload or {})
+            payload['capture_conditions'] = conditions
+            assessment.cv_analysis_payload = payload
+
+        scan_requested = bool(assessment.consent_movement_photos and assessment.consent_ai_analysis)
+        if not scan_requested:
+            assessment.scan_status = 'SKIPPED_NO_CONSENT'
+            assessment.scan_error = 'The member did not consent to photographic / AI movement analysis.'
+        elif not getattr(djsettings, 'BODY_SCAN_ENABLED', True):
+            assessment.scan_status = 'UNAVAILABLE'
+            assessment.scan_error = 'Body scanning is switched off on this server.'
+        elif not (getattr(djsettings, 'FAL_KEY', '') or '').strip():
+            assessment.scan_status = 'UNAVAILABLE'
+            assessment.scan_error = (
+                'Body scanning is not configured on this server. The captures were stored and no '
+                'measurements were produced.'
+            )
+        else:
+            assessment.scan_status = 'QUEUED'
+            assessment.scan_error = None
+            assessment.scan_started_at = timezone.now()
+            assessment.scan_completed_at = None
+
+        if assessment.status == 'DRAFT':
+            assessment.status = 'TESTING'
+
+        assessment.save(using=alias)
+
+        queued = False
+        if assessment.scan_status == 'QUEUED':
+            queued = self._enqueue_scan(request, assessment, alias)
+
+        body = self._serialize_assessment(assessment)
+        body['scan'] = self._serialize_scan(assessment)
+        body['scan']['queued'] = queued
+        body['views_received'] = received
+        return Response(body, status=status.HTTP_202_ACCEPTED if queued else status.HTTP_200_OK)
+
+    def _enqueue_scan(self, request, assessment, alias: str) -> bool:
+        """
+        Hands the scan to Celery, falling back to running it inline when no broker is
+        reachable so a single-process deployment still produces results.
+        """
+        tenant_id = getattr(getattr(request, 'tenant', None), 'id', None) or getattr(request, 'tenant_id', None)
+        if tenant_id:
+            try:
+                from .tasks_body_scan import run_assessment_body_scan
+                run_assessment_body_scan.delay(tenant_id=str(tenant_id), assessment_id=str(assessment.id))
+                return True
+            except Exception:
+                logger.warning(
+                    "Could not queue the body scan for assessment %s; running it inline.",
+                    assessment.id, exc_info=True,
+                )
+        else:
+            logger.info(
+                "No tenant id on the request for assessment %s; running the body scan inline.",
+                assessment.id,
+            )
+
+        try:
+            from .services_body_scan import BodyScanService, FalBodyScanClient
+            assessment.scan_status = 'PROCESSING'
+            assessment.save(using=alias, update_fields=['scan_status', 'updated_at'])
+            result = BodyScanService.analyse(assessment, client=FalBodyScanClient())
+            BodyScanService.apply_to_assessment(assessment, result, db_alias=alias)
+        except Exception as exc:
+            logger.exception("Inline body scan failed for assessment %s", assessment.id)
+            assessment.scan_status = 'FAILED'
+            assessment.scan_error = str(exc)[:2000]
+            assessment.scan_completed_at = timezone.now()
+            assessment.save(using=alias, update_fields=['scan_status', 'scan_error', 'scan_completed_at', 'updated_at'])
+        return False
+
+    def scan_status_view(self, request, pk=None):
+        """
+        GET /api/v1/tenant/assessments/<id>/scan/
+
+        Poll target while the analysis runs, and the record of what it concluded afterwards.
+        """
+        assessment = self.get_object()
+        return Response(self._serialize_scan(assessment), status=status.HTTP_200_OK)
+
+    def rescan(self, request, pk=None):
+        """
+        POST /api/v1/tenant/assessments/<id>/rescan/
+
+        Re-runs the analysis against the captures already on file, for when a transient
+        provider failure is the only thing standing between the coach and a result.
+        """
+        alias, org = _resolve_db_and_org(request)
+        assessment = self.get_object()
+
+        if assessment.status == 'APPROVED':
+            return Response(
+                {'error': 'This assessment is already approved. Re-open it before re-running the scan.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not (assessment.consent_movement_photos and assessment.consent_ai_analysis):
+            return Response(
+                {'error': 'The member did not consent to photographic / AI movement analysis.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        from .services_body_scan import BodyScanService
+        if not BodyScanService.collect_views(assessment):
+            return Response(
+                {'error': 'There are no captures on file to analyse. Take the baseline photos first.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        assessment.scan_status = 'QUEUED'
+        assessment.scan_error = None
+        assessment.scan_started_at = timezone.now()
+        assessment.scan_completed_at = None
+        assessment.save(
+            using=alias,
+            update_fields=['scan_status', 'scan_error', 'scan_started_at', 'scan_completed_at', 'updated_at'],
         )
 
-        assessment.posture_score = metrics['posture_score']
-        assessment.shoulder_tilt_degrees = metrics['shoulder_tilt_degrees']
-        assessment.hip_tilt_degrees = metrics['hip_tilt_degrees']
-        assessment.forward_head_angle_degrees = metrics.get('forward_head_angle_degrees')
-        assessment.estimated_body_fat_pct = metrics['estimated_body_fat_pct']
-        assessment.waist_to_hip_ratio = metrics['waist_to_hip_ratio']
-        assessment.cv_analysis_payload = metrics
+        queued = self._enqueue_scan(request, assessment, alias)
+        payload = self._serialize_scan(assessment)
+        payload['queued'] = queued
+        return Response(payload, status=status.HTTP_202_ACCEPTED)
 
-        # Milestone preview references
-        assessment.month_1_image_url = assessment.photo_front_url or "https://images.unsplash.com/photo-1518611012118-696072aa579a?auto=format&fit=crop&w=800&q=80"
-        assessment.month_2_image_url = assessment.photo_front_url or "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=800&q=80"
-        assessment.month_3_image_url = assessment.photo_front_url or "https://images.unsplash.com/photo-1544005313-94ddf0286df2?auto=format&fit=crop&w=800&q=80"
-
-        assessment.status = 'PENDING_REVIEW'
-        assessment.save(using=alias)
+    def _serialize_scan(self, assessment) -> dict:
+        """The scan's own view of itself: state, provenance, quality per view, and results."""
+        payload = assessment.cv_analysis_payload or {}
+        raw = assessment.scan_raw_payload or {}
+        return {
+            'assessment_id': str(assessment.id),
+            'status': assessment.scan_status,
+            'is_terminal': assessment.scan_status in (
+                'COMPLETED', 'PARTIAL', 'FAILED', 'UNAVAILABLE', 'SKIPPED_NO_CONSENT',
+            ),
+            'provider': assessment.scan_provider or None,
+            'model': assessment.scan_model or None,
+            'error': assessment.scan_error,
+            'started_at': assessment.scan_started_at.isoformat() if assessment.scan_started_at else None,
+            'completed_at': assessment.scan_completed_at.isoformat() if assessment.scan_completed_at else None,
+            'views_submitted': raw.get('views_submitted') or [],
+            'views_usable': raw.get('views_usable') or [],
+            'capture_quality': assessment.scan_capture_quality or {},
+            'warnings': raw.get('warnings') or [],
+            'per_view': raw.get('per_view') or {},
+            'posture': {
+                'posture_score': float(assessment.posture_score) if assessment.posture_score is not None else None,
+                'shoulder_tilt_degrees': float(assessment.shoulder_tilt_degrees) if assessment.shoulder_tilt_degrees is not None else None,
+                'hip_tilt_degrees': float(assessment.hip_tilt_degrees) if assessment.hip_tilt_degrees is not None else None,
+                'forward_head_angle_degrees': float(assessment.forward_head_angle_degrees) if assessment.forward_head_angle_degrees is not None else None,
+                'lateral_shift_degrees': float(assessment.lateral_shift_degrees) if assessment.lateral_shift_degrees is not None else None,
+                'breakdown': payload.get('posture_score_breakdown'),
+            },
+            'circumference_estimates': payload.get('circumference_estimates') or {},
+            'capture_conditions': payload.get('capture_conditions') or {},
+            'measurement_metadata': assessment.measurement_metadata or {},
+        }
 
         return Response(self._serialize_assessment(assessment), status=status.HTTP_200_OK)
 
@@ -444,23 +693,51 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
                 'tdee_kcal': instance.tdee_kcal,
                 'daily_calorie_target': instance.daily_calorie_target,
                 'macros': instance.nutrition_macros,
-                'estimated_body_fat_pct': float(instance.estimated_body_fat_pct or 0),
-                'waist_to_hip_ratio': float(instance.waist_to_hip_ratio or 0),
+                'estimated_body_fat_pct': float(instance.estimated_body_fat_pct) if instance.estimated_body_fat_pct is not None else None,
+                'waist_to_hip_ratio': float(instance.waist_to_hip_ratio) if instance.waist_to_hip_ratio is not None else None,
             },
 
             # Sections 4-11: Movement Tests & Capability Matrix
             'functional_tests': instance.functional_tests_payload,
             'capability_matrix': instance.capability_matrix,
 
-            # Photos & Posture Score
-            'photo_front_url': instance.photo_front.url if instance.photo_front else instance.photo_front_url,
-            'photo_side_url': instance.photo_side.url if instance.photo_side else instance.photo_side_url,
-            'metrics': {
-                'posture_score': float(instance.posture_score),
-                'shoulder_tilt_degrees': float(instance.shoulder_tilt_degrees or 0),
-                'hip_tilt_degrees': float(instance.hip_tilt_degrees or 0),
-                'forward_head_angle_degrees': float(instance.forward_head_angle_degrees or 0),
+            # Four standardised captures. A view with no image returns null rather than a
+            # stand-in, so the studio screen can show it as outstanding.
+            'photos': {
+                'front': _image_url(instance.photo_front) or instance.photo_front_url,
+                'back': _image_url(instance.photo_back) or instance.photo_back_url,
+                'left': _image_url(instance.photo_side_left) or instance.photo_side_left_url,
+                'right': _image_url(instance.photo_side_right) or _image_url(instance.photo_side)
+                         or instance.photo_side_right_url or instance.photo_side_url,
             },
+            'photo_front_url': _image_url(instance.photo_front) or instance.photo_front_url,
+            'photo_side_url': _image_url(instance.photo_side_right) or _image_url(instance.photo_side) or instance.photo_side_url,
+
+            # Measured posture geometry. These stay null until a scan succeeds — there is no
+            # placeholder value, so "not assessed" is distinguishable from "assessed as 0".
+            'metrics': {
+                'posture_score': float(instance.posture_score) if instance.posture_score is not None else None,
+                'shoulder_tilt_degrees': float(instance.shoulder_tilt_degrees) if instance.shoulder_tilt_degrees is not None else None,
+                'hip_tilt_degrees': float(instance.hip_tilt_degrees) if instance.hip_tilt_degrees is not None else None,
+                'forward_head_angle_degrees': float(instance.forward_head_angle_degrees) if instance.forward_head_angle_degrees is not None else None,
+                'lateral_shift_degrees': float(instance.lateral_shift_degrees) if instance.lateral_shift_degrees is not None else None,
+            },
+            'scan': {
+                'status': instance.scan_status,
+                'provider': instance.scan_provider or None,
+                'model': instance.scan_model or None,
+                'error': instance.scan_error,
+                'views_usable': (instance.scan_raw_payload or {}).get('views_usable') or [],
+                'capture_quality': instance.scan_capture_quality or {},
+            },
+            'estimated_measurements': {
+                'waist_cm': float(instance.estimated_waist_cm) if instance.estimated_waist_cm is not None else None,
+                'hip_cm': float(instance.estimated_hip_cm) if instance.estimated_hip_cm is not None else None,
+                'chest_cm': float(instance.estimated_chest_cm) if instance.estimated_chest_cm is not None else None,
+                'shoulder_width_cm': float(instance.estimated_shoulder_width_cm) if instance.estimated_shoulder_width_cm is not None else None,
+                'disclaimer': 'Estimated from capture geometry. Tape measurements remain authoritative.',
+            },
+            'measurement_metadata': instance.measurement_metadata or {},
 
             # Program & Package Recommendation (Revealed upon approval)
             'recommended_package': ret_pkg_payload,

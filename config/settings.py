@@ -224,6 +224,17 @@ META_REDIRECT_URI = os.getenv('META_REDIRECT_URI', '').strip()
 PRIVACY_CONTACT_EMAIL = os.getenv('PRIVACY_CONTACT_EMAIL', '').strip()
 
 # ---------------------------------------------------------------------------
+# Body scan (member assessments)
+# ---------------------------------------------------------------------------
+# fal.ai hosts the pose model used to derive posture geometry from the four baseline
+# captures. With no key configured the assessment flow still stores the photos and records
+# the scan as UNAVAILABLE — it never falls back to placeholder measurements.
+FAL_KEY = os.getenv('FAL_KEY', '').strip()
+FAL_BODY_SCAN_MODEL = os.getenv('FAL_BODY_SCAN_MODEL', 'fal-ai/sam-3/3d-body').strip()
+FAL_BODY_SCAN_TIMEOUT_SECONDS = int(os.getenv('FAL_BODY_SCAN_TIMEOUT_SECONDS', '180'))
+BODY_SCAN_ENABLED = os.getenv('BODY_SCAN_ENABLED', 'True').lower() in ('true', '1', 't')
+
+# ---------------------------------------------------------------------------
 # Internationalization
 # ---------------------------------------------------------------------------
 LANGUAGE_CODE = 'en-us'
