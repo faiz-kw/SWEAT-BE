@@ -914,7 +914,7 @@ class TrialBookingSerializer(serializers.ModelSerializer):
         return self._get_stats(obj).get('reschedules_remaining', 0)
 
     def get_max_reschedules(self, obj):
-        return self._get_stats(obj).get('max_reschedules', 3)
+        return self._get_stats(obj).get('max_reschedules', 1)
 
     def get_is_active_trial(self, obj):
         alias = obj._state.db or 'default'

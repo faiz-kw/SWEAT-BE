@@ -2324,8 +2324,9 @@ class CRMLeadService:
                 trial_booking=trial, to_status='RESCHEDULED'
             ).count()
             bp = BookingPolicySet.objects.using(alias).filter(organization=trial.lead.organization, status='ACTIVE').first()
-            if bp and bp.max_reschedules and reschedule_count >= bp.max_reschedules:
-                raise ValidationError(f"Maximum reschedules ({bp.max_reschedules}) exceeded for this trial.")
+            _max_resched = bp.max_reschedules if (bp and bp.max_reschedules is not None) else 1
+            if reschedule_count >= _max_resched:
+                raise ValidationError(f"Maximum reschedules ({_max_resched}) exceeded for this trial.")
 
             if not new_class_occurrence_id:
                 raise ValidationError("new_class_occurrence_id is required to reschedule trial to an authoritative session.")
@@ -2547,7 +2548,7 @@ class CRMLeadService:
 
         from .models_bookings import BookingPolicySet
         bp = BookingPolicySet.objects.using(alias).filter(organization=trial.lead.organization, status='ACTIVE').first()
-        max_resched = bp.max_reschedules if (bp and bp.max_reschedules is not None) else 3
+        max_resched = bp.max_reschedules if (bp and bp.max_reschedules is not None) else 1
         remaining = max(0, max_resched - used)
 
         return {
