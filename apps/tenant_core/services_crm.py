@@ -1900,10 +1900,20 @@ class CRMLeadService:
         Completely backend-driven: zero hardcoded program names.
         """
         alias = db_alias or get_tenant_db_alias() or 'default'
+        # The program choice must not be hidden just because nothing runs on the single
+        # selected/default day. Show every program that has a trial-eligible session within a
+        # forward window from the requested date; the date + slot step then narrows to a concrete
+        # session. (Fixes: Bootcamp missing at branches where it doesn't run on the default date.)
+        from datetime import timedelta
+        from django.utils.dateparse import parse_date
+        start_d = parse_date(date) if date else None
+        if not start_d:
+            start_d = timezone.now().date()
+        end_d = start_d + timedelta(days=30)
         slots = cls.get_available_trial_slots(
             branch_id=branch_id,
-            date_from=date,
-            date_to=date,
+            date_from=start_d.isoformat(),
+            date_to=end_d.isoformat(),
             lead_id=lead_id,
             db_alias=alias,
         )
@@ -2376,8 +2386,9 @@ class CRMLeadService:
                 trial_booking=trial, to_status='RESCHEDULED'
             ).count()
             bp = BookingPolicySet.objects.using(alias).filter(organization=trial.lead.organization, status='ACTIVE').first()
-            if bp and bp.max_reschedules and reschedule_count >= bp.max_reschedules:
-                raise ValidationError(f"Maximum reschedules ({bp.max_reschedules}) exceeded for this trial.")
+            _max_resched = bp.max_reschedules if (bp and bp.max_reschedules is not None) else 1
+            if reschedule_count >= _max_resched:
+                raise ValidationError(f"Maximum reschedules ({_max_resched}) exceeded for this trial.")
 
             if not new_class_occurrence_id:
                 raise ValidationError("new_class_occurrence_id is required to reschedule trial to an authoritative session.")
@@ -2602,7 +2613,7 @@ class CRMLeadService:
 
         from .models_bookings import BookingPolicySet
         bp = BookingPolicySet.objects.using(alias).filter(organization=trial.lead.organization, status='ACTIVE').first()
-        max_resched = bp.max_reschedules if (bp and bp.max_reschedules is not None) else 3
+        max_resched = bp.max_reschedules if (bp and bp.max_reschedules is not None) else 1
         remaining = max(0, max_resched - used)
 
         return {

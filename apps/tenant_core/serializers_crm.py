@@ -98,6 +98,11 @@ class LeadSerializer(serializers.ModelSerializer):
     last_activity = serializers.SerializerMethodField()
     attention = serializers.SerializerMethodField()
 
+    # Most recent call outcome (disposition) for the leads list "Last Call" column
+    last_call_disposition = serializers.SerializerMethodField()
+    last_call_disposition_display = serializers.SerializerMethodField()
+    last_call_at = serializers.SerializerMethodField()
+
     # Optional attribution input payload on lead intake
     attribution = serializers.DictField(required=False, write_only=True)
 
@@ -314,6 +319,43 @@ class LeadSerializer(serializers.ModelSerializer):
 
     def get_full_name(self, obj):
         return f"{obj.first_name} {obj.last_name}".strip()
+
+    def _latest_call(self, obj):
+        # Reuse the Subquery annotations set in LeadViewSet.get_queryset (no N+1);
+        # fall back to a direct lookup when the serializer is used off the list queryset.
+        if hasattr(obj, '_cached_latest_call'):
+            return obj._cached_latest_call
+        disp = getattr(obj, '_last_call_disposition', '__MISSING__')
+        if disp != '__MISSING__':
+            result = (disp or None, getattr(obj, '_last_call_at', None))
+        else:
+            alias = obj._state.db or 'default'
+            from .models_crm import CallSession
+            row = (CallSession.objects.using(alias)
+                   .filter(lead=obj).exclude(disposition='').exclude(disposition__isnull=True)
+                   .order_by('-disposition_submitted_at', '-started_at', '-id')
+                   .values_list('disposition', 'disposition_submitted_at').first())
+            result = (row[0], row[1]) if row else (None, None)
+        obj._cached_latest_call = result
+        return result
+
+    def get_last_call_disposition(self, obj):
+        return self._latest_call(obj)[0]
+
+    def get_last_call_disposition_display(self, obj):
+        code = self._latest_call(obj)[0]
+        if not code:
+            return None
+        from .models_crm import CallSession
+        label = dict(CallSession.DISPOSITION_CHOICES).get(code)
+        if label:
+            return label
+        # Humanize codes not in the model's choice map (e.g. CALLBACK_REQUESTED -> Callback Requested)
+        return str(code).replace('_', ' ').title()
+
+    def get_last_call_at(self, obj):
+        val = self._latest_call(obj)[1]
+        return val.isoformat() if val else None
 
     def get_assigned_sales_name(self, obj):
         u = obj.assigned_sales_user
@@ -914,7 +956,7 @@ class TrialBookingSerializer(serializers.ModelSerializer):
         return self._get_stats(obj).get('reschedules_remaining', 0)
 
     def get_max_reschedules(self, obj):
-        return self._get_stats(obj).get('max_reschedules', 3)
+        return self._get_stats(obj).get('max_reschedules', 1)
 
     def get_is_active_trial(self, obj):
         alias = obj._state.db or 'default'
