@@ -304,6 +304,15 @@ class BookingViewSet(viewsets.ModelViewSet):
                 qs = qs.filter(status='RESCHEDULED')
             elif sf != 'ALL':
                 qs = qs.filter(status=status_filter)
+        elif self.request.query_params.get('occurrence_id'):
+            # Class roster view (fetching bookings for a specific occurrence): show the FULL roster —
+            # everyone who booked, including those auto-marked COMPLETED/ATTENDED after the class ran,
+            # plus waitlist/no-show — excluding only cancelled/rescheduled. Otherwise a finished class
+            # (bookings -> COMPLETED) wrongly shows an empty roster ("0 booked, nobody's name").
+            qs = qs.filter(status__in=[
+                'RESERVED', 'BOOKED', 'CONFIRMED', 'WAITLISTED',
+                'ATTENDED', 'COMPLETED', 'LATE', 'LATE_ENTRY', 'LATE_SHOW', 'NO_SHOW',
+            ])
         else:
             # Active Bookings view by default shows active reservations/bookings
             qs = qs.filter(status__in=['RESERVED', 'BOOKED', 'CONFIRMED'])
