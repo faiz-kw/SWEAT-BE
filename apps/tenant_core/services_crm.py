@@ -1900,10 +1900,20 @@ class CRMLeadService:
         Completely backend-driven: zero hardcoded program names.
         """
         alias = db_alias or get_tenant_db_alias() or 'default'
+        # The program choice must not be hidden just because nothing runs on the single
+        # selected/default day. Show every program that has a trial-eligible session within a
+        # forward window from the requested date; the date + slot step then narrows to a concrete
+        # session. (Fixes: Bootcamp missing at branches where it doesn't run on the default date.)
+        from datetime import timedelta
+        from django.utils.dateparse import parse_date
+        start_d = parse_date(date) if date else None
+        if not start_d:
+            start_d = timezone.now().date()
+        end_d = start_d + timedelta(days=30)
         slots = cls.get_available_trial_slots(
             branch_id=branch_id,
-            date_from=date,
-            date_to=date,
+            date_from=start_d.isoformat(),
+            date_to=end_d.isoformat(),
             lead_id=lead_id,
             db_alias=alias,
         )
