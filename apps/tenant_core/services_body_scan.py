@@ -107,6 +107,37 @@ class FalBodyScanClient:
             os.environ['FAL_KEY'] = self.api_key
         return fal_client
 
+    @staticmethod
+    def _explain(exc: Exception) -> str:
+        """
+        Pulls the provider's own explanation out of an HTTP error.
+
+        fal answers an account problem with a plain 403 whose body carries the actual reason
+        ("Exhausted balance. Top up your balance at ..."). Without this the coach — and whoever
+        reads the logs — sees a bare status code and has nothing to act on.
+        """
+        response = getattr(exc, 'response', None)
+        if response is not None:
+            detail = None
+            try:
+                body = response.json()
+                if isinstance(body, dict):
+                    detail = body.get('detail') or body.get('error') or body.get('message')
+                    if isinstance(detail, (dict, list)):
+                        detail = str(detail)
+            except Exception:
+                detail = None
+            if not detail:
+                try:
+                    text = (response.text or '').strip()
+                    detail = text[:300] if text else None
+                except Exception:
+                    detail = None
+            status = getattr(response, 'status_code', None)
+            if detail:
+                return f"{detail} (HTTP {status})" if status else str(detail)
+        return str(exc)
+
     def analyse_image(self, image_bytes: bytes, content_type: str = 'image/jpeg') -> Dict[str, Any]:
         """
         Uploads one image and runs the pose model against it.
@@ -119,7 +150,9 @@ class FalBodyScanClient:
         try:
             image_url = fal_client.upload(image_bytes, content_type)
         except Exception as exc:
-            raise BodyScanError(f"Could not upload the capture to the scan provider: {exc}") from exc
+            raise BodyScanError(
+                f"Could not upload the capture to the scan provider: {self._explain(exc)}"
+            ) from exc
 
         try:
             result = fal_client.subscribe(
@@ -135,7 +168,9 @@ class FalBodyScanClient:
                 },
             )
         except Exception as exc:
-            raise BodyScanError(f"The scan provider rejected or failed the request: {exc}") from exc
+            raise BodyScanError(
+                f"The scan provider rejected or failed the request: {self._explain(exc)}"
+            ) from exc
 
         if not isinstance(result, dict):
             raise BodyScanError("The scan provider returned an unexpected response shape.")
