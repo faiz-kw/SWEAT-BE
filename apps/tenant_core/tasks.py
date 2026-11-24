@@ -688,3 +688,61 @@ def process_trial_whatsapp_lifecycle_periodic_task(self, tenant_id: str = None, 
         'tenants_processed': len(tenant_ids),
         'results': total_results,
     }
+
+
+@shared_task(
+    bind=True,
+    name='apps.tenant_core.tasks.reconcile_pending_payment_orders_periodic_task',
+    max_retries=2,
+    acks_late=True,
+)
+def reconcile_pending_payment_orders_periodic_task(self, tenant_id: str = None, dry_run: bool = False, **kwargs) -> dict:
+    """
+    Periodic safety-net: scan PENDING_PAYMENT orders and converge them against the Razorpay API.
+    - captured/authorized gateway payment -> finalize (idempotent: activate / extend / stamp PAID),
+    - no gateway payment and past the expiry window -> mark CANCELLED.
+    Covers the 'paid but never verified' gap (e.g. app closed after payment) when no webhook is wired.
+    """
+    from .context import tenant_database_context
+    from .services_razorpay import RazorpayReconciliationService
+    import os as _os
+
+    grace_minutes = int(_os.getenv('RZP_RECONCILE_GRACE_MINUTES', '15'))
+    expire_hours = int(_os.getenv('RZP_RECONCILE_EXPIRE_HOURS', '72'))
+    max_scan = int(_os.getenv('RZP_RECONCILE_MAX_SCAN', '200'))
+
+    if tenant_id:
+        tenant_ids = [tenant_id]
+    else:
+        try:
+            from apps.master.models import TenantDataSource
+            tenant_ids = list(
+                TenantDataSource.objects.using('default').filter(
+                    status='ACTIVE'
+                ).values_list('tenant_id', flat=True)
+            )
+        except Exception:
+            tenant_ids = []
+
+    total_results = []
+    for tid in tenant_ids:
+        try:
+            with tenant_database_context(tid) as db_alias:
+                res = RazorpayReconciliationService.reconcile_pending_orders(
+                    db_alias=db_alias,
+                    grace_minutes=grace_minutes,
+                    expire_hours=expire_hours,
+                    max_scan=max_scan,
+                    dry_run=dry_run,
+                )
+                if res.get('finalized') or res.get('cancelled') or res.get('errors'):
+                    logger.info("Reconcile pending payments tenant=%s: %s", tid, res)
+                total_results.append({'tenant_id': str(tid), 'results': res})
+        except Exception as exc:
+            logger.error("reconcile_pending_payment_orders_periodic_task error for tenant %s: %s", tid, exc, exc_info=True)
+
+    return {
+        'status': 'COMPLETED',
+        'tenants_processed': len(tenant_ids),
+        'results': total_results,
+    }

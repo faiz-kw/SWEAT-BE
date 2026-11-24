@@ -1010,9 +1010,12 @@ class BookingWaitlistAttendanceService:
                             if trials_used >= booking_policy.max_trial_bookings:
                                 raise ValidationError(f"Maximum trial bookings ({booking_policy.max_trial_bookings}) exceeded.")
 
-                # Check permitted booking types
+                # Check permitted booking types. TRIAL is governed by its own dedicated gates
+                # (allow_trial / max_trial_bookings above, plus trial-capacity and 1-trial checks in
+                # the trial view), so it is exempt from this session-type list — otherwise a policy
+                # whose allowed_booking_types omits 'TRIAL' silently blocks all free-trial bookings.
                 allowed_types = effective_bp.get('allowed_booking_types')
-                if allowed_types:
+                if allowed_types and booking_type != 'TRIAL':
                     # Normalize types: A member booking an occurrence/class is permitted under 'CLASS' or 'MEMBER'
                     normalized_type = 'CLASS' if booking_type in ['CLASS', 'MEMBER'] else booking_type
                     normalized_allowed = {'CLASS' if t in ['CLASS', 'MEMBER'] else t for t in allowed_types}
@@ -1486,7 +1489,23 @@ class BookingWaitlistAttendanceService:
             within_cutoff = not policy_eval['is_late']
             session_action = policy_eval['session_action']
             treated_as_no_show = policy_eval['treated_as_no_show']
+            # Refund the ACTUAL units this booking consumed on its linked entitlement, not a flat 1.
+            # Class credit cost can be >1 (e.g. Elite credit packs deduct the class's credit value),
+            # so a hardcoded 1 would under-refund credits on cancellation. Read it from the ledger
+            # scoped to the booking's own entitlement so cross-branch dual-deductions aren't double counted.
             session_units = Decimal('1.00')
+            try:
+                from .models_memberships import MembershipEntitlementLedger
+                if booking.entitlement_id:
+                    _consumed = MembershipEntitlementLedger.objects.using(alias).filter(
+                        booking_id=booking.id,
+                        transaction_type='CONSUMPTION',
+                        membership_entitlement_id=booking.entitlement_id,
+                    ).aggregate(total=models.Sum('units'))['total']
+                    if _consumed:
+                        session_units = abs(Decimal(str(_consumed)))
+            except Exception:
+                session_units = Decimal('1.00')
 
             # If an explicit BookingCancellationRule exists, it overrides default policy
             if applied_rule:

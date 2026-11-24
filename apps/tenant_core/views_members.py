@@ -1188,7 +1188,15 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
         seen_m_cats = set()
         for ent in sorted(ents, key=lambda x: (x.consumed_units or 0), reverse=True):
             et_lower = (ent.entitlement_type or '').lower()
-            cat = 'CROSS_BRANCH' if ('cross' in et_lower or 'passport' in et_lower) else 'BASE_SESSION'
+            if 'cross' in et_lower or 'passport' in et_lower:
+                cat = 'CROSS_BRANCH'
+            elif 'credit' in et_lower or 'wallet' in et_lower:
+                # Credit-wallet (Elite) packages are credit-based, NOT a session pool. Credits are
+                # reported separately (credits_remaining); never fold them into base/home sessions,
+                # or a 300-credit Elite member wrongly shows "300 home sessions".
+                cat = 'CREDIT_WALLET'
+            else:
+                cat = 'BASE_SESSION'
             if cat in seen_m_cats:
                 continue
             seen_m_cats.add(cat)
@@ -1197,9 +1205,10 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             if cat == 'CROSS_BRANCH':
                 passport_alloc = alloc
                 passport_consumed = cons
-            else:
+            elif cat == 'BASE_SESSION':
                 base_alloc = alloc
                 base_consumed = cons
+            # CREDIT_WALLET: intentionally skipped here (tracked via credits_remaining)
 
         if not ents and m.package_version:
             base_alloc = int(getattr(m.package_version, 'session_count', 0) or 0)

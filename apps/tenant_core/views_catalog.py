@@ -375,6 +375,20 @@ class ProgramCategoryViewSet(viewsets.ModelViewSet):
         status_param = request.query_params.get('status', 'ACTIVE')
         if status_param and status_param.upper() != 'ALL':
             qs = qs.filter(status=status_param.upper())
+        # branch_id -> only categories that have at least one ACTIVE program available at
+        # that branch (active branch-availability row, OR a program with no branch-availability
+        # rows = available everywhere). Mirrors the per-program visibility in get_programs(),
+        # so categories whose programs are all filtered out for this branch are not returned.
+        branch_id = request.query_params.get('branch_id')
+        if branch_id:
+            from django.db.models import Q
+            qs = qs.filter(
+                Q(programs__status='ACTIVE') & (
+                    Q(programs__branch_availabilities__branch_id=branch_id,
+                      programs__branch_availabilities__is_active=True) |
+                    Q(programs__branch_availabilities__isnull=True)
+                )
+            ).distinct()
         qs = qs.order_by('display_order', 'name')
         from .serializers_catalog import CategoryCatalogTreeSerializer
         serializer = CategoryCatalogTreeSerializer(qs, many=True, context={'request': request})
@@ -1886,6 +1900,20 @@ class CatalogTreeView(APIView):
         status_param = request.query_params.get('status', 'ACTIVE')
         if status_param and status_param.upper() != 'ALL':
             qs = qs.filter(status=status_param.upper())
+        # branch_id -> only categories that have at least one ACTIVE program available at
+        # that branch (active branch-availability row, OR a program with no branch-availability
+        # rows = available everywhere). Mirrors the per-program visibility in get_programs(),
+        # so categories whose programs are all filtered out for this branch are not returned.
+        branch_id = request.query_params.get('branch_id')
+        if branch_id:
+            from django.db.models import Q
+            qs = qs.filter(
+                Q(programs__status='ACTIVE') & (
+                    Q(programs__branch_availabilities__branch_id=branch_id,
+                      programs__branch_availabilities__is_active=True) |
+                    Q(programs__branch_availabilities__isnull=True)
+                )
+            ).distinct()
         qs = qs.order_by('display_order', 'name')
         from .serializers_catalog import CategoryCatalogTreeSerializer
         serializer = CategoryCatalogTreeSerializer(qs, many=True, context={'request': request})
