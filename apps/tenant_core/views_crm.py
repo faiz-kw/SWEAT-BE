@@ -4394,9 +4394,12 @@ class CRMCampaignPerformanceViewSet(viewsets.ViewSet):
     permission_action_map = {
         'list': 'crm.leads.view',
         'leads': 'crm.leads.view',
+        'trials': 'crm.leads.view',
         'conversions': 'crm.leads.view',
         'revenue': 'crm.leads.view',
         'redemptions': 'crm.leads.view',
+        'platforms': 'crm.leads.view',
+        'create': 'crm.leads.edit',
     }
 
     def list(self, request):
@@ -4408,7 +4411,7 @@ class CRMCampaignPerformanceViewSet(viewsets.ViewSet):
         from .models_crm import LeadAttribution, Lead, TrialBooking, LeadConversion
         from .models_commerce import Order
 
-        qs = LeadAttribution.objects.using(alias).filter(organization=org).select_related('lead')
+        qs = LeadAttribution.objects.using(alias).filter(organization=org).select_related('lead', 'lead__branch')
 
         # Filters
         branch_id = request.query_params.get('branch_id') or request.query_params.get('branch')
@@ -4417,7 +4420,7 @@ class CRMCampaignPerformanceViewSet(viewsets.ViewSet):
 
         platform = request.query_params.get('platform')
         if platform and platform != 'ALL':
-            qs = qs.filter(platform__iexact=platform)
+            qs = qs.filter(Q(platform__iexact=platform) | Q(utm_source__iexact=platform))
 
         source = request.query_params.get('source')
         if source and source != 'ALL':
@@ -4437,21 +4440,34 @@ class CRMCampaignPerformanceViewSet(viewsets.ViewSet):
             qs = qs.filter(
                 Q(campaign_name__icontains=s) |
                 Q(platform__icontains=s) |
-                Q(utm_campaign__icontains=s)
+                Q(utm_campaign__icontains=s) |
+                Q(utm_source__icontains=s) |
+                Q(utm_medium__icontains=s)
             )
 
         campaign_map = {}
         for attr in qs:
             camp_name = (attr.campaign_name or attr.utm_campaign or 'Direct / Unattributed').strip()
-            plat = (attr.platform or attr.utm_source or 'Direct').strip()
+            plat = (attr.platform or attr.utm_source or 'Direct').strip().upper()
             key = (camp_name, plat)
             if key not in campaign_map:
                 campaign_map[key] = {
                     'campaign_name': camp_name,
                     'platform': plat,
                     'lead_ids': set(),
+                    'utm_source': attr.utm_source or plat,
+                    'utm_medium': attr.utm_medium or '',
+                    'utm_campaign': attr.utm_campaign or camp_name,
+                    'utm_content': attr.utm_content or '',
+                    'utm_term': attr.utm_term or '',
+                    'first_captured_at': attr.captured_at or attr.created_at,
+                    'branches': set(),
                 }
             campaign_map[key]['lead_ids'].add(attr.lead_id)
+            if attr.lead and getattr(attr.lead, 'branch', None):
+                campaign_map[key]['branches'].add(attr.lead.branch.name)
+            if attr.captured_at and (not campaign_map[key]['first_captured_at'] or attr.captured_at < campaign_map[key]['first_captured_at']):
+                campaign_map[key]['first_captured_at'] = attr.captured_at
 
         all_lead_ids = set()
         for data in campaign_map.values():
@@ -4481,11 +4497,6 @@ class CRMCampaignPerformanceViewSet(viewsets.ViewSet):
                 paid_orders_map[ord_obj['id']] = ord_obj['total_amount']
 
         results = []
-        tot_leads = 0
-        tot_trials = 0
-        tot_conversions = 0
-        tot_revenue = Decimal('0.00')
-
         for (camp_name, plat), data in campaign_map.items():
             l_ids = data['lead_ids']
             leads_count = len(l_ids)
@@ -4496,11 +4507,6 @@ class CRMCampaignPerformanceViewSet(viewsets.ViewSet):
             camp_order_ids = {conv['order_id'] for conv in conversions if conv['lead_id'] in l_ids and conv['order_id']}
             camp_revenue = sum((paid_orders_map.get(oid, Decimal('0.00')) for oid in camp_order_ids), Decimal('0.00'))
 
-            tot_leads += leads_count
-            tot_trials += trials_count
-            tot_conversions += conv_count
-            tot_revenue += camp_revenue
-
             results.append({
                 'id': f"{camp_name}::{plat}",
                 'campaign_name': camp_name,
@@ -4510,22 +4516,207 @@ class CRMCampaignPerformanceViewSet(viewsets.ViewSet):
                 'conversions_count': conv_count,
                 'conversion_rate': c_rate,
                 'paid_revenue': str(camp_revenue),
+                'utm_source': data.get('utm_source'),
+                'utm_medium': data.get('utm_medium'),
+                'utm_campaign': data.get('utm_campaign'),
+                'utm_content': data.get('utm_content'),
+                'utm_term': data.get('utm_term'),
+                'created_at': data.get('first_captured_at').isoformat() if data.get('first_captured_at') else None,
+                'branches': sorted(list(data.get('branches', []))),
+                'status': 'ACTIVE',
             })
 
         results.sort(key=lambda x: (-x['leads_count'], -Decimal(x['paid_revenue'])))
-        overall_conv_rate = round((tot_conversions / tot_leads * 100), 1) if tot_leads > 0 else 0.0
+
+        # Deduplicated summary metrics across all matching campaigns (zero double counting)
+        tot_unique_leads = len(all_lead_ids)
+        tot_unique_trials = sum(trials_per_lead.values())
+        tot_unique_conversions = len(conversions_per_lead)
+        all_order_ids = {conv['order_id'] for conv in conversions if conv['order_id']}
+        tot_unique_revenue = sum((paid_orders_map.get(oid, Decimal('0.00')) for oid in all_order_ids), Decimal('0.00'))
+        overall_conv_rate = round((tot_unique_conversions / tot_unique_leads * 100), 1) if tot_unique_leads > 0 else 0.0
 
         return Response({
             'summary': {
                 'total_campaigns': len(results),
-                'total_leads': tot_leads,
-                'total_trials': tot_trials,
-                'total_conversions': tot_conversions,
+                'total_leads': tot_unique_leads,
+                'total_trials': tot_unique_trials,
+                'total_conversions': tot_unique_conversions,
                 'overall_conversion_rate': overall_conv_rate,
-                'total_paid_revenue': str(tot_revenue),
+                'total_paid_revenue': str(tot_unique_revenue),
             },
             'campaigns': results,
         })
+
+    def create(self, request):
+        alias = _get_db(request)
+        org = _get_org(request)
+        if not org:
+            return Response({'error': 'Organization not found'}, status=status.HTTP_400_BAD_REQUEST)
+
+        camp_name = (request.data.get('campaign_name') or '').strip()
+        if not camp_name:
+            return Response({'error': 'Campaign name is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        platform = (request.data.get('platform') or 'META').strip().upper()
+        utm_source = (request.data.get('utm_source') or platform.lower()).strip()
+        utm_medium = (request.data.get('utm_medium') or 'cpc').strip()
+        utm_campaign = (request.data.get('utm_campaign') or camp_name.lower().replace(' ', '_')).strip()
+        utm_content = (request.data.get('utm_content') or '').strip()
+        utm_term = (request.data.get('utm_term') or '').strip()
+        landing_page = (request.data.get('landing_page_url') or 'https://sweatfitwellness.com/trial').strip()
+        branch_id = request.data.get('branch_id')
+
+        from .models_org import Branch
+        from urllib.parse import urlencode
+
+        branch = None
+        if branch_id and branch_id != 'ALL':
+            branch = Branch.objects.using(alias).filter(organization=org, id=branch_id).first()
+
+        qp = {
+            'utm_source': utm_source,
+            'utm_medium': utm_medium,
+            'utm_campaign': utm_campaign,
+        }
+        if utm_content:
+            qp['utm_content'] = utm_content
+        if utm_term:
+            qp['utm_term'] = utm_term
+        if branch:
+            qp['branch'] = branch.code or str(branch.id)
+
+        delim = '&' if '?' in landing_page else '?'
+        tracking_url = f"{landing_page}{delim}{urlencode(qp)}"
+
+        return Response({
+            'id': f"{camp_name}::{platform}",
+            'campaign_name': camp_name,
+            'platform': platform,
+            'utm_source': utm_source,
+            'utm_medium': utm_medium,
+            'utm_campaign': utm_campaign,
+            'utm_content': utm_content,
+            'utm_term': utm_term,
+            'landing_page_url': landing_page,
+            'tracking_url': tracking_url,
+            'branch_name': branch.name if branch else 'All Branches',
+            'branches': [branch.name] if branch else ['All Branches (Global)'],
+            'created_at': timezone.now().isoformat(),
+            'leads_count': 0,
+            'trials_count': 0,
+            'conversions_count': 0,
+            'conversion_rate': 0.0,
+            'paid_revenue': '0.00',
+            'status': 'ACTIVE',
+        }, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['get'], url_path='platforms')
+    def platforms(self, request):
+        alias = _get_db(request)
+        org = _get_org(request)
+
+        from .models_meta_leads import MetaPageConnection, MetaConnection
+
+        platforms_list = []
+
+        # 1. Meta Ads (Facebook & Instagram)
+        meta_conn = MetaConnection.objects.using(alias).filter(organization=org).first()
+        meta_pages = MetaPageConnection.objects.using(alias).filter(organization=org, is_active=True)
+        pages_count = meta_pages.count()
+        last_meta_lead = meta_pages.order_by('-last_lead_received_at').first()
+        meta_status = 'CONNECTED' if meta_conn and meta_conn.status == 'CONNECTED' else ('ACTIVE' if pages_count > 0 else 'STANDBY')
+        platforms_list.append({
+            'platform': 'META',
+            'label': 'Meta Ads (Facebook & Instagram)',
+            'status': meta_status,
+            'pages_count': pages_count,
+            'last_lead_at': last_meta_lead.last_lead_received_at.isoformat() if last_meta_lead and last_meta_lead.last_lead_received_at else None,
+            'details': f"{pages_count} active page(s) mapped to branch routing" if pages_count > 0 else "Webhook listener ready",
+        })
+
+        # 2. Google Ads
+        platforms_list.append({
+            'platform': 'GOOGLE',
+            'label': 'Google Ads & Search',
+            'status': 'ACTIVE',
+            'pages_count': 0,
+            'last_lead_at': None,
+            'details': 'UTM parameter tracking active on landing pages',
+        })
+
+        # 3. WhatsApp Direct
+        platforms_list.append({
+            'platform': 'WHATSAPP',
+            'label': 'WhatsApp Business Marketing',
+            'status': 'ACTIVE',
+            'pages_count': 0,
+            'last_lead_at': None,
+            'details': 'WhatsApp click-to-chat campaign attribution enabled',
+        })
+
+        # 4. Website Direct
+        platforms_list.append({
+            'platform': 'WEBSITE',
+            'label': 'Direct Website & Landing Forms',
+            'status': 'ACTIVE',
+            'pages_count': 0,
+            'last_lead_at': None,
+            'details': 'Client trial booking widget and lead capture active',
+        })
+
+        return Response(platforms_list)
+
+    @action(detail=False, methods=['get'], url_path='trials')
+    def trials(self, request):
+        alias = _get_db(request)
+        org = _get_org(request)
+        campaign_name = request.query_params.get('campaign_name')
+        platform = request.query_params.get('platform')
+
+        from .models_crm import LeadAttribution, TrialBooking
+
+        qs = LeadAttribution.objects.using(alias).filter(organization=org)
+        if campaign_name:
+            if campaign_name == 'Direct / Unattributed':
+                qs = qs.filter(
+                    (Q(campaign_name__isnull=True) | Q(campaign_name='')) &
+                    (Q(utm_campaign__isnull=True) | Q(utm_campaign=''))
+                )
+            else:
+                qs = qs.filter(Q(campaign_name=campaign_name) | Q(utm_campaign=campaign_name))
+        if platform and platform != 'ALL':
+            qs = qs.filter(Q(platform__iexact=platform) | Q(utm_source__iexact=platform))
+
+        lead_ids = qs.values_list('lead_id', flat=True).distinct()
+        trials_qs = TrialBooking.objects.using(alias).filter(lead_id__in=lead_ids).select_related('lead', 'branch', 'assigned_trainer_profile__employee_profile__user_profile__user').order_by('-scheduled_start')
+
+        results = []
+        for t in trials_qs:
+            trainer_name = None
+            if t.assigned_trainer_profile:
+                try:
+                    ep = t.assigned_trainer_profile.employee_profile
+                    if ep and ep.user_profile and ep.user_profile.user:
+                        u = ep.user_profile.user
+                        trainer_name = f"{u.first_name} {u.last_name}".strip()
+                except Exception:
+                    pass
+            results.append({
+                'id': str(t.id),
+                'lead_id': str(t.lead_id),
+                'lead_name': f"{t.lead.first_name} {t.lead.last_name}".strip() if t.lead else 'Prospect',
+                'phone_normalized': t.lead.phone_normalized if t.lead else None,
+                'branch_name': t.branch.name if t.branch else 'All Branches',
+                'scheduled_start': t.scheduled_start.isoformat() if t.scheduled_start else None,
+                'scheduled_end': t.scheduled_end.isoformat() if t.scheduled_end else None,
+                'status': t.status,
+                'confirmation_status': getattr(t, 'confirmation_status', 'UNCONFIRMED'),
+                'attended': (t.status == 'ATTENDED'),
+                'trainer_name': trainer_name,
+                'created_at': t.created_at.isoformat() if t.created_at else None,
+            })
+        return Response(results)
 
     @action(detail=False, methods=['get'], url_path='leads')
     def leads(self, request):
@@ -4540,11 +4731,14 @@ class CRMCampaignPerformanceViewSet(viewsets.ViewSet):
         qs = LeadAttribution.objects.using(alias).filter(organization=org)
         if campaign_name:
             if campaign_name == 'Direct / Unattributed':
-                qs = qs.filter(Q(campaign_name__isnull=True) | Q(campaign_name=''))
+                qs = qs.filter(
+                    (Q(campaign_name__isnull=True) | Q(campaign_name='')) &
+                    (Q(utm_campaign__isnull=True) | Q(utm_campaign=''))
+                )
             else:
-                qs = qs.filter(campaign_name=campaign_name)
-        if platform:
-            qs = qs.filter(platform=platform)
+                qs = qs.filter(Q(campaign_name=campaign_name) | Q(utm_campaign=campaign_name))
+        if platform and platform != 'ALL':
+            qs = qs.filter(Q(platform__iexact=platform) | Q(utm_source__iexact=platform))
 
         lead_ids = qs.values_list('lead_id', flat=True).distinct()
         leads_qs = Lead.objects.using(alias).filter(id__in=lead_ids).select_related('branch', 'assigned_sales_user').order_by('-created_at')
@@ -4563,11 +4757,14 @@ class CRMCampaignPerformanceViewSet(viewsets.ViewSet):
         qs = LeadAttribution.objects.using(alias).filter(organization=org)
         if campaign_name:
             if campaign_name == 'Direct / Unattributed':
-                qs = qs.filter(Q(campaign_name__isnull=True) | Q(campaign_name=''))
+                qs = qs.filter(
+                    (Q(campaign_name__isnull=True) | Q(campaign_name='')) &
+                    (Q(utm_campaign__isnull=True) | Q(utm_campaign=''))
+                )
             else:
-                qs = qs.filter(campaign_name=campaign_name)
-        if platform:
-            qs = qs.filter(platform=platform)
+                qs = qs.filter(Q(campaign_name=campaign_name) | Q(utm_campaign=campaign_name))
+        if platform and platform != 'ALL':
+            qs = qs.filter(Q(platform__iexact=platform) | Q(utm_source__iexact=platform))
 
         lead_ids = qs.values_list('lead_id', flat=True).distinct()
         conversions = LeadConversion.objects.using(alias).filter(lead_id__in=lead_ids).select_related('lead', 'user_profile').order_by('-converted_at')
@@ -4603,11 +4800,14 @@ class CRMCampaignPerformanceViewSet(viewsets.ViewSet):
         qs = LeadAttribution.objects.using(alias).filter(organization=org)
         if campaign_name:
             if campaign_name == 'Direct / Unattributed':
-                qs = qs.filter(Q(campaign_name__isnull=True) | Q(campaign_name=''))
+                qs = qs.filter(
+                    (Q(campaign_name__isnull=True) | Q(campaign_name='')) &
+                    (Q(utm_campaign__isnull=True) | Q(utm_campaign=''))
+                )
             else:
-                qs = qs.filter(campaign_name=campaign_name)
-        if platform:
-            qs = qs.filter(platform=platform)
+                qs = qs.filter(Q(campaign_name=campaign_name) | Q(utm_campaign=campaign_name))
+        if platform and platform != 'ALL':
+            qs = qs.filter(Q(platform__iexact=platform) | Q(utm_source__iexact=platform))
 
         lead_ids = qs.values_list('lead_id', flat=True).distinct()
         order_ids = LeadConversion.objects.using(alias).filter(lead_id__in=lead_ids, order_id__isnull=False).values_list('order_id', flat=True).distinct()
