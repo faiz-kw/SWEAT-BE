@@ -19,6 +19,7 @@ Capabilities:
 - Transactional redemption audit snapshot and outbox event publishing.
 """
 
+import uuid
 import logging
 from decimal import Decimal
 from typing import Optional, Dict, Any, List, Union
