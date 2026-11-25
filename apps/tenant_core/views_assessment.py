@@ -673,6 +673,10 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
         approved = AssessmentEngineService.approve_and_dispatch(
             assessment=assessment, reviewer_user=request.user, coach_notes=val.get('coach_notes'),
             workout_prescription=val.get('workout_prescription'), diet_prescription=val.get('diet_prescription'),
+            member_acknowledgement_name=val.get('member_acknowledgement_name'),
+            coach_sign_off_name=val.get('coach_sign_off_name'),
+            agreed_first_milestone=val.get('agreed_first_milestone'),
+            goal_review_date=val.get('goal_review_date'),
             reassessment_interval_weeks=val.get('reassessment_interval_weeks', 6), send_whatsapp=val.get('send_whatsapp', False),
             db_alias=alias,
         )

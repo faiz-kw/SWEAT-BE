@@ -208,6 +208,10 @@ class AssessmentEngineService:
         assessment: MemberAssessment,
         reviewer_user: TenantUser,
         coach_notes: Optional[str] = None,
+        member_acknowledgement_name: Optional[str] = None,
+        coach_sign_off_name: Optional[str] = None,
+        agreed_first_milestone: Optional[str] = None,
+        goal_review_date=None,
         workout_prescription: Optional[str] = None,
         diet_prescription: Optional[str] = None,
         reassessment_interval_weeks: int = 6,
@@ -232,6 +236,17 @@ class AssessmentEngineService:
 
         if coach_notes:
             assessment.coach_notes = coach_notes.strip()
+
+        # Section 16: typed confirmations, each stamped at the moment of sign-off.
+        if coach_sign_off_name:
+            assessment.coach_sign_off_name = coach_sign_off_name.strip()[:150]
+        if member_acknowledgement_name:
+            assessment.member_acknowledgement_name = member_acknowledgement_name.strip()[:150]
+            assessment.member_acknowledged_at = now
+        if agreed_first_milestone:
+            assessment.agreed_first_milestone = agreed_first_milestone.strip()[:255]
+        if goal_review_date:
+            assessment.goal_review_date = goal_review_date
         if workout_prescription:
             assessment.workout_prescription = workout_prescription.strip()
         if diet_prescription:

@@ -170,13 +170,19 @@ class MemberAssessmentDetailSerializer(serializers.ModelSerializer):
             'consent_ai_analysis',
             'consent_secondary_use',
             'consent_notice_version',
+            # Section 12 commitment
+            'agreed_first_milestone',
+            'goal_review_date',
             # Governance & Sign-Offs
+            'member_acknowledgement_name',
+            'coach_sign_off_name',
             'member_acknowledged_at',
             'coach_signed_off_at',
             'coach_signed_off_by',
             'signed_off_by_name',
             'reassessment_due_date',
             # Coach Prescriptions
+            'coach_notes',
             'coach_strengths',
             'coach_areas_to_develop',
             'workout_prescription',
@@ -282,6 +288,8 @@ class MemberAssessmentWriteSerializer(serializers.ModelSerializer):
             'branch_id',
             'previous_assessment_id',
             'package_id',
+            'agreed_first_milestone',
+            'goal_review_date',
             'assessment_type',
             'member_name',
             'member_phone',
@@ -319,7 +327,18 @@ class MemberAssessmentWriteSerializer(serializers.ModelSerializer):
 
 
 class AssessmentApprovalSerializer(serializers.Serializer):
+    """
+    What the coach submits at sign-off.
+
+    The two names are typed confirmations, not drawn signatures: a name with a timestamp and
+    the authenticated user who recorded it is what the studio can stand behind, and it avoids
+    storing an image of someone's signature.
+    """
     coach_notes = serializers.CharField(required=False, allow_blank=True, default='')
+    member_acknowledgement_name = serializers.CharField(required=False, allow_blank=True, default='')
+    coach_sign_off_name = serializers.CharField(required=False, allow_blank=True, default='')
+    agreed_first_milestone = serializers.CharField(required=False, allow_blank=True, default='')
+    goal_review_date = serializers.DateField(required=False, allow_null=True)
     workout_prescription = serializers.CharField(required=False, allow_blank=True, default='')
     diet_prescription = serializers.CharField(required=False, allow_blank=True, default='')
     reassessment_interval_weeks = serializers.IntegerField(required=False, default=6)

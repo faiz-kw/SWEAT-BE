@@ -316,6 +316,21 @@ class MemberAssessment(models.Model):
     consent_notice_version = models.CharField(max_length=50, blank=True, default='')
 
     # Governance & Sign-Offs (Section 16)
+    # Section 12 closes with a commitment the member and coach agree on, and a date to
+    # revisit it. Without these the goal is a wish rather than a plan.
+    agreed_first_milestone = models.CharField(max_length=255, blank=True, default='', help_text="The first concrete step the member and coach agreed on")
+    goal_review_date = models.DateField(null=True, blank=True, help_text="When that milestone gets revisited")
+
+    # The coach's overall note at approval. Distinct from screening_coach_notes, which is
+    # about safety restrictions. approve_and_dispatch has always written to a `coach_notes`
+    # attribute; until this field existed, that assignment was silently dropped on save.
+    coach_notes = models.TextField(null=True, blank=True)
+
+    # Section 16 sign-off. Names are captured as typed confirmations rather than drawn
+    # signatures: a typed name with a timestamp and the user who recorded it is what the
+    # studio can actually stand behind, and it avoids storing an image of a signature.
+    member_acknowledgement_name = models.CharField(max_length=150, blank=True, default='')
+    coach_sign_off_name = models.CharField(max_length=150, blank=True, default='')
     member_acknowledged_at = models.DateTimeField(null=True, blank=True)
     coach_signed_off_at = models.DateTimeField(null=True, blank=True)
     coach_signed_off_by = models.ForeignKey(
