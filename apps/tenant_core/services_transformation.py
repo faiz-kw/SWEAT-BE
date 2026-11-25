@@ -198,14 +198,7 @@ class FalEditRenderer:
         except Exception as exc:
             raise TransformationError(f'Could not upload the baseline capture: {exc}') from exc
 
-        prompt = (
-            f'Subtly reduce waist circumference by approximately {waist_reduction_pct:.0f} percent, '
-            'as the same person would look after some months of consistent training. '
-            'Keep the face, hair, skin tone and clothing exactly as they are. '
-            'Keep the identical pose, camera angle, framing, lighting and background. '
-            'Do not add muscle definition, do not change height or limb proportions, '
-            'do not alter the face in any way. Photographic, not stylised.'
-        )
+        prompt = build_edit_prompt(waist_reduction_pct)
 
         try:
             result = fal_client.subscribe(self.model, arguments={
@@ -233,11 +226,133 @@ class FalEditRenderer:
             raise TransformationError(f'Could not download the rendered image: {exc}') from exc
 
 
+# The instruction given to any hosted editor. Written to constrain rather than invent: it
+# names the single change wanted and forbids the ones the specification warns about. Shared
+# between providers so a provider swap cannot quietly change what is asked for.
+def build_edit_prompt(waist_reduction_pct: float) -> str:
+    return (
+        f'Subtly reduce waist circumference by approximately {waist_reduction_pct:.0f} percent, '
+        'as the same person would look after some months of consistent training. '
+        'Keep the face, hair, skin tone and clothing exactly as they are. '
+        'Keep the identical pose, camera angle, framing, lighting and background. '
+        'Do not add muscle definition, do not change height or limb proportions, '
+        'do not alter the face in any way. Photographic, not stylised.'
+    )
+
+
+class ReplicateEditRenderer:
+    """
+    Hosted image editing through Replicate.
+
+    Same models and much the same price as fal; it exists so the studio is not stranded when
+    one provider's account is unavailable. Like the fal renderer its output is not trusted:
+    `validate_output` re-detects the pose and discards anything that moved the subject.
+
+    Uses the REST API directly rather than the `replicate` package, to avoid another
+    dependency for what is one POST and a poll.
+    """
+
+    name = 'replicate_image_edit_v1'
+    is_generative = True
+
+    def __init__(self, model: Optional[str] = None):
+        self.model = (model or getattr(settings, 'REPLICATE_TRANSFORMATION_MODEL', '')
+                      or 'black-forest-labs/flux-kontext-dev').strip()
+        self.cost_per_image_usd = float(getattr(settings, 'REPLICATE_TRANSFORMATION_COST_USD', 0.025))
+
+    def render(
+        self,
+        image_bytes: bytes,
+        *,
+        waist_reduction_pct: float,
+        month: int = 1,
+        **_: Any,
+    ) -> bytes:
+        import base64
+        import time
+
+        import requests
+
+        token = (getattr(settings, 'REPLICATE_API_TOKEN', '') or '').strip()
+        if not token:
+            raise TransformationError('REPLICATE_API_TOKEN is not configured on this server.')
+
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json',
+            # Ask for a synchronous answer; Replicate falls back to a pending prediction when
+            # the model takes longer than the wait window, which the poll below picks up.
+            'Prefer': 'wait=55',
+        }
+        data_uri = 'data:image/jpeg;base64,' + base64.b64encode(image_bytes).decode('ascii')
+        payload = {
+            'input': {
+                'input_image': data_uri,
+                'prompt': build_edit_prompt(waist_reduction_pct),
+                'output_format': 'jpg',
+            }
+        }
+
+        try:
+            response = requests.post(
+                f'https://api.replicate.com/v1/models/{self.model}/predictions',
+                headers=headers, json=payload, timeout=120,
+            )
+        except Exception as exc:
+            raise TransformationError(f'Could not reach the image editor: {exc}') from exc
+
+        if response.status_code >= 400:
+            detail = ''
+            try:
+                detail = (response.json() or {}).get('detail') or response.text[:200]
+            except Exception:
+                detail = response.text[:200]
+            raise TransformationError(f'The image editor refused the request: {detail} (HTTP {response.status_code})')
+
+        prediction = response.json()
+        deadline = time.time() + float(getattr(settings, 'REPLICATE_TIMEOUT_SECONDS', 180))
+
+        while prediction.get('status') in ('starting', 'processing'):
+            if time.time() > deadline:
+                raise TransformationError('The image editor did not finish in time.')
+            time.sleep(2)
+            poll_url = (prediction.get('urls') or {}).get('get')
+            if not poll_url:
+                raise TransformationError('The image editor returned no way to poll the result.')
+            try:
+                prediction = requests.get(poll_url, headers=headers, timeout=60).json()
+            except Exception as exc:
+                raise TransformationError(f'Lost contact with the image editor: {exc}') from exc
+
+        if prediction.get('status') != 'succeeded':
+            raise TransformationError(
+                f"The image editor failed: {prediction.get('error') or prediction.get('status')}"
+            )
+
+        output = prediction.get('output')
+        url = output[0] if isinstance(output, list) and output else output
+        if not isinstance(url, str) or not url.startswith('http'):
+            raise TransformationError('The image editor returned no usable image.')
+
+        try:
+            return requests.get(url, timeout=120).content
+        except Exception as exc:
+            raise TransformationError(f'Could not download the rendered image: {exc}') from exc
+
+
 def get_renderer(name: Optional[str] = None):
-    """Returns the configured renderer. Morph is the default: free, and identity-safe."""
+    """
+    Returns the configured renderer.
+
+    Morph is the default: it costs nothing and preserves identity by construction. The hosted
+    editors look better but send the member's photograph to a third party, so they are opt-in
+    and their output is verified against the baseline before anyone sees it.
+    """
     choice = (name or getattr(settings, 'TRANSFORMATION_RENDERER', '') or 'morph').strip().lower()
-    if choice in ('fal', 'generative', 'flux'):
+    if choice in ('fal', 'flux'):
         return FalEditRenderer()
+    if choice in ('replicate', 'generative'):
+        return ReplicateEditRenderer()
     return SilhouetteMorphRenderer()
 
 
