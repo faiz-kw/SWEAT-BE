@@ -363,8 +363,8 @@ def get_renderer(name: Optional[str] = None):
 class TransformationPipeline:
     """Builds the milestone previews for one assessment."""
 
-    @staticmethod
-    def detect_landmarks(image_bytes: bytes) -> Dict[str, Any]:
+    @classmethod
+    def detect_landmarks(cls, image_bytes: bytes) -> Dict[str, Any]:
         """
         Runs pose detection on an image and returns the named joints.
 
@@ -409,11 +409,27 @@ class TransformationPipeline:
         if hip_mid:
             joints['hip_mid'] = hip_mid
 
-        return {'usable': True, 'joints': joints}
+        # Joints are also returned normalised to the image, because a hosted editor may hand
+        # back a different resolution than it was given. Comparing raw pixels across two
+        # sizes makes an unchanged pose look like the subject jumped across the frame.
+        size = cls.image_size(image_bytes) or (0, 0)
+        width, height = (size[0] or 1), (size[1] or 1)
+        joints_norm = {k: (x / width, y / height) for k, (x, y) in joints.items()}
+
+        return {'usable': True, 'joints': joints, 'joints_norm': joints_norm, 'size': size}
+
+    @staticmethod
+    def image_size(image_bytes: bytes):
+        try:
+            from PIL import Image
+            with Image.open(io.BytesIO(image_bytes)) as img:
+                return img.size
+        except Exception:
+            return None
 
     @classmethod
     def validate_output(
-        cls, rendered_bytes: bytes, baseline_joints: Dict[str, Tuple[float, float]],
+        cls, rendered_bytes: bytes, baseline_norm: Dict[str, Tuple[float, float]],
     ) -> Dict[str, Any]:
         """
         The specification's validation step.
@@ -421,6 +437,10 @@ class TransformationPipeline:
         Re-detects the pose in the rendered image and compares every joint against the
         baseline. A render that moved the subject, changed their proportions or lost them
         entirely is rejected — it is never shown with a caveat.
+
+        The comparison runs in normalised coordinates, because a hosted editor may return a
+        different resolution than it was given; comparing raw pixels across two sizes
+        reported an unchanged pose as an 80% drift.
         """
         verdict: Dict[str, Any] = {'accepted': False, 'checks': {}}
 
@@ -437,25 +457,25 @@ class TransformationPipeline:
             )
             return verdict
 
-        rendered_joints = detected['joints']
+        rendered_norm = detected.get('joints_norm') or {}
 
-        # Scale drift by the subject's own height so the threshold is resolution-independent.
-        shoulder = baseline_joints.get('shoulder_mid')
-        ankle_l = baseline_joints.get('left_ankle')
-        ankle_r = baseline_joints.get('right_ankle')
+        # Drift is expressed against the subject's own height, so the threshold means the
+        # same thing whatever the framing.
+        shoulder = baseline_norm.get('shoulder_mid')
+        ankles = [baseline_norm.get('left_ankle'), baseline_norm.get('right_ankle')]
         reference = None
-        if shoulder and (ankle_l or ankle_r):
-            ankle_y = max(p[1] for p in (ankle_l, ankle_r) if p)
+        if shoulder and any(ankles):
+            ankle_y = max(p[1] for p in ankles if p)
             reference = abs(ankle_y - shoulder[1])
         if not reference or reference <= 0:
             verdict['reason'] = 'The baseline has no usable height reference for verification.'
             return verdict
 
         worst_label, worst_drift = None, 0.0
-        for label, baseline_point in baseline_joints.items():
+        for label, baseline_point in baseline_norm.items():
             if label in ('shoulder_mid', 'hip_mid'):
                 continue
-            rendered_point = rendered_joints.get(label)
+            rendered_point = rendered_norm.get(label)
             if not rendered_point:
                 verdict['reason'] = f'The rendered image lost the {label.replace("_", " ")}.'
                 return verdict
@@ -534,6 +554,7 @@ class TransformationPipeline:
                 f"The baseline capture is not usable for a preview: {detected.get('reason')}"
             )
         baseline_joints = detected['joints']
+        baseline_norm = detected.get('joints_norm') or {}
 
         result: Dict[str, Any] = {
             'renderer': renderer.name,
@@ -563,7 +584,7 @@ class TransformationPipeline:
                 continue
 
             # Step 4's precondition: verify before anything is shown.
-            verdict = cls.validate_output(rendered, baseline_joints)
+            verdict = cls.validate_output(rendered, baseline_norm)
             if not verdict.get('accepted'):
                 result['rejected'][f'month_{month}'] = verdict.get('reason', 'Verification failed.')
                 continue
