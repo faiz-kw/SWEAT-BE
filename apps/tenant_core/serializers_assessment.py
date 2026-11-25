@@ -185,6 +185,9 @@ class MemberAssessmentDetailSerializer(serializers.ModelSerializer):
             'consent_secondary_use',
             'consent_notice_version',
             'target_weight_kg',
+            'member_date_of_birth',
+            'member_age_years',
+            'member_sex',
             'consent_image_generation',
             'timeline_estimate',
             # Section 12 commitment
@@ -308,6 +311,8 @@ class MemberAssessmentWriteSerializer(serializers.ModelSerializer):
             'agreed_first_milestone',
             'goal_review_date',
             'target_weight_kg',
+            'member_date_of_birth',
+            'member_sex',
             'consent_image_generation',
             'assessment_type',
             'member_name',
