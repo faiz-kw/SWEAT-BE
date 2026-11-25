@@ -417,6 +417,7 @@ urlpatterns = [
 
     path('assessments/test-library/', AssessmentSessionViewSet.as_view({'get': 'test_library'}), name='assessment-test-library'),
     path('assessments/<uuid:pk>/capture/', AssessmentSessionViewSet.as_view({'post': 'capture_photos'}), name='assessment-capture'),
+    path('assessments/<uuid:pk>/transformation/', AssessmentSessionViewSet.as_view({'post': 'transformation', 'get': 'transformation_status_view'}), name='assessment-transformation'),
     path('assessments/<uuid:pk>/scan/', AssessmentSessionViewSet.as_view({'get': 'scan_status_view'}), name='assessment-scan-status'),
     path('assessments/<uuid:pk>/rescan/', AssessmentSessionViewSet.as_view({'post': 'rescan'}), name='assessment-rescan'),
     path('assessments/<uuid:pk>/approve-and-send/', AssessmentSessionViewSet.as_view({'post': 'approve_and_send'}), name='assessment-approve'),

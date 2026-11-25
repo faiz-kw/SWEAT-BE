@@ -240,6 +240,13 @@ BODY_SCAN_LOCAL_MODEL_PATH = os.getenv(
     str(BASE_DIR / 'models' / 'pose_landmarker_lite.task'),
 ).strip()
 
+# Transformation preview. 'morph' warps the member's own pixels (free, identity-safe by
+# construction); 'fal' sends the capture to a hosted editor. Either way the rendered image is
+# verified against the baseline pose before it is shown.
+TRANSFORMATION_RENDERER = os.getenv('TRANSFORMATION_RENDERER', 'morph').strip().lower()
+FAL_TRANSFORMATION_MODEL = os.getenv('FAL_TRANSFORMATION_MODEL', 'fal-ai/flux-2/flash/edit').strip()
+FAL_TRANSFORMATION_COST_USD = float(os.getenv('FAL_TRANSFORMATION_COST_USD', '0.005'))
+
 FAL_KEY = os.getenv('FAL_KEY', '').strip()
 FAL_BODY_SCAN_MODEL = os.getenv('FAL_BODY_SCAN_MODEL', 'fal-ai/sam-3/3d-body').strip()
 FAL_BODY_SCAN_TIMEOUT_SECONDS = int(os.getenv('FAL_BODY_SCAN_TIMEOUT_SECONDS', '180'))

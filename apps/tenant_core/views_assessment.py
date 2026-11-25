@@ -563,6 +563,67 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
             assessment.save(using=alias, update_fields=['scan_status', 'scan_error', 'scan_completed_at', 'updated_at'])
         return False
 
+    def transformation(self, request, pk=None):
+        """
+        POST /api/v1/tenant/assessments/<id>/transformation/
+
+        Builds the milestone previews from the member's own baseline capture.
+
+        Refuses outright without `consent_image_generation`: a simulated image of someone's
+        future body is a separate act from analysing their posture. Each rendered milestone
+        is verified against the baseline pose and discarded if the subject moved, so a
+        rejected milestone is reported rather than shown with a caveat.
+        """
+        alias, org = _resolve_db_and_org(request)
+        assessment = self.get_object()
+
+        from .services_transformation import (
+            TransformationError, TransformationNotPermitted, TransformationPipeline, get_renderer,
+        )
+
+        renderer = get_renderer(request.data.get('renderer'))
+        try:
+            result = TransformationPipeline.build(assessment, renderer=renderer, db_alias=alias)
+        except TransformationNotPermitted as exc:
+            assessment.transformation_status = 'REFUSED_NO_CONSENT'
+            assessment.transformation_payload = {'error': str(exc)}
+            assessment.save(using=alias, update_fields=[
+                'transformation_status', 'transformation_payload', 'updated_at'])
+            return Response({'error': str(exc)}, status=status.HTTP_403_FORBIDDEN)
+        except TransformationError as exc:
+            assessment.transformation_status = 'FAILED'
+            assessment.transformation_payload = {'error': str(exc)}
+            assessment.save(using=alias, update_fields=[
+                'transformation_status', 'transformation_payload', 'updated_at'])
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        accepted = result.get('accepted_count', 0)
+        if accepted == 0:
+            assessment.transformation_status = 'FAILED'
+        elif result.get('rejected'):
+            assessment.transformation_status = 'PARTIAL'
+        else:
+            assessment.transformation_status = 'COMPLETED'
+
+        assessment.transformation_payload = result
+        assessment.transformation_generated_at = timezone.now()
+        assessment.save(using=alias)
+
+        return Response({
+            'status': assessment.transformation_status,
+            **result,
+        }, status=status.HTTP_200_OK)
+
+    def transformation_status_view(self, request, pk=None):
+        """GET /api/v1/tenant/assessments/<id>/transformation/ — what was produced, and how."""
+        assessment = self.get_object()
+        return Response({
+            'status': assessment.transformation_status,
+            'generated_at': assessment.transformation_generated_at.isoformat()
+                            if assessment.transformation_generated_at else None,
+            **(assessment.transformation_payload or {}),
+        }, status=status.HTTP_200_OK)
+
     def test_library(self, request):
         """
         GET /api/v1/tenant/assessments/test-library/

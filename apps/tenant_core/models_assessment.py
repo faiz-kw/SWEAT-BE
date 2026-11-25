@@ -296,6 +296,20 @@ class MemberAssessment(models.Model):
     month_3_image_url = models.CharField(max_length=500, null=True, blank=True)
     milestone_metadata = models.JSONField(default=dict, blank=True)
 
+    # Transformation preview state. The payload records which renderer produced each
+    # milestone, the waist change illustrated, and the pose-verification result that let it
+    # be shown - so a coach can always answer "where did this picture come from".
+    TRANSFORMATION_STATUS_CHOICES = [
+        ('NOT_REQUESTED', 'Not requested'),
+        ('COMPLETED', 'Preview generated'),
+        ('PARTIAL', 'Some milestones rejected by verification'),
+        ('FAILED', 'Preview could not be produced'),
+        ('REFUSED_NO_CONSENT', 'Member did not consent to a generated preview'),
+    ]
+    transformation_status = models.CharField(max_length=30, choices=TRANSFORMATION_STATUS_CHOICES, default='NOT_REQUESTED')
+    transformation_payload = models.JSONField(default=dict, blank=True)
+    transformation_generated_at = models.DateTimeField(null=True, blank=True)
+
     # =========================================================================
     # COACH REVIEW & UNLOCK GATE
     # =========================================================================
