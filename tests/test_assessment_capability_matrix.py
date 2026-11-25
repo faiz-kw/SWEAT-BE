@@ -252,3 +252,118 @@ class FullBatteryTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestLibraryVariantTests(unittest.TestCase):
+    """
+    The catalogue offers several tests per domain so a 60-year-old and an athlete can be
+    assessed on the same framework with different protocols. Each has its own thresholds.
+    """
+
+    def test_chair_stand_is_scored_on_its_own_scale(self):
+        matrix = evaluate_capability_matrix({'lower_body': {
+            'test_code': 'CHAIR_STAND', 'reps': 16, 'status': 'VALID'}})
+        self.assertEqual(matrix['lower_body'], ESTABLISHED)
+
+    def test_chair_stand_using_hands_reads_beginner(self):
+        matrix = evaluate_capability_matrix({'lower_body': {
+            'test_code': 'CHAIR_STAND', 'reps': 18, 'used_hands': True, 'status': 'VALID'}})
+        self.assertEqual(matrix['lower_body'], BEGINNER)
+
+    def test_step_up_uses_the_weaker_side(self):
+        matrix = evaluate_capability_matrix({'lower_body': {
+            'test_code': 'STEP_UP', 'reps_left': 14, 'reps_right': 4, 'status': 'VALID'}})
+        self.assertEqual(matrix['lower_body'], BEGINNER)
+
+    def test_failing_a_pull_up_does_not_lower_the_domain(self):
+        """The specification: inability to perform an advanced test is not a deficiency."""
+        matrix = evaluate_capability_matrix({'lower_body': {}, 'upper_body': {'assessed_tests': [
+            {'test_code': 'PUSH_UP', 'variation': 'Floor push-up', 'reps': 14, 'status': 'VALID'},
+            {'test_code': 'PULL_UP', 'variation': 'Band-assisted', 'reps': 0, 'status': 'VALID'},
+        ]}})
+        self.assertEqual(matrix['upper_body'], ESTABLISHED)
+
+    def test_grip_strength_is_recorded_but_not_graded(self):
+        matrix = evaluate_capability_matrix({'upper_body': {
+            'test_code': 'GRIP', 'grip_left_kg': 30, 'grip_right_kg': 32, 'status': 'VALID'}})
+        self.assertEqual(matrix['upper_body'], NOT_ASSESSED)
+
+    def test_side_plank_contributes_to_core(self):
+        matrix = evaluate_capability_matrix({'core': {
+            'test_code': 'SIDE_PLANK', 'hold_left_seconds': 50,
+            'hold_right_seconds': 48, 'status': 'VALID'}})
+        self.assertEqual(matrix['core'], ESTABLISHED)
+
+    def test_farmers_carry_contributes_to_core(self):
+        matrix = evaluate_capability_matrix({'core': {
+            'test_code': 'FARMERS_CARRY', 'distance_m': 45, 'load_per_hand_kg': 16, 'status': 'VALID'}})
+        self.assertEqual(matrix['core'], ESTABLISHED)
+
+    def test_slow_tug_needs_support(self):
+        matrix = evaluate_capability_matrix({'balance': {
+            'test_code': 'TUG', 'time_seconds': 14.5, 'status': 'VALID'}})
+        self.assertEqual(matrix['balance'], NEEDS_SUPPORT)
+
+    def test_brisk_tug_is_independent(self):
+        matrix = evaluate_capability_matrix({'balance': {
+            'test_code': 'TUG', 'time_seconds': 8.0, 'status': 'VALID'}})
+        self.assertEqual(matrix['balance'], INDEPENDENT_UNDER_TEST)
+
+    def test_hands_on_assistance_anywhere_sets_needs_support(self):
+        matrix = evaluate_capability_matrix({'balance': {'assessed_tests': [
+            {'test_code': 'SINGLE_LEG_BALANCE', 'single_leg_left_sec': 40,
+             'single_leg_right_sec': 40, 'status': 'VALID'},
+            {'test_code': 'TANDEM_STANCE', 'hold_seconds': 30,
+             'support_used': 'Hands-on assistance', 'status': 'VALID'},
+        ]}})
+        self.assertEqual(matrix['balance'], NEEDS_SUPPORT)
+
+    def test_floor_to_stand_failure_needs_support(self):
+        matrix = evaluate_capability_matrix({'balance': {
+            'test_code': 'FLOOR_TO_STAND', 'completed_independently': False, 'status': 'VALID'}})
+        self.assertEqual(matrix['balance'], NEEDS_SUPPORT)
+
+    def test_cardio_protocol_from_catalogue_is_named(self):
+        matrix = evaluate_capability_matrix({'cardiovascular': {
+            'test_code': 'WALK_6MIN', 'name': '6-minute walk test',
+            'distance_m': 410, 'status': 'VALID'}})
+        self.assertIn('6-minute walk test', matrix['cardiovascular'])
+
+    def test_mobility_merges_several_catalogue_tests(self):
+        matrix = evaluate_capability_matrix({'mobility': {'assessed_tests': [
+            {'test_code': 'ANKLE_KNEE_TO_WALL', 'ankle_left_cm': 10,
+             'ankle_right_cm': 9.5, 'status': 'VALID'},
+            {'test_code': 'SHOULDER_MOBILITY', 'shoulder_mobility': 'Modified', 'status': 'VALID'},
+        ]}})
+        self.assertEqual(matrix['mobility'], MODIFIED)
+
+
+class TestLibraryShapeTests(unittest.TestCase):
+    """The catalogue itself must stay well-formed; the tablet renders straight from it."""
+
+    def test_every_test_declares_its_domain_and_section(self):
+        from apps.tenant_core.assessment_test_library import TEST_LIBRARY
+        for test in TEST_LIBRARY:
+            self.assertIn('code', test)
+            self.assertIn('domain', test)
+            self.assertIn('section', test)
+            self.assertTrue(test.get('fields'), test['code'])
+
+    def test_test_codes_are_unique(self):
+        from apps.tenant_core.assessment_test_library import TEST_LIBRARY
+        codes = [t['code'] for t in TEST_LIBRARY]
+        self.assertEqual(len(codes), len(set(codes)))
+
+    def test_library_payload_covers_every_domain(self):
+        from apps.tenant_core.assessment_test_library import library_payload
+        payload = library_payload()
+        self.assertTrue(payload['protocol_version'])
+        keys = [d['key'] for d in payload['domains']]
+        for domain in ('lower_body', 'upper_body', 'core', 'balance',
+                       'mobility', 'cardiovascular', 'performance'):
+            self.assertIn(domain, keys)
+
+    def test_optional_performance_domain_is_flagged_optional(self):
+        from apps.tenant_core.assessment_test_library import library_payload
+        perf = [d for d in library_payload()['domains'] if d['key'] == 'performance'][0]
+        self.assertTrue(perf['optional'])

@@ -563,6 +563,17 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
             assessment.save(using=alias, update_fields=['scan_status', 'scan_error', 'scan_completed_at', 'updated_at'])
         return False
 
+    def test_library(self, request):
+        """
+        GET /api/v1/tenant/assessments/test-library/
+
+        The assessment catalogue: every test the battery can run, its fields and the current
+        protocol version. Served rather than duplicated in the client so both sides agree on
+        which protocol a stored result was recorded under.
+        """
+        from .assessment_test_library import library_payload
+        return Response(library_payload(), status=status.HTTP_200_OK)
+
     def scan_status_view(self, request, pk=None):
         """
         GET /api/v1/tenant/assessments/<id>/scan/
