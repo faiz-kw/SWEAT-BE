@@ -1,0 +1,4 @@
+# Optional: on-device pose detection for the assessment body scan (BODY_SCAN_PROVIDER=local).
+# Install only on hosts that run the scan; it is a large dependency tree.
+mediapipe>=1.2.0,<2.0.0
+numpy>=1.26

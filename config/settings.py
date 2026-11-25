@@ -224,6 +224,40 @@ META_REDIRECT_URI = os.getenv('META_REDIRECT_URI', '').strip()
 PRIVACY_CONTACT_EMAIL = os.getenv('PRIVACY_CONTACT_EMAIL', '').strip()
 
 # ---------------------------------------------------------------------------
+# Body scan (member assessments)
+# ---------------------------------------------------------------------------
+# fal.ai hosts the pose model used to derive posture geometry from the four baseline
+# captures. With no key configured the assessment flow still stores the photos and records
+# the scan as UNAVAILABLE — it never falls back to placeholder measurements.
+# Provider for the assessment body scan:
+#   'local' — MediaPipe BlazePose on this server. Free, unlimited, and the member's
+#             photographs never leave the machine. Needs requirements-bodyscan.txt and a
+#             pose_landmarker .task file.
+#   'fal'   — fal.ai hosted SAM 3D Body. Costs per call and uploads the capture.
+BODY_SCAN_PROVIDER = os.getenv('BODY_SCAN_PROVIDER', 'local').strip().lower()
+BODY_SCAN_LOCAL_MODEL_PATH = os.getenv(
+    'BODY_SCAN_LOCAL_MODEL_PATH',
+    str(BASE_DIR / 'models' / 'pose_landmarker_lite.task'),
+).strip()
+
+# Transformation preview. 'morph' warps the member's own pixels (free, identity-safe by
+# construction); 'fal' sends the capture to a hosted editor. Either way the rendered image is
+# verified against the baseline pose before it is shown.
+# Per-action permission checks on assessments. Off by default: a tenant that has not had the
+# assessment permission codes granted to its coaching roles would lose access the moment this
+# turned on. See apps/tenant_core/management/commands/provision_assessment_rbac.py.
+ASSESSMENT_RBAC_ENFORCED = os.getenv('ASSESSMENT_RBAC_ENFORCED', 'False').lower() in ('true', '1', 't')
+
+TRANSFORMATION_RENDERER = os.getenv('TRANSFORMATION_RENDERER', 'morph').strip().lower()
+FAL_TRANSFORMATION_MODEL = os.getenv('FAL_TRANSFORMATION_MODEL', 'fal-ai/flux-2/flash/edit').strip()
+FAL_TRANSFORMATION_COST_USD = float(os.getenv('FAL_TRANSFORMATION_COST_USD', '0.005'))
+
+FAL_KEY = os.getenv('FAL_KEY', '').strip()
+FAL_BODY_SCAN_MODEL = os.getenv('FAL_BODY_SCAN_MODEL', 'fal-ai/sam-3/3d-body').strip()
+FAL_BODY_SCAN_TIMEOUT_SECONDS = int(os.getenv('FAL_BODY_SCAN_TIMEOUT_SECONDS', '180'))
+BODY_SCAN_ENABLED = os.getenv('BODY_SCAN_ENABLED', 'True').lower() in ('true', '1', 't')
+
+# ---------------------------------------------------------------------------
 # Internationalization
 # ---------------------------------------------------------------------------
 LANGUAGE_CODE = 'en-us'

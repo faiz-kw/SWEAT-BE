@@ -361,8 +361,9 @@ router.register(r'retail-orders', RetailOrderViewSet, basename='retail-order')
 router.register(r'inventory-movements', InventoryMovementViewSet, basename='inventory-movement')
 router.register(r'suppliers', SupplierViewSet, basename='supplier')
 
-from .views_assessment import AssessmentSessionViewSet, StudioScreenPairingView
+from .views_assessment import AssessmentSessionViewSet, AssessmentProgressionViewSet, StudioScreenPairingView
 router.register(r'assessments', AssessmentSessionViewSet, basename='assessment')
+router.register(r'assessment-progressions', AssessmentProgressionViewSet, basename='assessment-progression')
 
 from .views_tickets import SupportTicketViewSet
 router.register(r'tickets', SupportTicketViewSet, basename='ticket')
@@ -414,7 +415,11 @@ urlpatterns = [
     path('community/users/<uuid:user_id>/sanction/', views_community.CommunityAdminSanctionsView.as_view(), name='admin-community-sanction-user'),
     path('community/audit-logs/', views_community.CommunityAdminAuditLogsView.as_view(), name='admin-community-audit-logs'),
 
+    path('assessments/test-library/', AssessmentSessionViewSet.as_view({'get': 'test_library'}), name='assessment-test-library'),
     path('assessments/<uuid:pk>/capture/', AssessmentSessionViewSet.as_view({'post': 'capture_photos'}), name='assessment-capture'),
+    path('assessments/<uuid:pk>/transformation/', AssessmentSessionViewSet.as_view({'post': 'transformation', 'get': 'transformation_status_view'}), name='assessment-transformation'),
+    path('assessments/<uuid:pk>/scan/', AssessmentSessionViewSet.as_view({'get': 'scan_status_view'}), name='assessment-scan-status'),
+    path('assessments/<uuid:pk>/rescan/', AssessmentSessionViewSet.as_view({'post': 'rescan'}), name='assessment-rescan'),
     path('assessments/<uuid:pk>/approve-and-send/', AssessmentSessionViewSet.as_view({'post': 'approve_and_send'}), name='assessment-approve'),
     path('assessments/pair/', StudioScreenPairingView.as_view(), name='assessment-pair'),
 
