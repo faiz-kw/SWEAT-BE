@@ -24,6 +24,7 @@ Design rules, taken from the studio's assessment specification:
     with a reason the coach can act on ("move further from the camera", "two people in frame").
 """
 
+import hashlib
 import io
 import logging
 import math
@@ -746,6 +747,28 @@ class BodyScanService:
         return {view: f for view, f in candidates.items() if f}
 
     @classmethod
+    def _cached_view(cls, assessment, view: str, digest: str) -> Optional[Dict[str, Any]]:
+        """
+        A previous usable result for this exact image, if there is one.
+
+        Only a successful analysis is reused. A view that failed its quality gate is sent
+        again, because the coach may have fixed the lighting rather than the framing and the
+        bytes are what changed.
+        """
+        raw = (getattr(assessment, 'scan_raw_payload', None) or {})
+        previous_raw = (raw.get('raw') or {}).get(view) or {}
+        previous_quality = (getattr(assessment, 'scan_capture_quality', None) or {}).get(view) or {}
+        if not previous_raw.get('image_sha256') or previous_raw['image_sha256'] != digest:
+            return None
+        if not previous_quality.get('usable'):
+            return None
+        return {
+            'quality': previous_quality,
+            'per_view': (raw.get('per_view') or {}).get(view) or {},
+            'raw': previous_raw,
+        }
+
+    @classmethod
     def analyse(cls, assessment, client: Optional[FalBodyScanClient] = None) -> Dict[str, Any]:
         """
         Runs every available view through the provider and derives the metrics.
@@ -796,6 +819,17 @@ class BodyScanService:
                 result['quality'][view] = {'usable': False, 'reason': 'The stored image was empty.'}
                 continue
 
+            # Retaking one view used to re-bill all four, because every stored image was sent
+            # again. A view whose bytes are unchanged and whose last verdict was usable is
+            # reused instead: same result, no second charge.
+            digest = hashlib.sha256(image_bytes).hexdigest()
+            cached = cls._cached_view(assessment, view, digest)
+            if cached:
+                result['quality'][view] = cached['quality']
+                result['per_view'][view] = cached['per_view']
+                result['raw'][view] = {**cached['raw'], 'reused': True}
+                continue
+
             content_type = 'image/png' if image_bytes[:8].startswith(b'\x89PNG') else 'image/jpeg'
 
             try:
@@ -813,6 +847,7 @@ class BodyScanService:
             # Keypoints are bulky; keep the derived geometry and the provider's own reference
             # data, not the full per-joint dump for every view.
             result['raw'][view] = {
+                'image_sha256': digest,
                 'num_people': metadata.get('num_people'),
                 'keypoint_names_count': len(metadata.get('keypoint_names') or []),
                 'visualization_url': (response.get('visualization') or {}).get('url')

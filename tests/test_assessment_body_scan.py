@@ -241,3 +241,105 @@ class ClientConfigurationTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ProviderCallReuseTests(unittest.TestCase):
+    """
+    Retaking one view must not re-bill the other three.
+
+    Every provider call costs money, so a view whose bytes are unchanged and whose last
+    verdict was usable is reused rather than sent again.
+    """
+
+    class _CountingClient:
+        provider_name = 'test'
+        model = 'test/model'
+        is_configured = True
+
+        def __init__(self):
+            self.calls = []
+
+        def analyse_image(self, image_bytes, content_type='image/jpeg'):
+            self.calls.append(image_bytes)
+            return {'metadata': {
+                'num_people': 1,
+                'keypoint_names': NAMES,
+                'people': [{'bbox': [100, 50, 400, 950], 'keypoints_2d': frontal_keypoints(
+                    [400, 300], [600, 300], [430, 700], [570, 700], [440, 1200], [560, 1200])}],
+            }}
+
+    class _StubFile:
+        def __init__(self, payload: bytes):
+            self.payload = payload
+
+        def __bool__(self):
+            return True
+
+        def open(self, mode='rb'):
+            return self
+
+        def read(self):
+            return self.payload
+
+        def close(self):
+            pass
+
+    class _StubAssessment:
+        id = 'stub'
+        measured_height_cm = 170
+        scan_raw_payload: dict = {}
+        scan_capture_quality: dict = {}
+
+        def __init__(self, front, back):
+            self.photo_front = front
+            self.photo_back = back
+            self.photo_side_left = None
+            self.photo_side_right = None
+            self.photo_side = None
+
+    def _run(self, assessment, client):
+        from apps.tenant_core.services_body_scan import BodyScanService
+        result = BodyScanService.analyse(assessment, client=client)
+        # Mimic what apply_to_assessment persists, so the next run can match digests.
+        assessment.scan_capture_quality = result['quality']
+        assessment.scan_raw_payload = {
+            'views_submitted': result['views_submitted'],
+            'views_usable': result['views_usable'],
+            'per_view': result['per_view'],
+            'raw': result['raw'],
+        }
+        return result
+
+    def test_unchanged_views_are_not_sent_again(self):
+        front = self._StubFile(b'front-image-bytes')
+        back = self._StubFile(b'back-image-bytes')
+        assessment = self._StubAssessment(front, back)
+        client = self._CountingClient()
+
+        self._run(assessment, client)
+        self.assertEqual(len(client.calls), 2)
+
+        # Coach retakes only the back view; the front bytes are untouched.
+        assessment.photo_back = self._StubFile(b'back-image-RETAKEN')
+        self._run(assessment, client)
+
+        self.assertEqual(len(client.calls), 3, 'only the retaken view should be sent again')
+        self.assertEqual(client.calls[2], b'back-image-RETAKEN')
+
+    def test_a_reused_view_is_marked_as_such(self):
+        assessment = self._StubAssessment(self._StubFile(b'f'), self._StubFile(b'b'))
+        client = self._CountingClient()
+        self._run(assessment, client)
+        result = self._run(assessment, client)
+        self.assertTrue(result['raw']['front'].get('reused'))
+
+    def test_a_failed_view_is_retried_rather_than_reused(self):
+        """A rejected capture is sent again: the coach may have fixed lighting, not framing."""
+        assessment = self._StubAssessment(self._StubFile(b'f'), self._StubFile(b'b'))
+        client = self._CountingClient()
+        self._run(assessment, client)
+        # Mark the front view as having failed last time.
+        assessment.scan_capture_quality['front'] = {'usable': False, 'reason': 'too dark'}
+        before = len(client.calls)
+        self._run(assessment, client)
+        self.assertEqual(len(client.calls), before + 1)
