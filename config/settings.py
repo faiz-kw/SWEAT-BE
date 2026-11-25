@@ -243,6 +243,11 @@ BODY_SCAN_LOCAL_MODEL_PATH = os.getenv(
 # Transformation preview. 'morph' warps the member's own pixels (free, identity-safe by
 # construction); 'fal' sends the capture to a hosted editor. Either way the rendered image is
 # verified against the baseline pose before it is shown.
+# Per-action permission checks on assessments. Off by default: a tenant that has not had the
+# assessment permission codes granted to its coaching roles would lose access the moment this
+# turned on. See apps/tenant_core/management/commands/provision_assessment_rbac.py.
+ASSESSMENT_RBAC_ENFORCED = os.getenv('ASSESSMENT_RBAC_ENFORCED', 'False').lower() in ('true', '1', 't')
+
 TRANSFORMATION_RENDERER = os.getenv('TRANSFORMATION_RENDERER', 'morph').strip().lower()
 FAL_TRANSFORMATION_MODEL = os.getenv('FAL_TRANSFORMATION_MODEL', 'fal-ai/flux-2/flash/edit').strip()
 FAL_TRANSFORMATION_COST_USD = float(os.getenv('FAL_TRANSFORMATION_COST_USD', '0.005'))

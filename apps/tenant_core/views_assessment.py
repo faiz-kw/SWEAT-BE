@@ -112,14 +112,21 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
     # Turning the engine on now would deny every trainer and front-desk user and leave only
     # org admins (who pass via the super-admin bypass) able to run an assessment.
     #
-    # To enable: provision these codes to the coaching roles, run the tenant RBAC sync, then
-    # swap permission_classes for [RequireActiveTenantAndOrg, TenantRBACPermission]. The map
-    # is kept here so that switch is a one-line change.
+    # Enforcement is behind ASSESSMENT_RBAC_ENFORCED, which defaults to off. A tenant that
+    # has not yet had these codes granted would otherwise deny every trainer and front-desk
+    # user the moment this deployed, leaving only org admins via the super-admin bypass.
     #
-    # Note for whoever makes that switch: RequireActiveTenantAndOrg reads tenant context set
-    # by the middleware, so the existing API tests (which build requests with
-    # APIRequestFactory) return 401 under it and need that context stubbed first.
+    # To turn it on for a tenant:
+    #     python manage.py sync_tenant_catalog --tenant=<slug>
+    #     python manage.py provision_assessment_rbac --tenant=<slug>
+    # confirm a trainer can still open and save an assessment, then set
+    # ASSESSMENT_RBAC_ENFORCED=True.
     permission_classes = [IsAuthenticated]
+
+    def get_permissions(self):
+        if getattr(djsettings, 'ASSESSMENT_RBAC_ENFORCED', False):
+            return [IsAuthenticated(), TenantRBACPermission()]
+        return [IsAuthenticated()]
     required_module = 'performance'
     required_submodule = 'assessments'
     action_permission_map = {
@@ -127,6 +134,9 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
         'retrieve': 'performance.assessments.view',
         'scan_status_view': 'performance.assessments.view',
         'comparison': 'performance.assessments.view',
+        'test_library': 'performance.assessments.view',
+        'transformation_status_view': 'performance.assessments.view',
+        'transformation': 'performance.assessments.edit',
         'create': 'performance.assessments.create',
         'update': 'performance.assessments.edit',
         'partial_update': 'performance.assessments.edit',
