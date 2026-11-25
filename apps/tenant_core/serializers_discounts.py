@@ -61,18 +61,18 @@ class DiscountCodeSerializer(serializers.ModelSerializer):
             return 'SCHEDULED'
         if (camp.valid_until and now > camp.valid_until) or camp.status == 'EXPIRED':
             return 'EXPIRED'
-        if camp.usage_limit is not None and camp.redemptions.count() >= camp.usage_limit:
+        if camp.usage_limit is not None and camp.redemptions.filter(order__status='PAID').count() >= camp.usage_limit:
             return 'USAGE_EXHAUSTED'
         return 'ACTIVE'
 
     def get_redemption_count(self, obj) -> int:
-        return obj.redemptions.count()
+        return obj.redemptions.filter(order__status='PAID').count()
 
     def get_usage_remaining(self, obj):
         camp = obj.campaign
         if not camp or camp.usage_limit is None:
             return None
-        return max(0, camp.usage_limit - camp.redemptions.count())
+        return max(0, camp.usage_limit - camp.redemptions.filter(order__status='PAID').count())
 
 
 class DiscountCampaignSerializer(serializers.ModelSerializer):
@@ -108,7 +108,7 @@ class DiscountCampaignSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'organization', 'created_at', 'updated_at', 'computed_status', 'usage_remaining']
 
     def get_redemption_count(self, obj) -> int:
-        return obj.redemptions.count()
+        return obj.redemptions.filter(order__status='PAID').count()
 
     def get_computed_status(self, obj) -> str:
         now = timezone.now()
@@ -120,14 +120,14 @@ class DiscountCampaignSerializer(serializers.ModelSerializer):
             return 'SCHEDULED'
         if (obj.valid_until and now > obj.valid_until) or obj.status == 'EXPIRED':
             return 'EXPIRED'
-        if obj.usage_limit is not None and obj.redemptions.count() >= obj.usage_limit:
+        if obj.usage_limit is not None and obj.redemptions.filter(order__status='PAID').count() >= obj.usage_limit:
             return 'USAGE_EXHAUSTED'
         return 'ACTIVE'
 
     def get_usage_remaining(self, obj):
         if obj.usage_limit is None:
             return None
-        return max(0, obj.usage_limit - obj.redemptions.count())
+        return max(0, obj.usage_limit - obj.redemptions.filter(order__status='PAID').count())
 
     def validate_configuration(self, value):
         if value is None:

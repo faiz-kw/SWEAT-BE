@@ -350,20 +350,17 @@ class DiscountCouponEngineService:
             pkg_eligible = False
 
             if package:
-                if str(package.id) in allowed_package_set:
-                    pkg_eligible = True
-                elif allowed_program_set and getattr(package, 'program_id', None) and str(package.program_id) in allowed_program_set:
-                    pkg_eligible = True
+                pkg_ok = (not allowed_package_set) or (str(package.id) in allowed_package_set)
+                prog_ok = (not allowed_program_set) or (bool(getattr(package, 'program_id', None)) and str(package.program_id) in allowed_program_set)
+                pkg_eligible = pkg_ok and prog_ok
             elif order is not None:
-                order_pkg_ids = list(order.items.using(alias).filter(package_id__isnull=False).values_list('package_id', flat=True))
-                if any(str(p) in allowed_package_set for p in order_pkg_ids):
-                    pkg_eligible = True
-                elif allowed_program_set:
-                    for _it in order.items.using(alias).filter(package__isnull=False).select_related('package'):
-                        if getattr(_it, 'package', None) and getattr(_it.package, 'program_id', None):
-                            if str(_it.package.program_id) in allowed_program_set:
-                                pkg_eligible = True
-                                break
+                for _it in order.items.using(alias).filter(package_id__isnull=False).select_related('package'):
+                    pkg_ok = (not allowed_package_set) or (str(_it.package_id) in allowed_package_set)
+                    _it_prog = getattr(getattr(_it, 'package', None), 'program_id', None)
+                    prog_ok = (not allowed_program_set) or (bool(_it_prog) and str(_it_prog) in allowed_program_set)
+                    if pkg_ok and prog_ok:
+                        pkg_eligible = True
+                        break
 
             if not pkg_eligible:
                 if not package and order is None:
@@ -442,16 +439,18 @@ class DiscountCouponEngineService:
                 'reason_code': 'MINIMUM_ORDER_NOT_MET',
             }
 
-        # Global usage limit
+        # Global usage limit (only count PAID orders)
         if campaign.usage_limit is not None:
-            total_redemptions = DiscountRedemption.objects.using(alias).filter(campaign=campaign).count()
+            total_redemptions = DiscountRedemption.objects.using(alias).filter(
+                campaign=campaign, order__status='PAID'
+            ).count()
             if total_redemptions >= campaign.usage_limit:
                 return {'is_valid': False, 'reason': 'Coupon usage limit has been reached.', 'reason_code': 'USAGE_LIMIT_EXCEEDED'}
 
-        # Per-user limit
+        # Per-user limit (only count PAID orders)
         if campaign.per_user_limit is not None and user_profile:
             user_redemptions = DiscountRedemption.objects.using(alias).filter(
-                campaign=campaign, user_profile=user_profile
+                campaign=campaign, user_profile=user_profile, order__status='PAID'
             ).count()
             if user_redemptions >= campaign.per_user_limit:
                 return {'is_valid': False, 'reason': 'You have already reached the maximum usage limit for this coupon.', 'reason_code': 'PER_USER_LIMIT_EXCEEDED'}
@@ -1001,11 +1000,15 @@ class DiscountCouponEngineService:
                 raise ValidationError("Cross-organization redemption prohibited: campaign does not belong to order organization.")
 
             if campaign.usage_limit is not None:
-                total_redemptions = DiscountRedemption.objects.using(alias).filter(campaign=campaign).count()
+                total_redemptions = DiscountRedemption.objects.using(alias).filter(
+                    campaign=campaign, order__status='PAID'
+                ).count()
                 if total_redemptions >= campaign.usage_limit:
                     raise ValidationError("Coupon usage limit has been reached.")
             if campaign.per_user_limit is not None and user_profile:
-                user_redemptions = DiscountRedemption.objects.using(alias).filter(campaign=campaign, user_profile=user_profile).count()
+                user_redemptions = DiscountRedemption.objects.using(alias).filter(
+                    campaign=campaign, user_profile=user_profile, order__status='PAID'
+                ).count()
                 if user_redemptions >= campaign.per_user_limit:
                     raise ValidationError("You have reached your redemption limit for this coupon.")
 

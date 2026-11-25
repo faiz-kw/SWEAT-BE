@@ -292,21 +292,8 @@ class CommerceService:
                                 .select_related('campaign')
                                 .first()
                             )
-                            if code_obj:
-                                camp_obj = (
-                                    DiscountCampaign.objects.using(alias)
-                                    .select_for_update()
-                                    .filter(id=code_obj.campaign_id)
-                                    .first()
-                                )
-                                if camp_obj:
-                                    if camp_obj.usage_limit and camp_obj.usage_limit > 0:
-                                        camp_obj.usage_limit = max(0, camp_obj.usage_limit - 1)
-                                    camp_obj.redemption_count = (getattr(camp_obj, 'redemption_count', 0) or 0) + 1
-                                    camp_obj.save(using=alias)
-
+                            if code_obj and not DiscountRedemption.objects.using(alias).filter(order=order).exists():
                                 DiscountRedemption.objects.using(alias).create(
-                                    organization=order.branch.organization if order.branch else None,
                                     campaign=code_obj.campaign,
                                     discount_code=code_obj,
                                     user_profile=order.user_profile,

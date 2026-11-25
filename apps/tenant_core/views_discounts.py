@@ -6,9 +6,11 @@ import uuid
 from decimal import Decimal
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 from django.core.exceptions import ValidationError
 from django.db import transaction
+from django.db.models import Sum, Count
 
 from apps.tenant_core.permissions import RequireActiveTenantAndOrg, TenantRBACPermission
 from apps.tenant_core.context import get_tenant_db_alias
@@ -508,14 +510,22 @@ class DiscountEligibilityRuleViewSet(viewsets.ModelViewSet):
         return Response(DiscountEligibilityRuleSerializer(rule).data, status=status.HTTP_200_OK)
 
 
+class RedemptionAuditPagination(PageNumberPagination):
+    page_size = 25
+    page_size_query_param = 'page_size'
+    max_page_size = 100
+
+
 class DiscountRedemptionViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = DiscountRedemptionSerializer
+    pagination_class = RedemptionAuditPagination
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
     required_module = 'core'
     required_submodule = 'settings'
     required_permission = 'core.settings.view'
     permission_action_map = {
         'redeem': 'core.settings.edit',
+        'summary': 'core.settings.view',
     }
 
     def get_queryset(self):
@@ -524,6 +534,10 @@ class DiscountRedemptionViewSet(viewsets.ReadOnlyModelViewSet):
         qs = DiscountRedemption.objects.using(db).select_related('discount_code', 'campaign', 'user_profile', 'order')
         if org:
             qs = qs.filter(campaign__organization=org)
+        # Only show redemptions for PAID orders by default (excludes abandoned/unpaid retries)
+        include_unpaid = str(self.request.query_params.get('include_unpaid') or '').lower() in ('1', 'true', 'yes')
+        if not include_unpaid:
+            qs = qs.filter(order__status='PAID')
         campaign_id = self.request.query_params.get('campaign_id')
         if campaign_id:
             qs = qs.filter(campaign_id=campaign_id)
@@ -531,6 +545,18 @@ class DiscountRedemptionViewSet(viewsets.ReadOnlyModelViewSet):
         if order_id:
             qs = qs.filter(order_id=order_id)
         return qs.order_by('-redeemed_at')
+
+    @action(detail=False, methods=['get'], url_path='summary')
+    def summary(self, request):
+        qs = self.get_queryset()
+        agg = qs.aggregate(
+            total_redemptions=Count('id'),
+            total_savings=Sum('discount_amount'),
+        )
+        return Response({
+            'total_redemptions': agg['total_redemptions'] or 0,
+            'total_savings': str(agg['total_savings'] or Decimal('0.00')),
+        }, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['post'], url_path='redeem')
     def redeem(self, request):

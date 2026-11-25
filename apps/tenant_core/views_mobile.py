@@ -3692,13 +3692,11 @@ class MobileDiscountCouponsView(APIView):
                 _allowed_pkgs = [_code_pkg_id] if _code_pkg_id else (_cfg_pkg_ids if _cfg_pkg_ids else ([_cfg_single_pkg_id] if _cfg_single_pkg_id else []))
                 _cfg_program_ids = [str(x) for x in _cfg.get('program_ids', []) if x] if isinstance(_cfg.get('program_ids'), list) else []
 
-                pkg_matches = False
-                if _allowed_pkgs and str(req_package_id) in _allowed_pkgs:
-                    pkg_matches = True
-                elif _cfg_program_ids and req_program_id and str(req_program_id) in _cfg_program_ids:
-                    pkg_matches = True
-                elif not _allowed_pkgs and not _cfg_program_ids:
-                    pkg_matches = True
+                pkg_matches = True
+                if _allowed_pkgs and str(req_package_id) not in _allowed_pkgs:
+                    pkg_matches = False
+                if _cfg_program_ids and (not req_program_id or str(req_program_id) not in _cfg_program_ids):
+                    pkg_matches = False
 
                 if not pkg_matches:
                     continue
@@ -3723,8 +3721,9 @@ class MobileDiscountCouponsView(APIView):
 
             # Member lifecycle / status filtering
             _amt = _cfg.get('allowed_member_types') or _cfg.get('member_type')
-            if _amt and member_lifecycle:
-                if not DiscountCouponEngineService.matches_member_type(member_lifecycle, _amt):
+            if _amt:
+                effective_lifecycle = member_lifecycle or 'NEW'
+                if not DiscountCouponEngineService.matches_member_type(effective_lifecycle, _amt):
                     continue
 
             # User-lock filtering (allowed_user_ids)
