@@ -357,7 +357,10 @@ class TenantDatabaseMiddleware:
 
         tenant_id = None
         if not is_exempt:
-            tenant_id = _extract_tenant_id_from_jwt(request)
+            # Turnstile daemon endpoints use HMAC-SHA256 hex Bearer tokens (not JWTs).
+            # Skip JWT decode on those endpoints to avoid spurious DecodeError warnings.
+            if not path.startswith('/api/v1/tenant/access/turnstile/') and not path.startswith('/api/v1/access/turnstile/'):
+                tenant_id = _extract_tenant_id_from_jwt(request)
 
             # Allow open public lead capture & on-site edge service: resolve tenant DB via header or default to 'sweat'
             explicit_slug = (
@@ -365,7 +368,12 @@ class TenantDatabaseMiddleware:
                 or request.META.get('HTTP_X_TENANT_SLUG')
                 or request.GET.get('tenant')
             )
-            if not tenant_id and not explicit_slug and (path.startswith('/api/v1/access-control/') or path.startswith('/api/v1/tenant/access-control/')):
+            if not tenant_id and not explicit_slug and (
+                path.startswith('/api/v1/access-control/')
+                or path.startswith('/api/v1/tenant/access-control/')
+                or path.startswith('/api/v1/tenant/access/turnstile/')
+                or path.startswith('/api/v1/access/turnstile/')
+            ):
                 explicit_slug = 'sweat'
 
             if not tenant_id and explicit_slug:

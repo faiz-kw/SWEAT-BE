@@ -41,6 +41,7 @@ from .models_classes import (
 )
 from .models_bookings import Booking
 from .models_attendance import AccessPass, AccessEvent, AttendanceRecord
+from .models_devices import TurnstileDevice
 from .models_crm import (
     LeadSource,
     Lead,
@@ -509,11 +510,11 @@ class BookingAdmin(TenantModelAdmin):
 
 @admin.register(AccessPass)
 class AccessPassAdmin(TenantModelAdmin):
-    list_display = ['id', 'user_profile', 'booking', 'branch', 'status', 'pass_type', 'valid_from', 'valid_until', 'consumed_at']
+    list_display = ['id', 'user_profile', 'booking', 'trial_booking', 'branch', 'status', 'pass_type', 'valid_from', 'valid_until', 'consumed_at']
     list_filter = ['status', 'pass_type', 'branch']
-    search_fields = ['token_hash', 'user_profile__first_name_snapshot', 'user_profile__member_number', 'booking__booking_number']
+    search_fields = ['token_hash', 'user_profile__first_name_snapshot', 'user_profile__member_number', 'booking__booking_number', 'trial_booking__lead__first_name', 'trial_booking__lead__phone']
     readonly_fields = ['id', 'created_at', 'updated_at', 'token_hash', 'consumed_at']
-    list_select_related = ['user_profile', 'booking', 'branch']
+    list_select_related = ['user_profile', 'booking', 'trial_booking', 'trial_booking__lead', 'branch']
 
 
 @admin.register(AttendanceRecord)
@@ -527,11 +528,20 @@ class AttendanceRecordAdmin(TenantModelAdmin):
 
 @admin.register(AccessEvent)
 class AccessEventAdmin(TenantModelAdmin):
-    list_display = ['id', 'user_profile', 'event_type', 'direction', 'device_reference', 'reconciliation_status', 'event_at']
+    list_display = ['id', 'user_profile', 'trial_booking', 'event_type', 'direction', 'device_reference', 'reconciliation_status', 'event_at']
     list_filter = ['event_type', 'direction', 'reconciliation_status', 'branch']
-    search_fields = ['token_hash', 'device_reference', 'user_profile__first_name_snapshot', 'user_profile__member_number']
+    search_fields = ['token_hash', 'device_reference', 'user_profile__first_name_snapshot', 'user_profile__member_number', 'trial_booking__lead__first_name', 'trial_booking__lead__phone']
     readonly_fields = ['id', 'created_at', 'token_hash', 'event_at']
-    list_select_related = ['user_profile', 'branch', 'booking']
+    list_select_related = ['user_profile', 'branch', 'booking', 'trial_booking', 'trial_booking__lead']
+
+
+@admin.register(TurnstileDevice)
+class TurnstileDeviceAdmin(TenantModelAdmin):
+    list_display = ['name', 'branch', 'direction', 'host', 'port', 'class_category_code', 'device_serial', 'is_active', 'updated_at']
+    list_filter = ['is_active', 'direction', 'branch', 'class_category_code']
+    search_fields = ['name', 'host', 'device_serial', 'class_category_code']
+    readonly_fields = ['id', 'created_at', 'updated_at']
+    list_select_related = ['branch']
 
 
 @admin.register(Membership)

@@ -3781,30 +3781,31 @@ class MemberViewSet(viewsets.ViewSet):
 
         # 1. Resolve Administration Upgrade Window Policy
         policy_cfg = MembershipLifecycleService.get_policy_config(org, db_alias=alias)
-        window_days = getattr(policy_cfg, 'upgrade_allowed_window_days', 15) or 15
+        window_days = getattr(policy_cfg, 'upgrade_allowed_window_days', 0)
 
-        # 2. Determine initial purchase / enrollment date (first active package contract)
-        first_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('created_at').first()
-        initial_date = None
-        if first_m:
-            initial_date = first_m.start_date or (first_m.created_at.date() if first_m.created_at else None)
-        if not initial_date:
-            initial_date = active_m.start_date or (active_m.created_at.date() if active_m.created_at else timezone.now().date())
+        # 2. Enforce window check only if window_days is configured and > 0 (0 means unlimited / no time limit)
+        if window_days and window_days > 0:
+            first_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('created_at').first()
+            initial_date = None
+            if first_m:
+                initial_date = first_m.start_date or (first_m.created_at.date() if first_m.created_at else None)
+            if not initial_date:
+                initial_date = active_m.start_date or (active_m.created_at.date() if active_m.created_at else timezone.now().date())
 
-        today = timezone.now().date()
-        days_elapsed = max(0, (today - initial_date).days)
-        is_within_window = (days_elapsed <= window_days)
+            today = timezone.now().date()
+            days_elapsed = max(0, (today - initial_date).days)
+            is_within_window = (days_elapsed <= window_days)
 
-        # 3. IF OUTSIDE WINDOW -> DO NOT RETURN ANY PACKAGES
-        if not is_within_window:
-            return Response({
-                'is_within_window': False,
-                'window_days': window_days,
-                'days_elapsed': days_elapsed,
-                'initial_purchase_date': initial_date.isoformat(),
-                'message': f"Upgrade window expired. Upgrades by paying only difference are strictly allowed within {window_days} days of 1st package purchase ({days_elapsed} days elapsed since purchase on {initial_date}).",
-                'packages': [],
-            }, status=status.HTTP_200_OK)
+            # 3. IF OUTSIDE WINDOW -> DO NOT RETURN ANY PACKAGES
+            if not is_within_window:
+                return Response({
+                    'is_within_window': False,
+                    'window_days': window_days,
+                    'days_elapsed': days_elapsed,
+                    'initial_purchase_date': initial_date.isoformat(),
+                    'message': f"Upgrade window expired. Upgrades by paying only difference are strictly allowed within {window_days} days of 1st package purchase ({days_elapsed} days elapsed since purchase on {initial_date}).",
+                    'packages': [],
+                }, status=status.HTTP_200_OK)
 
         # 4. IF INSIDE WINDOW -> Calculate current sessions and price, return only higher packages
         cur_sessions = 0
@@ -3916,25 +3917,26 @@ class MemberViewSet(viewsets.ViewSet):
         if not active_m:
             return Response({'error': 'No active membership to upgrade.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # 1. Enforce Administration Upgrade Window Policy
+        # 1. Enforce Administration Upgrade Window Policy (if configured and > 0)
         policy_cfg = MembershipLifecycleService.get_policy_config(org, db_alias=alias)
-        window_days = getattr(policy_cfg, 'upgrade_allowed_window_days', 15) or 15
+        window_days = getattr(policy_cfg, 'upgrade_allowed_window_days', 0)
 
-        first_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('created_at').first()
-        initial_date = None
-        if first_m:
-            initial_date = first_m.start_date or (first_m.created_at.date() if first_m.created_at else None)
-        if not initial_date:
-            initial_date = active_m.start_date or (active_m.created_at.date() if active_m.created_at else timezone.now().date())
+        if window_days and window_days > 0:
+            first_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('created_at').first()
+            initial_date = None
+            if first_m:
+                initial_date = first_m.start_date or (first_m.created_at.date() if first_m.created_at else None)
+            if not initial_date:
+                initial_date = active_m.start_date or (active_m.created_at.date() if active_m.created_at else timezone.now().date())
 
-        days_elapsed = max(0, (timezone.now().date() - initial_date).days)
-        if days_elapsed > window_days:
-            return Response({
-                'error': f'Upgrade window expired. Upgrades by paying the difference are strictly allowed within {window_days} days of 1st package purchase ({days_elapsed} days elapsed).',
-                'code': 'UPGRADE_WINDOW_EXPIRED',
-                'window_days': window_days,
-                'days_elapsed': days_elapsed,
-            }, status=status.HTTP_400_BAD_REQUEST)
+            days_elapsed = max(0, (timezone.now().date() - initial_date).days)
+            if days_elapsed > window_days:
+                return Response({
+                    'error': f'Upgrade window expired. Upgrades by paying the difference are strictly allowed within {window_days} days of 1st package purchase ({days_elapsed} days elapsed).',
+                    'code': 'UPGRADE_WINDOW_EXPIRED',
+                    'window_days': window_days,
+                    'days_elapsed': days_elapsed,
+                }, status=status.HTTP_400_BAD_REQUEST)
 
         target_pkg_id = request.data.get('package_id')
         target_pkg_ver_id = request.data.get('package_version_id')

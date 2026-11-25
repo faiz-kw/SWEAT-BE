@@ -4,7 +4,11 @@ Replicates the high-converting 1-tap browser confirmation & management flow (e.g
 without requiring member authentication. Protected by cryptographic HMAC timestamp signatures.
 """
 
+import html
 import logging
+from datetime import timedelta
+from zoneinfo import ZoneInfo
+from django.conf import settings
 from django.utils import timezone
 from django.http import HttpResponse, JsonResponse
 from django.views import View
@@ -13,7 +17,15 @@ from django.db import transaction
 from django.core.signing import BadSignature, SignatureExpired
 
 from apps.tenant_core.communication.whatsapp_tokens import verify_trial_action_token
+from apps.tenant_core.models_attendance import AccessPass
+from apps.tenant_core.models_classes import ClassOccurrence
 from apps.tenant_core.models_crm import TrialBooking, TrialStatusHistory
+from apps.tenant_core.services_access_control import (
+    generate_trial_qr_token,
+    hash_qr_token,
+    push_qr_to_studio_terminals,
+)
+from apps.tenant_core.services_booking_policy import BookingPolicyService
 from apps.tenant_core.services_crm import CRMLeadService
 from apps.tenant_core.services_reliability import record_business_audit
 from apps.tenant_core.communication.whatsapp_variables import fmt_ist_datetime
@@ -422,8 +434,11 @@ class PublicTrialRescheduleView(View):
 class PublicTrialPassView(View):
     """
     Renders digital studio pass with QR code for turnstile check-in.
-    Only available on confirmed trial bookings.
+    Enforces trial lifecycle, ensures AccessPass with deterministic 22-char QR token,
+    and pushes active tokens to studio terminals.
     """
+    _ERR_ICON = '<svg width="36" height="36" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>'
+
     def get(self, request, token):
         try:
             trial_id, action, tenant_id = verify_trial_action_token(token)
@@ -435,7 +450,7 @@ class PublicTrialPassView(View):
                 heading="Pass Expired",
                 subtext="This studio pass has expired or is invalid.",
                 badge_color="239, 68, 68",
-                icon_svg='<svg width="36" height="36" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>',
+                icon_svg=self._ERR_ICON,
                 details_html="",
             )
 
@@ -446,34 +461,189 @@ class PublicTrialPassView(View):
                 heading="Pass Not Found",
                 subtext="This studio pass could not be located. Please contact studio reception.",
                 badge_color="239, 68, 68",
-                icon_svg='<svg width="36" height="36" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>',
+                icon_svg=self._ERR_ICON,
                 details_html="",
             )
-        date_str = fmt_ist_datetime(trial.scheduled_start)
-        branch_name = trial.branch.name if trial.branch else "SWEAT Studio"
-        lead_name = f"{trial.lead.first_name} {trial.lead.last_name}".strip() if trial.lead else "Athlete"
 
-        # Generate a public QR image URL via standard QR service
-        qr_data = f"SWEAT:TRIAL:{trial.id}"
-        qr_image_url = f"https://api.qrserver.com/v1/create-qr-code/?size=200x200&data={qr_data}&bgcolor=17-24-39&color=243-244-246"
+        with tenant_database_context(tenant_uuid) as alias:
+            trial = (
+                TrialBooking.objects.using(alias)
+                .select_related('lead', 'lead__organization', 'branch', 'branch__organization')
+                .filter(id=trial_id)
+                .first()
+            )
+            if not trial:
+                return _render_html_response(
+                    title="Pass Not Found",
+                    heading="Pass Not Found",
+                    subtext="This studio pass could not be located. Please contact studio reception.",
+                    badge_color="239, 68, 68",
+                    icon_svg=self._ERR_ICON,
+                    details_html="",
+                )
+
+            has_replacement = TrialBooking.objects.using(alias).filter(
+                rescheduled_from=trial,
+                status__in=['BOOKED', 'CONFIRMED', 'SCHEDULED'],
+            ).exclude(confirmation_status__in=['CANCELLED', 'DECLINED']).exists()
+
+            if (
+                trial.status in ('CANCELLED', 'RESCHEDULED', 'NO_SHOW')
+                or trial.confirmation_status in ('CANCELLED', 'DECLINED')
+                or has_replacement
+            ):
+                return _render_html_response(
+                    title="Pass No Longer Valid",
+                    heading="Pass No Longer Valid",
+                    subtext="This trial booking was cancelled, superseded, or missed. Please contact studio reception for assistance.",
+                    badge_color="239, 68, 68",
+                    icon_svg=self._ERR_ICON,
+                    details_html="",
+                )
+
+            occ = None
+            if trial.class_occurrence_id:
+                occ = (
+                    ClassOccurrence.objects.using(alias)
+                    .select_related('class_template', 'class_template__category', 'branch', 'branch__organization')
+                    .filter(id=trial.class_occurrence_id)
+                    .first()
+                )
+
+            pass_branch = trial.branch or (occ.branch if occ else None)
+            start_at = (occ.start_at if (occ and occ.start_at) else trial.scheduled_start)
+            end_at = (occ.end_at if (occ and occ.end_at) else trial.scheduled_end)
+            if start_at and not end_at:
+                tpl_dur = occ.class_template.default_duration_minutes if (occ and occ.class_template and occ.class_template.default_duration_minutes) else 50
+                end_at = start_at + timedelta(minutes=tpl_dur)
+
+            now = timezone.now()
+            if end_at and (end_at + timedelta(minutes=15)) < now:
+                return _render_html_response(
+                    title="Pass Expired",
+                    heading="Session Window Ended",
+                    subtext="This trial session has concluded and its turnstile pass has expired.",
+                    badge_color="239, 68, 68",
+                    icon_svg=self._ERR_ICON,
+                    details_html="",
+                )
+
+            org = (
+                (pass_branch.organization if pass_branch else None)
+                or (trial.lead.organization if trial.lead else None)
+            )
+            policy = BookingPolicyService.get_effective_policy(org, branch=pass_branch, db_alias=alias) if org else {}
+            qr_activation_minutes = int(policy.get('qr_activation_minutes_before_class', 20) or 20)
+
+            valid_from_dt = (start_at - timedelta(minutes=qr_activation_minutes)) if start_at else now
+            valid_until_dt = (end_at + timedelta(minutes=60)) if end_at else (now + timedelta(hours=2))
+
+            existing_pass = AccessPass.objects.using(alias).filter(trial_booking=trial).first()
+            if existing_pass and existing_pass.status == 'CANCELLED':
+                return _render_html_response(
+                    title="Pass Cancelled",
+                    heading="Pass Cancelled",
+                    subtext="This turnstile access pass has been revoked.",
+                    badge_color="239, 68, 68",
+                    icon_svg=self._ERR_ICON,
+                    details_html="",
+                )
+
+            if existing_pass and existing_pass.status == 'CONSUMED_EXITED':
+                return _render_html_response(
+                    title="Session Completed",
+                    heading="Thanks for Visiting SWEAT!",
+                    subtext="You have checked out of this trial session. Our wellness counselor will follow up with you shortly.",
+                    badge_color="59, 130, 246",
+                    icon_svg='<svg width="40" height="40" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>',
+                    details_html="",
+                )
+
+            qr_token = generate_trial_qr_token(str(trial.id), settings.SECRET_KEY)
+            t_hash = hash_qr_token(qr_token)
+            lead_name = f"{trial.lead.first_name} {trial.lead.last_name}".strip() if trial.lead else "Athlete"
+            category_code = (
+                occ.class_template.category.code
+                if occ and occ.class_template and getattr(occ.class_template, 'category', None)
+                else ''
+            )
+
+            pass_obj = existing_pass
+            if pass_branch:
+                if existing_pass and existing_pass.status == 'CONSUMED_ENTERED':
+                    existing_pass.valid_until = valid_until_dt
+                    existing_pass.updated_at = now
+                    existing_pass.save(using=alias, update_fields=['valid_until', 'updated_at'])
+                    pass_obj = existing_pass
+                else:
+                    pass_obj, _ = AccessPass.objects.using(alias).update_or_create(
+                        trial_booking=trial,
+                        defaults={
+                            'user_profile': trial.user_profile,
+                            'branch': pass_branch,
+                            'token_hash': t_hash,
+                            'pass_type': 'TRIAL_BOOKING',
+                            'valid_from': valid_from_dt,
+                            'valid_until': valid_until_dt,
+                            'status': 'ACTIVE',
+                            'updated_at': now,
+                        },
+                    )
+                if pass_obj and (not start_at or now >= (start_at - timedelta(hours=2))):
+                    push_qr_to_studio_terminals(
+                        pass_id=str(pass_obj.id),
+                        display_name=lead_name or "Trial Guest",
+                        qr_token=qr_token,
+                        branch=pass_branch,
+                        category_code=category_code,
+                        db_alias=alias,
+                    )
+
+            tz_str = (pass_branch.timezone if pass_branch and pass_branch.timezone else None) or 'Asia/Kolkata'
+            try:
+                branch_tz = ZoneInfo(tz_str)
+            except Exception:
+                branch_tz = ZoneInfo('Asia/Kolkata')
+
+            date_str = fmt_ist_datetime(start_at) if start_at else ""
+            act_local = valid_from_dt.astimezone(branch_tz).strftime('%I:%M %p').lstrip('0')
+            branch_name = html.escape(pass_branch.name if pass_branch else "SWEAT Studio")
+            session_label = html.escape(
+                (occ.class_template.name if (occ and occ.class_template) else None)
+                or trial.trial_type
+                or 'SWEAT Session'
+            )
+            escaped_lead_name = html.escape(lead_name or "Athlete")
+
+        window_note = (
+            f"Checked In — Scan QR at Exit Gate when leaving"
+            if (pass_obj and pass_obj.status == 'CONSUMED_ENTERED')
+            else (
+                f"Gate entry opens at {act_local} ({qr_activation_minutes} mins before class)"
+                if (start_at and now < valid_from_dt)
+                else "Scan at Turnstile or Front Desk Scanner"
+            )
+        )
+
+        qr_image_url = f"https://api.qrserver.com/v1/create-qr-code/?size=200x200&data={qr_token}&bgcolor=17-24-39&color=243-244-246"
 
         details_html = f"""
-        <div style="background:#111827; padding:16px; border-radius:12px; margin-bottom:20px; border: 1px solid #374151;">
+        <div style="background:#111827; padding:16px; border-radius:12px; margin-bottom:20px; border: 1px solid #374151; text-align:center;">
             <img src="{qr_image_url}" alt="Access QR Code" style="width:180px; height:180px; border-radius:8px; display:block; margin:0 auto;" />
-            <div style="font-size:12px; color:#9ca3af; margin-top:10px;">Scan at Turnstile or Front Desk Scanner</div>
+            <div style="font-size:12px; color:#9ca3af; margin-top:10px;">{html.escape(window_note)}</div>
         </div>
         <div class="details-box">
             <div class="detail-row">
                 <span class="detail-label">Athlete</span>
-                <span class="detail-val">{lead_name}</span>
+                <span class="detail-val">{escaped_lead_name}</span>
             </div>
             <div class="detail-row">
                 <span class="detail-label">Session</span>
-                <span class="detail-val">{trial.trial_type or 'SWEAT Session'}</span>
+                <span class="detail-val">{session_label}</span>
             </div>
             <div class="detail-row">
                 <span class="detail-label">Session Time</span>
-                <span class="detail-val">{date_str}</span>
+                <span class="detail-val">{html.escape(date_str)}</span>
             </div>
             <div class="detail-row">
                 <span class="detail-label">Studio</span>

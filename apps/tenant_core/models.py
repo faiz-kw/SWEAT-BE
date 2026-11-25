@@ -225,6 +225,10 @@ __all__ += [
     'AccessPass',
 ]
 
+from .models_devices import TurnstileDevice  # noqa: E402
+
+__all__ += ['TurnstileDevice']
+
 from .models_referrals import (
     ReferralProgram,
     ReferralIdentifier,

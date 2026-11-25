@@ -173,6 +173,11 @@ from .views_bookings import (
     AccessControlSyncPassesView,
     TurnstileVerifyPunchView,
 )
+from .views_turnstile import (
+    TurnstileActiveTokensView,
+    TurnstileDeviceListView,
+    TurnstileStaleTokensView,
+)
 from .views_rewards import (
     ReferralProgramViewSet,
     ReferralIdentifierViewSet,
@@ -402,6 +407,10 @@ urlpatterns = [
     path('access-control/events/bulk/', AccessControlBulkIngestView.as_view(), name='access-control-bulk-ingest'),
     path('access-control/sync/', AccessControlSyncPassesView.as_view(), name='access-control-sync-passes'),
     path('access/turnstile/verify-punch/', TurnstileVerifyPunchView.as_view(), name='tenant-turnstile-verify-punch'),
+    # Turnstile fleet management — used by studio daemons
+    path('access/turnstile/active-tokens/', TurnstileActiveTokensView.as_view(), name='tenant-turnstile-active-tokens'),
+    path('access/turnstile/devices/', TurnstileDeviceListView.as_view(), name='tenant-turnstile-devices'),
+    path('access/turnstile/stale-tokens/', TurnstileStaleTokensView.as_view(), name='tenant-turnstile-stale-tokens'),
 
     # Admin Community & Social Transformations Engine
     path('community/overview/', views_community.CommunityAdminOverviewView.as_view(), name='admin-community-overview'),

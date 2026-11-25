@@ -19,6 +19,11 @@ from apps.tenant_core.views_meta_webhook import MetaLeadWebhookView
 from apps.tenant_core.views_legal import privacy_policy_view, terms_of_service_view, data_deletion_view
 from apps.tenant_core.views_health import HealthLivenessView, HealthReadinessView
 from apps.tenant_core.views_bookings import AccessControlSyncPassesView, AccessControlBulkIngestView, TurnstileVerifyPunchView
+from apps.tenant_core.views_turnstile import (
+    TurnstileActiveTokensView,
+    TurnstileDeviceListView,
+    TurnstileStaleTokensView,
+)
 from apps.tenant_core.views_voice_agent import (
     VoiceAgentBranchesView,
     VoiceAgentClassesView,
@@ -117,6 +122,11 @@ urlpatterns = [
     path('api/v1/tenant/access/turnstile/verify-punch/', TurnstileVerifyPunchView.as_view(), name='turnstile-verify-punch-tenant'),
     path('api/v1/access/turnstile/verify-punch/', TurnstileVerifyPunchView.as_view(), name='turnstile-verify-punch-short'),
     path('api/v1/access-control/turnstile/verify-punch/', TurnstileVerifyPunchView.as_view(), name='turnstile-verify-punch-edge'),
+
+    # Turnstile Fleet Management — Daemon sync endpoints (HMAC-authenticated, hardware only)
+    path('api/v1/tenant/access/turnstile/active-tokens/', TurnstileActiveTokensView.as_view(), name='turnstile-active-tokens'),
+    path('api/v1/tenant/access/turnstile/devices/', TurnstileDeviceListView.as_view(), name='turnstile-devices'),
+    path('api/v1/tenant/access/turnstile/stale-tokens/', TurnstileStaleTokensView.as_view(), name='turnstile-stale-tokens'),
 
     # OpenAPI 3.1 Schema & Interactive Docs
     path('api/schema/', SpectacularAPIView.as_view(), name='schema'),

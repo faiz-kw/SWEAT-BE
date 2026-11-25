@@ -482,12 +482,16 @@ class AccessEventSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at']
 
     def get_member_name(self, obj):
-        if not obj.user_profile:
-            return 'Unknown'
-        name = f"{obj.user_profile.first_name_snapshot or ''} {obj.user_profile.last_name_snapshot or ''}".strip()
-        if not name and obj.user_profile.user:
-            name = obj.user_profile.user.full_name or obj.user_profile.user.email
-        return name or 'Unknown'
+        if obj.user_profile:
+            name = f"{obj.user_profile.first_name_snapshot or ''} {obj.user_profile.last_name_snapshot or ''}".strip()
+            if not name and obj.user_profile.user:
+                name = obj.user_profile.user.full_name or obj.user_profile.user.email
+            return name or 'Unknown'
+        if getattr(obj, 'trial_booking_id', None) and obj.trial_booking and obj.trial_booking.lead:
+            lead = obj.trial_booking.lead
+            name = f"{lead.first_name or ''} {lead.last_name or ''}".strip() or lead.email or lead.phone
+            return f"{name} (Trial)" if name else 'Trial Guest'
+        return 'Unknown'
 
 
 class BookingPolicyConfigSerializer(serializers.ModelSerializer):

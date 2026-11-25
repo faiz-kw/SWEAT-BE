@@ -64,10 +64,11 @@ from .models_bookings import Booking, BookingCancellation
 from .models_catalog import Package, PackageVersion, PackagePrice, PackageEntitlementDefinition
 from .models_memberships import Membership, MembershipEntitlement
 from .models_commerce import Order, OrderItem, PaymentTransaction
-from .models_discounts import DiscountCode
+from .models_discounts import DiscountCode, DiscountRedemption
 from .models_crm import IntakeForm, IntakeQuestion, IntakeSubmission, TrialBooking, Lead, LeadSource, LeadConversion
 from .services_bookings import BookingWaitlistAttendanceService, ParqRequiredValidationError
 from .services_memberships import MembershipLifecycleService
+from .permissions import RequireActiveTenantAndOrg, TenantRBACPermission
 from .services_discounts import DiscountCouponEngineService
 from .services_crm import CRMLeadService
 from .views_members import format_program_package_name
@@ -94,131 +95,25 @@ def _primary_entitlements(entitlements):
     return [v for k, v in by_type.items() if k not in PASSPORT and k not in CREDIT]
 
 
-def _push_qr_to_studio_terminals(pass_id: str, display_name: str, qr_token: str, branch=None):
-    """
-    Registers the QR token as a 'card' in the Dahua TrueFace3000 terminal's local
-    user database so that the camera scan fires an AccessControl event that the
-    malad_turnstile_daemon.py can receive and process.
+def _push_qr_to_studio_terminals(
+    pass_id: str,
+    display_name: str,
+    qr_token: str,
+    branch=None,
+    category_code: str = '',
+    db_alias: str = None,
+):
+    """Delegate QR push to the shared tenant access-control helper."""
+    from .services_access_control import push_qr_to_studio_terminals
 
-    Runs in a background thread — does NOT block the mobile API response.
-    Safe to call even when terminals are offline (errors are logged, not raised).
-
-    Terminal config:
-      ENTRY: 192.168.0.114  EXIT: 192.168.0.152
-    Only pushes to Malad-branch terminals for now. Extend via branch lookup as
-    more studios go live.
-    """
-    import threading
-    import hashlib
-    import logging
-
-    logger = logging.getLogger(__name__)
-
-    # Studio terminal map keyed by branch name fragment (case-insensitive)
-    STUDIO_TERMINALS = {
-        'malad': [
-            {'name': 'ENTRY', 'ip': '192.168.0.114'},
-            {'name': 'EXIT',  'ip': '192.168.0.152'},
-        ],
-    }
-
-    # Identify which studio terminals to push to
-    terminals_to_push = []
-    if branch:
-        branch_name_lower = (getattr(branch, 'name', '') or '').lower()
-        for studio_key, terminals in STUDIO_TERMINALS.items():
-            if studio_key in branch_name_lower:
-                terminals_to_push = terminals
-                break
-    # Default: push to Malad if branch not matched (single-studio deployment)
-    if not terminals_to_push:
-        terminals_to_push = STUDIO_TERMINALS['malad']
-
-    def _do_push():
-        try:
-            import requests as _req
-
-            admin_user = 'admin'
-            admin_pass = 'tipl9910'
-
-            # UserID for the terminal: use first 8 hex chars of pass UUID (stays within 32-char limit)
-            # Prefix with 'P' to avoid collision with management user IDs (which are numeric)
-            user_id_for_terminal = 'P' + pass_id.replace('-', '')[:7]
-
-            for terminal in terminals_to_push:
-                ip = terminal['ip']
-                tname = terminal['name']
-                try:
-                    # 1. Login
-                    sess = _req.Session()
-                    r1 = sess.post(
-                        f'http://{ip}/RPC2_Login',
-                        json={'method': 'global.login',
-                              'params': {'userName': admin_user, 'password': '', 'clientType': 'Web3.0'},
-                              'id': 1},
-                        timeout=4
-                    )
-                    d1 = r1.json()
-                    rand  = d1['params']['random']
-                    realm = d1['params']['realm']
-                    sid0  = d1['session']
-                    p1 = hashlib.md5(f'{admin_user}:{realm}:{admin_pass}'.encode()).hexdigest().upper()
-                    p2 = hashlib.md5(f'{admin_user}:{rand}:{p1}'.encode()).hexdigest().upper()
-                    r2 = sess.post(
-                        f'http://{ip}/RPC2_Login',
-                        json={'method': 'global.login',
-                              'params': {'userName': admin_user, 'password': p2,
-                                         'clientType': 'Web3.0', 'authorityType': 'Default'},
-                              'id': 2, 'session': sid0},
-                        timeout=4
-                    )
-                    sid = r2.json().get('session')
-                    if not r2.json().get('result') or not sid:
-                        logger.warning('Terminal %s %s login failed', tname, ip)
-                        continue
-
-                    # 2. Register user (idempotent — terminal returns True if already exists)
-                    sess.post(
-                        f'http://{ip}/RPC2',
-                        json={'method': 'AccessUser.insertMulti',
-                              'params': {'UserList': [{
-                                  'UserID': user_id_for_terminal,
-                                  'UserName': display_name[:31],  # 32-char terminal limit
-                                  'UserType': 0,
-                                  'TimeSections': [255],
-                                  'Doors': [0],
-                                  'UseTime': 0,
-                              }]},
-                              'id': 10, 'session': sid},
-                        timeout=5
-                    )
-
-                    # 3. Register QR token as a card (idempotent)
-                    r_card = sess.post(
-                        f'http://{ip}/RPC2',
-                        json={'method': 'AccessCard.insertMulti',
-                              'params': {'CardList': [{
-                                  'CardNo': qr_token,       # 22-char Base62 token
-                                  'UserID': user_id_for_terminal,
-                                  'CardType': 1,            # normal card
-                                  'UseTime': 0,             # unlimited
-                                  'ValidDateStart': '2026-01-01 00:00:00',
-                                  'ValidDateEnd':   '2099-12-31 23:59:59',
-                              }]},
-                              'id': 11, 'session': sid},
-                        timeout=5
-                    )
-                    ok = r_card.json().get('result', False)
-                    logger.info('Terminal push %s %s card=%s result=%s', tname, ip, qr_token[:8], ok)
-
-                except Exception as terminal_err:
-                    logger.warning('Terminal push failed %s %s: %s', tname, ip, terminal_err)
-
-        except Exception as e:
-            logger.error('_push_qr_to_studio_terminals thread error: %s', e)
-
-    thread = threading.Thread(target=_do_push, daemon=True, name=f'qr-push-{pass_id[:8]}')
-    thread.start()
+    push_qr_to_studio_terminals(
+        pass_id=pass_id,
+        display_name=display_name,
+        qr_token=qr_token,
+        branch=branch,
+        category_code=category_code,
+        db_alias=db_alias,
+    )
 
 
 def _resolve_mobile_tenant_and_db(request):
@@ -3219,19 +3114,45 @@ class MobileQRPassView(APIView):
         qr_display_token = generate_booking_qr_token(booking.id, settings.SECRET_KEY)
         t_hash = hash_qr_token(qr_display_token)
 
-        pass_obj, _ = AccessPass.objects.using(alias).update_or_create(
-            booking=booking,
-            defaults={
-                'user_profile': profile,
-                'branch': booking.branch,
-                'token_hash': t_hash,
-                'pass_type': 'CLASS_BOOKING',
-                'valid_from': valid_from_dt,
-                'valid_until': valid_until_dt,
-                'status': 'ACTIVE',
-                'updated_at': now,
-            }
-        )
+        existing_pass = AccessPass.objects.using(alias).filter(booking=booking).first()
+        if existing_pass and existing_pass.status == 'CANCELLED':
+            return Response({
+                'has_booking': False,
+                'is_active': False,
+                'status': 'CANCELLED',
+                'detail': 'This booking access pass has been cancelled.',
+            }, status=status.HTTP_200_OK)
+
+        if existing_pass and existing_pass.status == 'CONSUMED_EXITED':
+            return Response({
+                'has_booking': True,
+                'is_active': False,
+                'status': 'EXPIRED',
+                'detail': 'Workout attendance has completed. Access pass has expired.',
+            }, status=status.HTTP_200_OK)
+
+        if existing_pass and existing_pass.status == 'CONSUMED_ENTERED':
+            # Member already checked in — preserve CONSUMED_ENTERED so Exit scan works cleanly
+            pass_obj = existing_pass
+            pass_obj.valid_until = valid_until_dt
+            pass_obj.updated_at = now
+            pass_obj.save(using=alias, update_fields=['valid_until', 'updated_at'])
+            response_status = 'COMPLETED'
+        else:
+            pass_obj, _ = AccessPass.objects.using(alias).update_or_create(
+                booking=booking,
+                defaults={
+                    'user_profile': profile,
+                    'branch': booking.branch,
+                    'token_hash': t_hash,
+                    'pass_type': 'CLASS_BOOKING',
+                    'valid_from': valid_from_dt,
+                    'valid_until': valid_until_dt,
+                    'status': 'ACTIVE',
+                    'updated_at': now,
+                }
+            )
+            response_status = 'ACTIVE'
 
         # Push the QR token to the physical turnstile terminals so the camera
         # scan fires an AccessControl event that the daemon can receive.
@@ -3242,6 +3163,12 @@ class MobileQRPassView(APIView):
             display_name=f"{user.first_name} {user.last_name}".strip() or profile.member_number or "SWEAT Member",
             qr_token=qr_display_token,
             branch=booking.branch,
+            category_code=(
+                occ.class_template.category.code
+                if occ and occ.class_template and getattr(occ.class_template, 'category', None)
+                else ''
+            ),
+            db_alias=alias,
         )
 
         # Construct legacy signed payload for backwards compatibility
@@ -3264,7 +3191,8 @@ class MobileQRPassView(APIView):
         return Response({
             'has_booking': True,
             'is_active': True,
-            'status': 'ACTIVE',
+            'status': response_status,
+            'pass_status': pass_obj.status,
             'pass_id': str(pass_obj.id),
             'booking_id': str(booking.id),
             'booking_number': booking.booking_number,
@@ -3681,8 +3609,16 @@ class MobileDiscountCouponsView(APIView):
             if not camp.is_currently_valid():
                 continue
             if camp.usage_limit:
-                redemption_count = getattr(camp, 'redemptions', None)
-                if redemption_count and redemption_count.count() >= camp.usage_limit:
+                paid_cnt = DiscountRedemption.objects.using(alias).filter(
+                    campaign=camp, order__status='PAID'
+                ).count()
+                if paid_cnt >= camp.usage_limit:
+                    continue
+            if camp.per_user_limit and profile:
+                user_paid_cnt = DiscountRedemption.objects.using(alias).filter(
+                    campaign=camp, user_profile=profile, order__status='PAID'
+                ).count()
+                if user_paid_cnt >= camp.per_user_limit:
                     continue
             _cfg = camp.configuration if isinstance(camp.configuration, dict) else {}
             if req_package_id:
@@ -3714,15 +3650,28 @@ class MobileDiscountCouponsView(APIView):
                         continue
                 except (ValueError, TypeError):
                     pass
+            _camp_scope = str(_cfg.get('eligibility_scope', 'GLOBAL')).strip().upper()
+            if _camp_scope == 'TARGET_PROGRAM' and req_program_id and profile:
+                effective_lifecycle = DiscountCouponEngineService.get_member_lifecycle_state(
+                    profile, alias, target_program_id=req_program_id
+                )
+            else:
+                effective_lifecycle = member_lifecycle or 'NEW'
+
             if req_order_type:
                 _aots = _cfg.get('order_types') if isinstance(_cfg.get('order_types'), list) else None
                 if _aots and not DiscountCouponEngineService.matches_order_type(req_order_type, _aots):
                     continue
+            elif profile:
+                _aots = _cfg.get('order_types') if isinstance(_cfg.get('order_types'), list) else None
+                if _aots:
+                    derived_ot = 'RENEWAL' if effective_lifecycle == 'ACTIVE' else ('REJOIN' if effective_lifecycle == 'EXPIRED' else ('NEW_PACKAGE' if (_camp_scope == 'TARGET_PROGRAM' and req_program_id) else 'NEW_MEMBERSHIP'))
+                    if not DiscountCouponEngineService.matches_order_type(derived_ot, _aots):
+                        continue
 
             # Member lifecycle / status filtering
             _amt = _cfg.get('allowed_member_types') or _cfg.get('member_type')
             if _amt:
-                effective_lifecycle = member_lifecycle or 'NEW'
                 if not DiscountCouponEngineService.matches_member_type(effective_lifecycle, _amt):
                     continue
 
@@ -3731,6 +3680,23 @@ class MobileDiscountCouponsView(APIView):
             if _auids and isinstance(_auids, list):
                 if not profile or str(profile.id) not in [str(x) for x in _auids]:
                     continue
+            est_discount = None
+            est_final_price = None
+            if req_subtotal:
+                try:
+                    sub_f = float(req_subtotal)
+                    if sub_f > 0:
+                        if camp.discount_type == 'PERCENTAGE':
+                            d_val = round(sub_f * (float(camp.discount_value) / 100.0), 2)
+                            if camp.max_discount and float(camp.max_discount) > 0:
+                                d_val = min(d_val, float(camp.max_discount))
+                        else:
+                            d_val = min(float(camp.discount_value), sub_f)
+                        est_discount = round(d_val, 2)
+                        est_final_price = round(max(0.0, sub_f - d_val), 2)
+                except (ValueError, TypeError):
+                    pass
+
             results.append({
                 'id': str(c.id),
                 'code': c.code,
@@ -3740,6 +3706,8 @@ class MobileDiscountCouponsView(APIView):
                 'discount_value': float(camp.discount_value),
                 'max_discount': float(camp.max_discount) if camp.max_discount else None,
                 'minimum_order_amount': float(camp.minimum_order_amount) if camp.minimum_order_amount else 0.0,
+                'estimated_discount': est_discount,
+                'estimated_final_price': est_final_price,
                 'valid_until': camp.valid_until.isoformat() if camp.valid_until else None,
                 'applicable_branch': c.branch.name if c.branch else 'All Branches',
                 'applicable_package': c.package.name if c.package else 'All Packages',
@@ -3770,12 +3738,15 @@ class MobileValidateCouponView(APIView):
             member_id, request_user=request.user, db_alias=alias
         )
 
+        branch_id = request.data.get('branch_id')
+        branch_obj = Branch.objects.using(alias).filter(id=branch_id).first() if branch_id else None
         pkg = Package.objects.using(alias).filter(id=package_id).first() if package_id else None
 
         result = DiscountCouponEngineService.validate_coupon(
             code_str=code,
             user_profile=profile,
             order_subtotal=subtotal,
+            branch=branch_obj,
             package=pkg,
             db_alias=alias,
             order_type=order_type,
@@ -3898,16 +3869,26 @@ class MobileCheckoutOrderView(APIView):
         discount_amount = Decimal('0.00')
 
         if coupon_code:
+            req_order_type = (request.data.get('order_type') or '').strip().upper()
+            if not req_order_type:
+                target_prog_id = str(package.program_id) if package and getattr(package, 'program_id', None) else None
+                lifecycle = DiscountCouponEngineService.get_member_lifecycle_state(profile, alias, target_program_id=target_prog_id)
+                req_order_type = 'RENEWAL' if lifecycle == 'ACTIVE' else ('REJOIN' if lifecycle == 'EXPIRED' else 'NEW_PACKAGE')
             v_res = DiscountCouponEngineService.validate_coupon(
                 code_str=coupon_code,
                 user_profile=profile,
                 order_subtotal=subtotal,
+                branch=branch,
                 package=package,
                 db_alias=alias,
-                order_type='NEW_MEMBERSHIP',
+                order_type=req_order_type,
             )
-            if v_res.get('is_valid'):
-                discount_amount = Decimal(str(v_res.get('discount_amount', 0)))
+            if not v_res.get('is_valid'):
+                return Response(
+                    {'detail': v_res.get('reason') or 'Invalid promo code.', 'reason_code': v_res.get('reason_code')},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            discount_amount = Decimal(str(v_res.get('discount_amount', 0)))
 
         net_before_points = max(Decimal('0.00'), subtotal - discount_amount)
         reward_discount = Decimal('0.00')
@@ -4429,6 +4410,11 @@ class MobileCheckoutVerifyView(APIView):
                     try:
                         from .models_discounts import DiscountCode, DiscountRedemption
                         d_code_obj = (
+                            DiscountCode.objects.using(alias)
+                            .filter(code__iexact=str(applied_c_code).strip(), status='ACTIVE', campaign__status='ACTIVE')
+                            .select_related('campaign')
+                            .first()
+                        ) or (
                             DiscountCode.objects.using(alias)
                             .filter(code__iexact=str(applied_c_code).strip())
                             .select_related('campaign')
@@ -6818,18 +6804,54 @@ class MobileMembershipUnfreezeView(APIView):
 
 
 class MobileDirectTurnstileOpenView(APIView):
-    permission_classes = [AllowAny]
+    """
+    POST /api/v1/mobile/turnstile/open-direct/
+    Staff-only remote gate unlock backed by DB TurnstileDevice & dahua_rpc.
+    """
+    permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
+    required_module = 'ops'
+    required_submodule = 'bookings'
+    required_permission = 'ops.bookings.edit'
+
+    def initial(self, request, *args, **kwargs):
+        self.format_kwarg = self.get_format_suffix(**kwargs)
+        neg = self.perform_content_negotiation(request)
+        request.accepted_renderer, request.accepted_media_type = neg
+        version, scheme = self.determine_version(request, *args, **kwargs)
+        request.version, request.versioning_scheme = version, scheme
+        self.perform_authentication(request)
+        _resolve_mobile_tenant_and_db(request)
+        self.check_permissions(request)
+        self.check_throttles(request)
 
     def post(self, request):
-        import urllib.request
-        url = "http://192.168.1.108/cgi-bin/accessControl.cgi?action=openDoor&channel=1"
-        mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
-        mgr.add_password(None, url, "admin", "tipl9910")
-        handler = urllib.request.HTTPDigestAuthHandler(mgr)
-        opener = urllib.request.build_opener(handler)
+        from .models_devices import TurnstileDevice
+        from .dahua_rpc import open_door
+
+        alias = getattr(request, '_tenant_alias', None) or get_tenant_db_alias() or 'default'
+        device_id = request.data.get('device_id')
+        branch_id = request.data.get('branch_id')
+
+        qs = TurnstileDevice.objects.using(alias).filter(is_active=True)
+        if device_id:
+            qs = qs.filter(id=device_id)
+        elif branch_id:
+            qs = qs.filter(branch_id=branch_id, direction='ENTRY')
+        device = qs.first()
+
+        if not device:
+            return Response(
+                {'success': False, 'error': 'No active TurnstileDevice configured for request.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
         try:
-            resp = opener.open(url, timeout=3)
-            res_str = resp.read().decode('utf-8', errors='ignore').strip()
+            ok = open_door(device.base_url, label=f'STAFF_DIRECT:{device.name}')
+            if not ok:
+                return Response(
+                    {'success': False, 'error': f'Terminal {device.name} failed to acknowledge openDoor.'},
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
             try:
                 from .audit_engine import UnifiedAuditEngine
                 from .models_users import TenantUser
@@ -6840,23 +6862,25 @@ class MobileDirectTurnstileOpenView(APIView):
                     action_verb='UNLOCKED',
                     module='ACCESS_CONTROL',
                     submodule='TURNSTILE',
-                    entity_type='TurnstileHardware',
-                    entity_id='192.168.1.108',
-                    entity_name='Turnstile Channel 1',
+                    entity_type='TurnstileDevice',
+                    entity_id=str(device.id),
+                    entity_name=device.name,
                     actor_user=actor_user if isinstance(actor_user, TenantUser) else None,
-                    actor_type='MEMBER' if actor_user else 'SYSTEM',
+                    actor_type='STAFF' if actor_user else 'SYSTEM',
                     request=request,
                     result='SUCCESS',
-                    reason='Direct mobile turnstile unlock command',
-                    event_description="Direct turnstile gate unlock command triggered from mobile app.",
-                    source_channel='MOBILE_APP',
-                    metadata={'ip': '192.168.1.108', 'channel': 1},
+                    reason='Staff direct turnstile unlock command',
+                    event_description=f'Direct unlock command triggered for {device.name}.',
+                    source_channel='ADMIN_API',
+                    metadata={'device_id': str(device.id), 'branch_id': str(device.branch_id)},
+                    db_alias=alias,
                 )
-            except Exception:
-                pass
-            return Response({"success": True, "detail": "Turnstile gate unlocked!", "result": res_str}, status=status.HTTP_200_OK)
-        except Exception as e:
-            return Response({"success": False, "error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            except Exception as audit_err:
+                logger.warning('Direct turnstile unlock audit log error: %s', audit_err)
+            return Response({'success': True, 'detail': f'Turnstile {device.name} unlocked.'}, status=status.HTTP_200_OK)
+        except EnvironmentError as env_err:
+            logger.error('Direct turnstile unlock credential error: %s', env_err)
+            return Response({'success': False, 'error': str(env_err)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 

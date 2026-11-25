@@ -85,8 +85,9 @@ class AttendanceRecord(models.Model):
 
 class AccessEvent(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    user_profile = models.ForeignKey(UserProfile, on_delete=models.PROTECT, related_name='access_events')
+    user_profile = models.ForeignKey(UserProfile, on_delete=models.PROTECT, null=True, blank=True, related_name='access_events')
     booking = models.ForeignKey(Booking, on_delete=models.PROTECT, null=True, blank=True, related_name='access_events')
+    trial_booking = models.ForeignKey('tenant_core.TrialBooking', on_delete=models.PROTECT, null=True, blank=True, related_name='access_events')
     branch = models.ForeignKey(Branch, on_delete=models.PROTECT, related_name='access_events')
     event_type = models.CharField(
         max_length=20,
@@ -114,6 +115,7 @@ class AccessEvent(models.Model):
             ('REPLAY_ATTEMPT', 'REPLAY_ATTEMPT'),
             ('UNAUTHORIZED', 'UNAUTHORIZED'),
             ('EXPIRED', 'EXPIRED'),
+            ('EARLY', 'EARLY'),
         ]
     )
     token_hash = models.CharField(max_length=64, null=True, blank=True, db_index=True)
@@ -135,13 +137,15 @@ class AccessEvent(models.Model):
         ]
 
     def __str__(self):
-        return f"Access {self.event_type} ({self.direction}) - {self.user_profile} at {self.event_at}"
+        subject = self.user_profile or (f"Trial:{self.trial_booking_id}" if self.trial_booking_id else 'Guest')
+        return f"Access {self.event_type} ({self.direction}) - {subject} at {self.event_at}"
 
 
 class AccessPass(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    user_profile = models.ForeignKey(UserProfile, on_delete=models.PROTECT, related_name='access_passes')
+    user_profile = models.ForeignKey(UserProfile, on_delete=models.PROTECT, null=True, blank=True, related_name='access_passes')
     booking = models.OneToOneField(Booking, on_delete=models.CASCADE, null=True, blank=True, related_name='access_pass')
+    trial_booking = models.OneToOneField('tenant_core.TrialBooking', on_delete=models.CASCADE, null=True, blank=True, related_name='access_pass')
     branch = models.ForeignKey(Branch, on_delete=models.PROTECT, related_name='access_passes')
     token_hash = models.CharField(max_length=64, db_index=True)
     pass_type = models.CharField(
@@ -149,6 +153,7 @@ class AccessPass(models.Model):
         default='CLASS_BOOKING',
         choices=[
             ('CLASS_BOOKING', 'CLASS_BOOKING'),
+            ('TRIAL_BOOKING', 'TRIAL_BOOKING'),
             ('STUDIO_ACCESS', 'STUDIO_ACCESS'),
         ]
     )
@@ -179,4 +184,5 @@ class AccessPass(models.Model):
         ]
 
     def __str__(self):
-        return f"AccessPass {self.pass_type} ({self.status}) for {self.user_profile}"
+        subject = self.user_profile or (f"Trial:{self.trial_booking_id}" if self.trial_booking_id else 'Guest')
+        return f"AccessPass {self.pass_type} ({self.status}) for {subject}"

@@ -1174,7 +1174,9 @@ class AccessEventViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         alias = _get_db(self.request)
-        return AccessEvent.objects.using(alias).select_related('user_profile', 'user_profile__user', 'branch', 'booking').all().order_by('-created_at')
+        return AccessEvent.objects.using(alias).select_related(
+            'user_profile', 'user_profile__user', 'branch', 'booking', 'trial_booking', 'trial_booking__lead'
+        ).all().order_by('-created_at')
 
     def create(self, request, *args, **kwargs):
         alias = _get_db(request)
@@ -1402,6 +1404,17 @@ class TurnstileVerifyPunchView(APIView):
     Real-time webhook receiver for TimeWatch / Dahua face and QR turnstile access terminals.
     Hardware synchronously calls this endpoint when a member presents their QR pass.
 
+    Security:
+    - AllowAny is intentional (hardware cannot hold OAuth tokens).
+    - Protected instead by:
+      (a) TURNSTILE_GATEWAY_API_KEY env var — hardware/daemon sends
+          X-Turnstile-Api-Key header with this value.
+          If the env var is unset, the check is skipped (backward-compat
+          during migration). Set it on production before go-live.
+      (b) AnonRateThrottle — limits to 300/minute per IP to prevent abuse.
+      (c) Bench-test tokens are static strings, not cryptographic secrets —
+          they only bypass the DB check, not the token-extraction gate.
+
     Protocol:
     - Input: JSON or form payload containing card_no, CardNo, qr_code, token, szCardNo, etc.
     - Output:
@@ -1423,6 +1436,29 @@ class TurnstileVerifyPunchView(APIView):
     """
     permission_classes = [permissions.AllowAny]
 
+    # Rate limit: 300 punch requests per minute per IP
+    # (a 50-member simultaneous arrival = well under this)
+    from rest_framework.throttling import AnonRateThrottle
+
+    class _PunchThrottle(AnonRateThrottle):
+        rate = '300/min'
+
+    throttle_classes = [_PunchThrottle]
+
+    # Optional API-key guard (read dynamically so env/test overrides take effect immediately)
+    def _authenticate_gateway(self, request) -> bool:
+        """
+        Validates the X-Turnstile-Api-Key header when TURNSTILE_GATEWAY_API_KEY is set.
+        If the env var is empty, the check is skipped (permissive during migration).
+        """
+        import os as _os
+        import hmac as _hmac
+        expected_key = _os.environ.get('TURNSTILE_GATEWAY_API_KEY', '')
+        if not expected_key:
+            return True  # env var not set → allow (backward compatible)
+        provided = request.headers.get('X-Turnstile-Api-Key', '')
+        return _hmac.compare_digest(provided, expected_key)
+
     def get(self, request, *args, **kwargs):
         """Health check endpoint for device setup verification."""
         return Response({
@@ -1433,6 +1469,18 @@ class TurnstileVerifyPunchView(APIView):
         }, status=status.HTTP_200_OK)
 
     def post(self, request, *args, **kwargs):
+        # ── Gateway API-key guard ────────────────────────────────────────
+        if not self._authenticate_gateway(request):
+            import logging
+            logging.getLogger(__name__).warning(
+                'verify-punch: invalid X-Turnstile-Api-Key from %s',
+                request.META.get('REMOTE_ADDR'),
+            )
+            return Response(
+                {'allow_access': False, 'status': 'DENIED', 'reason': 'UNAUTHORIZED'},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
         alias = self._resolve_db_alias(request)
         raw_token = self._extract_token(request)
         if not raw_token:
@@ -1489,7 +1537,13 @@ class TurnstileVerifyPunchView(APIView):
         access_pass = (
             AccessPass.objects.using(alias)
             .filter(token_hash=token_hash)
-            .select_related('user_profile__user', 'booking__occurrence__class_template', 'branch')
+            .select_related(
+                'user_profile__user',
+                'booking__occurrence__class_template__category',
+                'trial_booking__lead',
+                'trial_booking__user_profile',
+                'branch',
+            )
             .first()
         )
 
@@ -1498,25 +1552,38 @@ class TurnstileVerifyPunchView(APIView):
             access_pass = (
                 AccessPass.objects.using(alias)
                 .filter(booking__booking_number=token_str)
-                .select_related('user_profile__user', 'booking__occurrence__class_template', 'branch')
+                .select_related(
+                    'user_profile__user',
+                    'booking__occurrence__class_template__category',
+                    'trial_booking__lead',
+                    'trial_booking__user_profile',
+                    'branch',
+                )
                 .first()
             )
 
-        # Default branch resolution
-        branch = None
-        if access_pass and access_pass.branch:
-            branch = access_pass.branch
-        else:
-            branch_id = (request.data.get('branch_id') if isinstance(request.data, dict) else None) or request.query_params.get('branch_id')
-            if branch_id:
-                branch = Branch.objects.using(alias).filter(id=branch_id).first()
-            if not branch:
-                branch = Branch.objects.using(alias).filter(status='ACTIVE').first() or Branch.objects.using(alias).first()
+        # Resolve scanning branch if provided by daemon/device
+        raw_branch_id = (
+            (request.data.get('branch_id') if hasattr(request, 'data') and isinstance(request.data, dict) else None)
+            or request.query_params.get('branch_id')
+        )
+        scan_branch = None
+        if raw_branch_id:
+            try:
+                scan_branch_uuid = uuid.UUID(str(raw_branch_id).strip())
+                scan_branch = Branch.objects.using(alias).filter(id=scan_branch_uuid).first()
+            except (ValueError, TypeError):
+                scan_branch = Branch.objects.using(alias).filter(code__iexact=str(raw_branch_id).strip()).first()
+
+        # Effective branch resolution
+        branch = (access_pass.branch if (access_pass and access_pass.branch) else None) or scan_branch
+        if not branch:
+            branch = Branch.objects.using(alias).filter(status='ACTIVE').first() or Branch.objects.using(alias).first()
 
         # 1. Unknown / Invalid Pass
         if not access_pass:
             fallback_user = UserProfile.objects.using(alias).first()
-            if fallback_user and branch:
+            if branch:
                 BookingWaitlistAttendanceService.log_access_event(
                     user_profile=fallback_user,
                     branch=branch,
@@ -1535,17 +1602,98 @@ class TurnstileVerifyPunchView(APIView):
                 "message": "Invalid or unrecognized access pass.",
             }, status=status.HTTP_200_OK)
 
-        target_user = access_pass.user_profile
         target_booking = access_pass.booking
-        user_name = (
-            f"{getattr(target_user, 'first_name_snapshot', '')} {getattr(target_user, 'last_name_snapshot', '')}"
-        ).strip() or "Valued Member"
+        target_trial = access_pass.trial_booking
+        target_user = access_pass.user_profile or (target_trial.user_profile if target_trial else None)
+        if target_user:
+            user_name = (
+                f"{getattr(target_user, 'first_name_snapshot', '')} {getattr(target_user, 'last_name_snapshot', '')}"
+            ).strip() or "Valued Member"
+        elif target_trial and getattr(target_trial, 'lead', None):
+            lead = target_trial.lead
+            user_name = f"{lead.first_name or ''} {lead.last_name or ''}".strip() or "Trial Guest"
+        else:
+            user_name = "Valued Member"
         member_num = getattr(target_user, 'member_number', '') or ''
-        class_name = (
-            target_booking.occurrence.class_template.name
+        class_tpl = (
+            target_booking.occurrence.class_template
             if target_booking and target_booking.occurrence and target_booking.occurrence.class_template
-            else "SWEAT Session"
+            else None
         )
+        if not class_tpl and target_trial and target_trial.class_occurrence_id:
+            trial_occ = (
+                ClassOccurrence.objects.using(alias)
+                .select_related('class_template__category')
+                .filter(id=target_trial.class_occurrence_id)
+                .first()
+            )
+            if trial_occ:
+                class_tpl = trial_occ.class_template
+        class_name = (
+            class_tpl.name
+            if class_tpl
+            else (target_trial.trial_type if target_trial and target_trial.trial_type else "SWEAT Session")
+        )
+
+        # 1A. Branch isolation: deny if device belongs to a different studio branch than the pass
+        if scan_branch and access_pass.branch_id and access_pass.branch_id != scan_branch.id:
+            BookingWaitlistAttendanceService.log_access_event(
+                user_profile=target_user,
+                branch=scan_branch,
+                booking=target_booking,
+                trial_booking=target_trial,
+                event_type='DENIED',
+                direction=direction,
+                device_reference=device_ref,
+                provider_reference='TIMEWATCH_TURNSTILE',
+                reconciliation_status='UNAUTHORIZED',
+                token_hash=token_hash,
+                db_alias=alias,
+            )
+            return Response({
+                "allow_access": False,
+                "status": "DENIED",
+                "reason": "WRONG_BRANCH",
+                "user_name": user_name,
+                "member_number": member_num,
+                "message": f"Pass is booked for {access_pass.branch.name}, not {scan_branch.name}.",
+            }, status=status.HTTP_200_OK)
+
+        # 1B. Room/category isolation (e.g. Andheri Pilates vs Bootcamp gates)
+        scanning_device = None
+        if device_ref and device_ref != 'TIMEWATCH-GATE-01' and branch:
+            from .models_devices import TurnstileDevice
+            scanning_device = (
+                TurnstileDevice.objects.using(alias)
+                .filter(branch=branch, is_active=True)
+                .filter(models.Q(name__iexact=device_ref) | models.Q(device_serial__iexact=device_ref))
+                .first()
+            )
+            if scanning_device and scanning_device.class_category_code:
+                cat_obj = getattr(class_tpl, 'category', None) if class_tpl else None
+                booking_cat_code = getattr(cat_obj, 'code', '') if cat_obj else ''
+                if not scanning_device.matches_category(booking_cat_code):
+                    BookingWaitlistAttendanceService.log_access_event(
+                        user_profile=target_user,
+                        branch=branch,
+                        booking=target_booking,
+                        trial_booking=target_trial,
+                        event_type='DENIED',
+                        direction=direction,
+                        device_reference=device_ref,
+                        provider_reference='TIMEWATCH_TURNSTILE',
+                        reconciliation_status='UNAUTHORIZED',
+                        token_hash=token_hash,
+                        db_alias=alias,
+                    )
+                    return Response({
+                        "allow_access": False,
+                        "status": "DENIED",
+                        "reason": "WRONG_ROOM_GATE",
+                        "user_name": user_name,
+                        "member_number": member_num,
+                        "message": f"Access denied: this gate is only for {scanning_device.class_category_code} sessions.",
+                    }, status=status.HTTP_200_OK)
 
         # 2. Check if pass has already completed both ENTRY and EXIT
         if access_pass.status == 'CONSUMED_EXITED':
@@ -1553,6 +1701,7 @@ class TurnstileVerifyPunchView(APIView):
                 user_profile=target_user,
                 branch=branch,
                 booking=target_booking,
+                trial_booking=target_trial,
                 event_type='DENIED',
                 direction=direction,
                 device_reference=device_ref,
@@ -1571,8 +1720,10 @@ class TurnstileVerifyPunchView(APIView):
             }, status=status.HTTP_200_OK)
 
         # Determine direction:
-        # Check explicit request payload/query param, or device name containing 'exit',
-        # or state machine: if pass is already CONSUMED_ENTERED, next valid punch is EXIT.
+        # 1. Explicit request payload/query param
+        # 2. Configured TurnstileDevice direction (ENTRY/EXIT; BOTH falls through)
+        # 3. Device reference naming ('exit' vs 'entry')
+        # 4. Bidirectional fallback: CONSUMED_ENTERED -> next punch is EXIT
         explicit_dir = None
         if hasattr(request, 'data') and isinstance(request.data, dict) and request.data.get('direction'):
             explicit_dir = str(request.data.get('direction')).upper()
@@ -1581,8 +1732,12 @@ class TurnstileVerifyPunchView(APIView):
 
         if explicit_dir in ('ENTRY', 'EXIT'):
             direction = explicit_dir
+        elif scanning_device and scanning_device.direction in ('ENTRY', 'EXIT'):
+            direction = scanning_device.direction
         elif 'exit' in device_ref.lower():
             direction = 'EXIT'
+        elif 'entry' in device_ref.lower():
+            direction = 'ENTRY'
         elif access_pass.status == 'CONSUMED_ENTERED':
             direction = 'EXIT'
         else:
@@ -1594,6 +1749,7 @@ class TurnstileVerifyPunchView(APIView):
                 user_profile=target_user,
                 branch=branch,
                 booking=target_booking,
+                trial_booking=target_trial,
                 event_type='DENIED',
                 direction='ENTRY',
                 device_reference=device_ref,
@@ -1612,15 +1768,22 @@ class TurnstileVerifyPunchView(APIView):
             }, status=status.HTTP_200_OK)
 
         # 3. Expired or Cancelled
-        if access_pass.status in ('CANCELLED', 'EXPIRED') or (access_pass.valid_until and now > access_pass.valid_until):
-            if access_pass.status != 'EXPIRED':
-                access_pass.status = 'EXPIRED'
+        trial_invalid = bool(
+            target_trial and (
+                target_trial.status in ('CANCELLED', 'RESCHEDULED', 'NO_SHOW')
+                or target_trial.confirmation_status in ('CANCELLED', 'DECLINED')
+            )
+        )
+        if access_pass.status in ('CANCELLED', 'EXPIRED') or trial_invalid or (access_pass.valid_until and now > access_pass.valid_until):
+            if access_pass.status not in ('CANCELLED', 'EXPIRED'):
+                access_pass.status = 'CANCELLED' if trial_invalid else 'EXPIRED'
                 access_pass.save(using=alias, update_fields=['status'])
 
             BookingWaitlistAttendanceService.log_access_event(
                 user_profile=target_user,
                 branch=branch,
                 booking=target_booking,
+                trial_booking=target_trial,
                 event_type='DENIED',
                 direction=direction,
                 device_reference=device_ref,
@@ -1635,7 +1798,7 @@ class TurnstileVerifyPunchView(APIView):
                 "reason": "EXPIRED",
                 "user_name": user_name,
                 "member_number": member_num,
-                "message": "Access pass has expired. Entry denied.",
+                "message": "Access pass has expired or been cancelled. Entry denied.",
             }, status=status.HTTP_200_OK)
 
         # 4. Early scan (before activation window) - only applies to initial ENTRY
@@ -1644,6 +1807,7 @@ class TurnstileVerifyPunchView(APIView):
                 user_profile=target_user,
                 branch=branch,
                 booking=target_booking,
+                trial_booking=target_trial,
                 event_type='DENIED',
                 direction=direction,
                 device_reference=device_ref,
@@ -1667,6 +1831,7 @@ class TurnstileVerifyPunchView(APIView):
                 user_profile=target_user,
                 branch=branch,
                 booking=target_booking,
+                trial_booking=target_trial,
                 event_type=direction,
                 direction=direction,
                 device_reference=device_ref,
@@ -1675,6 +1840,15 @@ class TurnstileVerifyPunchView(APIView):
                 token_hash=token_hash,
                 db_alias=alias,
             )
+            if event.event_type == 'DENIED':
+                return Response({
+                    "allow_access": False,
+                    "status": "DENIED",
+                    "reason": event.reconciliation_status or "DENIED",
+                    "user_name": user_name,
+                    "member_number": member_num,
+                    "message": "Access pass is no longer valid for entry.",
+                }, status=status.HTTP_200_OK)
             if direction == 'ENTRY':
                 access_pass.status = 'CONSUMED_ENTERED'
                 access_pass.consumed_at = now
@@ -1686,6 +1860,8 @@ class TurnstileVerifyPunchView(APIView):
             att_rec = AttendanceRecord.objects.using(alias).filter(booking=target_booking).first() if target_booking else None
             if att_rec and att_rec.status == 'LATE':
                 welcome_msg = f"Welcome {user_name}! Late Entry Recorded."
+            elif target_trial and not target_booking:
+                welcome_msg = f"Welcome {user_name}! Trial Check-In Recorded."
             else:
                 welcome_msg = f"Welcome {user_name}! Access Granted."
         else:
@@ -1701,12 +1877,14 @@ class TurnstileVerifyPunchView(APIView):
             "message": welcome_msg,
         }, status=status.HTTP_200_OK)
 
+    _alias_cache: dict = {}
+
     def _resolve_db_alias(self, request):
         from apps.master.models import Tenant
         from apps.authentication.views import _register_and_resolve_tenant
         from apps.tenant_core.context import set_tenant_db_alias, get_tenant_db_alias
 
-        alias = get_tenant_db_alias()
+        alias = getattr(request, '_tenant_alias', None) or get_tenant_db_alias()
         if alias and alias != 'default':
             return alias
 
@@ -1716,18 +1894,27 @@ class TurnstileVerifyPunchView(APIView):
             or (getattr(request, 'query_params', None) or getattr(request, 'GET', {})).get('tenant')
             or (request.data.get('tenant_slug') if hasattr(request, 'data') and isinstance(request.data, dict) else None)
         )
+        slug = 'sweat'
         if explicit_slug:
-            slug = str(explicit_slug).strip().lower()
-            if slug in ('sweat-demo', 'sweat_demo', 'sweat-staging', 'sweat-dev'):
+            clean_slug = str(explicit_slug).strip().lower()
+            if clean_slug in ('sweat-demo', 'sweat_demo', 'sweat-staging', 'sweat-dev'):
                 slug = 'sweat'
-            tenant = Tenant.objects.using('default').filter(slug=slug, status='ACTIVE').first()
-        else:
-            tenant = Tenant.objects.using('default').filter(slug='sweat', status='ACTIVE').first()
-            if not tenant:
-                tenant = Tenant.objects.using('default').filter(status='ACTIVE').first()
+            else:
+                slug = clean_slug
+
+        # High-speed memory cache check (0.001ms) for instant turnstile gate response
+        if slug in self._alias_cache:
+            cached_alias = self._alias_cache[slug]
+            set_tenant_db_alias(cached_alias)
+            return cached_alias
+
+        tenant = Tenant.objects.using('default').filter(slug=slug, status='ACTIVE').first()
+        if not tenant:
+            tenant = Tenant.objects.using('default').filter(status='ACTIVE').first()
 
         if tenant:
             alias = _register_and_resolve_tenant(tenant)
+            self._alias_cache[slug] = alias
             set_tenant_db_alias(alias)
             return alias
         return 'default'

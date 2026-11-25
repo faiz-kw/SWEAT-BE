@@ -1594,6 +1594,19 @@ class BookingWaitlistAttendanceService:
             booking.cancelled_at = now
             booking.save(using=alias, update_fields=['status', 'cancelled_at', 'updated_at'])
 
+            # Revoke any active AccessPass so a cancelled booking cannot scan at the turnstile
+            cancelled_pass_count = AccessPass.objects.using(alias).filter(
+                booking=booking,
+                status__in=['ACTIVE', 'CONSUMED_ENTERED'],
+            ).update(status='CANCELLED', updated_at=now)
+            if cancelled_pass_count:
+                def _purge_cancelled_pass_from_terminals():
+                    from django.conf import settings as _settings
+                    from .services_access_control import generate_booking_qr_token, purge_qr_from_branch_terminals
+                    token = generate_booking_qr_token(str(booking.id), _settings.SECRET_KEY)
+                    purge_qr_from_branch_terminals(token, branch_id=branch.id, db_alias=alias)
+                transaction.on_commit(_purge_cancelled_pass_from_terminals, using=alias)
+
             cancellation_record = BookingCancellation.objects.using(alias).create(
                 booking=booking,
                 cancelled_by_user=cancelled_by_user,
@@ -2070,6 +2083,35 @@ class BookingWaitlistAttendanceService:
             booking.branch = to_occ_locked.branch
             booking.save(using=alias, update_fields=['occurrence', 'branch', 'updated_at'])
 
+            # 7A. Keep existing AccessPass synchronized with rescheduled slot & branch
+            existing_pass = AccessPass.objects.using(alias).filter(booking=booking).first()
+            if existing_pass and existing_pass.status not in ('CONSUMED_EXITED', 'CANCELLED'):
+                from .services_booking_policy import BookingPolicyService as _BPS
+                _pol = _BPS.get_effective_policy(organization, branch=to_occ_locked.branch, db_alias=alias)
+                _act_mins = int(_pol.get('qr_activation_minutes_before_class', 20) or 20)
+                _dur = (
+                    to_occ_locked.class_template.default_duration_minutes
+                    if (to_occ_locked.class_template and to_occ_locked.class_template.default_duration_minutes)
+                    else 50
+                )
+                _end_at = to_occ_locked.end_at or (to_occ_locked.start_at + timedelta(minutes=_dur))
+                existing_pass.branch = to_occ_locked.branch
+                existing_pass.valid_from = to_occ_locked.start_at - timedelta(minutes=_act_mins)
+                existing_pass.valid_until = _end_at + timedelta(minutes=60)
+                if existing_pass.status == 'EXPIRED':
+                    existing_pass.status = 'ACTIVE'
+                existing_pass.updated_at = timezone.now()
+                existing_pass.save(using=alias, update_fields=['branch', 'valid_from', 'valid_until', 'status', 'updated_at'])
+
+                if from_occ_locked.branch_id != to_occ_locked.branch_id:
+                    _old_branch_id = from_occ_locked.branch_id
+                    def _purge_old_branch_terminals():
+                        from django.conf import settings as _settings
+                        from .services_access_control import generate_booking_qr_token, purge_qr_from_branch_terminals
+                        token = generate_booking_qr_token(str(booking.id), _settings.SECRET_KEY)
+                        purge_qr_from_branch_terminals(token, branch_id=_old_branch_id, db_alias=alias)
+                    transaction.on_commit(_purge_old_branch_terminals, using=alias)
+
             # 7B. Sync CRM TrialBooking if this is a trial session
             if booking.booking_type == 'TRIAL':
                 from .models_crm import TrialBooking
@@ -2436,11 +2478,12 @@ class BookingWaitlistAttendanceService:
     @classmethod
     def log_access_event(
         cls,
-        user_profile: UserProfile,
-        branch,
+        user_profile: Optional[UserProfile] = None,
+        branch = None,
         event_type: str = 'ENTRY',
         device_reference: str = None,
         booking: Booking = None,
+        trial_booking = None,
         provider_reference: str = None,
         event_id: uuid.UUID = None,
         scanned_at = None,
@@ -2463,7 +2506,7 @@ class BookingWaitlistAttendanceService:
                     return existing_event
 
             # 2. Resolve booking if not explicitly provided
-            if not booking:
+            if not booking and not trial_booking and user_profile:
                 today = scan_time.date() if hasattr(scan_time, 'date') else now.date()
                 booking = Booking.objects.using(alias).filter(
                     user_profile=user_profile,
@@ -2476,7 +2519,7 @@ class BookingWaitlistAttendanceService:
             effective_event_type = event_type
             effective_reconciliation = reconciliation_status
 
-            if dir_value == 'ENTRY':
+            if dir_value == 'ENTRY' and effective_event_type == 'ENTRY':
                 if booking:
                     already_present = AttendanceRecord.objects.using(alias).filter(
                         booking=booking,
@@ -2485,10 +2528,22 @@ class BookingWaitlistAttendanceService:
                     if already_present:
                         effective_event_type = 'DENIED'
                         effective_reconciliation = 'REPLAY_ATTEMPT'
+                elif trial_booking:
+                    already_entered = (
+                        trial_booking.status == 'ATTENDED'
+                        or AccessEvent.objects.using(alias).filter(
+                            trial_booking=trial_booking,
+                            event_type='ENTRY',
+                        ).exists()
+                    )
+                    if already_entered:
+                        effective_event_type = 'DENIED'
+                        effective_reconciliation = 'REPLAY_ATTEMPT'
 
             event_kwargs = {
                 'user_profile': user_profile,
                 'booking': booking,
+                'trial_booking': trial_booking,
                 'branch': branch,
                 'event_type': effective_event_type,
                 'direction': dir_value,
@@ -2555,28 +2610,75 @@ class BookingWaitlistAttendanceService:
                         consumed_at=scan_time,
                         updated_at=now
                     )
+                    # Also sync linked CRM TrialBooking if mobile-claimed trial
+                    if booking.booking_type == 'TRIAL' and booking.occurrence_id:
+                        try:
+                            from .models_crm import TrialBooking
+                            from .services_crm import CRMLeadService
+                            linked_trial = (
+                                TrialBooking.objects.using(alias)
+                                .filter(
+                                    class_occurrence_id=booking.occurrence_id,
+                                    user_profile=booking.user_profile,
+                                    status__in=['BOOKED', 'CONFIRMED'],
+                                )
+                                .exclude(confirmation_status__in=['CANCELLED', 'DECLINED'])
+                                .order_by('-created_at')
+                                .first()
+                            )
+                            if linked_trial:
+                                CRMLeadService.mark_trial_attended(
+                                    trial=linked_trial,
+                                    notes="Checked in via turnstile QR pass",
+                                    allow_override=True,
+                                    skip_window_validation=True,
+                                    db_alias=alias,
+                                )
+                        except Exception as trial_sync_err:
+                            logger.warning("Could not mark linked TrialBooking attended for booking %s: %s", booking.id, trial_sync_err)
+                elif trial_booking:
+                    if trial_booking.status in ('BOOKED', 'CONFIRMED'):
+                        from .services_crm import CRMLeadService
+                        CRMLeadService.mark_trial_attended(
+                            trial=trial_booking,
+                            notes="Checked in via turnstile QR pass",
+                            allow_override=True,
+                            skip_window_validation=True,
+                            db_alias=alias,
+                        )
+                    AccessPass.objects.using(alias).filter(trial_booking=trial_booking, status='ACTIVE').update(
+                        status='CONSUMED_ENTERED',
+                        consumed_at=scan_time,
+                        updated_at=now
+                    )
 
             # 5. Handle EXIT Auto-Checkout
             elif dir_value == 'EXIT' and effective_event_type == 'EXIT':
-                att_record = AttendanceRecord.objects.using(alias).filter(
-                    user_profile=user_profile,
-                    branch=branch,
-                    status__in=['PRESENT', 'LATE'],
-                    check_out_at__isnull=True,
-                ).order_by('-check_in_at').first()
+                if user_profile:
+                    att_record = AttendanceRecord.objects.using(alias).filter(
+                        user_profile=user_profile,
+                        branch=branch,
+                        status__in=['PRESENT', 'LATE'],
+                        check_out_at__isnull=True,
+                    ).order_by('-check_in_at').first()
 
-                if att_record:
-                    att_record.check_out_at = scan_time
-                    att_record.attendance_completed = True
-                    att_record.completion_verified_at = now
-                    att_record.updated_at = now
-                    att_record.save(
-                        update_fields=['check_out_at', 'attendance_completed', 'completion_verified_at', 'updated_at'],
-                        using=alias
-                    )
+                    if att_record:
+                        att_record.check_out_at = scan_time
+                        att_record.attendance_completed = True
+                        att_record.completion_verified_at = now
+                        att_record.updated_at = now
+                        att_record.save(
+                            update_fields=['check_out_at', 'attendance_completed', 'completion_verified_at', 'updated_at'],
+                            using=alias
+                        )
 
                 if booking:
                     AccessPass.objects.using(alias).filter(booking=booking).exclude(status='CONSUMED_EXITED').update(
+                        status='CONSUMED_EXITED',
+                        updated_at=now
+                    )
+                if trial_booking:
+                    AccessPass.objects.using(alias).filter(trial_booking=trial_booking).exclude(status='CONSUMED_EXITED').update(
                         status='CONSUMED_EXITED',
                         updated_at=now
                     )
@@ -2585,7 +2687,13 @@ class BookingWaitlistAttendanceService:
             try:
                 from .audit_engine import UnifiedAuditEngine
                 member_user = user_profile.user if user_profile else None
-                member_name = f"{user_profile.first_name_snapshot or ''} {user_profile.last_name_snapshot or ''}".strip() or (member_user.email if member_user else 'Member')
+                if user_profile:
+                    member_name = f"{user_profile.first_name_snapshot or ''} {user_profile.last_name_snapshot or ''}".strip() or (member_user.email if member_user else 'Member')
+                elif trial_booking and getattr(trial_booking, 'lead', None):
+                    lead = trial_booking.lead
+                    member_name = f"{lead.first_name or ''} {lead.last_name or ''}".strip() or lead.email or lead.phone or 'Trial Guest'
+                else:
+                    member_name = 'Guest'
                 is_denied = effective_event_type == 'DENIED'
                 UnifiedAuditEngine.record_activity(
                     action_code='IOT.PUNCH_DENIED' if is_denied else f'IOT.PUNCH_{dir_value}',

@@ -22,7 +22,8 @@ Capabilities:
 import logging
 from decimal import Decimal
 from typing import Optional, Dict, Any, List, Union
-from django.db import transaction
+from django.db import transaction, models
+from django.db.models import Q
 from django.utils import timezone
 from django.core.exceptions import ValidationError
 
@@ -142,7 +143,7 @@ class DiscountCouponEngineService:
             # Only fall back to request.user if the user is a genuine customer/member, NOT a staff/admin user
             user_type = str(getattr(request_user, 'user_type', '')).upper()
             is_staff = getattr(request_user, 'is_staff', False) or user_type in ('STAFF', 'ADMIN', 'MANAGER', 'OWNER', 'COACH', 'TRAINER')
-            if not is_staff and user_type in ('MEMBER', 'CUSTOMER'):
+            if not is_staff and user_type in ('MEMBER', 'CUSTOMER', 'LEAD'):
                 return UserProfile.objects.using(alias).filter(user=request_user).first()
             return None
 
@@ -182,19 +183,30 @@ class DiscountCouponEngineService:
         return None
 
     @classmethod
-    def get_member_lifecycle_state(cls, user_profile: Optional[UserProfile], db_alias: Optional[str] = None) -> str:
+    def get_member_lifecycle_state(
+        cls,
+        user_profile: Optional[UserProfile],
+        db_alias: Optional[str] = None,
+        target_program_id: Optional[Union[str, uuid.UUID]] = None
+    ) -> str:
         """
         Determines authoritative member lifecycle state:
-        - 'NEW': First-time user / lead with zero past memberships.
-        - 'ACTIVE': Has at least 1 currently active, valid, unexpired membership.
-        - 'EXPIRED': Has prior membership(s), but all are expired, cancelled, or inactive.
+        - 'NEW': First-time user / lead with zero past memberships in the evaluated scope.
+        - 'ACTIVE': Has at least 1 currently active, valid, unexpired membership in the evaluated scope.
+        - 'EXPIRED': Has prior membership(s), but all are expired, cancelled, or inactive in the evaluated scope.
+        When target_program_id is provided, scoping is restricted to memberships under that program.
         """
         if not user_profile:
             return 'NEW'
         alias = db_alias or (getattr(user_profile, '_state', None) and user_profile._state.db) or get_current_tenant_db_alias() or 'default'
         from .models_memberships import Membership
         today = timezone.now().date()
-        mems = list(Membership.objects.using(alias).filter(user_profile=user_profile))
+        qs = Membership.objects.using(alias).filter(user_profile=user_profile)
+        if target_program_id:
+            qs = qs.filter(
+                models.Q(program_id=target_program_id) | models.Q(package__program_id=target_program_id)
+            )
+        mems = list(qs)
         if not mems:
             return 'NEW'
         has_active = any(
@@ -387,6 +399,19 @@ class DiscountCouponEngineService:
             if not uid or uid not in [str(x) for x in allowed_user_ids]:
                 return {'is_valid': False, 'reason': 'This coupon is not available for your account.', 'reason_code': 'USER_NOT_ELIGIBLE'}
 
+        # Resolve target program ID if available (from package or order)
+        target_program_id = None
+        if package and getattr(package, 'program_id', None):
+            target_program_id = str(package.program_id)
+        elif order is not None:
+            first_pkg_item = order.items.using(alias).filter(package_id__isnull=False).select_related('package').first()
+            if first_pkg_item and getattr(getattr(first_pkg_item, 'package', None), 'program_id', None):
+                target_program_id = str(first_pkg_item.package.program_id)
+
+        # Check campaign eligibility scope configuration ('GLOBAL' vs 'TARGET_PROGRAM')
+        eligibility_scope = str(camp_cfg.get('eligibility_scope', 'GLOBAL')).strip().upper()
+        lifecycle_target_prog_id = target_program_id if eligibility_scope == 'TARGET_PROGRAM' else None
+
         # Order-type gate (Dynamic & configurable across ALL platforms)
         allowed_order_types = camp_cfg.get('order_types') if isinstance(camp_cfg.get('order_types'), list) else None
         if allowed_order_types:
@@ -396,13 +421,13 @@ class DiscountCouponEngineService:
             elif order is not None and getattr(order, 'order_type', None):
                 otype = str(order.order_type).strip().upper()
             elif user_profile is not None:
-                member_state = cls.get_member_lifecycle_state(user_profile, alias)
+                member_state = cls.get_member_lifecycle_state(user_profile, alias, target_program_id=lifecycle_target_prog_id)
                 if member_state == 'ACTIVE':
                     otype = 'RENEWAL'
                 elif member_state == 'EXPIRED':
                     otype = 'REJOIN'
                 else:
-                    otype = 'NEW_MEMBERSHIP'
+                    otype = 'NEW_PACKAGE' if lifecycle_target_prog_id else 'NEW_MEMBERSHIP'
             else:
                 otype = 'NEW_MEMBERSHIP'
 
@@ -416,10 +441,14 @@ class DiscountCouponEngineService:
         # Member lifecycle gate (NEW, ACTIVE, EXPIRED/INACTIVE/REJOIN, NEW_OR_EXPIRED)
         allowed_member_types = camp_cfg.get('allowed_member_types') or camp_cfg.get('member_type')
         if allowed_member_types:
-            member_state = cls.get_member_lifecycle_state(user_profile, alias)
+            member_state = cls.get_member_lifecycle_state(user_profile, alias, target_program_id=lifecycle_target_prog_id)
             if not cls.matches_member_type(member_state, allowed_member_types):
                 if member_state == 'ACTIVE':
-                    reason = 'This offer is only for new members or rejoining expired members; you currently have an active membership.'
+                    reason = (
+                        'This offer is only for new members or rejoining expired members; you currently have an active membership in this program.'
+                        if eligibility_scope == 'TARGET_PROGRAM'
+                        else 'This offer is only for new members or rejoining expired members; you currently have an active membership.'
+                    )
                 elif member_state == 'EXPIRED':
                     reason = 'This offer is only for active members.'
                 else:

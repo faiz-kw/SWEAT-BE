@@ -2485,6 +2485,55 @@ class CRMLeadService:
                 'cancellation_reason', 'updated_at'
             ])
 
+            # Keep existing Trial AccessPass synchronized with rescheduled slot
+            from .models_attendance import AccessPass
+            trial_pass = AccessPass.objects.using(alias).filter(
+                trial_booking=trial
+            ).exclude(status__in=['CONSUMED_EXITED', 'CANCELLED']).first()
+            if trial_pass:
+                from .services_booking_policy import BookingPolicyService as _BPS
+                _pol = _BPS.get_effective_policy(trial.lead.organization, branch=new_occ.branch, db_alias=alias)
+                _act_mins = int(_pol.get('qr_activation_minutes_before_class', 20) or 20)
+                _dur = (
+                    new_occ.class_template.default_duration_minutes
+                    if (new_occ.class_template and new_occ.class_template.default_duration_minutes)
+                    else 50
+                )
+                _end_at = new_occ.end_at or (new_occ.start_at + timedelta(minutes=_dur))
+                trial_pass.branch = new_occ.branch
+                trial_pass.valid_from = new_occ.start_at - timedelta(minutes=_act_mins)
+                trial_pass.valid_until = _end_at + timedelta(minutes=60)
+                if trial_pass.status == 'EXPIRED':
+                    trial_pass.status = 'ACTIVE'
+                trial_pass.updated_at = timezone.now()
+                trial_pass.save(using=alias, update_fields=['branch', 'valid_from', 'valid_until', 'status', 'updated_at'])
+
+                def _sync_rescheduled_trial_terminals():
+                    from django.conf import settings as _settings
+                    from .models_devices import TurnstileDevice
+                    from .dahua_rpc import delete_card as _delete_card
+                    from .services_access_control import generate_trial_qr_token, push_qr_to_studio_terminals
+                    _cat = (
+                        new_occ.class_template.category.code
+                        if (new_occ.class_template and getattr(new_occ.class_template, 'category', None))
+                        else ''
+                    )
+                    _token = generate_trial_qr_token(str(trial.id), _settings.SECRET_KEY)
+                    # Remove from branch devices that do not serve the rescheduled room category
+                    for dev in TurnstileDevice.objects.using(alias).filter(branch_id=trial.branch_id, is_active=True):
+                        if not dev.matches_category(_cat):
+                            _delete_card(dev.base_url, _token)
+                    _name = f"{trial.lead.first_name} {trial.lead.last_name}".strip() if trial.lead else "Trial Guest"
+                    push_qr_to_studio_terminals(
+                        pass_id=str(trial_pass.id),
+                        display_name=_name or "Trial Guest",
+                        qr_token=_token,
+                        branch=new_occ.branch,
+                        category_code=_cat,
+                        db_alias=alias,
+                    )
+                transaction.on_commit(_sync_rescheduled_trial_terminals, using=alias)
+
             # Write status transition history
             TrialStatusHistory.objects.using(alias).create(
                 trial_booking=trial,
@@ -2642,6 +2691,20 @@ class CRMLeadService:
             trial.cancellation_reason = reason
             trial.save(using=alias, update_fields=['status', 'confirmation_status', 'cancellation_reason', 'updated_at'])
 
+            # Revoke any active AccessPass so cancelled trial QR cannot scan at turnstile
+            from .models_attendance import AccessPass
+            revoked_trial_pass = AccessPass.objects.using(alias).filter(
+                trial_booking=trial,
+                status__in=['ACTIVE', 'CONSUMED_ENTERED'],
+            ).update(status='CANCELLED', updated_at=timezone.now())
+            if revoked_trial_pass:
+                def _purge_cancelled_trial_pass():
+                    from django.conf import settings as _settings
+                    from .services_access_control import generate_trial_qr_token, purge_qr_from_branch_terminals
+                    token = generate_trial_qr_token(str(trial.id), _settings.SECRET_KEY)
+                    purge_qr_from_branch_terminals(token, branch_id=trial.branch_id, db_alias=alias)
+                transaction.on_commit(_purge_cancelled_trial_pass, using=alias)
+
             TrialStatusHistory.objects.using(alias).create(
                 trial_booking=trial,
                 from_status=old_status,
@@ -2796,6 +2859,7 @@ class CRMLeadService:
         actor_user: Optional[TenantUser] = None,
         allow_override: bool = False,
         db_alias: Optional[str] = None,
+        skip_window_validation: bool = False,
     ) -> TrialBooking:
         alias = db_alias or get_tenant_db_alias() or 'default'
         from .models_crm import CRMTrialReminderPolicy
@@ -2814,15 +2878,16 @@ class CRMLeadService:
             if has_replacement:
                 raise ValidationError("Cannot mark attendance on a trial that has been replaced. Please attend the active replacement trial.")
 
-            # Authoritative attendance time window validation
-            is_valid_window, window_err = cls.validate_attendance_window(
-                trial=trial,
-                actor_user=actor_user,
-                allow_override=allow_override,
-                db_alias=alias,
-            )
-            if not is_valid_window:
-                raise ValidationError(window_err)
+            # Authoritative attendance time window validation (skipped only when turnstile AccessPass window already validated entry)
+            if not skip_window_validation:
+                is_valid_window, window_err = cls.validate_attendance_window(
+                    trial=trial,
+                    actor_user=actor_user,
+                    allow_override=allow_override,
+                    db_alias=alias,
+                )
+                if not is_valid_window:
+                    raise ValidationError(window_err)
 
             old_status = trial.status
             trial.status = 'ATTENDED'
