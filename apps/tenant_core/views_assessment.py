@@ -561,7 +561,15 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
         Hands the scan to Celery, falling back to running it inline when no broker is
         reachable so a single-process deployment still produces results.
         """
-        tenant_id = getattr(getattr(request, 'tenant', None), 'id', None) or getattr(request, 'tenant_id', None)
+        # The JWT backend puts the tenant on the authenticated user; nothing attaches it to
+        # the request object. Reading only request.tenant meant the queue handoff never
+        # fired and every scan ran inline inside the web request - tolerable with the local
+        # provider, a gateway timeout with a hosted one at ten seconds a view.
+        tenant_id = (
+            getattr(request.user, '_tenant_id', None)
+            or getattr(getattr(request, 'tenant', None), 'id', None)
+            or getattr(request, 'tenant_id', None)
+        )
         if tenant_id:
             try:
                 from .tasks_body_scan import run_assessment_body_scan
