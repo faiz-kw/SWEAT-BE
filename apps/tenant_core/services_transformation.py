@@ -198,14 +198,7 @@ class FalEditRenderer:
         except Exception as exc:
             raise TransformationError(f'Could not upload the baseline capture: {exc}') from exc
 
-        prompt = (
-            f'Subtly reduce waist circumference by approximately {waist_reduction_pct:.0f} percent, '
-            'as the same person would look after some months of consistent training. '
-            'Keep the face, hair, skin tone and clothing exactly as they are. '
-            'Keep the identical pose, camera angle, framing, lighting and background. '
-            'Do not add muscle definition, do not change height or limb proportions, '
-            'do not alter the face in any way. Photographic, not stylised.'
-        )
+        prompt = build_edit_prompt(waist_reduction_pct)
 
         try:
             result = fal_client.subscribe(self.model, arguments={
@@ -233,11 +226,133 @@ class FalEditRenderer:
             raise TransformationError(f'Could not download the rendered image: {exc}') from exc
 
 
+# The instruction given to any hosted editor. Written to constrain rather than invent: it
+# names the single change wanted and forbids the ones the specification warns about. Shared
+# between providers so a provider swap cannot quietly change what is asked for.
+def build_edit_prompt(waist_reduction_pct: float) -> str:
+    return (
+        f'Subtly reduce waist circumference by approximately {waist_reduction_pct:.0f} percent, '
+        'as the same person would look after some months of consistent training. '
+        'Keep the face, hair, skin tone and clothing exactly as they are. '
+        'Keep the identical pose, camera angle, framing, lighting and background. '
+        'Do not add muscle definition, do not change height or limb proportions, '
+        'do not alter the face in any way. Photographic, not stylised.'
+    )
+
+
+class ReplicateEditRenderer:
+    """
+    Hosted image editing through Replicate.
+
+    Same models and much the same price as fal; it exists so the studio is not stranded when
+    one provider's account is unavailable. Like the fal renderer its output is not trusted:
+    `validate_output` re-detects the pose and discards anything that moved the subject.
+
+    Uses the REST API directly rather than the `replicate` package, to avoid another
+    dependency for what is one POST and a poll.
+    """
+
+    name = 'replicate_image_edit_v1'
+    is_generative = True
+
+    def __init__(self, model: Optional[str] = None):
+        self.model = (model or getattr(settings, 'REPLICATE_TRANSFORMATION_MODEL', '')
+                      or 'black-forest-labs/flux-kontext-dev').strip()
+        self.cost_per_image_usd = float(getattr(settings, 'REPLICATE_TRANSFORMATION_COST_USD', 0.025))
+
+    def render(
+        self,
+        image_bytes: bytes,
+        *,
+        waist_reduction_pct: float,
+        month: int = 1,
+        **_: Any,
+    ) -> bytes:
+        import base64
+        import time
+
+        import requests
+
+        token = (getattr(settings, 'REPLICATE_API_TOKEN', '') or '').strip()
+        if not token:
+            raise TransformationError('REPLICATE_API_TOKEN is not configured on this server.')
+
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json',
+            # Ask for a synchronous answer; Replicate falls back to a pending prediction when
+            # the model takes longer than the wait window, which the poll below picks up.
+            'Prefer': 'wait=55',
+        }
+        data_uri = 'data:image/jpeg;base64,' + base64.b64encode(image_bytes).decode('ascii')
+        payload = {
+            'input': {
+                'input_image': data_uri,
+                'prompt': build_edit_prompt(waist_reduction_pct),
+                'output_format': 'jpg',
+            }
+        }
+
+        try:
+            response = requests.post(
+                f'https://api.replicate.com/v1/models/{self.model}/predictions',
+                headers=headers, json=payload, timeout=120,
+            )
+        except Exception as exc:
+            raise TransformationError(f'Could not reach the image editor: {exc}') from exc
+
+        if response.status_code >= 400:
+            detail = ''
+            try:
+                detail = (response.json() or {}).get('detail') or response.text[:200]
+            except Exception:
+                detail = response.text[:200]
+            raise TransformationError(f'The image editor refused the request: {detail} (HTTP {response.status_code})')
+
+        prediction = response.json()
+        deadline = time.time() + float(getattr(settings, 'REPLICATE_TIMEOUT_SECONDS', 180))
+
+        while prediction.get('status') in ('starting', 'processing'):
+            if time.time() > deadline:
+                raise TransformationError('The image editor did not finish in time.')
+            time.sleep(2)
+            poll_url = (prediction.get('urls') or {}).get('get')
+            if not poll_url:
+                raise TransformationError('The image editor returned no way to poll the result.')
+            try:
+                prediction = requests.get(poll_url, headers=headers, timeout=60).json()
+            except Exception as exc:
+                raise TransformationError(f'Lost contact with the image editor: {exc}') from exc
+
+        if prediction.get('status') != 'succeeded':
+            raise TransformationError(
+                f"The image editor failed: {prediction.get('error') or prediction.get('status')}"
+            )
+
+        output = prediction.get('output')
+        url = output[0] if isinstance(output, list) and output else output
+        if not isinstance(url, str) or not url.startswith('http'):
+            raise TransformationError('The image editor returned no usable image.')
+
+        try:
+            return requests.get(url, timeout=120).content
+        except Exception as exc:
+            raise TransformationError(f'Could not download the rendered image: {exc}') from exc
+
+
 def get_renderer(name: Optional[str] = None):
-    """Returns the configured renderer. Morph is the default: free, and identity-safe."""
+    """
+    Returns the configured renderer.
+
+    Morph is the default: it costs nothing and preserves identity by construction. The hosted
+    editors look better but send the member's photograph to a third party, so they are opt-in
+    and their output is verified against the baseline before anyone sees it.
+    """
     choice = (name or getattr(settings, 'TRANSFORMATION_RENDERER', '') or 'morph').strip().lower()
-    if choice in ('fal', 'generative', 'flux'):
+    if choice in ('fal', 'flux'):
         return FalEditRenderer()
+    if choice in ('replicate', 'generative'):
+        return ReplicateEditRenderer()
     return SilhouetteMorphRenderer()
 
 
@@ -248,8 +363,8 @@ def get_renderer(name: Optional[str] = None):
 class TransformationPipeline:
     """Builds the milestone previews for one assessment."""
 
-    @staticmethod
-    def detect_landmarks(image_bytes: bytes) -> Dict[str, Any]:
+    @classmethod
+    def detect_landmarks(cls, image_bytes: bytes) -> Dict[str, Any]:
         """
         Runs pose detection on an image and returns the named joints.
 
@@ -294,11 +409,27 @@ class TransformationPipeline:
         if hip_mid:
             joints['hip_mid'] = hip_mid
 
-        return {'usable': True, 'joints': joints}
+        # Joints are also returned normalised to the image, because a hosted editor may hand
+        # back a different resolution than it was given. Comparing raw pixels across two
+        # sizes makes an unchanged pose look like the subject jumped across the frame.
+        size = cls.image_size(image_bytes) or (0, 0)
+        width, height = (size[0] or 1), (size[1] or 1)
+        joints_norm = {k: (x / width, y / height) for k, (x, y) in joints.items()}
+
+        return {'usable': True, 'joints': joints, 'joints_norm': joints_norm, 'size': size}
+
+    @staticmethod
+    def image_size(image_bytes: bytes):
+        try:
+            from PIL import Image
+            with Image.open(io.BytesIO(image_bytes)) as img:
+                return img.size
+        except Exception:
+            return None
 
     @classmethod
     def validate_output(
-        cls, rendered_bytes: bytes, baseline_joints: Dict[str, Tuple[float, float]],
+        cls, rendered_bytes: bytes, baseline_norm: Dict[str, Tuple[float, float]],
     ) -> Dict[str, Any]:
         """
         The specification's validation step.
@@ -306,6 +437,10 @@ class TransformationPipeline:
         Re-detects the pose in the rendered image and compares every joint against the
         baseline. A render that moved the subject, changed their proportions or lost them
         entirely is rejected — it is never shown with a caveat.
+
+        The comparison runs in normalised coordinates, because a hosted editor may return a
+        different resolution than it was given; comparing raw pixels across two sizes
+        reported an unchanged pose as an 80% drift.
         """
         verdict: Dict[str, Any] = {'accepted': False, 'checks': {}}
 
@@ -322,25 +457,25 @@ class TransformationPipeline:
             )
             return verdict
 
-        rendered_joints = detected['joints']
+        rendered_norm = detected.get('joints_norm') or {}
 
-        # Scale drift by the subject's own height so the threshold is resolution-independent.
-        shoulder = baseline_joints.get('shoulder_mid')
-        ankle_l = baseline_joints.get('left_ankle')
-        ankle_r = baseline_joints.get('right_ankle')
+        # Drift is expressed against the subject's own height, so the threshold means the
+        # same thing whatever the framing.
+        shoulder = baseline_norm.get('shoulder_mid')
+        ankles = [baseline_norm.get('left_ankle'), baseline_norm.get('right_ankle')]
         reference = None
-        if shoulder and (ankle_l or ankle_r):
-            ankle_y = max(p[1] for p in (ankle_l, ankle_r) if p)
+        if shoulder and any(ankles):
+            ankle_y = max(p[1] for p in ankles if p)
             reference = abs(ankle_y - shoulder[1])
         if not reference or reference <= 0:
             verdict['reason'] = 'The baseline has no usable height reference for verification.'
             return verdict
 
         worst_label, worst_drift = None, 0.0
-        for label, baseline_point in baseline_joints.items():
+        for label, baseline_point in baseline_norm.items():
             if label in ('shoulder_mid', 'hip_mid'):
                 continue
-            rendered_point = rendered_joints.get(label)
+            rendered_point = rendered_norm.get(label)
             if not rendered_point:
                 verdict['reason'] = f'The rendered image lost the {label.replace("_", " ")}.'
                 return verdict
@@ -419,6 +554,7 @@ class TransformationPipeline:
                 f"The baseline capture is not usable for a preview: {detected.get('reason')}"
             )
         baseline_joints = detected['joints']
+        baseline_norm = detected.get('joints_norm') or {}
 
         result: Dict[str, Any] = {
             'renderer': renderer.name,
@@ -448,7 +584,7 @@ class TransformationPipeline:
                 continue
 
             # Step 4's precondition: verify before anything is shown.
-            verdict = cls.validate_output(rendered, baseline_joints)
+            verdict = cls.validate_output(rendered, baseline_norm)
             if not verdict.get('accepted'):
                 result['rejected'][f'month_{month}'] = verdict.get('reason', 'Verification failed.')
                 continue

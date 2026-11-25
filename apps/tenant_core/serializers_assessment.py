@@ -138,6 +138,7 @@ class MemberAssessmentDetailSerializer(serializers.ModelSerializer):
     recommended_package = serializers.SerializerMethodField()
     alternatives = serializers.SerializerMethodField()
     signed_off_by_name = serializers.SerializerMethodField()
+    photos = serializers.SerializerMethodField()
     photo_front_url = serializers.SerializerMethodField()
     photo_side_url = serializers.SerializerMethodField()
 
@@ -185,6 +186,9 @@ class MemberAssessmentDetailSerializer(serializers.ModelSerializer):
             'consent_secondary_use',
             'consent_notice_version',
             'target_weight_kg',
+            'member_date_of_birth',
+            'member_age_years',
+            'member_sex',
             'consent_image_generation',
             'timeline_estimate',
             # Section 12 commitment
@@ -206,6 +210,7 @@ class MemberAssessmentDetailSerializer(serializers.ModelSerializer):
             'diet_prescription',
             'reassessment_interval_weeks',
             # Media
+            'photos',
             'photo_front_url',
             'photo_side_url',
             # Timestamps
@@ -291,6 +296,28 @@ class MemberAssessmentDetailSerializer(serializers.ModelSerializer):
             return build_signed_media_url(obj.photo_side.name)
         return obj.photo_side_url or ''
 
+    def get_photos(self, obj) -> dict:
+        """
+        All four capture views. photo_front_url and photo_side_url above predate the
+        four-view capture and only ever expose two of them, so the back and left profiles
+        were invisible to the client.
+
+        A view with no image is null rather than an empty string, so the UI can tell
+        "not captured" apart from "captured but unreadable".
+        """
+        def url_for(field, fallback):
+            if field:
+                return build_signed_media_url(field.name)
+            return fallback or None
+
+        return {
+            'front': url_for(obj.photo_front, obj.photo_front_url),
+            'back': url_for(obj.photo_back, obj.photo_back_url),
+            'left': url_for(obj.photo_side_left, obj.photo_side_left_url),
+            'right': url_for(obj.photo_side_right, obj.photo_side_right_url)
+                     or url_for(obj.photo_side, obj.photo_side_url),
+        }
+
 
 class MemberAssessmentWriteSerializer(serializers.ModelSerializer):
     user_profile_id = serializers.UUIDField(required=False, allow_null=True)
@@ -308,6 +335,8 @@ class MemberAssessmentWriteSerializer(serializers.ModelSerializer):
             'agreed_first_milestone',
             'goal_review_date',
             'target_weight_kg',
+            'member_date_of_birth',
+            'member_sex',
             'consent_image_generation',
             'assessment_type',
             'member_name',

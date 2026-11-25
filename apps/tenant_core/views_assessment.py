@@ -378,8 +378,27 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
                 rec_pkg, rec_ver = custom_pkg, custom_pkg.get_active_version()
 
         trainer = request.user if getattr(request.user, 'user_type', None) != 'MEMBER' else None
+
+        # Section 1 demographics. When the coach picked a member from the directory, these
+        # come from that profile rather than from the request, because the profile is the
+        # authoritative record. Mifflin-St Jeor takes both, so a wrong value here moves the
+        # calorie target by hundreds of kilocalories.
+        dob = getattr(user_profile, 'date_of_birth', None) if user_profile else None
+        if not dob and val.get('member_date_of_birth'):
+            dob = val['member_date_of_birth']
+        sex = (getattr(user_profile, 'gender', '') if user_profile else '') or val.get('member_sex') or ''
+        sex = str(sex).strip().upper()
+        if sex in ('F', 'WOMAN'):
+            sex = 'FEMALE'
+        elif sex in ('M', 'MAN'):
+            sex = 'MALE'
+        if sex not in ('FEMALE', 'MALE', 'OTHER', 'UNDISCLOSED'):
+            sex = ''
+        age = _derive_age(dob) if dob else None
+
         assessment = MemberAssessment.objects.using(alias).create(
             organization=org, branch=branch, user_profile=user_profile, previous_assessment=prev_assessment,
+            member_date_of_birth=dob or None, member_age_years=age, member_sex=sex,
             member_name=name, member_phone=phone, conducted_by_trainer=trainer, assessment_type=val.get('assessment_type', 'INITIAL'),
             training_experience=val.get('training_experience', 'BEGINNER'), current_activity_level=act,
             preferred_training_style=val.get('preferred_training_style', 'PILATES'), target_goal=goal,
@@ -542,7 +561,15 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
         Hands the scan to Celery, falling back to running it inline when no broker is
         reachable so a single-process deployment still produces results.
         """
-        tenant_id = getattr(getattr(request, 'tenant', None), 'id', None) or getattr(request, 'tenant_id', None)
+        # The JWT backend puts the tenant on the authenticated user; nothing attaches it to
+        # the request object. Reading only request.tenant meant the queue handoff never
+        # fired and every scan ran inline inside the web request - tolerable with the local
+        # provider, a gateway timeout with a hosted one at ten seconds a view.
+        tenant_id = (
+            getattr(request.user, '_tenant_id', None)
+            or getattr(getattr(request, 'tenant', None), 'id', None)
+            or getattr(request, 'tenant_id', None)
+        )
         if tenant_id:
             try:
                 from .tasks_body_scan import run_assessment_body_scan

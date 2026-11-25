@@ -180,3 +180,38 @@ class RendererSelectionTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ReplicateRendererTests(unittest.TestCase):
+    """
+    The second hosted renderer exists so the studio is not stranded when one provider's
+    account is unavailable. It must behave like the first: declare itself generative, refuse
+    without a token, and share the constraining prompt rather than inventing its own.
+    """
+
+    def test_it_is_selectable_by_name(self):
+        from apps.tenant_core.services_transformation import ReplicateEditRenderer
+        self.assertIsInstance(get_renderer('replicate'), ReplicateEditRenderer)
+
+    def test_it_declares_itself_generative(self):
+        from apps.tenant_core.services_transformation import ReplicateEditRenderer
+        self.assertTrue(ReplicateEditRenderer().is_generative)
+
+    def test_without_a_token_it_refuses(self):
+        from apps.tenant_core.services_transformation import (
+            ReplicateEditRenderer, TransformationError,
+        )
+        from django.test import override_settings
+        with override_settings(REPLICATE_API_TOKEN=''):
+            with self.assertRaises(TransformationError):
+                ReplicateEditRenderer().render(_solid_image(), waist_reduction_pct=3.0)
+
+    def test_both_hosted_renderers_share_one_prompt(self):
+        """A provider swap must not quietly change what the model is asked to do."""
+        from apps.tenant_core.services_transformation import build_edit_prompt
+        prompt = build_edit_prompt(3.0)
+        for forbidden in ('do not alter the face', 'identical pose', 'Do not add muscle'):
+            self.assertIn(forbidden.lower(), prompt.lower())
+
+    def test_morph_remains_the_default(self):
+        self.assertIsInstance(get_renderer(None), SilhouetteMorphRenderer)
