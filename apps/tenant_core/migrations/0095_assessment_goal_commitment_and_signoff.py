@@ -15,10 +15,20 @@ class Migration(migrations.Migration):
             name='agreed_first_milestone',
             field=models.CharField(blank=True, default='', help_text='The first concrete step the member and coach agreed on', max_length=255),
         ),
-        migrations.AddField(
-            model_name='memberassessment',
-            name='coach_notes',
-            field=models.TextField(blank=True, null=True),
+        migrations.SeparateDatabaseAndState(
+            state_operations=[
+                migrations.AddField(
+                    model_name='memberassessment',
+                    name='coach_notes',
+                    field=models.TextField(blank=True, null=True),
+                ),
+            ],
+            database_operations=[
+                migrations.RunSQL(
+                    sql='ALTER TABLE member_assessments ADD COLUMN IF NOT EXISTS coach_notes text;',
+                    reverse_sql='ALTER TABLE member_assessments DROP COLUMN IF EXISTS coach_notes;',
+                ),
+            ],
         ),
         migrations.AddField(
             model_name='memberassessment',
