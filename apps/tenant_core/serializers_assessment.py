@@ -115,6 +115,20 @@ class ProgressionApprovalSerializer(serializers.Serializer):
 
 
 class MemberAssessmentDetailSerializer(serializers.ModelSerializer):
+    timeline_estimate = serializers.SerializerMethodField()
+
+    def get_timeline_estimate(self, obj):
+        """
+        A week range rather than a date. The specification forbids promising a result by a
+        fixed date, and requires the range be recalculated at reassessment from the member's
+        own trend.
+        """
+        try:
+            from .services_assessment_timeline import timeline_for_assessment
+            return timeline_for_assessment(obj, getattr(obj, 'previous_assessment', None))
+        except Exception:
+            return None
+
     branch_detail = serializers.SerializerMethodField()
     masked_phone = serializers.SerializerMethodField()
     vitals = serializers.SerializerMethodField()
@@ -170,6 +184,9 @@ class MemberAssessmentDetailSerializer(serializers.ModelSerializer):
             'consent_ai_analysis',
             'consent_secondary_use',
             'consent_notice_version',
+            'target_weight_kg',
+            'consent_image_generation',
+            'timeline_estimate',
             # Section 12 commitment
             'agreed_first_milestone',
             'goal_review_date',
@@ -290,6 +307,8 @@ class MemberAssessmentWriteSerializer(serializers.ModelSerializer):
             'package_id',
             'agreed_first_milestone',
             'goal_review_date',
+            'target_weight_kg',
+            'consent_image_generation',
             'assessment_type',
             'member_name',
             'member_phone',

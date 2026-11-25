@@ -175,6 +175,9 @@ class MemberAssessment(models.Model):
     measured_height_cm = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
     measured_weight_kg = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
     waist_circumference_cm = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    # Module specification section A: capture the target alongside the current weight, so the
+    # timeline has something concrete to estimate toward rather than a vague goal.
+    target_weight_kg = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
     resting_heart_rate_bpm = models.PositiveIntegerField(null=True, blank=True)
     resting_blood_pressure = models.CharField(max_length=20, null=True, blank=True, help_text="e.g. 120/80")
 
@@ -313,6 +316,11 @@ class MemberAssessment(models.Model):
     consent_movement_photos = models.BooleanField(default=False)
     consent_ai_analysis = models.BooleanField(default=False)
     consent_secondary_use = models.BooleanField(default=False)
+    # Generating a simulated image of a member's future body is a different act from
+    # analysing their posture, so it carries its own opt-in. The module specification treats
+    # the transformation preview as a separate consent, and without this one the pipeline
+    # refuses to run.
+    consent_image_generation = models.BooleanField(default=False)
     consent_notice_version = models.CharField(max_length=50, blank=True, default='')
 
     # Governance & Sign-Offs (Section 16)
