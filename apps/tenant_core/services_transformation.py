@@ -55,7 +55,7 @@ MAX_JOINT_DRIFT_RATIO = 0.08
 # three-month trajectory is clearly visible on a heavier starting frame (a sub-5% change still
 # reads as "no change" to the member), while staying inside what consistent training plausibly
 # delivers and what the pose verification will accept.
-WAIST_CHANGE_PCT_PER_MONTH = 4.0
+WAIST_CHANGE_PCT_PER_MONTH = 3.0
 
 
 class TransformationError(Exception):
