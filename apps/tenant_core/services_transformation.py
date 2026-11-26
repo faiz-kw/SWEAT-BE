@@ -115,43 +115,56 @@ class SilhouetteMorphRenderer:
                 'cannot be located. Re-run the body scan first.'
             )
 
-        midline_x = (shoulder[0] + hip[0]) / 2.0
-        shoulder_y, hip_y = shoulder[1], hip[1]
+        midline_x = float((shoulder[0] + hip[0]) / 2.0)
+        shoulder_y, hip_y = float(shoulder[1]), float(hip[1])
         if hip_y <= shoulder_y:
             raise TransformationError('The baseline landmarks are inconsistent; cannot morph.')
 
-        # The waist sits around 55% of the way from shoulder to hip.
-        waist_y = shoulder_y + (hip_y - shoulder_y) * 0.55
-        span = max(1.0, (hip_y - shoulder_y))
-        max_squeeze = max(0.0, min(0.12, waist_reduction_pct / 100.0))
+        # The whole mid-body is compressed horizontally toward the midline: strongest at the
+        # lower belly (the widest point on a heavier frame), tapering up through the chest and
+        # down into the upper thigh, and zero by the knees so the feet, legs and pose are
+        # untouched. Full-width source compresses into a narrower band and the exposed edges
+        # are filled by stretching the plain background, so nothing is invented - identity,
+        # face, hair and clothing are the member's own pixels, only the silhouette narrows.
+        span = hip_y - shoulder_y
+        peak_y = shoulder_y + span * 0.72          # lower belly
+        top_inf = shoulder_y - span * 0.10         # start just above the chest
+        bot_inf = hip_y + span * 0.90              # fade out in the upper thigh, above the knees
+        peak_slim = max(0.0, min(0.22, (waist_reduction_pct / 100.0) * 1.5))
 
-        strips = 48
+        bg = max(2, int(width * 0.015))
+        strips = 64
         strip_h = height / strips
         mesh: List[Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int, int, int, int, int]]] = []
 
         for i in range(strips):
             top = i * strip_h
             bottom = (i + 1) * strip_h
-            centre_y = (top + bottom) / 2.0
+            cy = (top + bottom) / 2.0
+            t0, t1 = int(top), int(math.ceil(bottom))
 
-            # Falls off smoothly either side of the waist and is zero outside the torso.
-            distance = abs(centre_y - waist_y) / span
-            factor = max(0.0, 1.0 - (distance / 0.75) ** 2) if distance < 0.75 else 0.0
-            squeeze = max_squeeze * factor
+            if cy <= top_inf or cy >= bot_inf:
+                factor = 0.0
+            else:
+                half = (peak_y - top_inf) if cy < peak_y else (bot_inf - peak_y)
+                norm = (cy - peak_y) / max(1.0, half)
+                factor = max(0.0, 1.0 - norm * norm)
+            s = peak_slim * factor
 
-            # Source quad is pulled inward, so the destination strip shows a narrower body.
-            left = midline_x - (midline_x - 0) * (1.0 - squeeze)
-            right = midline_x + (width - midline_x) * (1.0 - squeeze)
+            full_src = (0, t0, 0, t1, width, t1, width, t0)
+            if s <= 0.001:
+                mesh.append(((0, t0, width, t1), full_src))
+                continue
 
-            mesh.append((
-                (0, int(top), width, int(math.ceil(bottom))),
-                (
-                    int(left), int(top),
-                    int(left), int(math.ceil(bottom)),
-                    int(right), int(math.ceil(bottom)),
-                    int(right), int(top),
-                ),
-            ))
+            lt = int(midline_x * s)
+            rt = int(width - (width - midline_x) * s)
+            # Full-width body compressed into the narrower [lt, rt] band.
+            mesh.append(((lt, t0, rt, t1), full_src))
+            # Exposed edges filled by stretching the outermost background columns.
+            if lt > 0:
+                mesh.append(((0, t0, lt, t1), (0, t0, 0, t1, bg, t1, bg, t0)))
+            if rt < width:
+                mesh.append(((rt, t0, width, t1), (width - bg, t0, width - bg, t1, width, t1, width, t0)))
 
         rendered = source.transform(source.size, Image.MESH, mesh, Image.BICUBIC)
         buffer = io.BytesIO()
