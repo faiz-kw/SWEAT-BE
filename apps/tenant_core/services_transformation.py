@@ -267,10 +267,12 @@ def build_edit_prompt(
         'a leaner, fitter build with a slimmer waist',
     )
     parts = [
-        f'Edit this photo to show the SAME person after several months of consistent training, with {look}. ',
-        f'Clearly and visibly reduce the belly and waist fat: trim the abdomen by about '
-        f'{waist_reduction_pct:.0f} percent so the stomach is noticeably flatter and the whole torso '
-        'looks leaner and tighter. The difference should be obvious at a glance, not subtle. ',
+        'Edit this photo to show the SAME person after several months of consistent fat-loss '
+        f'training: {look}. ',
+        f'Significantly slim the body - noticeably reduce the belly and waist fat so the stomach is '
+        f'clearly flatter, the love handles are smaller and the midsection is visibly tighter, '
+        f'roughly a {waist_reduction_pct:.0f} percent smaller waist. Make the fat loss obvious at a '
+        'glance - a clear, believable before-and-after difference, not a subtle one. ',
     ]
     if weight_loss_kg and weight_loss_kg > 0:
         parts.append(f'Consistent with losing roughly {weight_loss_kg:.0f} kg of body fat. ')
@@ -341,6 +343,12 @@ class ReplicateEditRenderer:
                     weight_loss_kg=weight_loss_kg, stated_outcome=stated_outcome,
                 ),
                 'output_format': 'jpg',
+                # Push the editor to actually apply the fat-loss edit rather than return a
+                # near-copy. Higher guidance = stronger prompt adherence; more steps = cleaner
+                # result. Tunable without a deploy via settings.
+                'guidance': float(getattr(settings, 'REPLICATE_FLUX_GUIDANCE', 4.5)),
+                'num_inference_steps': int(getattr(settings, 'REPLICATE_FLUX_STEPS', 32)),
+                'prompt_upsampling': bool(getattr(settings, 'REPLICATE_FLUX_PROMPT_UPSAMPLING', True)),
             }
         }
 
