@@ -55,7 +55,7 @@ MAX_JOINT_DRIFT_RATIO = 0.08
 # three-month trajectory is clearly visible on a heavier starting frame (a sub-5% change still
 # reads as "no change" to the member), while staying inside what consistent training plausibly
 # delivers and what the pose verification will accept.
-WAIST_CHANGE_PCT_PER_MONTH = 5.0
+WAIST_CHANGE_PCT_PER_MONTH = 4.0
 
 
 class TransformationError(Exception):
@@ -614,6 +614,11 @@ class TransformationPipeline:
                 continue
             rendered_point = rendered_norm.get(label)
             if not rendered_point:
+                # Feet/ankles sit at the frame edge and a refine pass occasionally blurs one out
+                # of detection without the pose actually changing - tolerate a lost ankle rather
+                # than discard an otherwise-good preview. A lost core joint still fails.
+                if 'ankle' in label or 'foot' in label or 'heel' in label or 'toe' in label:
+                    continue
                 verdict['reason'] = f'The rendered image lost the {label.replace("_", " ")}.'
                 return verdict
             drift = math.hypot(rendered_point[0] - baseline_point[0],
