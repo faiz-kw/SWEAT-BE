@@ -446,6 +446,22 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
             if instance.status == 'DRAFT':
                 instance.status = 'TESTING'
 
+        # Re-match recommended package if goal or timeline/frequency was updated
+        if any(k in request.data for k in ('target_goal', 'target_timeline_months', 'target_timeline_weeks', 'weekly_frequency_days')):
+            timeline_m = instance.target_timeline_months or 3
+            freq = instance.weekly_frequency_days or 3
+            match_res = AssessmentEngineService.match_system_packages(
+                organization=org, branch=instance.branch, goal=instance.target_goal,
+                timeline_months=timeline_m, weekly_frequency=freq, db_alias=alias,
+            )
+            rec_pkg = match_res.get('recommended_package')
+            if rec_pkg:
+                instance.recommended_package = rec_pkg
+                instance.recommended_package_version = match_res.get('recommended_package_version')
+                instance.recommendation_reason = match_res.get('recommendation_reason')
+                instance.alternative_packages_payload = match_res.get('alternatives', [])
+                instance.recommended_program = rec_pkg.program if rec_pkg else None
+
         instance.save(using=alias)
         return Response(MemberAssessmentDetailSerializer(instance, context={'request': request}).data)
 
