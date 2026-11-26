@@ -127,10 +127,12 @@ class SilhouetteMorphRenderer:
         # are filled by stretching the plain background, so nothing is invented - identity,
         # face, hair and clothing are the member's own pixels, only the silhouette narrows.
         span = hip_y - shoulder_y
-        peak_y = shoulder_y + span * 0.72          # lower belly
-        top_inf = shoulder_y - span * 0.10         # start just above the chest
-        bot_inf = hip_y + span * 0.90              # fade out in the upper thigh, above the knees
-        peak_slim = max(0.0, min(0.22, (waist_reduction_pct / 100.0) * 1.5))
+        peak_y = shoulder_y + span * 0.80          # the belly overhang - the widest point
+        top_inf = shoulder_y + span * 0.25         # below the chest, so shoulders/chest keep their width
+        bot_inf = hip_y + span * 0.55              # ease out through the hips, well above the knees
+        # Deliberately gentle so it reads as a believable reduction of the belly, not a photo
+        # squeeze: capped low and concentrated on the belly rather than the whole torso.
+        peak_slim = max(0.0, min(0.13, (waist_reduction_pct / 100.0) * 1.0))
 
         bg = max(2, int(width * 0.015))
         strips = 64
