@@ -49,10 +49,11 @@ MILESTONE_MONTHS = (1, 2, 3)
 # the rendered image means the pose was not preserved, and the render is rejected.
 MAX_JOINT_DRIFT_RATIO = 0.04
 
-# Waist change we are willing to illustrate per month, as a share of the starting waist.
-# Deliberately conservative: an illustration that outruns what training plausibly delivers
-# is the thing the specification is warning about.
-WAIST_CHANGE_PCT_PER_MONTH = 1.2
+# Waist change we illustrate per month, as a share of the starting waist. Set so the
+# three-month trajectory is actually visible (a sub-2% change reads as "no change" to the
+# member), while staying inside what consistent training plausibly delivers and what the
+# pose verification will accept.
+WAIST_CHANGE_PCT_PER_MONTH = 3.0
 
 
 class TransformationError(Exception):
@@ -179,6 +180,10 @@ class FalEditRenderer:
         *,
         waist_reduction_pct: float,
         month: int = 1,
+        goal_code: Optional[str] = None,
+        goal_label: Optional[str] = None,
+        weight_loss_kg: Optional[float] = None,
+        stated_outcome: Optional[str] = None,
         **_: Any,
     ) -> bytes:
         api_key = (getattr(settings, 'FAL_KEY', '') or '').strip()
@@ -198,7 +203,10 @@ class FalEditRenderer:
         except Exception as exc:
             raise TransformationError(f'Could not upload the baseline capture: {exc}') from exc
 
-        prompt = build_edit_prompt(waist_reduction_pct)
+        prompt = build_edit_prompt(
+            waist_reduction_pct, goal_code=goal_code, goal_label=goal_label,
+            weight_loss_kg=weight_loss_kg, stated_outcome=stated_outcome,
+        )
 
         try:
             result = fal_client.subscribe(self.model, arguments={
@@ -226,18 +234,50 @@ class FalEditRenderer:
             raise TransformationError(f'Could not download the rendered image: {exc}') from exc
 
 
+# How each goal is described to the editor. The member's own goal decides what "progress"
+# looks like, so a fat-loss client is shown a leaner torso while a glutes client is shown a
+# toned lower body - rather than every member getting the same anonymous waist pinch.
+GOAL_EDIT_PHRASING = {
+    'FAT_LOSS': 'a visibly leaner build with noticeably less body fat around the waist, belly and torso',
+    'POSTURE_ALIGNMENT': 'a more upright posture, an aligned spine and a slightly leaner, tighter midsection',
+    'HYPERTROPHY_GLUTES': 'a more toned and firm lower body and a leaner waist',
+    'STRENGTH_CONDITIONING': 'a leaner, more solid and conditioned physique with a tighter waist',
+    'ATHLETIC_PERFORMANCE': 'a leaner, more athletic and defined physique with a tighter waist',
+    'MOBILITY_LONGEVITY': 'a healthier, slightly leaner and fitter build with a tighter waist',
+    'GENERAL_FITNESS': 'a healthier, slightly leaner and fitter build with a tighter waist',
+}
+
+
 # The instruction given to any hosted editor. Written to constrain rather than invent: it
-# names the single change wanted and forbids the ones the specification warns about. Shared
-# between providers so a provider swap cannot quietly change what is asked for.
-def build_edit_prompt(waist_reduction_pct: float) -> str:
-    return (
-        f'Subtly reduce waist circumference by approximately {waist_reduction_pct:.0f} percent, '
-        'as the same person would look after some months of consistent training. '
-        'Keep the face, hair, skin tone and clothing exactly as they are. '
-        'Keep the identical pose, camera angle, framing, lighting and background. '
-        'Do not add muscle definition, do not change height or limb proportions, '
-        'do not alter the face in any way. Photographic, not stylised.'
+# names the change wanted for this member's goal and forbids the ones the specification warns
+# about. Shared between providers so a provider swap cannot quietly change what is asked for.
+def build_edit_prompt(
+    waist_reduction_pct: float,
+    *,
+    goal_code: Optional[str] = None,
+    goal_label: Optional[str] = None,
+    weight_loss_kg: Optional[float] = None,
+    stated_outcome: Optional[str] = None,
+    **_: Any,
+) -> str:
+    look = GOAL_EDIT_PHRASING.get(
+        (goal_code or '').upper(),
+        'a leaner, fitter build with a slimmer waist',
     )
+    parts = [
+        f'Show the same person after a few months of consistent training, with {look}. ',
+        f'Reduce the waist and abdominal circumference by approximately {waist_reduction_pct:.0f} '
+        'percent and slim the torso to match. ',
+    ]
+    if weight_loss_kg and weight_loss_kg > 0:
+        parts.append(f'Consistent with losing roughly {weight_loss_kg:.0f} kg of body fat. ')
+    parts.append(
+        'Keep it clearly the same person: same face, hair, skin tone, clothing and identity. '
+        'Keep the identical pose, camera angle, framing, lighting and background. '
+        'Do not change height, do not distort or rearrange limbs, do not alter the face. '
+        'A realistic, natural, believable photograph - not stylised, not exaggerated.'
+    )
+    return ''.join(parts)
 
 
 class ReplicateEditRenderer:
@@ -266,6 +306,10 @@ class ReplicateEditRenderer:
         *,
         waist_reduction_pct: float,
         month: int = 1,
+        goal_code: Optional[str] = None,
+        goal_label: Optional[str] = None,
+        weight_loss_kg: Optional[float] = None,
+        stated_outcome: Optional[str] = None,
         **_: Any,
     ) -> bytes:
         import base64
@@ -288,7 +332,10 @@ class ReplicateEditRenderer:
         payload = {
             'input': {
                 'input_image': data_uri,
-                'prompt': build_edit_prompt(waist_reduction_pct),
+                'prompt': build_edit_prompt(
+                    waist_reduction_pct, goal_code=goal_code, goal_label=goal_label,
+                    weight_loss_kg=weight_loss_kg, stated_outcome=stated_outcome,
+                ),
                 'output_format': 'jpg',
             }
         }
@@ -501,6 +548,30 @@ class TransformationPipeline:
         return verdict
 
     @classmethod
+    def _goal_context(cls, assessment) -> Dict[str, Any]:
+        """
+        What the member is training for, in the form the prompt builder wants. The goal decides
+        what "after training" is illustrated as, so a fat-loss client and a glutes client are
+        not shown the same generic edit.
+        """
+        code = getattr(assessment, 'target_goal', None) or ''
+        labels = dict(getattr(assessment.__class__, 'GOAL_CHOICES', []))
+        weight_loss = None
+        try:
+            current_weight = assessment.measured_weight_kg
+            target_weight = getattr(assessment, 'target_weight_kg', None)
+            if current_weight and target_weight and float(current_weight) > float(target_weight):
+                weight_loss = float(current_weight) - float(target_weight)
+        except (TypeError, ValueError):
+            weight_loss = None
+        return {
+            'goal_code': code,
+            'goal_label': labels.get(code, ''),
+            'weight_loss_kg': weight_loss,
+            'stated_outcome': getattr(assessment, 'stated_goal_outcome', None),
+        }
+
+    @classmethod
     def waist_reduction_for_month(cls, assessment, month: int) -> float:
         """
         How much narrower the waist is illustrated at a given month.
@@ -570,6 +641,8 @@ class TransformationPipeline:
             ),
         }
 
+        goal_ctx = cls._goal_context(assessment)
+
         for month in MILESTONE_MONTHS:
             reduction = cls.waist_reduction_for_month(assessment, month)
             try:
@@ -578,6 +651,7 @@ class TransformationPipeline:
                     landmarks=baseline_joints,
                     waist_reduction_pct=reduction,
                     month=month,
+                    **goal_ctx,
                 )
             except TransformationError as exc:
                 result['rejected'][f'month_{month}'] = str(exc)
