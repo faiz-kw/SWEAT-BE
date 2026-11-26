@@ -277,7 +277,8 @@ def build_edit_prompt(
     if weight_loss_kg and weight_loss_kg > 0:
         parts.append(f'Consistent with losing roughly {weight_loss_kg:.0f} kg of body fat. ')
     parts.append(
-        'Keep it unmistakably the same person: identical face, hair, skin tone and clothing. '
+        'Keep it unmistakably the same person: identical face, exact same hairstyle, hairline and '
+        'facial hair, same skin tone and same clothing. '
         'Keep the exact same pose, stance, arm and leg position, foot placement, camera angle, '
         'framing, lighting and background - only the body fat changes. '
         'Do not move the limbs, feet or head, do not change height, do not alter the face. '
@@ -346,9 +347,11 @@ class ReplicateEditRenderer:
                 # Push the editor to actually apply the fat-loss edit rather than return a
                 # near-copy. Higher guidance = stronger prompt adherence; more steps = cleaner
                 # result. Tunable without a deploy via settings.
-                'guidance': float(getattr(settings, 'REPLICATE_FLUX_GUIDANCE', 4.5)),
+                'guidance': float(getattr(settings, 'REPLICATE_FLUX_GUIDANCE', 3.5)),
                 'num_inference_steps': int(getattr(settings, 'REPLICATE_FLUX_STEPS', 32)),
-                'prompt_upsampling': bool(getattr(settings, 'REPLICATE_FLUX_PROMPT_UPSAMPLING', True)),
+                # Prompt upsampling rewrites the prompt and tends to drift identity (e.g. change
+                # the hair), so keep it off - we want only the body fat to change.
+                'prompt_upsampling': bool(getattr(settings, 'REPLICATE_FLUX_PROMPT_UPSAMPLING', False)),
             }
         }
 
