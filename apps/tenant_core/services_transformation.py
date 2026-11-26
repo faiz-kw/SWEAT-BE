@@ -46,14 +46,16 @@ logger = logging.getLogger(__name__)
 MILESTONE_MONTHS = (1, 2, 3)
 
 # A joint that moves more than this share of the subject's height between the baseline and
-# the rendered image means the pose was not preserved, and the render is rejected.
-MAX_JOINT_DRIFT_RATIO = 0.04
+# the rendered image means the pose was not preserved, and the render is rejected. Hands, feet
+# and ankles naturally shift a little when a hosted editor reshapes the torso, so too tight a
+# limit discards otherwise-good previews; 8% still catches a genuinely moved or swapped limb.
+MAX_JOINT_DRIFT_RATIO = 0.08
 
 # Waist change we illustrate per month, as a share of the starting waist. Set so the
-# three-month trajectory is actually visible (a sub-2% change reads as "no change" to the
-# member), while staying inside what consistent training plausibly delivers and what the
-# pose verification will accept.
-WAIST_CHANGE_PCT_PER_MONTH = 3.0
+# three-month trajectory is clearly visible on a heavier starting frame (a sub-5% change still
+# reads as "no change" to the member), while staying inside what consistent training plausibly
+# delivers and what the pose verification will accept.
+WAIST_CHANGE_PCT_PER_MONTH = 5.0
 
 
 class TransformationError(Exception):
@@ -265,17 +267,19 @@ def build_edit_prompt(
         'a leaner, fitter build with a slimmer waist',
     )
     parts = [
-        f'Show the same person after a few months of consistent training, with {look}. ',
-        f'Reduce the waist and abdominal circumference by approximately {waist_reduction_pct:.0f} '
-        'percent and slim the torso to match. ',
+        f'Edit this photo to show the SAME person after several months of consistent training, with {look}. ',
+        f'Clearly and visibly reduce the belly and waist fat: trim the abdomen by about '
+        f'{waist_reduction_pct:.0f} percent so the stomach is noticeably flatter and the whole torso '
+        'looks leaner and tighter. The difference should be obvious at a glance, not subtle. ',
     ]
     if weight_loss_kg and weight_loss_kg > 0:
         parts.append(f'Consistent with losing roughly {weight_loss_kg:.0f} kg of body fat. ')
     parts.append(
-        'Keep it clearly the same person: same face, hair, skin tone, clothing and identity. '
-        'Keep the identical pose, camera angle, framing, lighting and background. '
-        'Do not change height, do not distort or rearrange limbs, do not alter the face. '
-        'A realistic, natural, believable photograph - not stylised, not exaggerated.'
+        'Keep it unmistakably the same person: identical face, hair, skin tone and clothing. '
+        'Keep the exact same pose, stance, arm and leg position, foot placement, camera angle, '
+        'framing, lighting and background - only the body fat changes. '
+        'Do not move the limbs, feet or head, do not change height, do not alter the face. '
+        'Keep it a realistic, believable photograph.'
     )
     return ''.join(parts)
 
