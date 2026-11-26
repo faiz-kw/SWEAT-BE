@@ -977,6 +977,12 @@ class MobileMeView(APIView):
         # Passport (cross-branch) sessions aggregated across ALL active memberships. Passport
         # can live on a different pack than the one in `active_membership` (the newest), so it
         # must be summed across every active pack rather than read from a single membership.
+        #
+        # Elite / credit-wallet memberships grant all-branch access by design: the universal
+        # credit wallet spends at any branch, so it IS the member's cross-branch capability. The
+        # app gates cross-branch booking on passport_sessions > 0, so an Elite member's remaining
+        # credits are counted here too — otherwise an Elite member (who can book anywhere) would
+        # be wrongly told to buy a passport at a non-home branch.
         from .models_memberships import MembershipEntitlement as _MEnt
         _today_me = timezone.now().date()
         _passport_remaining = Decimal('0')
@@ -986,13 +992,14 @@ class MobileMeView(APIView):
             membership__status='ACTIVE',
             membership__end_date__gte=_today_me,
             status='ACTIVE',
-            entitlement_type__in=['CROSS_BRANCH', 'CROSS_BRANCH_SESSION'],
+            entitlement_type__in=['CROSS_BRANCH', 'CROSS_BRANCH_SESSION', 'CREDIT_WALLET'],
         ):
             if getattr(_pe, 'is_unlimited', False):
                 _passport_unlimited = True
             else:
                 _passport_remaining += (_pe.remaining_units or Decimal('0'))
-        passport_sessions = 'Unlimited' if _passport_unlimited else float(_passport_remaining)
+        # Keep it numeric and > 0 for unlimited so the app's `passport_sessions > 0` gate passes.
+        passport_sessions = 999999 if _passport_unlimited else float(_passport_remaining)
         active_packs_count = Membership.objects.using(alias).filter(
             user_profile=profile, status='ACTIVE', end_date__gte=_today_me
         ).count()
