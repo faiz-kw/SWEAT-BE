@@ -302,6 +302,21 @@ def build_edit_prompt(
     return ''.join(parts)
 
 
+# Used on the SECOND pass of the hybrid renderer: the morph has already reshaped the body, so
+# this only asks the editor to repair the warp artefacts and restore a natural photographic
+# look - explicitly NOT to resize the body or touch the person.
+def build_refine_prompt() -> str:
+    return (
+        'This photo was lightly retouched and has small warping and stretching artefacts along '
+        'the body outline and background. Repair them so it looks like a natural, realistic, '
+        'un-edited photograph. Keep the body shape and size exactly as they are now, and keep '
+        'the exact same person: identical face, hairstyle, hairline, facial hair, skin, pose, '
+        'stance, limb and foot position, clothing, lighting and background. Do not slim, enlarge '
+        'or reshape the body, do not add muscle or abs, do not alter the face. Only smooth the '
+        'distortion and make it photorealistic.'
+    )
+
+
 class ReplicateEditRenderer:
     """
     Hosted image editing through Replicate.
@@ -332,6 +347,8 @@ class ReplicateEditRenderer:
         goal_label: Optional[str] = None,
         weight_loss_kg: Optional[float] = None,
         stated_outcome: Optional[str] = None,
+        prompt_override: Optional[str] = None,
+        guidance_override: Optional[float] = None,
         **_: Any,
     ) -> bytes:
         import base64
@@ -351,18 +368,19 @@ class ReplicateEditRenderer:
             'Prefer': 'wait=55',
         }
         data_uri = 'data:image/jpeg;base64,' + base64.b64encode(image_bytes).decode('ascii')
+        prompt = prompt_override if prompt_override else build_edit_prompt(
+            waist_reduction_pct, goal_code=goal_code, goal_label=goal_label,
+            weight_loss_kg=weight_loss_kg, stated_outcome=stated_outcome,
+        )
         payload = {
             'input': {
                 'input_image': data_uri,
-                'prompt': build_edit_prompt(
-                    waist_reduction_pct, goal_code=goal_code, goal_label=goal_label,
-                    weight_loss_kg=weight_loss_kg, stated_outcome=stated_outcome,
-                ),
+                'prompt': prompt,
                 'output_format': 'jpg',
-                # Push the editor to actually apply the fat-loss edit rather than return a
-                # near-copy. Higher guidance = stronger prompt adherence; more steps = cleaner
-                # result. Tunable without a deploy via settings.
-                'guidance': float(getattr(settings, 'REPLICATE_FLUX_GUIDANCE', 3.5)),
+                # Higher guidance = stronger prompt adherence; more steps = cleaner result.
+                # The refine pass passes a lower guidance_override so it only smooths.
+                'guidance': float(guidance_override if guidance_override is not None
+                                  else getattr(settings, 'REPLICATE_FLUX_GUIDANCE', 3.5)),
                 'num_inference_steps': int(getattr(settings, 'REPLICATE_FLUX_STEPS', 32)),
                 # Prompt upsampling rewrites the prompt and tends to drift identity (e.g. change
                 # the hair), so keep it off - we want only the body fat to change.
@@ -417,15 +435,57 @@ class ReplicateEditRenderer:
             raise TransformationError(f'Could not download the rendered image: {exc}') from exc
 
 
+class MorphRefineRenderer:
+    """
+    Hybrid: morph then refine.
+
+    The morph does the geometry - it reshapes the member's own pixels, so the slimmer silhouette
+    is real and identity is preserved exactly, but the warp leaves small artefacts that read as
+    "edited". The hosted editor then runs a SECOND, light pass whose only job is to repair those
+    artefacts and restore a natural photograph - it is told not to resize or reshape the body,
+    so there is little for it to drift on. This gives the believable slim of the morph with the
+    photographic finish of the generative editor.
+    """
+
+    name = 'morph_refine_v1'
+    is_generative = True
+
+    def __init__(self):
+        self.morph = SilhouetteMorphRenderer()
+        self.refiner = ReplicateEditRenderer()
+        self.cost_per_image_usd = self.refiner.cost_per_image_usd
+
+    def render(self, image_bytes: bytes, *, landmarks, waist_reduction_pct: float, **kw: Any) -> bytes:
+        morphed = self.morph.render(
+            image_bytes, landmarks=landmarks, waist_reduction_pct=waist_reduction_pct,
+        )
+        # If the geometry change is negligible, there is nothing worth a paid refine pass for.
+        if waist_reduction_pct <= 0.01:
+            return morphed
+        try:
+            return self.refiner.render(
+                morphed,
+                waist_reduction_pct=0.0,
+                prompt_override=build_refine_prompt(),
+                guidance_override=float(getattr(settings, 'REPLICATE_REFINE_GUIDANCE', 2.5)),
+            )
+        except TransformationError:
+            # If the refine pass fails, the morph alone is still a valid, identity-safe preview.
+            return morphed
+
+
 def get_renderer(name: Optional[str] = None):
     """
     Returns the configured renderer.
 
     Morph is the default: it costs nothing and preserves identity by construction. The hosted
     editors look better but send the member's photograph to a third party, so they are opt-in
-    and their output is verified against the baseline before anyone sees it.
+    and their output is verified against the baseline before anyone sees it. `morph_refine`
+    combines the two: morph for the shape, a light hosted pass for a natural finish.
     """
     choice = (name or getattr(settings, 'TRANSFORMATION_RENDERER', '') or 'morph').strip().lower()
+    if choice in ('morph_refine', 'hybrid', 'morph+replicate'):
+        return MorphRefineRenderer()
     if choice in ('fal', 'flux'):
         return FalEditRenderer()
     if choice in ('replicate', 'generative'):
