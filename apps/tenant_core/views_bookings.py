@@ -1464,6 +1464,33 @@ class CRMClassPassScanView(APIView):
                   .select_related('user_profile__user', 'booking__occurrence__class_template', 'branch')
                   .first())
         if not ap:
+            # The member booked this class but has no pass yet (e.g. never opened their app QR).
+            # Resolve their booking within THIS class by matching the deterministic QR token (or the
+            # booking number), and issue the pass on the spot so any booked member can be checked in.
+            from django.conf import settings as _settings
+            from datetime import timedelta as _td
+            from .services_access_control import generate_booking_qr_token
+            from .models_bookings import Booking as _Booking
+            _now = timezone.now()
+            cands = (_Booking.objects.using(alias)
+                     .filter(occurrence_id=occ_id, status__in=['CONFIRMED', 'BOOKED', 'ATTENDED'])
+                     .select_related('user_profile__user', 'occurrence__class_template', 'occurrence__branch'))
+            for b in cands:
+                expected = hash_qr_token(generate_booking_qr_token(str(b.id), _settings.SECRET_KEY))
+                if expected == token_hash or (b.booking_number and b.booking_number == token):
+                    occ = b.occurrence
+                    start_at = getattr(occ, 'start_at', None)
+                    end_at = getattr(occ, 'end_at', None)
+                    vfrom = (start_at - _td(hours=2)) if start_at else _now
+                    vuntil = ((end_at or (start_at + _td(hours=1))) + _td(hours=2)) if start_at else (_now + _td(hours=2))
+                    ap = AccessPass.objects.using(alias).create(
+                        booking=b, user_profile=b.user_profile, branch=occ.branch,
+                        token_hash=expected, pass_type='CLASS_BOOKING',
+                        valid_from=vfrom, valid_until=vuntil, status='ACTIVE',
+                    )
+                    token_hash = expected
+                    break
+        if not ap:
             return Response({'ok': False, 'reason': 'INVALID_PASS', 'message': 'Pass not recognised.'},
                             status=status.HTTP_200_OK)
 
