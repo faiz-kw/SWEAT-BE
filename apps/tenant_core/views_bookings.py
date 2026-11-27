@@ -1395,6 +1395,150 @@ class AccessControlSyncPassesView(APIView):
         }, status=status.HTTP_200_OK)
 
 
+class CRMClassPassScanView(APIView):
+    """
+    Staff-operated manual pass scan for a SPECIFIC class session — the front-desk fallback
+    until the physical turnstile is live.
+
+    POST /api/v1/tenant/access/class-pass-scan/
+      Body: { "token": "<QR code / 22-char token / 64-hex hash / booking number>",
+              "occurrence_id": "<class occurrence uuid>" }
+      Validates the member's booking pass belongs to THIS class, then toggles the pass:
+        ACTIVE -> IN (CONSUMED_ENTERED)  ->  OUT (CONSUMED_EXITED)  ->  already used.
+      Every IN/OUT is logged in AccessEvent (the in/out log).
+
+    GET /api/v1/tenant/access/class-pass-scan/?occurrence_id=<uuid>
+      Returns the in/out log for that class session.
+    """
+    permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
+    required_module = 'members'
+    required_submodule = 'attendance'
+    required_permission = 'members.attendance.edit'
+    permission_action_map = {'get': 'members.attendance.view'}
+
+    @staticmethod
+    def _member_name(profile):
+        try:
+            u = getattr(profile, 'user', None)
+            nm = (getattr(u, 'full_name', None) or '').strip() if u else ''
+            return nm or 'Member'
+        except Exception:
+            return 'Member'
+
+    @staticmethod
+    def _class_name(booking):
+        try:
+            occ = getattr(booking, 'occurrence', None)
+            tpl = getattr(occ, 'class_template', None) if occ else None
+            return (getattr(tpl, 'name', None) or 'Class')
+        except Exception:
+            return 'Class'
+
+    def post(self, request):
+        alias = _get_db(request)
+        from .services_access_control import hash_qr_token
+        from .models_attendance import AccessPass
+        from .services_bookings import BookingWaitlistAttendanceService
+
+        token = str(request.data.get('token') or '').strip()
+        occ_id = str(request.data.get('occurrence_id') or '').strip()
+        if not token:
+            return Response({'ok': False, 'reason': 'MISSING_TOKEN', 'message': 'No pass code provided.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if not occ_id:
+            return Response({'ok': False, 'reason': 'MISSING_CLASS', 'message': 'Class session is required.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        if len(token) == 64 and all(c in '0123456789abcdefABCDEF' for c in token):
+            token_hash = token.lower()
+        else:
+            token_hash = hash_qr_token(token)
+
+        ap = (AccessPass.objects.using(alias)
+              .filter(token_hash=token_hash)
+              .select_related('user_profile__user', 'booking__occurrence__class_template', 'branch')
+              .first())
+        if not ap:
+            ap = (AccessPass.objects.using(alias)
+                  .filter(booking__booking_number=token)
+                  .select_related('user_profile__user', 'booking__occurrence__class_template', 'branch')
+                  .first())
+        if not ap:
+            return Response({'ok': False, 'reason': 'INVALID_PASS', 'message': 'Pass not recognised.'},
+                            status=status.HTTP_200_OK)
+
+        booking = ap.booking
+        member_name = self._member_name(ap.user_profile)
+        member_number = getattr(ap.user_profile, 'member_number', None) or ''
+
+        # Class-specific: the pass's booking must be for THIS class session.
+        if not booking or str(getattr(booking, 'occurrence_id', '')) != occ_id:
+            return Response({'ok': False, 'reason': 'WRONG_CLASS', 'member_name': member_name,
+                             'message': f'{member_name} is not booked for this class.'},
+                            status=status.HTTP_200_OK)
+
+        now = timezone.now()
+        class_name = self._class_name(booking)
+
+        if ap.status == 'CANCELLED':
+            return Response({'ok': False, 'reason': 'CANCELLED', 'member_name': member_name,
+                             'message': 'This pass is cancelled.'}, status=status.HTTP_200_OK)
+        if ap.status == 'ACTIVE' and ap.valid_until and ap.valid_until < now:
+            ap.status = 'EXPIRED'
+            ap.save(using=alias, update_fields=['status', 'updated_at'])
+        if ap.status == 'EXPIRED':
+            return Response({'ok': False, 'reason': 'EXPIRED', 'member_name': member_name,
+                             'message': 'This pass has expired.'}, status=status.HTTP_200_OK)
+
+        def _log(evt):
+            BookingWaitlistAttendanceService.log_access_event(
+                user_profile=ap.user_profile, branch=ap.branch, event_type=evt, direction=evt,
+                booking=booking, token_hash=token_hash, device_reference='CRM_MANUAL_SCAN',
+                provider_reference='CRM_MANUAL', reconciliation_status='NORMAL', db_alias=alias,
+            )
+
+        if ap.status == 'ACTIVE':
+            ap.status = 'CONSUMED_ENTERED'
+            ap.consumed_at = now
+            ap.save(using=alias, update_fields=['status', 'consumed_at', 'updated_at'])
+            _log('ENTRY')
+            return Response({'ok': True, 'action': 'IN', 'direction': 'ENTRY', 'member_name': member_name,
+                             'member_number': member_number, 'class_name': class_name, 'time': now.isoformat(),
+                             'message': f'{member_name} checked IN.'}, status=status.HTTP_200_OK)
+
+        if ap.status == 'CONSUMED_ENTERED':
+            ap.status = 'CONSUMED_EXITED'
+            ap.save(using=alias, update_fields=['status', 'updated_at'])
+            _log('EXIT')
+            return Response({'ok': True, 'action': 'OUT', 'direction': 'EXIT', 'member_name': member_name,
+                             'member_number': member_number, 'class_name': class_name, 'time': now.isoformat(),
+                             'message': f'{member_name} checked OUT.'}, status=status.HTTP_200_OK)
+
+        # CONSUMED_EXITED -> both in & out already done
+        return Response({'ok': False, 'reason': 'ALREADY_USED', 'action': 'USED', 'member_name': member_name,
+                         'member_number': member_number, 'class_name': class_name,
+                         'message': f"{member_name}'s pass is already used (in & out done)."},
+                        status=status.HTTP_200_OK)
+
+    def get(self, request):
+        alias = _get_db(request)
+        from .models_attendance import AccessEvent
+        occ_id = str(request.query_params.get('occurrence_id') or '').strip()
+        if not occ_id:
+            return Response({'ok': False, 'reason': 'MISSING_CLASS', 'message': 'Class session is required.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        qs = (AccessEvent.objects.using(alias)
+              .filter(booking__occurrence_id=occ_id, event_type__in=['ENTRY', 'EXIT'])
+              .select_related('user_profile__user')
+              .order_by('-created_at')[:200])
+        events = [{
+            'member_name': self._member_name(e.user_profile),
+            'direction': (e.direction or e.event_type or '').upper(),
+            'time': e.created_at.isoformat() if e.created_at else None,
+        } for e in qs]
+        return Response({'ok': True, 'events': events}, status=status.HTTP_200_OK)
+
+
 class TurnstileVerifyPunchView(APIView):
     """
     POST /api/v1/tenant/access/turnstile/verify-punch/
