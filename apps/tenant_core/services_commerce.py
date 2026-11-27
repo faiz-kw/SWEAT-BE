@@ -9,6 +9,7 @@ Key Rules Enforced:
 4. Comprehensive Auditing & Outbox: Emits structured business audits and reliable domain outbox events.
 """
 
+import logging
 import uuid
 from decimal import Decimal
 from datetime import datetime, timedelta
@@ -454,7 +455,56 @@ class CommerceService:
             raise ValidationError(f"Cannot generate payment link for order with status {order.status}.")
 
         expires_at = timezone.now() + timedelta(hours=expiry_hours)
-        payment_url = f"https://pay.sweat.fit/order/{order.order_number}?token={uuid.uuid4().hex}"
+
+        # Generate a REAL Razorpay payment link so the shared link actually collects money and the
+        # webhook can match the payment back to this order (via notes) and activate the membership.
+        # Falls back to a recorded-only link if the gateway is unavailable, so the staff flow never breaks.
+        payment_url = None
+        provider_ref = None
+        if provider == 'RAZORPAY':
+            try:
+                from .services_razorpay import RazorpayService
+
+                cust_name = cust_email = cust_phone = None
+                if order.user_profile:
+                    up = order.user_profile
+                    cust_name = (getattr(up, 'full_name', None) or '').strip() or None
+                    cust_email = getattr(up, 'email', None) or None
+                    cust_phone = getattr(up, 'phone', None) or None
+                elif order.lead:
+                    ld = order.lead
+                    cust_name = (getattr(ld, 'name', None) or '').strip() or None
+                    cust_email = getattr(ld, 'email_normalized', None) or getattr(ld, 'email', None) or None
+                    cust_phone = getattr(ld, 'phone_normalized', None) or getattr(ld, 'phone', None) or None
+
+                amount_paise = int(round(float(order.total_amount) * 100))
+                resp = RazorpayService.create_payment_link(
+                    amount_paise=amount_paise,
+                    description=f"SWEAT membership - Order {order.order_number}",
+                    customer_name=cust_name,
+                    customer_email=cust_email,
+                    customer_phone=cust_phone,
+                    reference_id=order.order_number,
+                    notes={
+                        # 'internal_order_id' is the exact key the Razorpay webhook finalizer looks up
+                        # to match the payment back to this order and activate the membership.
+                        'internal_order_id': str(order.id),
+                        'order_number': order.order_number,
+                        'user_profile_id': str(order.user_profile_id) if order.user_profile_id else '',
+                        'source': 'crm_payment_link',
+                    },
+                    db_alias=alias,
+                )
+                payment_url = resp.get('short_url')
+                provider_ref = resp.get('id')
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "Razorpay payment link failed for order %s: %s; recording link without a live gateway URL",
+                    order.order_number, exc,
+                )
+
+        if not payment_url:
+            payment_url = f"https://pay.sweat.fit/order/{order.order_number}?token={uuid.uuid4().hex}"
 
         link = PaymentLink(
             order=order,
@@ -468,6 +518,8 @@ class CommerceService:
             status='CREATED',
             created_by_user=actor,
         )
+        if provider_ref:
+            link.provider_reference = provider_ref
         link.save(using=alias)
 
         PaymentLinkEvent.objects.using(alias).create(
