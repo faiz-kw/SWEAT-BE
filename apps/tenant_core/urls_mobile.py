@@ -90,6 +90,7 @@ urlpatterns = [
     path('experience-studio/', ExperienceStudioView.as_view(), name='mobile-experience-studio'),
     path('notifications/', MobileNotificationsView.as_view(), name='mobile-notifications'),
     path('bookings/book/', MobileBookClassView.as_view(), name='mobile-book-class'),
+    path('bookings/book-guest/', MobileBookClassView.as_view(), name='mobile-book-guest'),
     path('bookings/my-bookings/', MobileMyBookingsView.as_view(), name='mobile-my-bookings'),
     path('bookings/', MobileMyBookingsView.as_view(), name='mobile-bookings-direct'),
     path('bookings/<uuid:booking_id>/cancel/', MobileCancelBookingView.as_view(), name='mobile-cancel-booking'),

@@ -527,6 +527,47 @@ class TurnstileFleetTests(TestCase):
             self.assertEqual(kwargs['json']['branch_id'], str(self.branch_andheri.id))
             self.assertEqual(kwargs['json']['device_reference'], 'Andheri Pilates Entry')
 
+            # Verify _listen_terminal dispatches single small (<512B) AccessControl event via readline()
+            import threading as _th
+            stop_ev = _th.Event()
+            lines = [
+                b'--myboundary\r\n',
+                b'Content-Type: text/plain\r\n',
+                b'Code=AccessControl;action=Pulse;index=0;data={\r\n',
+                b'  "CardNo" : "SmallEventTok123"\r\n',
+                b'}\r\n',
+                b'',
+            ]
+            line_iter = iter(lines)
+            stream_mock2 = MagicMock()
+            stream_mock2.headers = {'Content-Type': 'multipart/x-mixed-replace; boundary=myboundary'}
+            def _next_line():
+                val = next(line_iter, b'')
+                if not val:
+                    stop_ev.set()
+                return val
+            stream_mock2.readline.side_effect = _next_line
+            ctx2 = MagicMock()
+            ctx2.__enter__.return_value = stream_mock2
+            ctx2.__exit__.return_value = False
+            opener2 = MagicMock()
+            opener2.open.return_value = ctx2
+
+            captured = []
+            with patch('urllib.request.build_opener', return_value=opener2), \
+                 patch.object(mod, '_process_scan', side_effect=lambda c, d, t: captured.append((c, d, t.name))):
+                mod._listen_terminal(term, stop_ev)
+                import time as _t; _t.sleep(0.05)
+            self.assertEqual(captured, [('SmallEventTok123', 'ENTRY', 'Andheri Pilates Entry')])
+
+            # Verify _process_scan on ENTRY opens gate and deletes card from terminal
+            with patch.object(mod, '_verify_token_with_cloud', return_value={'allow_access': True, 'user_name': 'Aarav'}), \
+                 patch.object(mod, '_open_physical_gate') as open_spy, \
+                 patch.object(mod, '_delete_cards_batch') as del_spy:
+                mod._process_scan('SmallEventTok123', 'ENTRY', term)
+            open_spy.assert_called_once()
+            del_spy.assert_called_once_with(term, ['SmallEventTok123'])
+
     def test_trial_booking_active_tokens_public_pass_punch_and_lifecycle(self):
         from django.conf import settings
         TenantDataSource.objects.using('default').create(
@@ -747,3 +788,153 @@ class TurnstileFleetTests(TestCase):
             req_punch._tenant_alias = self.db
             res_punch = TurnstileVerifyPunchView.as_view()(req_punch)
             self.assertFalse(res_punch.data['allow_access'])
+
+    def test_dahua_failcode_286064919_remove_fallback_and_doorcard_events(self):
+        import importlib.util
+        import json
+        import threading
+        from django.conf import settings
+        from apps.tenant_core import dahua_rpc
+
+        daemon_path = os.path.join(os.path.dirname(str(settings.BASE_DIR)), 'sweat_turnstile_daemon.py')
+        spec = importlib.util.spec_from_file_location('sweat_turnstile_daemon_v2_test', daemon_path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules['sweat_turnstile_daemon_v2_test'] = mod
+        spec.loader.exec_module(mod)
+
+        class _FakeResp:
+            def __init__(self, payload):
+                self._payload = payload
+                self.text = json.dumps(payload)
+
+            def json(self):
+                return self._payload
+
+        with patch.dict(os.environ, {
+            'SWEAT_BRANCH_ID': 'e6a23bd5-cdf7-4fd9-a921-9bc848db4052',
+            'TURNSTILE_SYNC_SECRET': self.sync_secret,
+            'TURNSTILE_GATEWAY_API_KEY': 'gw-key-xyz',
+            'DAHUA_ADMIN_PASS': 'pw123',
+        }):
+            mod._init_config()
+
+            # 1. dahua_rpc.register_card treats FailCodes [286064919] as already-registered (True)
+            sess_dup = MagicMock()
+            sess_dup.post.side_effect = [
+                _FakeResp({'id': 10, 'result': True}),
+                _FakeResp({'error': {'code': 268632336, 'detail': {'FailCodes': [286064919]}, 'message': 'Batch Process Error'}, 'id': 11, 'result': False}),
+            ]
+            with patch.object(dahua_rpc, '_dahua_login', return_value=(sess_dup, 'sid-1')):
+                self.assertTrue(dahua_rpc.register_card('http://192.168.1.119', 'P123', 'Test', 'DupTok123456'))
+
+            # 2. dahua_rpc.delete_cards falls back to AccessCard.removeMulti when deleteMulti returns False
+            sess_del = MagicMock()
+            sess_del.post.side_effect = [
+                _FakeResp({'id': 20, 'result': False}),
+                _FakeResp({'id': 21, 'result': True}),
+            ]
+            with patch.object(dahua_rpc, '_dahua_login', return_value=(sess_del, 'sid-2')):
+                self.assertTrue(dahua_rpc.delete_cards('http://192.168.1.119', ['Tok123']))
+            self.assertEqual(sess_del.post.call_args_list[0].kwargs['json']['method'], 'AccessCard.deleteMulti')
+            self.assertEqual(sess_del.post.call_args_list[1].kwargs['json']['method'], 'AccessCard.removeMulti')
+
+            # 3. Daemon _register_cards_batch & _delete_cards_batch handle 286064919 and removeMulti fallback
+            term = mod.TerminalConfig(
+                name='Goregaon Entry',
+                base_url='http://192.168.1.119',
+                direction='ENTRY',
+                class_category_code='',
+                is_active=True,
+                branch_id='e6a23bd5-cdf7-4fd9-a921-9bc848db4052',
+            )
+            mod._synced_cards.clear()
+            mod._card_users.clear()
+            mod._purged_cards.clear()
+            mod._confirmed_revoked.clear()
+            mod._last_seen.clear()
+
+            d_sess_reg = MagicMock()
+            d_sess_reg.post.side_effect = [
+                _FakeResp({'id': 10, 'result': True}),
+                _FakeResp({'error': {'code': 268632336, 'detail': {'FailCodes': [286064919]}, 'message': 'Batch Process Error'}, 'id': 11, 'result': False}),
+            ]
+            with patch.object(mod, '_dahua_login', return_value=(d_sess_reg, 'sid-3')):
+                ok_count = mod._register_cards_batch(
+                    term,
+                    [('P920faed', 'Test User', 'TokDup2860', '2026-11-25 21:00:00', '2026-11-25 23:00:00')],
+                )
+            self.assertEqual(ok_count, 1)
+            self.assertIn(('http://192.168.1.119', 'TokDup2860'), mod._synced_cards)
+
+            # Falls back through deleteMulti -> removeMulti -> AccessUser.removeMulti
+            d_sess_del = MagicMock()
+            d_sess_del.post.side_effect = [
+                _FakeResp({'id': 20, 'result': False}),
+                _FakeResp({'id': 21, 'result': False}),
+                _FakeResp({'id': 22, 'result': True}),
+            ]
+            with patch.object(mod, '_dahua_login', return_value=(d_sess_del, 'sid-4')):
+                self.assertTrue(mod._delete_cards_batch(term, ['TokDup2860']))
+            self.assertEqual(d_sess_del.post.call_args_list[2].kwargs['json']['method'], 'AccessUser.removeMulti')
+            self.assertEqual(d_sess_del.post.call_args_list[2].kwargs['json']['params'], {'UserIDList': ['P920faed']})
+            self.assertNotIn(('http://192.168.1.119', 'TokDup2860'), mod._synced_cards)
+
+            # Anti-resync guard prevents an in-flight sync batch from re-pushing a just-purged token
+            with patch.object(mod, '_dahua_login') as login_spy:
+                re_pushed = mod._register_cards_batch(
+                    term,
+                    [('P920faed', 'Test User', 'TokDup2860', '2026-11-25 21:00:00', '2026-11-25 23:00:00')],
+                )
+            self.assertEqual(re_pushed, 0)
+            login_spy.assert_not_called()
+
+            # 4. _listen_terminal parses Code=_DoorCard_ and skips RFID Code=DoorCard ("Number" only)
+            lines = [
+                b'--myboundary\r\n',
+                b'Content-Type: text/plain\r\n',
+                b'Code=DoorCard;action=Pulse;index=0;data={\n',
+                b'   "Number" : "0238107985"\n',
+                b'}\r\n',
+                b'Code=_DoorCard_;action=Pulse;index=0;data={\n',
+                b'   "CardNo" : "DoorCardTok99"\n',
+                b'}\r\n',
+                b'',
+            ]
+            line_iter = iter(lines)
+            stop_ev = threading.Event()
+            done_ev = threading.Event()
+            stream_mock = MagicMock()
+            stream_mock.headers = {'Content-Type': 'multipart/x-mixed-replace; boundary=myboundary'}
+
+            def _next_line():
+                val = next(line_iter, b'')
+                if not val:
+                    stop_ev.set()
+                return val
+
+            stream_mock.readline.side_effect = _next_line
+            ctx = MagicMock()
+            ctx.__enter__.return_value = stream_mock
+            ctx.__exit__.return_value = False
+            fake_opener = MagicMock()
+            fake_opener.open.return_value = ctx
+
+            captured = []
+
+            def _record_scan(card_no, direction, t):
+                captured.append((card_no, direction))
+                done_ev.set()
+
+            with patch('urllib.request.build_opener', return_value=fake_opener), \
+                 patch.object(mod, '_process_scan', side_effect=_record_scan):
+                mod._listen_terminal(term, stop_ev)
+                self.assertTrue(done_ev.wait(timeout=1.0))
+            self.assertEqual(captured, [('DoorCardTok99', 'ENTRY')])
+
+            # 5. _process_scan purges card BEFORE opening gate on ENTRY
+            call_order = []
+            with patch.object(mod, '_verify_token_with_cloud', return_value={'allow_access': True, 'user_name': 'Kunal'}), \
+                 patch.object(mod, '_delete_cards_batch', side_effect=lambda t, cards: call_order.append(('delete', list(cards))) or True), \
+                 patch.object(mod, '_open_physical_gate', side_effect=lambda url, lbl: call_order.append(('open', url)) or True):
+                mod._process_scan('DoorCardTok99', 'ENTRY', term)
+            self.assertEqual(call_order, [('delete', ['DoorCardTok99']), ('open', 'http://192.168.1.119')])

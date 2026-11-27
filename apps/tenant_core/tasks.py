@@ -632,6 +632,53 @@ def recycle_stale_leads_periodic_task(self, tenant_id: str = None, dry_run: bool
     }
 
 
+@shared_task(
+    bind=True,
+    name='apps.tenant_core.tasks.expire_overdue_memberships_periodic_task',
+    max_retries=2,
+    acks_late=True,
+)
+def expire_overdue_memberships_periodic_task(self, tenant_id: str = None, max_scan: int = 500, **kwargs) -> dict:
+    """
+    Periodic task to transition overdue ACTIVE memberships (end_date < today) to EXPIRED,
+    expire active entitlements with ledger entries, and update member profile statuses.
+    """
+    from .services_memberships import MembershipLifecycleService
+
+    if tenant_id:
+        tenant_ids = [tenant_id]
+    else:
+        try:
+            from apps.master.models import TenantDataSource
+            tenant_ids = list(
+                TenantDataSource.objects.using('default')
+                .filter(status='ACTIVE')
+                .values_list('tenant_id', flat=True)
+            )
+        except Exception:
+            tenant_ids = []
+
+    total_results = []
+    for tid in tenant_ids:
+        try:
+            with tenant_database_context(tid) as db_alias:
+                res = MembershipLifecycleService.expire_overdue_memberships(
+                    db_alias=db_alias,
+                    max_scan=max_scan,
+                )
+                if res.get('expired_memberships') or res.get('errors'):
+                    logger.info("Expired overdue memberships tenant=%s: %s", tid, res)
+                total_results.append({'tenant_id': str(tid), 'results': res})
+        except Exception as exc:
+            logger.error("expire_overdue_memberships_periodic_task error for tenant %s: %s", tid, exc, exc_info=True)
+
+    return {
+        'status': 'COMPLETED',
+        'tenants_processed': len(tenant_ids),
+        'results': total_results,
+    }
+
+
 # Ensure specialized task modules are loaded and registered when Celery imports tasks.py
 from .tasks_voice_calling import (  # noqa: F401
     trigger_automated_sarvam_call_task,
@@ -695,6 +742,53 @@ def process_trial_whatsapp_lifecycle_periodic_task(self, tenant_id: str = None, 
 
 @shared_task(
     bind=True,
+    name='apps.tenant_core.tasks.expire_overdue_memberships_periodic_task',
+    max_retries=2,
+    acks_late=True,
+)
+def expire_overdue_memberships_periodic_task(self, tenant_id: str = None, max_scan: int = 500, **kwargs) -> dict:
+    """
+    Periodic task to transition overdue ACTIVE memberships (end_date < today) to EXPIRED,
+    expire active entitlements with ledger entries, and update member profile statuses.
+    """
+    from .services_memberships import MembershipLifecycleService
+
+    if tenant_id:
+        tenant_ids = [tenant_id]
+    else:
+        try:
+            from apps.master.models import TenantDataSource
+            tenant_ids = list(
+                TenantDataSource.objects.using('default')
+                .filter(status='ACTIVE')
+                .values_list('tenant_id', flat=True)
+            )
+        except Exception:
+            tenant_ids = []
+
+    total_results = []
+    for tid in tenant_ids:
+        try:
+            with tenant_database_context(tid) as db_alias:
+                res = MembershipLifecycleService.expire_overdue_memberships(
+                    db_alias=db_alias,
+                    max_scan=max_scan,
+                )
+                if res.get('expired_memberships') or res.get('errors'):
+                    logger.info("Expired overdue memberships tenant=%s: %s", tid, res)
+                total_results.append({'tenant_id': str(tid), 'results': res})
+        except Exception as exc:
+            logger.error("expire_overdue_memberships_periodic_task error for tenant %s: %s", tid, exc, exc_info=True)
+
+    return {
+        'status': 'COMPLETED',
+        'tenants_processed': len(tenant_ids),
+        'results': total_results,
+    }
+
+
+@shared_task(
+    bind=True,
     name='apps.tenant_core.tasks.reconcile_pending_payment_orders_periodic_task',
     max_retries=2,
     acks_late=True,
@@ -743,6 +837,53 @@ def reconcile_pending_payment_orders_periodic_task(self, tenant_id: str = None, 
                 total_results.append({'tenant_id': str(tid), 'results': res})
         except Exception as exc:
             logger.error("reconcile_pending_payment_orders_periodic_task error for tenant %s: %s", tid, exc, exc_info=True)
+
+    return {
+        'status': 'COMPLETED',
+        'tenants_processed': len(tenant_ids),
+        'results': total_results,
+    }
+
+
+@shared_task(
+    bind=True,
+    name='apps.tenant_core.tasks.expire_overdue_memberships_periodic_task',
+    max_retries=2,
+    acks_late=True,
+)
+def expire_overdue_memberships_periodic_task(self, tenant_id: str = None, max_scan: int = 500, **kwargs) -> dict:
+    """
+    Periodic task to transition overdue ACTIVE memberships (end_date < today) to EXPIRED,
+    expire active entitlements with ledger entries, and update member profile statuses.
+    """
+    from .services_memberships import MembershipLifecycleService
+
+    if tenant_id:
+        tenant_ids = [tenant_id]
+    else:
+        try:
+            from apps.master.models import TenantDataSource
+            tenant_ids = list(
+                TenantDataSource.objects.using('default')
+                .filter(status='ACTIVE')
+                .values_list('tenant_id', flat=True)
+            )
+        except Exception:
+            tenant_ids = []
+
+    total_results = []
+    for tid in tenant_ids:
+        try:
+            with tenant_database_context(tid) as db_alias:
+                res = MembershipLifecycleService.expire_overdue_memberships(
+                    db_alias=db_alias,
+                    max_scan=max_scan,
+                )
+                if res.get('expired_memberships') or res.get('errors'):
+                    logger.info("Expired overdue memberships tenant=%s: %s", tid, res)
+                total_results.append({'tenant_id': str(tid), 'results': res})
+        except Exception as exc:
+            logger.error("expire_overdue_memberships_periodic_task error for tenant %s: %s", tid, exc, exc_info=True)
 
     return {
         'status': 'COMPLETED',

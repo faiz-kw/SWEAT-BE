@@ -78,15 +78,25 @@ class MobileMembershipHistoryView(APIView):
                 .order_by('-start_date', '-created_at'))
         out = []
         for m in mems:
-            total = 0
-            used = 0
+            total = 0.0
+            used = 0.0
             unlimited = False
+            is_credit_based = False
             for e in MembershipEntitlement.objects.using(alias).filter(membership=m):
+                et_low = (getattr(e, 'entitlement_type', '') or '').lower()
+                if 'credit' in et_low or 'wallet' in et_low:
+                    is_credit_based = True
                 if getattr(e, 'is_unlimited', False):
                     unlimited = True
                     continue
-                total += int(getattr(e, 'allocated_units', 0) or 0)
-                used += int(getattr(e, 'consumed_units', 0) or 0)
+                total += float(getattr(e, 'allocated_units', 0) or 0)
+                used += float(getattr(e, 'consumed_units', 0) or 0)
+            total = round(total, 2)
+            used = round(used, 2)
+            rem = round(max(0.0, total - used), 2)
+            total_disp = int(total) if total == int(total) else total
+            used_disp = int(used) if used == int(used) else used
+            rem_disp = int(rem) if rem == int(rem) else rem
             inv = _invoice_for_order(alias, getattr(m, 'source_order', None))
             invoice_url = None
             invoice_number = None
@@ -100,11 +110,12 @@ class MobileMembershipHistoryView(APIView):
                 'package_name': getattr(m.package, 'name', 'Membership'),
                 'status': m.status,
                 'is_active': m.status == 'ACTIVE' and (not m.end_date or m.end_date >= today),
+                'is_credit_based': is_credit_based,
                 'sessions_unlimited': unlimited,
-                'sessions_total': total,
-                'sessions_used': used,
-                'sessions_remaining': max(0, total - used),
-                'sessions_label': 'Unlimited' if unlimited else ('%d / %d used' % (used, total)),
+                'sessions_total': total_disp,
+                'sessions_used': used_disp,
+                'sessions_remaining': rem_disp,
+                'sessions_label': 'Unlimited' if unlimited else ('%s / %s used' % (used_disp, total_disp)),
                 'start_date': m.start_date.isoformat() if m.start_date else None,
                 'end_date': m.end_date.isoformat() if m.end_date else None,
                 'branch_name': getattr(m.home_branch, 'name', '') if getattr(m, 'home_branch', None) else '',

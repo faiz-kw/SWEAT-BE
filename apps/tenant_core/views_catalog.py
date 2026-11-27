@@ -1024,6 +1024,7 @@ class PackageViewSet(viewsets.ModelViewSet):
                 only_for_trial=request.data.get('only_for_trial', False),
                 show_on_web=request.data.get('show_on_web', True),
                 show_on_app=request.data.get('show_on_app', True),
+                perks_config=request.data.get('perks_config') if isinstance(request.data.get('perks_config'), dict) else {},
                 status='DRAFT' if wants_active else request.data.get('status', 'DRAFT'),
                 db_alias=alias,
             )

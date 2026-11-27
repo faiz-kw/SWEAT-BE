@@ -159,6 +159,11 @@ class MembershipContractSnapshot(models.Model):
     end_date = models.DateField()
     entitlements_snapshot = models.JSONField(default=list)
     class_access_snapshot = models.JSONField(default=list, null=True, blank=True)
+    perks_config = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Frozen snapshot of PackageVersion.perks_config at purchase time.",
+    )
     purchase_branch = models.ForeignKey(Branch, on_delete=models.PROTECT, related_name='+')
     terms_document_version_ids = models.JSONField(default=list, blank=True)
     applicable_policy_versions = models.JSONField(default=dict, blank=True)
@@ -578,6 +583,11 @@ class MembershipPackageHistory(models.Model):
     from_package_version = models.ForeignKey(PackageVersion, on_delete=models.PROTECT, null=True, blank=True, related_name='+')
     to_package = models.ForeignKey(Package, on_delete=models.PROTECT, related_name='+')
     to_package_version = models.ForeignKey(PackageVersion, on_delete=models.PROTECT, related_name='+')
+    perks_snapshot = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Frozen snapshot of to_package_version.perks_config at transition time.",
+    )
     change_type = models.CharField(max_length=30, choices=CHANGE_TYPE_CHOICES)
     effective_at = models.DateTimeField(default=timezone.now)
     order = models.ForeignKey(Order, on_delete=models.PROTECT, null=True, blank=True, related_name='+')

@@ -47,6 +47,7 @@ DEFAULT_BOOKING_POLICY: Dict[str, Any] = {
     'cancellation_cutoff_hours': 2,
     'rescheduling_cutoff_hours': 2,
     'max_reschedules_per_booking': 2,
+    'reschedule_credit_diff_mode': 'ADJUST_DIFFERENCE',
 
     # 4. Late cancellation policy
     'late_cancellation_allowed': True,
@@ -181,6 +182,7 @@ class BookingPolicyService:
                 'cancellation_cutoff_hours',
                 'rescheduling_cutoff_hours',
                 'max_reschedules_per_booking',
+                'reschedule_credit_diff_mode',
                 'late_cancellation_allowed',
                 'late_cancellation_session_action',
                 'late_cancellation_fee',

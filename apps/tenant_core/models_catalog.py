@@ -407,6 +407,11 @@ class PackageVersion(models.Model):
     only_for_trial = models.BooleanField(default=False)
     show_on_web = models.BooleanField(default=True)
     show_on_app = models.BooleanField(default=True)
+    perks_config = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Dynamic UI-configurable perks: assessments, guest passes, PT credit rate, advance booking override, branch access mode."
+    )
     effective_from = models.DateTimeField()
     effective_until = models.DateTimeField(null=True, blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='DRAFT')

@@ -729,7 +729,7 @@ class PackageVersionSerializer(serializers.ModelSerializer):
             'id', 'package', 'package_code', 'package_name', 'version_number',
             'name_snapshot', 'description_snapshot', 'duration_value', 'duration_unit',
             'total_days', 'validity_days', 'is_trial_package', 'is_trial',
-            'only_for_trial', 'show_on_web', 'show_on_app',
+            'only_for_trial', 'show_on_web', 'show_on_app', 'perks_config',
             'effective_from', 'effective_until', 'published_at',
             'status', 'prices', 'effective_price', 'currency', 'allow_partial_payment', 'credits', 'entitlement_definitions',
             'created_by_user', 'created_at', 'updated_at',
@@ -1006,6 +1006,7 @@ class PackageSerializer(serializers.ModelSerializer):
                 'show_on_app': active.show_on_app,
                 'status': active.status,
                 'credits': credits_val,
+                'perks_config': active.perks_config or {},
                 'prices': prices,
                 'entitlements': entitlements,
             }

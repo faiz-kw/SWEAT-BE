@@ -304,6 +304,7 @@ class PackageCatalogService:
         only_for_trial: bool = False,
         show_on_web: bool = True,
         show_on_app: bool = True,
+        perks_config: Optional[dict] = None,
         effective_from: Optional[timezone.datetime] = None,
         effective_until: Optional[timezone.datetime] = None,
         status: str = 'DRAFT',
@@ -344,6 +345,7 @@ class PackageCatalogService:
             only_for_trial=only_for_trial,
             show_on_web=show_on_web,
             show_on_app=show_on_app,
+            perks_config=perks_config if isinstance(perks_config, dict) else {},
             effective_from=effective_from,
             effective_until=effective_until,
             status=status,
@@ -473,6 +475,12 @@ class PackageCatalogService:
             )
             return pkg_ver
 
+    @staticmethod
+    def _copy_perks_config(raw_perks: Any) -> Dict[str, Any]:
+        """Returns an isolated deep copy of a perks_config dict so cloned versions never share references."""
+        import copy
+        return copy.deepcopy(raw_perks) if isinstance(raw_perks, dict) else {}
+
     @classmethod
     def reuse_package_version(
         cls,
@@ -482,7 +490,7 @@ class PackageCatalogService:
     ) -> PackageVersion:
         """
         Clones an existing (typically RETIRED) version into a new DRAFT with the next version number.
-        Deep-copies prices, entitlements, and access rules so historical versions remain immutable.
+        Deep-copies prices, entitlements, perks_config, and access rules so historical versions remain immutable.
         """
         alias = _get_alias(db_alias)
         with transaction.atomic(using=alias):
@@ -506,6 +514,7 @@ class PackageCatalogService:
                 only_for_trial=source.only_for_trial,
                 show_on_web=source.show_on_web,
                 show_on_app=source.show_on_app,
+                perks_config=cls._copy_perks_config(source.perks_config),
                 effective_from=timezone.now(),
                 effective_until=None,
                 status='DRAFT',
@@ -589,7 +598,10 @@ class PackageCatalogService:
             if existing.status == 'DRAFT':
                 for key, val in modifications.items():
                     if hasattr(existing, key):
-                        setattr(existing, key, val)
+                        if key == 'perks_config':
+                            setattr(existing, key, cls._copy_perks_config(val))
+                        else:
+                            setattr(existing, key, val)
                 existing.save(using=alias)
                 return existing
 
@@ -600,6 +612,11 @@ class PackageCatalogService:
             next_ver = latest_version.version_number + 1
 
             trial_flag = modifications.get('is_trial', modifications.get('is_trial_package', existing.is_trial))
+            perks_snapshot = (
+                cls._copy_perks_config(modifications['perks_config'])
+                if 'perks_config' in modifications and isinstance(modifications.get('perks_config'), dict)
+                else cls._copy_perks_config(existing.perks_config)
+            )
 
             new_version = PackageVersion(
                 package=existing.package,
@@ -615,6 +632,7 @@ class PackageCatalogService:
                 only_for_trial=modifications.get('only_for_trial', existing.only_for_trial),
                 show_on_web=modifications.get('show_on_web', existing.show_on_web),
                 show_on_app=modifications.get('show_on_app', existing.show_on_app),
+                perks_config=perks_snapshot,
                 effective_from=modifications.get('effective_from', timezone.now()),
                 effective_until=modifications.get('effective_until', None),
                 status='DRAFT',

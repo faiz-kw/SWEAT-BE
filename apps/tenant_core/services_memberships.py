@@ -167,6 +167,8 @@ class MembershipLifecycleService:
             if not terms_acc_ids and order.user_profile:
                 terms_acc_ids = list(TermsAcceptance.objects.using(alias).filter(user_profile=order.user_profile).order_by('-accepted_at').values_list('terms_document_version_id', flat=True)[:1])
 
+            import copy
+            ver_perks = getattr(package_version, 'perks_config', None) if package_version else None
             # Create Immutable Contract Snapshot
             contract_snapshot = MembershipContractSnapshot.objects.using(alias).create(
                 terms_document_version_ids=[str(t_id) for t_id in terms_acc_ids],
@@ -185,6 +187,7 @@ class MembershipLifecycleService:
                 start_date=start,
                 end_date=end,
                 entitlements_snapshot=entitlements_data,
+                perks_config=copy.deepcopy(ver_perks) if isinstance(ver_perks, dict) else {},
                 purchase_branch=order.branch,
                 source_order=order,
                 source_order_item=order_item,
@@ -383,6 +386,7 @@ class MembershipLifecycleService:
         reason_text: Optional[str] = None,
         created_by_user: Optional[TenantUser] = None,
         db_alias: Optional[str] = None,
+        reason_code: str = 'CANCELLATION_REVERSAL',
     ) -> MembershipEntitlementLedger:
         """
         Reverses consumed units back to an entitlement upon booking cancellation and writes an immutable ledger entry.
@@ -413,7 +417,7 @@ class MembershipLifecycleService:
                 transaction_type='REVERSAL',
                 units=units,
                 booking_id=booking_id,
-                reason_code='CANCELLATION_REVERSAL',
+                reason_code=reason_code,
                 reason_text=reason_text or f"Reversed {units} unit(s) for booking {booking_id}",
                 balance_after=balance_after,
                 created_by_user=created_by_user,
@@ -856,12 +860,15 @@ class MembershipLifecycleService:
             membership.package_version = target_package_version
             membership.save(using=alias, update_fields=['package', 'package_version', 'updated_at'])
 
+            import copy
+            target_perks_raw = getattr(target_package_version, 'perks_config', None) if target_package_version else None
             MembershipPackageHistory.objects.using(alias).create(
                 membership=membership,
                 from_package=from_pkg,
                 from_package_version=from_pkg_v,
                 to_package=target_package,
                 to_package_version=target_package_version,
+                perks_snapshot=copy.deepcopy(target_perks_raw) if isinstance(target_perks_raw, dict) else {},
                 change_type=change_type,
                 membership_change_request=req,
                 changed_by_user=actor_user,
@@ -1023,12 +1030,15 @@ class MembershipLifecycleService:
             MembershipPackageHistory, MembershipStatusHistory,
             MembershipEntitlement, MembershipEntitlementLedger
         )
+        import copy
+        target_perks_raw = getattr(target_package_version, 'perks_config', None) if target_package_version else None
         MembershipPackageHistory.objects.using(alias).create(
             membership=membership,
             from_package=from_pkg,
             from_package_version=from_pkg_v,
             to_package=target_package,
             to_package_version=target_package_version,
+            perks_snapshot=copy.deepcopy(target_perks_raw) if isinstance(target_perks_raw, dict) else {},
             change_type='UPGRADE',
             order=order,
             changed_by_user=actor_user,
@@ -1037,7 +1047,33 @@ class MembershipLifecycleService:
 
         valid_until_dt = timezone.make_aware(datetime.combine(membership.end_date, datetime.max.time())) if membership.end_date else timezone.now() + timedelta(days=90)
 
-        for ped in target_package_version.entitlement_definitions.using(alias).filter(status='ACTIVE'):
+        target_defs = list(target_package_version.entitlement_definitions.using(alias).filter(status='ACTIVE'))
+        target_types = {ped.entitlement_type for ped in target_defs}
+
+        # When upgrading into a CREDIT_WALLET (Elite) plan that replaces session pools,
+        # expire stale session entitlements not carried by the target version so they do not
+        # double-count or bypass Elite wallet accounting.
+        if 'CREDIT_WALLET' in target_types:
+            stale_session_types = {'HOME_BRANCH_SESSION', 'CLASS_SESSION', 'CROSS_BRANCH_SESSION', 'CROSS_BRANCH'} - target_types
+            for stale_ent in membership.entitlements.using(alias).filter(
+                status='ACTIVE',
+                entitlement_type__in=stale_session_types,
+            ):
+                rem = stale_ent.remaining_units or Decimal('0.00')
+                if rem > Decimal('0.00'):
+                    MembershipEntitlementLedger.objects.using(alias).create(
+                        membership_entitlement=stale_ent,
+                        transaction_type='EXPIRY',
+                        units=-rem,
+                        reason_code='UPGRADE_SUPERSEDED_BY_CREDIT_WALLET',
+                        reason_text=f"Closed {stale_ent.entitlement_type} pool on upgrade to {target_package.name}",
+                        balance_after=Decimal('0.00'),
+                        created_by_user=actor_user,
+                    )
+                stale_ent.status = 'EXPIRED'
+                stale_ent.save(using=alias, update_fields=['status', 'updated_at'])
+
+        for ped in target_defs:
             existing_ent = membership.entitlements.using(alias).filter(entitlement_type=ped.entitlement_type, status='ACTIVE').first()
             if existing_ent:
                 add_units = max(Decimal('0.00'), (ped.allocated_units or Decimal('0.00')) - (existing_ent.allocated_units or Decimal('0.00')))
@@ -1661,3 +1697,221 @@ class MembershipLifecycleService:
                 created_by_user=actor_user,
             )
             return ledger
+
+    @classmethod
+    def reserve_pt_session(
+        cls,
+        user_profile: UserProfile,
+        appointment_id=None,
+        db_alias: Optional[str] = None,
+        actor_user: Optional[TenantUser] = None,
+    ) -> Tuple[Membership, MembershipEntitlement, Decimal]:
+        """
+        Reserves 1:1 Personal Training entitlement or configurable CREDIT_WALLET PT credits
+        from the member's active memberships.
+        """
+        from django.db.models import Q
+        from .services_bookings import BookingWaitlistAttendanceService
+
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        today = timezone.now().date()
+        active_mems = list(
+            Membership.objects.using(alias)
+            .filter(user_profile=user_profile, status='ACTIVE', end_date__gte=today)
+            .filter(Q(start_date__lte=today) | Q(start_date__isnull=True))
+            .select_related('package', 'package_version')
+            .prefetch_related('entitlements')
+            .order_by('end_date', '-created_at')
+        )
+
+        # 1. Prefer dedicated PERSONAL_TRAINING_SESSION / PT_SESSION entitlements first
+        for m in active_mems:
+            pt_ent = m.entitlements.using(alias).filter(
+                status='ACTIVE',
+                entitlement_type__in=['PERSONAL_TRAINING_SESSION', 'PT_SESSION'],
+            ).first()
+            if pt_ent and (pt_ent.is_unlimited or (pt_ent.remaining_units or Decimal('0.00')) >= Decimal('1.00')):
+                ledger = cls.consume_entitlement(
+                    membership=m,
+                    entitlement_type=pt_ent.entitlement_type,
+                    units=Decimal('1.00'),
+                    booking_id=appointment_id,
+                    reason_text="Personal Training 1-on-1 appointment booking",
+                    created_by_user=actor_user,
+                    db_alias=alias,
+                )
+                if appointment_id:
+                    ledger.reference_type = 'APPOINTMENT'
+                    ledger.reference_id = appointment_id
+                    ledger.save(using=alias, update_fields=['reference_type', 'reference_id'])
+                return m, pt_ent, Decimal('1.00')
+
+        # 2. Fallback to Elite CREDIT_WALLET memberships with UI-configured pt_enabled perk
+        for m in active_mems:
+            perks = BookingWaitlistAttendanceService.get_membership_effective_perks(m, db_alias=alias)
+            if not perks.get('pt_enabled'):
+                continue
+            pt_units = Decimal(str(perks.get('pt_credits_per_session') or '1.00'))
+            credit_ent = m.entitlements.using(alias).filter(status='ACTIVE', entitlement_type='CREDIT_WALLET').first()
+            if credit_ent and (credit_ent.is_unlimited or (credit_ent.remaining_units or Decimal('0.00')) >= pt_units):
+                ledger = cls.consume_entitlement(
+                    membership=m,
+                    entitlement_type='CREDIT_WALLET',
+                    units=pt_units,
+                    booking_id=appointment_id,
+                    reason_text=f"Elite Personal Training booking ({pt_units} credits)",
+                    created_by_user=actor_user,
+                    db_alias=alias,
+                )
+                if appointment_id:
+                    ledger.reference_type = 'APPOINTMENT'
+                    ledger.reference_id = appointment_id
+                    ledger.save(using=alias, update_fields=['reference_type', 'reference_id'])
+                return m, credit_ent, pt_units
+
+        raise ValidationError(
+            "Personal Training requires an active PT entitlement or a credit package with Personal Training enabled.",
+            code="PT_ENTITLEMENT_REQUIRED",
+        )
+
+    @classmethod
+    def release_pt_session(
+        cls,
+        membership_id,
+        entitlement_id,
+        appointment_id,
+        db_alias: Optional[str] = None,
+        actor_user: Optional[TenantUser] = None,
+    ) -> Decimal:
+        """Restores consumed PT sessions/credits when a PT appointment is cancelled."""
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        if not membership_id or not entitlement_id:
+            return Decimal('0.00')
+        m = Membership.objects.using(alias).filter(id=membership_id).first()
+        ent = MembershipEntitlement.objects.using(alias).filter(id=entitlement_id).first()
+        if not m or not ent:
+            return Decimal('0.00')
+
+        consumed_sum = Decimal('0.00')
+        if appointment_id:
+            from django.db.models import Sum
+            raw = MembershipEntitlementLedger.objects.using(alias).filter(
+                membership_entitlement=ent,
+                transaction_type='CONSUMPTION',
+                booking_id=appointment_id,
+            ).aggregate(total=Sum('units'))['total']
+            if raw:
+                consumed_sum = abs(Decimal(str(raw)))
+        if consumed_sum <= Decimal('0.00'):
+            consumed_sum = Decimal('1.00')
+
+        cls.reverse_entitlement(
+            membership=m,
+            entitlement_type=ent.entitlement_type,
+            units=consumed_sum,
+            booking_id=appointment_id,
+            reason_text="Personal Training appointment cancelled — credits restored",
+            created_by_user=actor_user,
+            db_alias=alias,
+        )
+        return consumed_sum
+
+    @classmethod
+    def expire_overdue_memberships(
+        cls,
+        db_alias: Optional[str] = None,
+        as_of_date: Optional[date] = None,
+        max_scan: int = 500,
+    ) -> Dict[str, Any]:
+        """
+        Transitions overdue ACTIVE memberships (end_date < as_of_date) to EXPIRED,
+        expires their active entitlements with ledger entries, and syncs profile status.
+        Safe and idempotent for repeated periodic execution.
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        cutoff_date = as_of_date or timezone.now().date()
+        overdue_ids = list(
+            Membership.objects.using(alias)
+            .filter(status='ACTIVE', end_date__lt=cutoff_date)
+            .order_by('end_date')
+            .values_list('id', flat=True)[:max_scan]
+        )
+        expired_memberships = 0
+        expired_entitlements = 0
+        errors: list = []
+
+        for mem_id in overdue_ids:
+            try:
+                with transaction.atomic(using=alias):
+                    mem = (
+                        Membership.objects.using(alias)
+                        .select_for_update()
+                        .select_related('user_profile')
+                        .filter(id=mem_id)
+                        .first()
+                    )
+                    if not mem or mem.status != 'ACTIVE' or not mem.end_date or mem.end_date >= cutoff_date:
+                        continue
+
+                    mem.status = 'EXPIRED'
+                    mem.save(using=alias, update_fields=['status', 'updated_at'])
+                    expired_memberships += 1
+
+                    MembershipStatusHistory.objects.using(alias).create(
+                        membership=mem,
+                        from_status='ACTIVE',
+                        to_status='EXPIRED',
+                        reason_code='AUTO_EXPIRY',
+                        reason_text=f"Membership expired automatically after end date {mem.end_date}.",
+                        changed_by_user=None,
+                    )
+
+                    active_ents = list(
+                        mem.entitlements.using(alias)
+                        .select_for_update()
+                        .filter(status='ACTIVE')
+                    )
+                    for ent in active_ents:
+                        remaining = (
+                            Decimal('0.00')
+                            if ent.is_unlimited
+                            else max(Decimal('0.00'), (ent.allocated_units or Decimal('0.00')) - (ent.consumed_units or Decimal('0.00')))
+                        )
+                        ent.status = 'EXPIRED'
+                        ent.save(using=alias, update_fields=['status', 'updated_at'])
+                        expired_entitlements += 1
+                        if remaining > Decimal('0.00'):
+                            MembershipEntitlementLedger.objects.using(alias).create(
+                                membership_entitlement=ent,
+                                transaction_type='EXPIRY',
+                                units=-remaining,
+                                reason_code='TERM_EXPIRED',
+                                reason_text=f"Expired {remaining} remaining unit(s) upon membership {mem.membership_number} end date {mem.end_date}.",
+                                balance_after=Decimal('0.00'),
+                                created_by_user=None,
+                            )
+
+                    if mem.user_profile:
+                        from django.db.models import Q
+                        has_other_live = (
+                            Membership.objects.using(alias)
+                            .filter(
+                                user_profile=mem.user_profile,
+                                status__in=['ACTIVE', 'FROZEN'],
+                            )
+                            .filter(Q(end_date__gte=cutoff_date) | Q(end_date__isnull=True))
+                            .exists()
+                        )
+                        if not has_other_live and mem.user_profile.member_status == 'ACTIVE':
+                            mem.user_profile.member_status = 'EXPIRED'
+                            mem.user_profile.save(using=alias, update_fields=['member_status', 'updated_at'])
+            except Exception as exc:
+                logger.error("Failed to expire overdue membership %s on %s: %s", mem_id, alias, exc, exc_info=True)
+                errors.append({'membership_id': str(mem_id), 'error': str(exc)})
+
+        return {
+            'evaluated': len(overdue_ids),
+            'expired_memberships': expired_memberships,
+            'expired_entitlements': expired_entitlements,
+            'errors': errors,
+        }

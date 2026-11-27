@@ -75,6 +75,317 @@ def is_matching_program_category(cat1, cat2, prog1=None, prog2=None) -> bool:
 
 class BookingWaitlistAttendanceService:
 
+    @staticmethod
+    def get_package_version_perks(package_version, db_alias: str = None) -> Dict[str, Any]:
+        """
+        Extracts normalized, DB-driven package perks from PackageVersion.perks_config
+        (falling back to active CREDIT_WALLET entitlement configuration).
+        Nothing is hardcoded to package names.
+        """
+        raw: Dict[str, Any] = {}
+        if package_version:
+            ver_cfg = getattr(package_version, 'perks_config', None)
+            if isinstance(ver_cfg, dict):
+                raw.update(ver_cfg)
+            try:
+                alias = db_alias or get_current_tenant_db_alias() or 'default'
+                if hasattr(package_version, 'entitlement_definitions'):
+                    for ent in package_version.entitlement_definitions.using(alias).filter(
+                        entitlement_type='CREDIT_WALLET', status='ACTIVE'
+                    ):
+                        if isinstance(ent.configuration, dict):
+                            for k, v in ent.configuration.items():
+                                raw.setdefault(k, v)
+            except Exception:
+                pass
+
+        return BookingWaitlistAttendanceService._normalize_raw_perks(raw)
+
+    @staticmethod
+    def _normalize_raw_perks(raw: Dict[str, Any], fallback: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Normalizes raw perks dict into canonical typed settings without hardcoded plan names."""
+        fb = fallback or {}
+        cross_mode = str(raw.get('cross_branch_mode') or fb.get('cross_branch_mode') or 'CATALOG_BRANCHES').strip().upper()
+        if cross_mode not in ('CATALOG_BRANCHES', 'ALL_BRANCHES', 'HOME_ONLY'):
+            cross_mode = 'CATALOG_BRANCHES'
+
+        guest_passes_raw = raw.get('guest_passes_per_month', fb.get('guest_passes_per_month', 0))
+        try:
+            guest_passes = max(0, int(guest_passes_raw or 0))
+        except (TypeError, ValueError):
+            guest_passes = 0
+
+        pt_credits_raw = raw.get('pt_credits_per_session', fb.get('pt_credits_per_session', 1))
+        try:
+            pt_credits = Decimal(str(pt_credits_raw)) if pt_credits_raw is not None else Decimal('1.00')
+            if pt_credits <= Decimal('0.00'):
+                pt_credits = Decimal('1.00')
+        except Exception:
+            pt_credits = Decimal('1.00')
+
+        adv_override = None
+        if raw.get('advance_booking_days_override') not in (None, ''):
+            try:
+                parsed_adv = int(raw.get('advance_booking_days_override'))
+                if parsed_adv > 0:
+                    adv_override = parsed_adv
+            except (TypeError, ValueError):
+                adv_override = None
+        elif 'advance_booking_days_override' not in raw:
+            adv_override = fb.get('advance_booking_days_override')
+
+        assessment_credits = None
+        if raw.get('assessment_credits') not in (None, ''):
+            try:
+                parsed_ac = int(raw.get('assessment_credits'))
+                if parsed_ac >= 0:
+                    assessment_credits = parsed_ac
+            except (TypeError, ValueError):
+                assessment_credits = None
+        elif 'assessment_credits' not in raw:
+            assessment_credits = fb.get('assessment_credits')
+
+        return {
+            'cross_branch_mode': cross_mode,
+            'include_assessments': bool(raw.get('include_assessments', fb.get('include_assessments', False))),
+            'assessment_credits': assessment_credits,
+            'guest_passes_per_month': guest_passes,
+            'pt_enabled': bool(raw.get('pt_enabled', fb.get('pt_enabled', False))),
+            'pt_credits_per_session': pt_credits,
+            'advance_booking_days_override': adv_override,
+        }
+
+    @classmethod
+    def get_membership_effective_perks(cls, membership: Optional[Membership], db_alias: str = None) -> Dict[str, Any]:
+        """Resolves dynamic perks for a specific Membership from its frozen transition/contract snapshot or package_version."""
+        if not membership:
+            return cls.get_package_version_perks(None, db_alias=db_alias)
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        pkg_ver = getattr(membership, 'package_version', None)
+        perks = cls.get_package_version_perks(pkg_ver, db_alias=alias)
+        pkg_ver_id = getattr(membership, 'package_version_id', None) or (getattr(pkg_ver, 'id', None) if pkg_ver else None)
+
+        frozen_raw = None
+        try:
+            from .models_memberships import MembershipPackageHistory
+            hist = (
+                MembershipPackageHistory.objects.using(alias)
+                .filter(membership=membership, to_package_version_id=pkg_ver_id, change_type='UPGRADE')
+                .order_by('-effective_at', '-created_at')
+                .first()
+            ) if pkg_ver_id else None
+            hist_perks = getattr(hist, 'perks_snapshot', None) if hist else None
+            if isinstance(hist_perks, dict) and hist_perks:
+                frozen_raw = hist_perks
+        except Exception:
+            pass
+
+        if not frozen_raw:
+            try:
+                snap = getattr(membership, 'contract_snapshot', None)
+                snap_perks = getattr(snap, 'perks_config', None) if snap else None
+                snap_ver_id = getattr(snap, 'package_version_id', None) if snap else None
+                if (
+                    isinstance(snap_perks, dict)
+                    and snap_perks
+                    and (not pkg_ver_id or snap_ver_id == pkg_ver_id)
+                ):
+                    frozen_raw = snap_perks
+            except Exception:
+                pass
+
+        if isinstance(frozen_raw, dict) and frozen_raw:
+            merged_res = cls.get_package_version_perks(None, db_alias=alias)
+            merged_res.update({k: v for k, v in perks.items()})
+            for k, v in cls._normalize_raw_perks(frozen_raw, fallback=perks).items():
+                merged_res[k] = v
+            return merged_res
+        return perks
+
+    @classmethod
+    def get_member_guest_pass_summary(
+        cls,
+        membership: Optional[Membership],
+        db_alias: str = None,
+    ) -> Dict[str, Any]:
+        """Returns current calendar-month guest pass allowance and usage for a membership."""
+        if not membership:
+            return {'enabled': False, 'limit': 0, 'used': 0, 'remaining': 0}
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        perks = cls.get_membership_effective_perks(membership, db_alias=alias)
+        limit = int(perks.get('guest_passes_per_month', 0) or 0)
+        if limit <= 0:
+            return {'enabled': False, 'limit': 0, 'used': 0, 'remaining': 0}
+        org = getattr(membership, 'organization', None) or (membership.package.organization if getattr(membership, 'package', None) else None)
+        if org:
+            from .models_govern import OrganizationSettings
+            org_settings = OrganizationSettings.objects.using(alias).filter(organization=org).first()
+            if org_settings and org_settings.allow_guest_passes is False:
+                return {'enabled': False, 'limit': 0, 'used': 0, 'remaining': 0}
+        now = timezone.now()
+        used = Booking.objects.using(alias).filter(
+            membership=membership,
+            is_guest_pass=True,
+            booked_at__year=now.year,
+            booked_at__month=now.month,
+            status__in=['CONFIRMED', 'RESERVED', 'COMPLETED'],
+        ).count()
+        return {
+            'enabled': True,
+            'limit': limit,
+            'used': used,
+            'remaining': max(0, limit - used),
+        }
+
+    @staticmethod
+    def get_membership_credit_entitlement(
+        membership: Optional[Membership],
+        db_alias: str = None,
+    ) -> Tuple[bool, Optional[MembershipEntitlement]]:
+        """Single source of truth for whether a membership operates as a CREDIT_WALLET (Elite)."""
+        if not membership:
+            return False, None
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        credit_ent = (
+            membership.entitlements.using(alias)
+            .filter(status='ACTIVE', entitlement_type='CREDIT_WALLET')
+            .first()
+        )
+        is_credit = bool(
+            credit_ent
+            and (
+                credit_ent.is_unlimited
+                or (credit_ent.remaining_units is not None and credit_ent.remaining_units > 0)
+                or credit_ent.allocated_units
+            )
+        )
+        return is_credit, credit_ent
+
+    @staticmethod
+    def get_occurrence_required_credits(
+        occurrence: Optional[ClassOccurrence],
+        fallback_program=None,
+    ) -> Decimal:
+        """
+        Single canonical resolver for how many booking credits a class occurrence costs.
+        Priority: ProgramCategory.credits -> Program.credits -> ClassCategory.credits -> fallback Program.credits -> 1.00.
+        Preserves fractional decimal values (e.g. 0.50, 1.50).
+        """
+        template = getattr(occurrence, 'class_template', None) if occurrence else None
+        occ_program = getattr(template, 'program', None) if template else None
+        prog_category = getattr(occ_program, 'category', None) if occ_program else None
+        cls_category = getattr(template, 'category', None) if template else None
+
+        raw_credits = None
+        for source in (prog_category, occ_program, cls_category, fallback_program):
+            val = getattr(source, 'credits', None) if source else None
+            if val is not None:
+                try:
+                    dec_val = Decimal(str(val))
+                    if dec_val > Decimal('0.00'):
+                        raw_credits = dec_val
+                        break
+                except Exception:
+                    continue
+
+        return raw_credits.quantize(Decimal('0.01')) if raw_credits is not None else Decimal('1.00')
+
+    @classmethod
+    def is_membership_branch_permitted(
+        cls,
+        membership: Membership,
+        occurrence: ClassOccurrence,
+        db_alias: str = None,
+        is_credit_based: Optional[bool] = None,
+        has_passport: Optional[bool] = None,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Validates branch availability consistently across schedule, eligibility, and booking.
+        - Credit-based (Elite): honors dynamic cross_branch_mode + Program/PackageBranchAvailability.
+        - Session-based: preserves PackageBranchAvailability with existing passport bypass.
+        """
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        if not membership or not occurrence or not getattr(occurrence, 'branch_id', None):
+            return True, None
+
+        if is_credit_based is None:
+            is_credit_based, _ = cls.get_membership_credit_entitlement(membership, db_alias=alias)
+
+        from .models_catalog import PackageBranchAvailability, ProgramBranchAvailability
+        pkg = membership.package_version.package if membership.package_version else membership.package
+        prog = membership.program or (pkg.program if pkg else None)
+
+        if is_credit_based:
+            perks = cls.get_membership_effective_perks(membership, db_alias=alias)
+            cross_mode = perks.get('cross_branch_mode', 'CATALOG_BRANCHES')
+            if cross_mode == 'ALL_BRANCHES':
+                return True, None
+            if cross_mode == 'HOME_ONLY':
+                if membership.home_branch_id and occurrence.branch_id != membership.home_branch_id:
+                    return False, f"Your package is only valid at your home branch ('{membership.home_branch.name}')."
+                return True, None
+
+            # CATALOG_BRANCHES: follow PackageBranchAvailability, or fallback to ProgramBranchAvailability
+            if pkg:
+                pba_qs = PackageBranchAvailability.objects.using(alias).filter(package=pkg)
+                if pba_qs.exists():
+                    if not pba_qs.filter(branch=occurrence.branch, status='ENABLED').exists():
+                        return False, f"Your package is not valid at '{occurrence.branch.name}'."
+                    return True, None
+            if prog:
+                prog_qs = ProgramBranchAvailability.objects.using(alias).filter(program=prog)
+                if prog_qs.exists() and not prog_qs.filter(branch=occurrence.branch, is_active=True).exists():
+                    return False, f"Your program is not available at '{occurrence.branch.name}'."
+            return True, None
+
+        # Non-Elite session-based: preserve exact existing contract
+        _is_cross_branch = bool(membership.home_branch_id and occurrence.branch_id != membership.home_branch_id)
+        if has_passport is None:
+            has_passport = membership.entitlements.using(alias).filter(
+                status='ACTIVE',
+                entitlement_type__in=['CROSS_BRANCH', 'CROSS_BRANCH_SESSION'],
+            ).filter(models.Q(is_unlimited=True) | models.Q(allocated_units__gt=0)).exists()
+
+        if pkg and not (_is_cross_branch and has_passport):
+            pba_qs = PackageBranchAvailability.objects.using(alias).filter(package=pkg)
+            if pba_qs.exists() and not pba_qs.filter(branch=occurrence.branch, status='ENABLED').exists():
+                return False, f"Your package is not valid at '{occurrence.branch.name}'."
+        return True, None
+
+    @classmethod
+    def _get_booking_consumed_units(
+        cls,
+        booking: Booking,
+        occurrence: Optional[ClassOccurrence] = None,
+        db_alias: str = None,
+    ) -> Decimal:
+        """Reads exact consumed units from ledger, with smart credit-wallet fallback."""
+        if getattr(booking, 'is_guest_pass', False) or getattr(booking, 'booking_type', '') == 'GUEST':
+            return Decimal('0.00')
+        alias = db_alias or get_current_tenant_db_alias() or 'default'
+        try:
+            from .models_memberships import MembershipEntitlementLedger
+            if booking.entitlement_id:
+                net_consumed = (
+                    MembershipEntitlementLedger.objects.using(alias)
+                    .filter(
+                        booking_id=booking.id,
+                        membership_entitlement_id=booking.entitlement_id,
+                    )
+                    .filter(
+                        models.Q(transaction_type='CONSUMPTION')
+                        | models.Q(transaction_type='REVERSAL', reason_code='RESCHEDULE_CREDIT_REFUND')
+                    )
+                    .aggregate(total=models.Sum('units'))['total']
+                )
+                if net_consumed is not None and net_consumed < Decimal('0.00'):
+                    return abs(Decimal(str(net_consumed)))
+        except Exception:
+            pass
+        if booking.entitlement and booking.entitlement.entitlement_type == 'CREDIT_WALLET':
+            return cls.get_occurrence_required_credits(occurrence or getattr(booking, 'occurrence', None))
+        return Decimal('1.00')
+
     @classmethod
     def resolve_booking_policy(cls, occurrence: ClassOccurrence, db_alias: str = None) -> BookingPolicySet:
         """
@@ -460,7 +771,8 @@ class BookingWaitlistAttendanceService:
         # 4. Membership Specific Validations (if membership provided)
         if membership:
             bp = cls.resolve_booking_policy(occurrence, db_alias=alias)
-            if bp and bp.require_parq and getattr(membership, 'parq_status', 'PENDING') != 'COMPLETED':
+            parq_enforced = bool(bp.require_parq if bp else (getattr(membership, 'parq_form_id', None) is not None or getattr(membership, 'parq_form', None) is not None))
+            if parq_enforced and getattr(membership, 'parq_status', 'PENDING') != 'COMPLETED':
                 return {
                     'eligible': False,
                     'reason_code': 'PARQ_REQUIRED',
@@ -521,39 +833,27 @@ class BookingWaitlistAttendanceService:
                     'reason_message': 'Class occurs during an active or scheduled membership freeze window.',
                 }
 
-            # Package Branch Availability
-            from .models_catalog import PackageBranchAvailability
-            pkg = membership.package_version.package if membership.package_version else membership.package
-            # Cross-branch bookings are governed by the passport entitlement below, so skip the
-            # home-branch validity gate when booking at a non-home branch with passport sessions.
-            _is_cross_branch = bool(membership.home_branch_id and occurrence.branch_id != membership.home_branch_id)
-            _has_passport = membership.entitlements.using(alias).filter(
-                status='ACTIVE',
-                entitlement_type__in=['CROSS_BRANCH', 'CROSS_BRANCH_SESSION'],
-            ).filter(models.Q(is_unlimited=True) | models.Q(allocated_units__gt=0)).exists()
-            if pkg and not (_is_cross_branch and _has_passport):
-                pba_qs = PackageBranchAvailability.objects.using(alias).filter(package=pkg)
-                if pba_qs.exists() and not pba_qs.filter(branch=occurrence.branch, status='ENABLED').exists():
-                    return {
-                        'eligible': False,
-                        'reason_code': 'BRANCH_NOT_PERMITTED',
-                        'reason_message': f"Your package is not valid at '{occurrence.branch.name}'.",
-                    }
-
             # Resolve if membership is Credit-Based (Elite) vs Session-Based
             ent_qs = membership.entitlements.using(alias).filter(status='ACTIVE')
-            credit_ent = ent_qs.filter(entitlement_type='CREDIT_WALLET').first()
-            is_credit_based = bool(credit_ent and (credit_ent.is_unlimited or (credit_ent.remaining_units and credit_ent.remaining_units > 0) or credit_ent.allocated_units))
+            is_credit_based, credit_ent = cls.get_membership_credit_entitlement(membership, db_alias=alias)
+
+            # Package / Program Branch Availability (unified across schedule, eligibility, and booking)
+            branch_ok, branch_err = cls.is_membership_branch_permitted(
+                membership,
+                occurrence,
+                db_alias=alias,
+                is_credit_based=is_credit_based,
+            )
+            if not branch_ok:
+                return {
+                    'eligible': False,
+                    'reason_code': 'BRANCH_NOT_PERMITTED',
+                    'reason_message': branch_err or f"Your package is not valid at '{occurrence.branch.name}'.",
+                }
 
             if is_credit_based:
                 # Credit-based membership: Universal access to all classes across all programs
-                template = occurrence.class_template
-                cat_credits = None
-                if template and template.program and template.program.category:
-                    cat_credits = template.program.category.credits
-                elif template and getattr(template, 'category', None):
-                    cat_credits = getattr(template.category, 'credits', None)
-                required_credits = Decimal(str(cat_credits)) if (cat_credits is not None and Decimal(str(cat_credits)) > 0) else Decimal('1.00')
+                required_credits = cls.get_occurrence_required_credits(occurrence)
 
                 if not credit_ent or (not credit_ent.is_unlimited and credit_ent.remaining_units < required_credits):
                     return {
@@ -812,13 +1112,8 @@ class BookingWaitlistAttendanceService:
         occ_prog_id = str(occ_program.id) if occ_program else None
         occ_prog_name = str(getattr(occ_program, 'name', '')).strip().lower() if occ_program else ''
 
-        # Determine required credits for elite check
-        cat_credits = None
-        if occ_category and getattr(occ_category, 'credits', None) is not None:
-            cat_credits = occ_category.credits
-        elif occ_program and getattr(occ_program, 'credits', None) is not None:
-            cat_credits = occ_program.credits
-        units_needed = Decimal(str(cat_credits)) if (cat_credits is not None and Decimal(str(cat_credits)) > 0) else Decimal('1.00')
+        # Determine required credits for elite check via unified resolver
+        units_needed = cls.get_occurrence_required_credits(occurrence)
 
         dedicated_candidates = []
         elite_candidates = []
@@ -846,8 +1141,11 @@ class BookingWaitlistAttendanceService:
 
             if is_elite:
                 has_enough = credit_ent.is_unlimited or (credit_ent.remaining_units is not None and credit_ent.remaining_units >= units_needed)
-                if has_enough:
+                branch_ok, _ = cls.is_membership_branch_permitted(mem, occurrence, db_alias=alias, is_credit_based=True)
+                if has_enough and branch_ok:
                     elite_candidates.append(mem)
+                else:
+                    fallback_candidates.append(mem)
                 continue
 
             # Dedicated session-based membership
@@ -863,8 +1161,12 @@ class BookingWaitlistAttendanceService:
             has_sessions = bool(session_ent and (session_ent.is_unlimited or (session_ent.remaining_units is not None and session_ent.remaining_units > 0) or (session_ent.allocated_units and session_ent.allocated_units > (session_ent.consumed_units or 0))))
 
             is_cat_match = is_matching_program_category(mem_cat, occ_category, mem_prog, occ_program)
+            is_cross_occ = bool(mem.home_branch_id and getattr(occurrence, 'branch_id', None) and occurrence.branch_id != mem.home_branch_id)
+            passport_ent = next((e for e in active_ents if e.entitlement_type in ['CROSS_BRANCH_SESSION', 'CROSS_BRANCH']), None)
+            has_valid_passport = bool(passport_ent and (passport_ent.is_unlimited or (passport_ent.remaining_units is not None and passport_ent.remaining_units > 0)))
+            cross_branch_usable = (not is_cross_occ) or has_valid_passport
 
-            if is_cat_match and has_sessions:
+            if is_cat_match and has_sessions and cross_branch_usable:
                 dedicated_candidates.append(mem)
             else:
                 fallback_candidates.append(mem)
@@ -908,6 +1210,8 @@ class BookingWaitlistAttendanceService:
         payment_status: str = 'PAID',
         confirmation_status: str = 'CONFIRMED',
         initial_status: str = None,
+        guest_name: Optional[str] = None,
+        guest_phone: Optional[str] = None,
         db_alias: str = None,
     ) -> Booking:
         alias = db_alias or get_current_tenant_db_alias() or 'default'
@@ -951,14 +1255,31 @@ class BookingWaitlistAttendanceService:
                 if occurrence.start_at and occurrence.start_at <= now:
                     raise ValidationError("Cannot book a class occurrence that has already started.")
 
-            # 2. Prevent duplicate active booking
-            existing = Booking.objects.using(alias).filter(
-                user_profile=user_profile,
-                occurrence=occurrence,
-                status__in=['RESERVED', 'WAITLISTED', 'CONFIRMED']
-            ).first()
-            if existing:
-                raise ValidationError(f"User already has an active booking ({existing.booking_number}) for this class occurrence.")
+            # 2. Prevent duplicate active booking (guest passes allow a member to bring a distinct guest)
+            if booking_type == 'GUEST':
+                if not guest_name or not str(guest_name).strip():
+                    raise ValidationError("Guest name is required for a guest pass booking.", code="GUEST_NAME_REQUIRED")
+                if guest_phone:
+                    dup_guest = Booking.objects.using(alias).filter(
+                        user_profile=user_profile,
+                        occurrence=occurrence,
+                        is_guest_pass=True,
+                        guest_phone=str(guest_phone).strip(),
+                        status__in=['RESERVED', 'WAITLISTED', 'CONFIRMED'],
+                    ).first()
+                    if dup_guest:
+                        raise ValidationError(
+                            f"Guest with phone '{guest_phone}' already has an active booking ({dup_guest.booking_number}) for this class.",
+                            code="DUPLICATE_GUEST_BOOKING",
+                        )
+            else:
+                existing = Booking.objects.using(alias).filter(
+                    user_profile=user_profile,
+                    occurrence=occurrence,
+                    status__in=['RESERVED', 'WAITLISTED', 'CONFIRMED']
+                ).first()
+                if existing:
+                    raise ValidationError(f"User already has an active booking ({existing.booking_number}) for this class occurrence.")
 
             # 3. Check Attendance / No-Show restrictions via restriction service (staff/admin bypasses restriction)
             if not is_staff_override:
@@ -982,13 +1303,14 @@ class BookingWaitlistAttendanceService:
                 else:
                     max_upcoming = 7
 
-                upcoming_count = Booking.objects.using(alias).filter(
-                    user_profile=user_profile,
-                    status__in=['CONFIRMED', 'RESERVED'],
-                    occurrence__start_at__gt=now
-                ).count()
-                if upcoming_count >= max_upcoming:
-                    raise ValidationError(f"Maximum upcoming bookings ({max_upcoming}) exceeded.")
+                if booking_type != 'GUEST':
+                    upcoming_count = Booking.objects.using(alias).filter(
+                        user_profile=user_profile,
+                        status__in=['CONFIRMED', 'RESERVED'],
+                        occurrence__start_at__gt=now,
+                    ).exclude(is_guest_pass=True).count()
+                    if upcoming_count >= max_upcoming:
+                        raise ValidationError(f"Maximum upcoming bookings ({max_upcoming}) exceeded.")
 
                 # Check booking window from policy hierarchy if configured
                 if booking_policy:
@@ -1015,19 +1337,24 @@ class BookingWaitlistAttendanceService:
                 # the trial view), so it is exempt from this session-type list — otherwise a policy
                 # whose allowed_booking_types omits 'TRIAL' silently blocks all free-trial bookings.
                 allowed_types = effective_bp.get('allowed_booking_types')
-                if allowed_types and booking_type != 'TRIAL':
+                if allowed_types and booking_type not in ('TRIAL', 'GUEST'):
                     # Normalize types: A member booking an occurrence/class is permitted under 'CLASS' or 'MEMBER'
                     normalized_type = 'CLASS' if booking_type in ['CLASS', 'MEMBER'] else booking_type
                     normalized_allowed = {'CLASS' if t in ['CLASS', 'MEMBER'] else t for t in allowed_types}
                     if normalized_type not in normalized_allowed:
                         raise ValidationError(f"Booking type '{booking_type}' is not permitted by current booking policy.")
 
-                # Check advance booking window limit dynamically from effective_bp (e.g. 14 days)
-                adv_days_max = effective_bp.get('advance_booking_days_max') or 14
+                # Check advance booking window limit dynamically from package perk override -> effective_bp -> 14 days
+                target_mem_for_window = membership or (cls.resolve_member_booking_membership(user_profile, occurrence, db_alias=alias) if booking_type in ('MEMBER', 'GUEST') else None)
+                adv_override = cls.get_membership_effective_perks(target_mem_for_window, db_alias=alias).get('advance_booking_days_override') if target_mem_for_window else None
+                adv_days_max = adv_override or effective_bp.get('advance_booking_days_max') or 14
                 if adv_days_max and occurrence.occurrence_date:
                     max_allowed_date = timezone.now().date() + timedelta(days=int(adv_days_max))
                     if occurrence.occurrence_date > max_allowed_date:
-                        raise ValidationError(f"Advance bookings beyond {adv_days_max} days are not permitted.")
+                        raise ValidationError(
+                            f"Advance bookings beyond {adv_days_max} days are not permitted.",
+                            code="ADVANCE_WINDOW_EXCEEDED",
+                        )
 
             # 5. Member validation & Package Class Access
             units_to_consume = Decimal('1.00')
@@ -1082,7 +1409,7 @@ class BookingWaitlistAttendanceService:
                     raise ValidationError("Cannot book class occurring during an active or scheduled membership freeze window.")
 
                 # Gate: Verify PAR-Q completed and digitally signed for this specific membership
-                parq_enforced = bool(booking_policy and booking_policy.require_parq)
+                parq_enforced = bool(booking_policy.require_parq if booking_policy else (getattr(membership, 'parq_form_id', None) is not None or getattr(membership, 'parq_form', None) is not None))
                 if parq_enforced and getattr(membership, 'parq_status', 'PENDING') != 'COMPLETED':
                     if not membership.parq_form:
                         from .models_crm import IntakeForm
@@ -1129,17 +1456,22 @@ class BookingWaitlistAttendanceService:
 
                 # Check if membership is Credit-Based (Elite) vs Session-Based
                 ent_qs = membership.entitlements.using(alias).filter(status='ACTIVE')
-                credit_ent = ent_qs.filter(entitlement_type='CREDIT_WALLET').first()
-                is_credit_based = bool(credit_ent and (credit_ent.is_unlimited or (credit_ent.remaining_units and credit_ent.remaining_units > 0) or credit_ent.allocated_units))
+                is_credit_based, credit_ent = cls.get_membership_credit_entitlement(membership, db_alias=alias)
+
+                branch_ok, branch_err = cls.is_membership_branch_permitted(
+                    membership,
+                    occurrence,
+                    db_alias=alias,
+                    is_credit_based=is_credit_based,
+                )
+                if not branch_ok:
+                    raise ValidationError(
+                        branch_err or f"Your package is not valid at '{occurrence.branch.name}'.",
+                        code="BRANCH_NOT_PERMITTED"
+                    )
 
                 if is_credit_based:
-                    template = occurrence.class_template
-                    cat_credits = None
-                    if template and template.program and template.program.category:
-                        cat_credits = template.program.category.credits
-                    elif template and getattr(template, 'category', None):
-                        cat_credits = getattr(template.category, 'credits', None)
-                    units_to_consume = Decimal(str(cat_credits)) if (cat_credits is not None and Decimal(str(cat_credits)) > 0) else Decimal('1.00')
+                    units_to_consume = cls.get_occurrence_required_credits(occurrence)
                     ent_type_filter = 'CREDIT_WALLET'
                 else:
                     # Validate dedicated pack category match (only Elite has universal cross-category privileges)
@@ -1165,6 +1497,54 @@ class BookingWaitlistAttendanceService:
 
                     units_to_consume = access_res.get('units') or Decimal('1.00')
                     ent_type_filter = access_res.get('entitlement_type')
+            elif booking_type == 'GUEST':
+                occ_date = occurrence.start_at.date() if occurrence.start_at else timezone.now().date()
+                if not membership:
+                    active_mems = (
+                        Membership.objects.using(alias)
+                        .filter(user_profile=user_profile, status='ACTIVE', end_date__gte=occ_date)
+                        .filter(models.Q(start_date__lte=occ_date) | models.Q(start_date__isnull=True))
+                        .select_related('package_version', 'package', 'program', 'home_branch')
+                        .order_by('end_date', '-created_at')
+                    )
+                    for cand_m in active_mems:
+                        if cls.get_membership_effective_perks(cand_m, db_alias=alias).get('guest_passes_per_month', 0) > 0:
+                            membership = cand_m
+                            break
+                    if not membership:
+                        membership = active_mems.first()
+                if not membership:
+                    raise ValidationError("Active membership required to redeem a guest pass.", code="NO_ACTIVE_MEMBERSHIP")
+
+                from .models_govern import OrganizationSettings
+                org_settings = OrganizationSettings.objects.using(alias).filter(organization=organization).first() if organization else None
+                if org_settings and org_settings.allow_guest_passes is False:
+                    raise ValidationError("Guest passes are disabled by studio configuration.", code="GUEST_PASS_DISABLED")
+
+                perks = cls.get_membership_effective_perks(membership, db_alias=alias)
+                monthly_limit = int(perks.get('guest_passes_per_month', 0) or 0)
+                if monthly_limit <= 0:
+                    raise ValidationError("Guest passes are not enabled for your current package.", code="GUEST_PASS_NOT_ENABLED")
+
+                is_credit_based, _ = cls.get_membership_credit_entitlement(membership, db_alias=alias)
+                branch_ok, branch_err = cls.is_membership_branch_permitted(
+                    membership, occurrence, db_alias=alias, is_credit_based=is_credit_based
+                )
+                if not branch_ok:
+                    raise ValidationError(branch_err or f"Guest pass is not valid at '{occurrence.branch.name}'.", code="BRANCH_NOT_PERMITTED")
+
+                used_this_month = Booking.objects.using(alias).filter(
+                    membership=membership,
+                    is_guest_pass=True,
+                    booked_at__year=now.year,
+                    booked_at__month=now.month,
+                    status__in=['CONFIRMED', 'RESERVED', 'COMPLETED'],
+                ).count()
+                if used_this_month >= monthly_limit:
+                    raise ValidationError(
+                        f"Monthly guest pass allowance ({monthly_limit}) already used for this month.",
+                        code="GUEST_PASS_LIMIT_REACHED",
+                    )
 
             # Generate unique booking number
             booking_number = f"BK-{timezone.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
@@ -1351,6 +1731,9 @@ class BookingWaitlistAttendanceService:
                     payment_status=payment_status,
                     confirmation_status=confirmation_status,
                     confirmed_at=timezone.now() if confirmation_status == 'CONFIRMED' else None,
+                    is_guest_pass=(booking_type == 'GUEST'),
+                    guest_name=str(guest_name).strip() if guest_name else None,
+                    guest_phone=str(guest_phone).strip() if guest_phone else None,
                     booked_at=timezone.now(),
                     created_by_user=created_by_user,
                 )
@@ -1394,6 +1777,8 @@ class BookingWaitlistAttendanceService:
 
             else:
                 # Capacity is full: evaluate waitlist. WAITLIST CONSUMES ZERO ENTITLEMENT.
+                if booking_type == 'GUEST':
+                    raise ValidationError("This class session is currently full. Guest passes require an open spot.", code="CLASS_FULL")
                 if booking_type == 'TRIAL':
                     raise ValidationError("Trial capacity reached for this session. This trial session is now full. Please select another slot.")
 
@@ -1489,23 +1874,8 @@ class BookingWaitlistAttendanceService:
             within_cutoff = not policy_eval['is_late']
             session_action = policy_eval['session_action']
             treated_as_no_show = policy_eval['treated_as_no_show']
-            # Refund the ACTUAL units this booking consumed on its linked entitlement, not a flat 1.
-            # Class credit cost can be >1 (e.g. Elite credit packs deduct the class's credit value),
-            # so a hardcoded 1 would under-refund credits on cancellation. Read it from the ledger
-            # scoped to the booking's own entitlement so cross-branch dual-deductions aren't double counted.
-            session_units = Decimal('1.00')
-            try:
-                from .models_memberships import MembershipEntitlementLedger
-                if booking.entitlement_id:
-                    _consumed = MembershipEntitlementLedger.objects.using(alias).filter(
-                        booking_id=booking.id,
-                        transaction_type='CONSUMPTION',
-                        membership_entitlement_id=booking.entitlement_id,
-                    ).aggregate(total=models.Sum('units'))['total']
-                    if _consumed:
-                        session_units = abs(Decimal(str(_consumed)))
-            except Exception:
-                session_units = Decimal('1.00')
+            # Refund the ACTUAL units this booking consumed on its linked entitlement (with credit-wallet fallback).
+            session_units = cls._get_booking_consumed_units(booking, occurrence=occurrence, db_alias=alias)
 
             # If an explicit BookingCancellationRule exists, it overrides default policy
             if applied_rule:
@@ -1791,7 +2161,7 @@ class BookingWaitlistAttendanceService:
 
                     # Revalidate PAR-Q requirement at promotion time if required by policy
                     bp = cls.resolve_booking_policy(occurrence, db_alias=alias)
-                    parq_enforced = bool(bp and bp.require_parq)
+                    parq_enforced = bool(bp.require_parq if bp else (getattr(membership, 'parq_form_id', None) is not None or getattr(membership, 'parq_form', None) is not None))
                     if parq_enforced and getattr(membership, 'parq_status', 'PENDING') != 'COMPLETED':
                         candidate.status = 'CANCELLED'
                         candidate.waitlist_position = None
@@ -1806,9 +2176,16 @@ class BookingWaitlistAttendanceService:
                         )
                         continue
 
-                    # Package class access check
-                    access_res = cls.resolve_package_class_access(membership.package_version, occurrence, db_alias=alias)
-                    if not access_res['allowed']:
+                    ent_qs = membership.entitlements.using(alias).filter(status='ACTIVE')
+                    is_credit_based, credit_ent = cls.get_membership_credit_entitlement(membership, db_alias=alias)
+
+                    branch_ok, branch_err = cls.is_membership_branch_permitted(
+                        membership,
+                        occurrence,
+                        db_alias=alias,
+                        is_credit_based=is_credit_based,
+                    )
+                    if not branch_ok:
                         candidate.status = 'CANCELLED'
                         candidate.waitlist_position = None
                         candidate.save(using=alias, update_fields=['status', 'waitlist_position', 'updated_at'])
@@ -1816,27 +2193,14 @@ class BookingWaitlistAttendanceService:
                             booking=candidate,
                             occurrence=occurrence,
                             event_type='AUTO_CANCELLED',
-                            reason=f"Promotion blocked by package class access: {access_res.get('reason')}",
+                            reason=branch_err or 'Promotion blocked: branch not enabled for membership package',
                             triggered_by_type='SYSTEM',
                             created_at=timezone.now()
                         )
                         continue
 
-                    units_to_consume = access_res.get('units') or Decimal('1.00')
-                    ent_type_filter = access_res.get('entitlement_type')
-
-                    ent_qs = membership.entitlements.using(alias).filter(status='ACTIVE')
-                    credit_ent = ent_qs.filter(entitlement_type='CREDIT_WALLET').first()
-                    is_credit_based = bool(credit_ent and (credit_ent.is_unlimited or (credit_ent.remaining_units and credit_ent.remaining_units > 0) or credit_ent.allocated_units))
-
                     if is_credit_based:
-                        template = occurrence.class_template
-                        cat_credits = None
-                        if template and template.program and template.program.category:
-                            cat_credits = template.program.category.credits
-                        elif template and getattr(template, 'category', None):
-                            cat_credits = getattr(template.category, 'credits', None)
-                        units_to_consume = Decimal(str(cat_credits)) if (cat_credits is not None and Decimal(str(cat_credits)) > 0) else Decimal('1.00')
+                        units_to_consume = cls.get_occurrence_required_credits(occurrence)
 
                         if not credit_ent or (not credit_ent.is_unlimited and credit_ent.remaining_units < units_to_consume):
                             candidate.status = 'CANCELLED'
@@ -1849,12 +2213,30 @@ class BookingWaitlistAttendanceService:
                             entitlement_type='CREDIT_WALLET',
                             units=units_to_consume,
                             booking_id=candidate.id,
-                            reason_text="Promoted from waitlist to confirmed (credits)",
+                            reason_text=f"Promoted from waitlist to confirmed ({units_to_consume} credits)",
                             created_by_user=None,
                             db_alias=alias,
                         )
                         entitlement = credit_ent
                     else:
+                        # Package class access check for session-based packs
+                        access_res = cls.resolve_package_class_access(membership.package_version, occurrence, db_alias=alias)
+                        if not access_res['allowed']:
+                            candidate.status = 'CANCELLED'
+                            candidate.waitlist_position = None
+                            candidate.save(using=alias, update_fields=['status', 'waitlist_position', 'updated_at'])
+                            BookingWaitlistEvent.objects.using(alias).create(
+                                booking=candidate,
+                                occurrence=occurrence,
+                                event_type='AUTO_CANCELLED',
+                                reason=f"Promotion blocked by package class access: {access_res.get('reason')}",
+                                triggered_by_type='SYSTEM',
+                                created_at=timezone.now()
+                            )
+                            continue
+
+                        units_to_consume = access_res.get('units') or Decimal('1.00')
+                        ent_type_filter = access_res.get('entitlement_type')
                         is_cross_branch = bool(membership.home_branch and occurrence.branch_id != membership.home_branch_id)
                         passport_ent = ent_qs.filter(
                             models.Q(entitlement_type='CROSS_BRANCH_SESSION') | models.Q(entitlement_type='CROSS_BRANCH')
@@ -2023,14 +2405,32 @@ class BookingWaitlistAttendanceService:
             if not to_occ_locked.class_template.allow_reschedule:
                 raise ValidationError("Rescheduling is not permitted for the target class.")
 
-            # Check duplicate on target occurrence
-            existing_target = Booking.objects.using(alias).filter(
-                user_profile=booking.user_profile,
-                occurrence=to_occ_locked,
-                status__in=['RESERVED', 'WAITLISTED', 'CONFIRMED']
-            ).first()
-            if existing_target:
-                raise ValidationError(f"User already has an active booking ({existing_target.booking_number}) for target class occurrence.")
+            is_guest_booking = bool(getattr(booking, 'is_guest_pass', False) or booking.booking_type == 'GUEST')
+
+            # Check duplicate on target occurrence (guest passes may coexist with the member's own seat)
+            if is_guest_booking:
+                guest_phone_clean = (getattr(booking, 'guest_phone', None) or '').strip()
+                if guest_phone_clean:
+                    existing_target = Booking.objects.using(alias).filter(
+                        user_profile=booking.user_profile,
+                        occurrence=to_occ_locked,
+                        is_guest_pass=True,
+                        guest_phone=guest_phone_clean,
+                        status__in=['RESERVED', 'WAITLISTED', 'CONFIRMED'],
+                    ).exclude(id=booking.id).first()
+                    if existing_target:
+                        raise ValidationError(
+                            f"Guest with phone '{guest_phone_clean}' already has an active booking ({existing_target.booking_number}) for target class occurrence.",
+                            code="DUPLICATE_GUEST_BOOKING",
+                        )
+            else:
+                existing_target = Booking.objects.using(alias).filter(
+                    user_profile=booking.user_profile,
+                    occurrence=to_occ_locked,
+                    status__in=['RESERVED', 'WAITLISTED', 'CONFIRMED'],
+                ).exclude(is_guest_pass=True).first()
+                if existing_target:
+                    raise ValidationError(f"User already has an active booking ({existing_target.booking_number}) for target class occurrence.")
 
             # Check capacity on target occurrence
             enrolled_target = Booking.objects.using(alias).filter(
@@ -2051,9 +2451,9 @@ class BookingWaitlistAttendanceService:
                 if prior_reschedules >= policy.max_reschedules:
                     raise ValidationError(f"Maximum allowed reschedules ({policy.max_reschedules}) reached for this booking.")
 
-            # 5. Check Package Class Access for new occurrence
+            # 5. Check Package Class Access & Configurable Reschedule Credit Adjustment
             if booking.membership:
-                parq_enforced = bool(policy and policy.require_parq)
+                parq_enforced = bool(policy.require_parq if policy else (getattr(booking.membership, 'parq_form_id', None) is not None or getattr(booking.membership, 'parq_form', None) is not None))
                 if parq_enforced and getattr(booking.membership, 'parq_status', 'PENDING') != 'COMPLETED':
                     raise ParqRequiredValidationError(
                         f"A completed and digitally signed PAR-Q is required before rescheduling under membership {booking.membership.membership_number}.",
@@ -2061,9 +2461,66 @@ class BookingWaitlistAttendanceService:
                         membership=booking.membership,
                         form=booking.membership.parq_form
                     )
-                access_res = cls.resolve_package_class_access(booking.membership.package_version, to_occ_locked, db_alias=alias)
-                if not access_res['allowed']:
-                    raise ValidationError(f"Target class is not accessible under current package version: {access_res.get('reason')}")
+
+                is_credit_based, credit_ent = cls.get_membership_credit_entitlement(booking.membership, db_alias=alias)
+                branch_ok, branch_err = cls.is_membership_branch_permitted(
+                    booking.membership,
+                    to_occ_locked,
+                    db_alias=alias,
+                    is_credit_based=is_credit_based,
+                )
+                if not branch_ok:
+                    raise ValidationError(branch_err or f"Your package is not valid at '{to_occ_locked.branch.name}'.", code="BRANCH_NOT_PERMITTED")
+
+                if is_guest_booking:
+                    # Complimentary guest passes never deduct/refund wallet credits or require member class-access rules.
+                    pass
+                elif is_credit_based:
+                    effective_bp = BookingPolicyService.get_effective_policy(organization, branch=to_occ_locked.branch, db_alias=alias)
+                    diff_mode = str(effective_bp.get('reschedule_credit_diff_mode') or 'ADJUST_DIFFERENCE').strip().upper()
+                    old_units = cls._get_booking_consumed_units(booking, occurrence=from_occ_locked, db_alias=alias)
+                    new_units = cls.get_occurrence_required_credits(to_occ_locked)
+
+                    if old_units != new_units and credit_ent:
+                        if diff_mode == 'BLOCK_MISMATCH':
+                            raise ValidationError(
+                                f"Rescheduling between classes with different credit costs ({old_units} vs {new_units} credits) is disabled by studio policy.",
+                                code="RESCHEDULE_CREDIT_MISMATCH",
+                            )
+                        elif diff_mode == 'ADJUST_DIFFERENCE':
+                            cls_title = to_occ_locked.class_template.name if to_occ_locked.class_template else "Class"
+                            if new_units > old_units:
+                                extra_units = (new_units - old_units).quantize(Decimal('0.01'))
+                                if not credit_ent.is_unlimited and (credit_ent.remaining_units or Decimal('0.00')) < extra_units:
+                                    raise ValidationError(
+                                        f"Insufficient credits for reschedule. Target class requires {extra_units} extra credits ({new_units} total vs {old_units} paid).",
+                                        code="INSUFFICIENT_CREDITS",
+                                    )
+                                MembershipLifecycleService.consume_entitlement(
+                                    membership=booking.membership,
+                                    entitlement_type='CREDIT_WALLET',
+                                    units=extra_units,
+                                    booking_id=booking.id,
+                                    reason_text=f"Reschedule credit top-up ({old_units} -> {new_units} for {cls_title})",
+                                    created_by_user=rescheduled_by_user,
+                                    db_alias=alias,
+                                )
+                            else:
+                                refund_units = (old_units - new_units).quantize(Decimal('0.01'))
+                                MembershipLifecycleService.reverse_entitlement(
+                                    membership=booking.membership,
+                                    entitlement_type='CREDIT_WALLET',
+                                    units=refund_units,
+                                    booking_id=booking.id,
+                                    reason_text=f"Reschedule excess credit refund ({old_units} -> {new_units} for {cls_title})",
+                                    created_by_user=rescheduled_by_user,
+                                    db_alias=alias,
+                                    reason_code='RESCHEDULE_CREDIT_REFUND',
+                                )
+                else:
+                    access_res = cls.resolve_package_class_access(booking.membership.package_version, to_occ_locked, db_alias=alias)
+                    if not access_res['allowed']:
+                        raise ValidationError(f"Target class is not accessible under current package version: {access_res.get('reason')}")
 
             # 6. Create BookingReschedule audit
             reschedule_count = BookingReschedule.objects.using(alias).filter(booking=booking).count() + 1
@@ -2302,10 +2759,15 @@ class BookingWaitlistAttendanceService:
                         if ent:
                             try:
                                 cls_name = occurrence.class_template.name if (occurrence and occurrence.class_template) else "Class"
+                                deduct_units = (
+                                    cls.get_occurrence_required_credits(occurrence)
+                                    if ent.entitlement_type == 'CREDIT_WALLET'
+                                    else Decimal('1.00')
+                                )
                                 ledger = MembershipLifecycleService.consume_entitlement(
                                     membership=booking.membership,
                                     entitlement_type=ent.entitlement_type,
-                                    units=Decimal('1.00'),
+                                    units=deduct_units,
                                     booking_id=booking.id,
                                     reason_text=f"Class attendance deduction ({cls_name})",
                                     created_by_user=marked_by_user,
@@ -2382,10 +2844,11 @@ class BookingWaitlistAttendanceService:
                                 db_alias=alias,
                             )
                         if penalty_rule.restore_booked_session and booking.membership and booking.entitlement:
+                            restore_units = cls._get_booking_consumed_units(booking, occurrence=occurrence, db_alias=alias)
                             MembershipLifecycleService.reverse_entitlement(
                                 membership=booking.membership,
                                 entitlement_type=booking.entitlement.entitlement_type,
-                                units=Decimal('1.00'),
+                                units=restore_units,
                                 booking_id=booking.id,
                                 reason_text="No-show session restored per policy rule",
                                 created_by_user=marked_by_user,

@@ -4911,6 +4911,7 @@ class LeadConversionService:
                             'is_unlimited': ed.is_unlimited,
                         })
 
+                    pv_perks = getattr(pv, 'perks_config', None) if pv else None
                     MembershipContractSnapshot.objects.using(alias).create(
                         membership=membership,
                         package=pkg,
@@ -4927,6 +4928,7 @@ class LeadConversionService:
                         start_date=start,
                         end_date=end,
                         entitlements_snapshot=entitlements_data,
+                        perks_config=dict(pv_perks) if isinstance(pv_perks, dict) else {},
                         purchase_branch=branch,
                         source_order=order,
                         source_order_item=order_item,

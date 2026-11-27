@@ -78,12 +78,48 @@ class AssessmentEngineService:
                     'is_unlimited': ent.is_unlimited,
                 }
 
+        from .services_bookings import BookingWaitlistAttendanceService
+        from .models_assessment import MemberAssessment
+
         active_memberships = (
             Membership.objects.using(alias)
             .filter(user_profile=user_profile, status='ACTIVE', end_date__gte=now.date())
-            .select_related('package')
+            .filter(models.Q(start_date__lte=now.date()) | models.Q(start_date__isnull=True))
+            .select_related('package', 'package_version')
+            .order_by('end_date', '-created_at')
         )
+        exhausted_reason = None
         for mb in active_memberships:
+            perks = BookingWaitlistAttendanceService.get_membership_effective_perks(mb, db_alias=alias)
+            if perks.get('include_assessments'):
+                limit = perks.get('assessment_credits')
+                if limit is None or int(limit) == 0:
+                    return {
+                        'eligible': True,
+                        'entitlement_id': None,
+                        'membership_id': str(mb.id),
+                        'package_name': mb.package.name if mb.package else 'Elite Membership',
+                        'remaining_credits': None,
+                        'is_unlimited': True,
+                    }
+                used_count = MemberAssessment.objects.using(alias).filter(
+                    user_profile=user_profile,
+                    membership=mb,
+                ).exclude(status='CANCELLED').count()
+                rem_count = max(0, int(limit) - used_count)
+                if rem_count > 0:
+                    return {
+                        'eligible': True,
+                        'entitlement_id': None,
+                        'membership_id': str(mb.id),
+                        'package_name': mb.package.name if mb.package else 'Elite Membership',
+                        'remaining_credits': rem_count,
+                        'is_unlimited': False,
+                    }
+                exhausted_reason = (
+                    f"All {int(limit)} included assessment(s) under '{mb.package.name if mb.package else 'your membership'}' have been used."
+                )
+
             pkg_name = (mb.package.name or '').lower()
             if any(term in pkg_name for term in ['transformation', 'vip', 'annual', '365', 'assessment']):
                 return {
@@ -94,6 +130,14 @@ class AssessmentEngineService:
                     'remaining_credits': 1,
                     'is_unlimited': False,
                 }
+
+        if exhausted_reason:
+            return {
+                'eligible': False,
+                'code': 'ASSESSMENT_QUOTA_EXHAUSTED',
+                'reason': exhausted_reason,
+                'remaining_credits': 0,
+            }
 
         return {
             'eligible': False,

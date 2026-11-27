@@ -434,9 +434,12 @@ def serialize_member(profile: UserProfile, alias: str = 'default', compact: bool
     else:
         # Entitlement calculation
         home_sessions, cross_sessions, balances_for_calc = get_member_sessions_summary(profile, active_m, alias)
-        credits_rem_calc = sum(int(b['remaining']) for b in balances_for_calc if b.get('category') == 'CREDIT_WALLET' and b.get('remaining') is not None)
-        credits_cons_calc = sum(int(b['consumed']) for b in balances_for_calc if b.get('category') == 'CREDIT_WALLET')
-        credits_alloc_calc = sum(int(b['allocated'] or 0) for b in balances_for_calc if b.get('category') == 'CREDIT_WALLET')
+        credits_rem_calc = round(sum(float(b['remaining']) for b in balances_for_calc if b.get('category') == 'CREDIT_WALLET' and b.get('remaining') is not None), 2)
+        credits_cons_calc = round(sum(float(b['consumed']) for b in balances_for_calc if b.get('category') == 'CREDIT_WALLET'), 2)
+        credits_alloc_calc = round(sum(float(b['allocated'] or 0) for b in balances_for_calc if b.get('category') == 'CREDIT_WALLET'), 2)
+        credits_rem_calc = int(credits_rem_calc) if credits_rem_calc == int(credits_rem_calc) else credits_rem_calc
+        credits_cons_calc = int(credits_cons_calc) if credits_cons_calc == int(credits_cons_calc) else credits_cons_calc
+        credits_alloc_calc = int(credits_alloc_calc) if credits_alloc_calc == int(credits_alloc_calc) else credits_alloc_calc
 
         # Outstanding balance
         outstanding_balance = calculate_member_outstanding(profile, alias)
@@ -3086,12 +3089,11 @@ class MemberViewSet(viewsets.ViewSet):
         pricing_mode = renewal_policy.renewal_pricing_mode if renewal_policy else 'CURRENT_PRICE'
 
         if pricing_mode == 'ORIGINAL_PRICE' and getattr(active_m, 'contract_snapshot', None):
+            price_obj, _ = self._resolve_package_price(package, package_version, alias)
             unit_price = active_m.contract_snapshot.purchase_price
         else:
-            price_obj = package_version.prices.using(alias).filter(status='ACTIVE').first()
-            unit_price = price_obj.base_price if price_obj else Decimal('5000.00')
+            price_obj, unit_price = self._resolve_package_price(package, package_version, alias)
 
-        price_obj = package_version.prices.using(alias).filter(status='ACTIVE').first()
         branch = active_m.purchase_branch or active_m.home_branch or profile.preferred_branch
 
         # Determine start date: respect start_schedule / custom_start_date or day after active_m.end_date
@@ -3151,7 +3153,7 @@ class MemberViewSet(viewsets.ViewSet):
             pay_amt = Decimal(str(payment_amount)) if payment_amount is not None else order.total_amount
             carry_forward = request.data.get('carry_forward', True)
 
-            if is_link:
+            if is_link and order.total_amount > Decimal('0.00'):
                 link = CommerceService.create_payment_link(
                     order_id=str(order.id),
                     expiry_hours=48,
@@ -3280,8 +3282,11 @@ class MemberViewSet(viewsets.ViewSet):
                     'member': serialize_member(profile, alias, request=request),
                 }, status=status.HTTP_202_ACCEPTED)
 
-            elif pay_amt == Decimal('0.00'):
+            elif pay_amt <= Decimal('0.00'):
                 order_item = order.items.first()
+                if order.total_amount <= Decimal('0.00'):
+                    order.status = 'PAID'
+                    order.save(using=alias, update_fields=['status', 'updated_at'])
                 new_membership = MembershipLifecycleService.activate_membership_from_order(
                     order=order,
                     order_item=order_item,
@@ -3304,13 +3309,21 @@ class MemberViewSet(viewsets.ViewSet):
                         new_membership.parq_completed_at = prior_sub.submitted_at
                         new_membership.parq_form = prior_sub.intake_form or new_membership.parq_form
                         new_membership.save(using=alias, update_fields=['parq_status', 'parq_submission', 'parq_completed_at', 'parq_form', 'updated_at'])
-                new_membership.status = 'PENDING_PAYMENT'
-                new_membership.save(using=alias, update_fields=['status', 'updated_at'])
-                new_membership.entitlements.using(alias).update(status='INACTIVE')
-
+                if order.total_amount > Decimal('0.00'):
+                    new_membership.status = 'PENDING_PAYMENT'
+                    new_membership.save(using=alias, update_fields=['status', 'updated_at'])
+                    new_membership.entitlements.using(alias).update(status='INACTIVE')
+                    return Response({
+                        'success': True,
+                        'message': f"Renewal order {order.order_number} created (Payment Pending). Membership will activate upon payment.",
+                        'old_membership_id': str(active_m.id),
+                        'new_membership_id': str(new_membership.id),
+                        'order_id': str(order.id),
+                        'member': serialize_member(profile, alias, request=request),
+                    }, status=status.HTTP_201_CREATED)
                 return Response({
                     'success': True,
-                    'message': f"Renewal order {order.order_number} created (Payment Pending). Membership will activate upon payment.",
+                    'message': f"Membership renewed under complimentary/zero-balance plan ({package.name}).",
                     'old_membership_id': str(active_m.id),
                     'new_membership_id': str(new_membership.id),
                     'order_id': str(order.id),
@@ -3461,8 +3474,7 @@ class MemberViewSet(viewsets.ViewSet):
                     created_by_user=request.user
                 )
 
-        price_obj = package_version.prices.using(alias).filter(status='ACTIVE').first()
-        unit_price = price_obj.base_price if price_obj else (package.price if hasattr(package, 'price') and package.price else Decimal('5000.00'))
+        price_obj, unit_price = self._resolve_package_price(package, package_version, alias)
 
         # Branch
         branch_id = request.data.get('branch_id')
@@ -3539,7 +3551,30 @@ class MemberViewSet(viewsets.ViewSet):
 
             order_item = order.items.first()
 
-            if is_link:
+            if order.total_amount <= Decimal('0.00') and pay_amt <= Decimal('0.00'):
+                order.status = 'PAID'
+                order.save(using=alias, update_fields=['status', 'updated_at'])
+                new_membership = MembershipLifecycleService.activate_membership_from_order(
+                    order=order,
+                    order_item=order_item,
+                    start_date=start_date,
+                    db_alias=alias,
+                    created_by_user=request.user,
+                )
+                new_membership.status = 'ACTIVE'
+                new_membership.save(using=alias, update_fields=['status', 'updated_at'])
+                new_membership.entitlements.using(alias).update(status='ACTIVE')
+
+                MembershipStatusHistory.objects.using(alias).create(
+                    membership=new_membership,
+                    from_status=None,
+                    to_status='ACTIVE',
+                    reason_code='NEW_PROGRAM_PACKAGE_PURCHASE_FREE',
+                    reason_text=f"Enrolled in {package.name} ({package.program.name if package.program else ''}) at ₹0 recorded by {getattr(request.user, 'email', 'Staff')}",
+                    changed_by_user=request.user,
+                )
+
+            elif is_link and order.total_amount > Decimal('0.00'):
                 link = CommerceService.create_payment_link(
                     order_id=str(order.id),
                     expiry_hours=48,
@@ -3666,14 +3701,15 @@ class MemberViewSet(viewsets.ViewSet):
                         'member': serialize_member(profile, alias, request=request),
                     }, status=status.HTTP_202_ACCEPTED)
                 else:
-                    CommerceService.record_payment(
-                        order_id=str(order.id),
-                        amount=pay_amt,
-                        provider='CASH',
-                        payment_method='CASH',
-                        actor=request.user,
-                        db_alias=alias,
-                    )
+                    if pay_amt > Decimal('0.00'):
+                        CommerceService.record_payment(
+                            order_id=str(order.id),
+                            amount=pay_amt,
+                            provider='CASH',
+                            payment_method='CASH',
+                            actor=request.user,
+                            db_alias=alias,
+                        )
                     new_membership = MembershipLifecycleService.activate_membership_from_order(
                         order=order,
                         order_item=order_item,
@@ -3681,28 +3717,34 @@ class MemberViewSet(viewsets.ViewSet):
                         db_alias=alias,
                         created_by_user=request.user,
                     )
-                    new_membership.status = 'ACTIVE'
-                    new_membership.legacy_reference = 'CASH_VERIFIED'
-                    new_membership.save(using=alias, update_fields=['status', 'legacy_reference', 'updated_at'])
-                    new_membership.entitlements.using(alias).update(status='ACTIVE')
+                    if pay_amt > Decimal('0.00'):
+                        new_membership.status = 'ACTIVE'
+                        new_membership.legacy_reference = 'CASH_VERIFIED'
+                        new_membership.save(using=alias, update_fields=['status', 'legacy_reference', 'updated_at'])
+                        new_membership.entitlements.using(alias).update(status='ACTIVE')
+                    else:
+                        new_membership.status = 'PENDING_PAYMENT'
+                        new_membership.save(using=alias, update_fields=['status', 'updated_at'])
+                        new_membership.entitlements.using(alias).update(status='INACTIVE')
 
                     MembershipStatusHistory.objects.using(alias).create(
                         membership=new_membership,
                         from_status=None,
-                        to_status='ACTIVE',
+                        to_status=new_membership.status,
                         reason_code='NEW_PROGRAM_PACKAGE_PURCHASE_CASH',
-                        reason_text=f"Purchased {package.name} ({package.program.name if package.program else ''}) via Cash verified by {getattr(request.user, 'email', 'Staff')}",
+                        reason_text=f"Purchased {package.name} ({package.program.name if package.program else ''}) via Cash recorded by {getattr(request.user, 'email', 'Staff')}",
                         changed_by_user=request.user,
                     )
             else:
-                CommerceService.record_payment(
-                    order_id=str(order.id),
-                    amount=pay_amt,
-                    provider=payment_provider,
-                    payment_method=payment_method,
-                    actor=request.user,
-                    db_alias=alias,
-                )
+                if pay_amt > Decimal('0.00'):
+                    CommerceService.record_payment(
+                        order_id=str(order.id),
+                        amount=pay_amt,
+                        provider=payment_provider,
+                        payment_method=payment_method,
+                        actor=request.user,
+                        db_alias=alias,
+                    )
                 new_membership = MembershipLifecycleService.activate_membership_from_order(
                     order=order,
                     order_item=order_item,
@@ -3710,10 +3752,14 @@ class MemberViewSet(viewsets.ViewSet):
                     db_alias=alias,
                     created_by_user=request.user,
                 )
+                if pay_amt <= Decimal('0.00'):
+                    new_membership.status = 'PENDING_PAYMENT'
+                    new_membership.save(using=alias, update_fields=['status', 'updated_at'])
+                    new_membership.entitlements.using(alias).update(status='INACTIVE')
                 MembershipStatusHistory.objects.using(alias).create(
                     membership=new_membership,
                     from_status=None,
-                    to_status='ACTIVE',
+                    to_status=new_membership.status,
                     reason_code='NEW_PROGRAM_PACKAGE_PURCHASE',
                     reason_text=f"Purchased {package.name} ({package.program.name if package.program else ''}) via {payment_method} recorded by {getattr(request.user, 'email', 'Staff')}",
                     changed_by_user=request.user,
@@ -3785,7 +3831,13 @@ class MemberViewSet(viewsets.ViewSet):
 
         # 2. Enforce window check only if window_days is configured and > 0 (0 means unlimited / no time limit)
         if window_days and window_days > 0:
-            first_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('created_at').first()
+            first_m = (
+                Membership.objects.using(alias)
+                .filter(user_profile=profile)
+                .exclude(status='CANCELLED')
+                .order_by('created_at')
+                .first()
+            )
             initial_date = None
             if first_m:
                 initial_date = first_m.start_date or (first_m.created_at.date() if first_m.created_at else None)
@@ -3808,17 +3860,33 @@ class MemberViewSet(viewsets.ViewSet):
                 }, status=status.HTTP_200_OK)
 
         # 4. IF INSIDE WINDOW -> Calculate current sessions and price, return only higher packages
+        from .views_mobile import _resolve_package_price_totals
+
         cur_sessions = 0
+        cur_is_credit_based = False
         if active_m.package_version:
-            cur_sessions = getattr(active_m.package_version, 'max_sessions', None) or getattr(active_m.package_version, 'session_count', None) or 0
+            # Check credit wallet definitions
+            credit_ped = active_m.package_version.entitlement_definitions.using(alias).filter(
+                entitlement_type='CREDIT_WALLET', status='ACTIVE'
+            ).first()
+            if credit_ped:
+                cur_is_credit_based = True
+                cur_sessions = int(credit_ped.allocated_units or 0)
+            else:
+                cur_sessions = getattr(active_m.package_version, 'max_sessions', None) or getattr(active_m.package_version, 'session_count', None) or 0
         if not cur_sessions:
             cur_sessions = getattr(active_m, 'home_sessions_remaining', None)
         if not cur_sessions:
-            ent = active_m.entitlements.using(alias).filter(status='ACTIVE').first()
-            if ent and ent.remaining_units is not None:
-                cur_sessions = int(ent.remaining_units)
+            credit_ent = active_m.entitlements.using(alias).filter(entitlement_type='CREDIT_WALLET', status='ACTIVE').first()
+            if credit_ent:
+                cur_is_credit_based = True
+                cur_sessions = int(credit_ent.allocated_units or credit_ent.remaining_units or 0)
             else:
-                cur_sessions = 36
+                ent = active_m.entitlements.using(alias).filter(status='ACTIVE').first()
+                if ent and ent.remaining_units is not None:
+                    cur_sessions = int(ent.remaining_units)
+                else:
+                    cur_sessions = 36
 
         cur_price = 0.0
         if getattr(active_m, 'source_order', None):
@@ -3826,11 +3894,13 @@ class MemberViewSet(viewsets.ViewSet):
         elif getattr(active_m, 'source_order_item', None) and getattr(active_m.source_order_item, 'order', None):
             cur_price = float(active_m.source_order_item.order.total_amount or 0.0)
         elif getattr(active_m, 'package_price', None):
-            cur_price = float(active_m.package_price.base_price)
+            _, _, _, _cur_tot, _ = _resolve_package_price_totals(active_m.package_price)
+            cur_price = float(_cur_tot)
         elif active_m.package_version:
             p_obj = active_m.package_version.prices.using(alias).filter(status='ACTIVE').first()
             if p_obj:
-                cur_price = float(p_obj.base_price)
+                _, _, _, _cur_tot, _ = _resolve_package_price_totals(p_obj)
+                cur_price = float(_cur_tot)
 
         current_prog_id = active_m.package.program_id if (active_m.package and active_m.package.program_id) else None
         current_prog_name = active_m.package.program.name if (active_m.package and active_m.package.program) else ''
@@ -3852,17 +3922,27 @@ class MemberViewSet(viewsets.ViewSet):
             if not p_obj:
                 continue
 
-            pkg_price = float(p_obj.base_price)
-            pkg_sessions = getattr(ver, 'max_sessions', None) or getattr(ver, 'session_count', None) or 0
-            if not pkg_sessions:
-                s_match = re.search(r'(\d+)\s*(?:sessions?|sess)?', pkg.name, re.I)
-                if s_match:
-                    pkg_sessions = int(s_match.group(1))
+            _, _, _, _pkg_tot, _ = _resolve_package_price_totals(p_obj)
+            pkg_price = float(_pkg_tot)
+
+            # Check if candidate package is credit-based (Elite)
+            credit_ped = ver.entitlement_definitions.using(alias).filter(
+                entitlement_type='CREDIT_WALLET', status='ACTIVE'
+            ).first()
+            is_credit_based = bool(credit_ped)
+            if is_credit_based:
+                pkg_sessions = int(credit_ped.allocated_units or 0)
+            else:
+                pkg_sessions = getattr(ver, 'max_sessions', None) or getattr(ver, 'session_count', None) or 0
+                if not pkg_sessions:
+                    s_match = re.search(r'(\d+)\s*(?:sessions?|sess|credits?)?', pkg.name, re.I)
+                    if s_match:
+                        pkg_sessions = int(s_match.group(1))
 
             validity_days = ver.validity_days or ver.total_days or (ver.duration_value if ver.duration_unit == 'DAYS' else 30)
 
-            # Strictly higher session tier & higher price
-            if pkg_sessions > cur_sessions and pkg_price > cur_price:
+            # Higher tier: strictly higher sessions/credits OR higher price tier
+            if (pkg_sessions > cur_sessions or pkg_price > cur_price) and pkg_price >= cur_price:
                 diff = max(0.0, round(pkg_price - cur_price, 2))
                 candidate_packages.append({
                     'id': str(pkg.id),
@@ -3871,6 +3951,8 @@ class MemberViewSet(viewsets.ViewSet):
                     'name': pkg.name,
                     'program_name': pkg.program.name if pkg.program else current_prog_name,
                     'sessions': pkg_sessions,
+                    'is_credit_based': is_credit_based,
+                    'credits': float(pkg_sessions) if is_credit_based else None,
                     'price': pkg_price,
                     'validity_days': validity_days,
                     'difference_amount': diff,
@@ -3922,7 +4004,13 @@ class MemberViewSet(viewsets.ViewSet):
         window_days = getattr(policy_cfg, 'upgrade_allowed_window_days', 0)
 
         if window_days and window_days > 0:
-            first_m = Membership.objects.using(alias).filter(user_profile=profile).order_by('created_at').first()
+            first_m = (
+                Membership.objects.using(alias)
+                .filter(user_profile=profile)
+                .exclude(status='CANCELLED')
+                .order_by('created_at')
+                .first()
+            )
             initial_date = None
             if first_m:
                 initial_date = first_m.start_date or (first_m.created_at.date() if first_m.created_at else None)
@@ -4728,8 +4816,7 @@ class MemberViewSet(viewsets.ViewSet):
         if not package_version:
             return Response({'error': 'Active package version not found for package.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        price_obj = package_version.prices.using(alias).filter(status='ACTIVE').first()
-        unit_price = price_obj.base_price if price_obj else Decimal('5000.00')
+        price_obj, unit_price = self._resolve_package_price(package, package_version, alias)
 
         branch = Branch.objects.using(alias).filter(id=branch_id).first() if branch_id else profile.preferred_branch
         if not branch and org:
@@ -4779,7 +4866,7 @@ class MemberViewSet(viewsets.ViewSet):
             is_link = str(payment_provider).upper() in ('PAYMENT_LINK', 'LINK') or str(payment_method).upper() in ('PAYMENT_LINK', 'LINK')
             pay_amt = Decimal(str(payment_amount)) if payment_amount is not None else order.total_amount
 
-            if is_link:
+            if is_link and order.total_amount > Decimal('0.00'):
                 link = CommerceService.create_payment_link(
                     order_id=str(order.id),
                     expiry_hours=48,
@@ -4822,6 +4909,9 @@ class MemberViewSet(viewsets.ViewSet):
                     actor=request.user,
                     db_alias=alias,
                 )
+            elif order.total_amount <= Decimal('0.00'):
+                order.status = 'PAID'
+                order.save(using=alias, update_fields=['status', 'updated_at'])
 
             # Activate new Membership contract snapshot & entitlements
             order_item = order.items.first()
@@ -5234,6 +5324,117 @@ class MemberViewSet(viewsets.ViewSet):
 
         return Response({'payment_methods': methods}, status=status.HTTP_200_OK)
 
+    @staticmethod
+    def _resolve_package_price(
+        pkg: Package | None, package_version: PackageVersion | None, alias: str
+    ) -> tuple[PackagePrice | None, Decimal]:
+        """
+        Resolve authoritative selling price (base_price, never MRP display_price) from the target
+        version, falling back to any active price on the package instead of a 5000.00 placeholder.
+        """
+        price_obj = (
+            package_version.prices.using(alias).filter(status='ACTIVE').first()
+            if package_version
+            else None
+        )
+        if not price_obj and pkg:
+            price_obj = (
+                PackagePrice.objects.using(alias)
+                .filter(package_version__package=pkg, status='ACTIVE')
+                .order_by('-package_version__version_number')
+                .first()
+            )
+        if price_obj:
+            return price_obj, price_obj.base_price
+        pkg_price = getattr(pkg, 'price', None) if pkg else None
+        if pkg_price is not None:
+            return None, Decimal(str(pkg_price))
+        return None, Decimal('0.00')
+
+    @staticmethod
+    def _resolve_plan_sessions(pkg: Package, ver: PackageVersion | None, alias: str) -> tuple[int | None, bool]:
+        """
+        Resolve authoritative session count and unlimited flag from version entitlements,
+        matching PackagesWorkspace display logic before falling back to package name digits.
+        """
+        import re
+
+        session_types = (
+            'HOME_BRANCH_SESSION',
+            'CLASS_SESSION',
+            'PERSONAL_TRAINING_SESSION',
+            'OPEN_ACCESS',
+        )
+        ents: list[PackageEntitlementDefinition] = []
+
+        if ver:
+            try:
+                ents = list(
+                    PackageEntitlementDefinition.objects.using(alias).filter(
+                        package_version=ver,
+                        status='ACTIVE',
+                    )
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to load entitlement definitions for package %s version %s: %s",
+                    pkg.id,
+                    ver.id,
+                    exc,
+                )
+                ents = []
+
+        if not ents:
+            try:
+                fallback_ent = (
+                    PackageEntitlementDefinition.objects.using(alias)
+                    .filter(
+                        package_version__package=pkg,
+                        status='ACTIVE',
+                        entitlement_type__in=(*session_types, 'CREDIT_WALLET'),
+                    )
+                    .order_by('-package_version__version_number')
+                    .first()
+                )
+                if fallback_ent:
+                    ents = list(
+                        PackageEntitlementDefinition.objects.using(alias).filter(
+                            package_version_id=fallback_ent.package_version_id,
+                            status='ACTIVE',
+                        )
+                    )
+            except Exception as exc:
+                logger.warning("Failed fallback entitlement lookup for package %s: %s", pkg.id, exc)
+
+        session_ents = [e for e in ents if e.entitlement_type in session_types]
+        if any(e.is_unlimited for e in session_ents):
+            return None, True
+
+        ent_sum = sum(
+            (e.allocated_units or Decimal('0'))
+            for e in session_ents
+            if (e.allocated_units or Decimal('0')) > 0
+        )
+        if ent_sum > 0:
+            return int(ent_sum), False
+
+        credit_ent = next(
+            (
+                e
+                for e in ents
+                if e.entitlement_type == 'CREDIT_WALLET' and (e.allocated_units or Decimal('0')) > 0
+            ),
+            None,
+        )
+        if credit_ent:
+            return int(credit_ent.allocated_units), False
+
+        s_match = re.search(r'(\d+)\s*(?:sessions?|sess)?', pkg.name, re.I)
+        if s_match:
+            return int(s_match.group(1)), False
+
+        return None, False
+
     @action(detail=False, methods=['get'], url_path='plans')
     def plans(self, request):
         alias = _get_db(request)
@@ -5243,58 +5444,37 @@ class MemberViewSet(viewsets.ViewSet):
             packages = packages.filter(Q(organization=org) | Q(organization__isnull=True))
 
         out = []
-        import re
         for pkg in packages.order_by('name'):
             pv = pkg.versions.using(alias).filter(status='ACTIVE').order_by('-version_number').first()
+            # Align metadata fallback with PackageSerializer.get_active_version() when a package
+            # has no ACTIVE version (e.g., latest version was retired or left in draft) so session
+            # counts and validity match /ops/programs.
+            ver_for_meta = pv or pkg.versions.using(alias).order_by('-version_number').first()
             price_val = 0.0
             currency = 'INR'
             duration_months = 1
             validity_days = 30
-            total_sessions = None
-            # Resolve the real price: prefer the current version's active price, else fall back
-            # to any active price on this package (e.g. one left on a retired/older version after
-            # a migration created price-less new versions). Never fabricate a 5000 placeholder.
-            pr = pv.prices.using(alias).filter(status='ACTIVE').first() if pv else None
-            if not pr:
-                from .models_catalog import PackagePrice as _PPref
-                pr = _PPref.objects.using(alias).filter(
-                    package_version__package=pkg, status='ACTIVE'
-                ).order_by('-package_version__version_number').first()
-            if pr:
-                price_val = float(pr.display_price if pr.display_price else pr.base_price)
-                currency = pr.currency
-            if pv:
-                if getattr(pv, 'duration_unit', '') == 'MONTH':
-                    duration_months = pv.duration_value or 1
-                elif getattr(pv, 'duration_unit', '') == 'YEAR':
-                    duration_months = (pv.duration_value or 1) * 12
-                elif getattr(pv, 'duration_unit', '') == 'WEEK':
-                    duration_months = max(1, round((pv.duration_value or 1) / 4))
+            # Resolve the real selling price (base_price, never MRP display_price): prefer the
+            # current version's active price, else fall back to any active price on this package.
+            pr, resolved_price = self._resolve_package_price(pkg, pv, alias)
+            price_val = float(resolved_price)
+            currency = pr.currency if pr else 'INR'
+            if ver_for_meta:
+                if getattr(ver_for_meta, 'duration_unit', '') == 'MONTH':
+                    duration_months = ver_for_meta.duration_value or 1
+                elif getattr(ver_for_meta, 'duration_unit', '') == 'YEAR':
+                    duration_months = (ver_for_meta.duration_value or 1) * 12
+                elif getattr(ver_for_meta, 'duration_unit', '') == 'WEEK':
+                    duration_months = max(1, round((ver_for_meta.duration_value or 1) / 4))
                 else:  # DAY or fallback
-                    duration_months = max(1, round((pv.duration_value or 30) / 30))
-                validity_days = pv.validity_days or pv.total_days or (duration_months * 30)
+                    duration_months = max(1, round((ver_for_meta.duration_value or 30) / 30))
+                validity_days = ver_for_meta.validity_days or ver_for_meta.total_days or (duration_months * 30)
 
-                # Check entitlement definitions for explicit allocated session units
-                try:
-                    from django.db.models import Sum
-                    ent_sessions = pv.entitlement_definitions.using(alias).filter(
-                        entitlement_type__in=['HOME_BRANCH_SESSION', 'CLASS_SESSION']
-                    ).aggregate(tot=Sum('allocated_units'))['tot']
-                    if ent_sessions and ent_sessions > 0:
-                        total_sessions = int(ent_sessions)
-                except Exception:
-                    pass
-
-            # Extract session count from package name if not found in entitlements:
-            # Matches "Bootcamp - 384 sessions", "Performance 36", "Transform 72", "Transform + 144"
-            if not total_sessions:
-                s_match = re.search(r'(\d+)\s*(?:sessions?|sess)?', pkg.name, re.I)
-                if s_match:
-                    total_sessions = int(s_match.group(1))
+            total_sessions, is_unlimited = self._resolve_plan_sessions(pkg, ver_for_meta, alias)
 
             prog = pkg.program
             cat_name = prog.category.name if (prog and getattr(prog, 'category', None)) else 'General'
-            desc = getattr(pv, 'description_snapshot', '') if pv else ''
+            desc = getattr(ver_for_meta, 'description_snapshot', '') if ver_for_meta else ''
             out.append({
                 'id': str(pkg.id),
                 'package_id': str(pkg.id),
@@ -5309,6 +5489,7 @@ class MemberViewSet(viewsets.ViewSet):
                 'price': price_val,
                 'currency': currency,
                 'total_sessions': total_sessions,
+                'is_unlimited': is_unlimited,
                 'is_active': True,
                 'description': desc or '',
             })

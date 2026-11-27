@@ -155,6 +155,8 @@ class MemberAssessmentDetailSerializer(serializers.ModelSerializer):
             'branch',
             'branch_detail',
             'previous_assessment',
+            'membership_id',
+            'assessment_entitlement_id',
             'training_experience',
             'current_activity_level',
             'preferred_training_style',

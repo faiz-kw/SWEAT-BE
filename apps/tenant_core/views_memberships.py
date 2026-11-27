@@ -337,6 +337,7 @@ class MembershipViewSet(viewsets.ModelViewSet):
                     }
                     for e in membership.entitlements.all()
                 ]
+                pv_perks = getattr(pv, 'perks_config', None) if pv else None
                 contract = MembershipContractSnapshot.objects.using(db).create(
                     membership=membership,
                     package=membership.package,
@@ -353,6 +354,7 @@ class MembershipViewSet(viewsets.ModelViewSet):
                     start_date=membership.start_date,
                     end_date=membership.end_date,
                     entitlements_snapshot=ents,
+                    perks_config=dict(pv_perks) if isinstance(pv_perks, dict) else {},
                     purchase_branch=membership.purchase_branch or membership.home_branch,
                 )
             except Exception:
@@ -380,7 +382,7 @@ class MembershipViewSet(viewsets.ModelViewSet):
             getattr(user, 'is_staff_or_admin', False)
             or getattr(user, 'is_staff', False)
             or getattr(user, 'is_superuser', False)
-            or getattr(user, 'user_type', None) in ['STAFF', 'ADMIN', 'SUPERADMIN', 'TENANT_ADMIN', 'ORG_ADMIN']
+            or getattr(user, 'user_type', None) in ['ADMIN', 'SUPERADMIN', 'TENANT_ADMIN', 'ORG_ADMIN']
             or any(r in str(getattr(user, 'role', '')).upper() for r in ['ADMIN', 'STAFF', 'MANAGER', 'DESK', 'OWNER', 'ORG'])
             or any(r in str(getattr(user, 'role_code', '')).upper() for r in ['ADMIN', 'STAFF', 'MANAGER', 'DESK', 'OWNER', 'ORG'])
         )
@@ -553,6 +555,11 @@ class MembershipViewSet(viewsets.ModelViewSet):
             or getattr(user, 'is_superuser', False)
             or getattr(user, 'user_type', None) in ['STAFF', 'ADMIN', 'SUPERADMIN']
             or any(r in str(getattr(user, 'role', '')).upper() for r in ['ADMIN', 'STAFF', 'MANAGER', 'DESK'])
+        ) and bool(
+            request.data.get('staff_assisted')
+            or request.data.get('tablet_mode')
+            or request.data.get('is_tablet')
+            or str(request.headers.get('X-Tablet-Mode', '')).lower() == 'true'
         )
         if not is_owner and not is_staff_assisting:
             return Response(

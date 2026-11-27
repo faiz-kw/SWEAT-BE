@@ -265,6 +265,7 @@ class Booking(models.Model):
         default='MEMBER',
         choices=[
             ('MEMBER', 'MEMBER'),
+            ('GUEST', 'GUEST'),
             ('TRIAL', 'TRIAL'),
             ('WALK_IN', 'WALK_IN'),
             ('COMPLIMENTARY', 'COMPLIMENTARY'),
@@ -322,6 +323,9 @@ class Booking(models.Model):
     )
     confirmed_at = models.DateTimeField(null=True, blank=True)
     waitlist_position = models.IntegerField(null=True, blank=True)
+    is_guest_pass = models.BooleanField(default=False)
+    guest_name = models.CharField(max_length=150, null=True, blank=True)
+    guest_phone = models.CharField(max_length=30, null=True, blank=True)
     booked_at = models.DateTimeField(default=timezone.now)
     cancelled_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
@@ -508,6 +512,16 @@ class BookingPolicyConfig(models.Model):
     max_reschedules_per_booking = models.IntegerField(
         default=2,
         help_text="Maximum allowed reschedules for a single booking"
+    )
+    reschedule_credit_diff_mode = models.CharField(
+        max_length=30,
+        default='ADJUST_DIFFERENCE',
+        choices=[
+            ('ADJUST_DIFFERENCE', 'Adjust Credit Difference (Charge Extra / Refund Excess)'),
+            ('BLOCK_MISMATCH', 'Block Reschedule If Credit Cost Differs'),
+            ('KEEP_ORIGINAL', 'Keep Original Credit Deduction'),
+        ],
+        help_text="How variable credit costs are handled when a credit-wallet member reschedules across classes."
     )
 
     # 4. Late Cancellation Policy

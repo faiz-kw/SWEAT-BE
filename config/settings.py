@@ -674,6 +674,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'apps.tenant_core.tasks.reconcile_pending_payment_orders_periodic_task',
         'schedule': float(os.getenv('CELERY_SCHEDULE_RZP_RECONCILE_SECONDS', '600.0')),  # every 10 min
     },
+    'tenant-expire-overdue-memberships': {
+        'task': 'apps.tenant_core.tasks.expire_overdue_memberships_periodic_task',
+        'schedule': float(os.getenv('CELERY_SCHEDULE_MEMBERSHIP_EXPIRY_SECONDS', '3600.0')),  # hourly
+    },
 }
 
 

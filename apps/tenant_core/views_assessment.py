@@ -300,6 +300,7 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
             'member_name': member_name or 'Guest',
             'member_phone': mask_phone_if_restricted(getattr(self, 'request', None), instance.member_phone),
             'member_id': str(instance.user_profile_id) if instance.user_profile_id else None,
+            'membership_id': str(instance.membership_id) if instance.membership_id else None,
             'lead_id': str(instance.lead_id) if instance.lead_id else None,
             'previous_assessment_id': str(instance.previous_assessment_id) if instance.previous_assessment_id else None,
             'assessment_type': instance.assessment_type,
@@ -330,6 +331,34 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
             user_profile = UserProfile.objects.using(alias).filter(id=val['user_profile_id']).first()
         elif getattr(request.user, 'user_type', None) == 'MEMBER':
             user_profile = UserProfile.objects.using(alias).filter(user=request.user).first()
+
+        linked_membership_id = None
+        linked_entitlement_id = None
+        if user_profile:
+            elig = AssessmentEngineService.check_member_eligibility(
+                user_profile=user_profile,
+                branch_id=str(val['branch_id']) if val.get('branch_id') else None,
+                db_alias=alias,
+            )
+            if elig.get('eligible'):
+                linked_membership_id = elig.get('membership_id')
+                linked_entitlement_id = elig.get('entitlement_id')
+            else:
+                caller_is_member = (
+                    getattr(request.user, 'user_type', None) == 'MEMBER'
+                    and not getattr(request.user, 'is_staff', False)
+                )
+                if elig.get('code') == 'ASSESSMENT_QUOTA_EXHAUSTED' or caller_is_member:
+                    msg = elig.get('reason') or 'No active assessment allowance available.'
+                    return Response(
+                        {
+                            'error': msg,
+                            'detail': msg,
+                            'code': elig.get('code') or 'ASSESSMENT_NOT_ELIGIBLE',
+                            'remaining_credits': elig.get('remaining_credits', 0),
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
 
         user_name = ''
         user_phone = ''
@@ -397,7 +426,9 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
         age = _derive_age(dob) if dob else None
 
         assessment = MemberAssessment.objects.using(alias).create(
-            organization=org, branch=branch, user_profile=user_profile, previous_assessment=prev_assessment,
+            organization=org, branch=branch, user_profile=user_profile,
+            membership_id=linked_membership_id, assessment_entitlement_id=linked_entitlement_id,
+            previous_assessment=prev_assessment,
             member_date_of_birth=dob or None, member_age_years=age, member_sex=sex,
             member_name=name, member_phone=phone, conducted_by_trainer=trainer, assessment_type=val.get('assessment_type', 'INITIAL'),
             training_experience=val.get('training_experience', 'BEGINNER'), current_activity_level=act,
@@ -863,7 +894,7 @@ class StudioScreenPairingView(APIView):
     @staticmethod
     def _approved_summary(assessment: MemberAssessment) -> dict:
         rec_pkg = assessment.recommended_package
-        price, sessions = None, None
+        price, sessions, is_credit_plan = None, None, False
         if rec_pkg:
             ver = assessment.recommended_package_version or rec_pkg.get_active_version()
             if ver:
@@ -871,6 +902,19 @@ class StudioScreenPairingView(APIView):
                 if p:
                     price = float(p.total_price)
                 for e in ver.entitlement_definitions.filter(status='ACTIVE'):
+                    if e.entitlement_type == 'CREDIT_WALLET':
+                        is_credit_plan = True
+                        if e.is_unlimited:
+                            sessions = 365
+                        elif e.allocated_units is not None:
+                            sessions = (
+                                int(e.allocated_units)
+                                if e.allocated_units == int(e.allocated_units)
+                                else float(e.allocated_units)
+                            )
+                        else:
+                            sessions = 0
+                        break
                     if e.entitlement_type in ['HOME_BRANCH_SESSION', 'CLASS_SESSION', 'PERSONAL_TRAINING_SESSION', 'OPEN_ACCESS']:
                         sessions = 365 if e.is_unlimited else int(e.allocated_units or 0)
 
@@ -880,5 +924,12 @@ class StudioScreenPairingView(APIView):
             'stated_goal_outcome': assessment.stated_goal_outcome, 'timeline_weeks': assessment.target_timeline_weeks,
             'timeline_months': assessment.target_timeline_months, 'posture_score': float(assessment.posture_score or 0),
             'capability_matrix': assessment.capability_matrix or {},
-            'recommended_package': {'name': rec_pkg.name if rec_pkg else 'Tailored Studio Plan', 'session_units': sessions or 72, 'price': price or 0, 'reason': assessment.recommendation_reason},
+            'recommended_package': {
+                'name': rec_pkg.name if rec_pkg else 'Tailored Studio Plan',
+                'session_units': sessions or 72,
+                'is_credit_based': is_credit_plan,
+                'credits': sessions if is_credit_plan else None,
+                'price': price or 0,
+                'reason': assessment.recommendation_reason,
+            },
         }

@@ -147,15 +147,20 @@ def register_card(
             },
             timeout=timeout,
         )
-        result = r_card.json().get('result', False)
+        rj = r_card.json()
+        err = rj.get('error') or {}
+        err_msg = str(err.get('message', ''))
+        fail_codes = (err.get('detail') or {}).get('FailCodes') or []
+        # 286064919 = Dahua/TimeWatch "Card already exists" batch error code
+        result = bool(rj.get('result', False)) or 'exist' in err_msg.lower() or 286064919 in fail_codes
         if result:
             logger.debug('register_card OK: %s card=%s…', base_url, card_no[:6])
         else:
             logger.warning(
                 'register_card returned result=False: %s card=%s… resp=%s',
-                base_url, card_no[:6], r_card.json(),
+                base_url, card_no[:6], rj,
             )
-        return bool(result)
+        return result
 
     except Exception as exc:
         logger.error('register_card failed: %s card=%s… err=%s', base_url, card_no[:6], exc)
@@ -174,16 +179,21 @@ def delete_cards(base_url: str, card_nos: list[str], timeout: int = 10, batch_si
         all_ok = True
         for i in range(0, len(card_nos), batch_size):
             chunk = card_nos[i:i + batch_size]
-            r = sess.post(
-                f'{base_url}/RPC2',
-                json={
-                    'method': 'AccessCard.deleteMulti',
-                    'params': {'CardNoList': chunk},
-                    'id': 20 + i, 'session': sid,
-                },
-                timeout=timeout,
-            )
-            ok = bool(r.json().get('result', False))
+            ok = False
+            for offset, method in enumerate(('AccessCard.deleteMulti', 'AccessCard.removeMulti')):
+                r = sess.post(
+                    f'{base_url}/RPC2',
+                    json={
+                        'method': method,
+                        'params': {'CardNoList': chunk},
+                        'id': 20 + offset + i, 'session': sid,
+                    },
+                    timeout=timeout,
+                )
+                ok = bool(r.json().get('result', False))
+                if ok:
+                    break
+                logger.warning('delete_cards %s failed on %s: %s', method, base_url, r.text[:200])
             all_ok = all_ok and ok
         return all_ok
     except Exception as exc:
