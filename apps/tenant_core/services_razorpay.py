@@ -868,4 +868,74 @@ class RazorpayReconciliationService:
                     "Reconcile: error checking order %s (rzp_order=%s): %s",
                     order.order_number, order.gateway_order_id, e,
                 )
+
+        # Payment-LINK orders have no gateway_order_id (Razorpay mints its own order when the link is
+        # paid), so the scan above misses them. Converge them via the stored Razorpay link id. This is
+        # the safety-net that makes "Send Payment Link" work even when the Razorpay webhook never fires.
+        from .models_commerce import PaymentLink
+        link_qs = (
+            PaymentLink.objects.using(alias)
+            .filter(
+                provider='RAZORPAY',
+                order__status='PENDING_PAYMENT',
+                order__created_at__lte=grace_cutoff,
+                external_reference__startswith='plink_',
+            )
+            .exclude(status__in=['PAID', 'CANCELLED', 'EXPIRED'])
+            .select_related('order')
+            .order_by('created_at')[:max_scan]
+        )
+        for link in link_qs:
+            order = link.order
+            result['scanned'] += 1
+            try:
+                pl = client.payment_link.fetch(link.external_reference) or {}
+                pl_status = pl.get('status')
+                if pl_status == 'paid':
+                    pays = pl.get('payments') or []
+                    pay = next((p for p in pays if p.get('status') == 'captured'), None) or (pays[0] if pays else None)
+                    rzp_order_id = pl.get('order_id') or (pay.get('order_id') if pay else None)
+                    rzp_pay_id = (pay.get('payment_id') or pay.get('id')) if pay else None
+                    if not rzp_pay_id or not rzp_order_id:
+                        result['still_pending'] += 1
+                        continue
+                    if dry_run:
+                        result['finalized'] += 1
+                        continue
+                    raw_event = {
+                        'event': 'payment_link.paid',
+                        'payload': {
+                            'payment_link': {'entity': pl},
+                            'payment': {'entity': {'id': rzp_pay_id, 'order_id': rzp_order_id, 'notes': pl.get('notes') or {}}},
+                        },
+                    }
+                    RazorpayPaymentFinalizerService.finalize_payment(
+                        razorpay_order_id=rzp_order_id,
+                        razorpay_payment_id=rzp_pay_id,
+                        order_id=str(order.id),
+                        source='RECOVERY_LINK',
+                        db_alias=alias,
+                        raw_event=raw_event,
+                    )
+                    link.status = 'PAID'
+                    link.save(using=alias, update_fields=['status', 'updated_at'])
+                    result['finalized'] += 1
+                    logger.info(
+                        "Reconcile(link): finalized order %s via %s (payment=%s)",
+                        order.order_number, link.external_reference, rzp_pay_id,
+                    )
+                elif pl_status in ('expired', 'cancelled'):
+                    if not dry_run:
+                        link.status = 'EXPIRED' if pl_status == 'expired' else 'CANCELLED'
+                        link.save(using=alias, update_fields=['status', 'updated_at'])
+                    result['still_pending'] += 1
+                else:
+                    result['still_pending'] += 1
+            except Exception as e:
+                result['errors'] += 1
+                logger.warning(
+                    "Reconcile(link): error checking link %s (order %s): %s",
+                    link.external_reference, order.order_number, e,
+                )
+
         return result

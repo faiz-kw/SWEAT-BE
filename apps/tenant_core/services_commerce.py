@@ -520,7 +520,9 @@ class CommerceService:
             created_by_user=actor,
         )
         if provider_ref:
-            link.provider_reference = provider_ref
+            # Store the Razorpay payment-link id (plink_...) so the reconciliation safety-net can
+            # look the link up later and finalize it even if the webhook never delivers.
+            link.external_reference = provider_ref
         link.save(using=alias)
 
         PaymentLinkEvent.objects.using(alias).create(
