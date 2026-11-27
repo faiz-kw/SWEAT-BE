@@ -467,10 +467,11 @@ class CommerceService:
 
                 cust_name = cust_email = cust_phone = None
                 if order.user_profile:
-                    up = order.user_profile
-                    cust_name = (getattr(up, 'full_name', None) or '').strip() or None
-                    cust_email = getattr(up, 'email', None) or None
-                    cust_phone = getattr(up, 'phone', None) or None
+                    tu = getattr(order.user_profile, 'user', None)
+                    if tu is not None:
+                        cust_name = (getattr(tu, 'full_name', None) or '').strip() or None
+                        cust_email = getattr(tu, 'email', None) or None
+                        cust_phone = getattr(tu, 'phone', None) or None
                 elif order.lead:
                     ld = order.lead
                     cust_name = (getattr(ld, 'name', None) or '').strip() or None
