@@ -691,6 +691,9 @@ from .tasks_meta_leads import (  # noqa: F401
 from .tasks_body_scan import (  # noqa: F401
     run_assessment_body_scan,
 )
+from .tasks_transformation import (  # noqa: F401
+    run_assessment_transformation,
+)
 
 
 @shared_task(

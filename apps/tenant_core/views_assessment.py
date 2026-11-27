@@ -477,6 +477,22 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
             if instance.status == 'DRAFT':
                 instance.status = 'TESTING'
 
+        # Re-match recommended package if goal or timeline/frequency was updated
+        if any(k in request.data for k in ('target_goal', 'target_timeline_months', 'target_timeline_weeks', 'weekly_frequency_days')):
+            timeline_m = instance.target_timeline_months or 3
+            freq = instance.weekly_frequency_days or 3
+            match_res = AssessmentEngineService.match_system_packages(
+                organization=org, branch=instance.branch, goal=instance.target_goal,
+                timeline_months=timeline_m, weekly_frequency=freq, db_alias=alias,
+            )
+            rec_pkg = match_res.get('recommended_package')
+            if rec_pkg:
+                instance.recommended_package = rec_pkg
+                instance.recommended_package_version = match_res.get('recommended_package_version')
+                instance.recommendation_reason = match_res.get('recommendation_reason')
+                instance.alternative_packages_payload = match_res.get('alternatives', [])
+                instance.recommended_program = rec_pkg.program if rec_pkg else None
+
         instance.save(using=alias)
         return Response(MemberAssessmentDetailSerializer(instance, context={'request': request}).data)
 
@@ -649,7 +665,47 @@ class AssessmentSessionViewSet(viewsets.ModelViewSet):
             TransformationError, TransformationNotPermitted, TransformationPipeline, get_renderer,
         )
 
-        renderer = get_renderer(request.data.get('renderer'))
+        # Consent is a hard gate, checked up front so the member never waits on a queue for an
+        # answer we already have.
+        if not getattr(assessment, 'consent_image_generation', False):
+            msg = 'The member has not consented to a generated transformation preview.'
+            assessment.transformation_status = 'REFUSED_NO_CONSENT'
+            assessment.transformation_payload = {'error': msg}
+            assessment.save(using=alias, update_fields=[
+                'transformation_status', 'transformation_payload', 'updated_at'])
+            return Response({'error': msg}, status=status.HTTP_403_FORBIDDEN)
+
+        renderer_name = request.data.get('renderer')
+
+        # A three-milestone build is ~90s of hosted round-trips; holding the request open that
+        # long times the browser out ("preview could not be produced") even though the server
+        # succeeds. Mark it in progress and hand off to Celery; the studio polls the GET below.
+        tenant_id = (
+            getattr(request.user, '_tenant_id', None)
+            or getattr(getattr(request, 'tenant', None), 'id', None)
+            or getattr(request, 'tenant_id', None)
+        )
+        if tenant_id:
+            try:
+                from .tasks_transformation import run_assessment_transformation
+                assessment.transformation_status = 'PROCESSING'
+                assessment.transformation_payload = {}
+                assessment.save(using=alias, update_fields=[
+                    'transformation_status', 'transformation_payload', 'updated_at'])
+                run_assessment_transformation.delay(
+                    tenant_id=str(tenant_id),
+                    assessment_id=str(assessment.id),
+                    renderer_name=renderer_name,
+                )
+                return Response({'status': 'PROCESSING'}, status=status.HTTP_202_ACCEPTED)
+            except Exception:
+                logger.warning(
+                    "Could not queue the transformation for assessment %s; building it inline.",
+                    assessment.id,
+                )
+
+        # Fallback: no tenant on the request, or no broker reachable — build inline.
+        renderer = get_renderer(renderer_name)
         try:
             result = TransformationPipeline.build(assessment, renderer=renderer, db_alias=alias)
         except TransformationNotPermitted as exc:

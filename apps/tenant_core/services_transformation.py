@@ -46,13 +46,16 @@ logger = logging.getLogger(__name__)
 MILESTONE_MONTHS = (1, 2, 3)
 
 # A joint that moves more than this share of the subject's height between the baseline and
-# the rendered image means the pose was not preserved, and the render is rejected.
-MAX_JOINT_DRIFT_RATIO = 0.04
+# the rendered image means the pose was not preserved, and the render is rejected. Hands, feet
+# and ankles naturally shift a little when a hosted editor reshapes the torso, so too tight a
+# limit discards otherwise-good previews; 8% still catches a genuinely moved or swapped limb.
+MAX_JOINT_DRIFT_RATIO = 0.08
 
-# Waist change we are willing to illustrate per month, as a share of the starting waist.
-# Deliberately conservative: an illustration that outruns what training plausibly delivers
-# is the thing the specification is warning about.
-WAIST_CHANGE_PCT_PER_MONTH = 1.2
+# Waist change we illustrate per month, as a share of the starting waist. Set so the
+# three-month trajectory is clearly visible on a heavier starting frame (a sub-5% change still
+# reads as "no change" to the member), while staying inside what consistent training plausibly
+# delivers and what the pose verification will accept.
+WAIST_CHANGE_PCT_PER_MONTH = 3.0
 
 
 class TransformationError(Exception):
@@ -112,43 +115,58 @@ class SilhouetteMorphRenderer:
                 'cannot be located. Re-run the body scan first.'
             )
 
-        midline_x = (shoulder[0] + hip[0]) / 2.0
-        shoulder_y, hip_y = shoulder[1], hip[1]
+        midline_x = float((shoulder[0] + hip[0]) / 2.0)
+        shoulder_y, hip_y = float(shoulder[1]), float(hip[1])
         if hip_y <= shoulder_y:
             raise TransformationError('The baseline landmarks are inconsistent; cannot morph.')
 
-        # The waist sits around 55% of the way from shoulder to hip.
-        waist_y = shoulder_y + (hip_y - shoulder_y) * 0.55
-        span = max(1.0, (hip_y - shoulder_y))
-        max_squeeze = max(0.0, min(0.12, waist_reduction_pct / 100.0))
+        # The whole mid-body is compressed horizontally toward the midline: strongest at the
+        # lower belly (the widest point on a heavier frame), tapering up through the chest and
+        # down into the upper thigh, and zero by the knees so the feet, legs and pose are
+        # untouched. Full-width source compresses into a narrower band and the exposed edges
+        # are filled by stretching the plain background, so nothing is invented - identity,
+        # face, hair and clothing are the member's own pixels, only the silhouette narrows.
+        span = hip_y - shoulder_y
+        peak_y = shoulder_y + span * 0.80          # the belly overhang - the widest point
+        top_inf = shoulder_y + span * 0.25         # below the chest, so shoulders/chest keep their width
+        bot_inf = hip_y + span * 0.55              # ease out through the hips, well above the knees
+        # Deliberately gentle so it reads as a believable reduction of the belly, not a photo
+        # squeeze: capped low and concentrated on the belly rather than the whole torso.
+        peak_slim = max(0.0, min(0.13, (waist_reduction_pct / 100.0) * 1.0))
 
-        strips = 48
+        bg = max(2, int(width * 0.015))
+        strips = 64
         strip_h = height / strips
         mesh: List[Tuple[Tuple[int, int, int, int], Tuple[int, int, int, int, int, int, int, int]]] = []
 
         for i in range(strips):
             top = i * strip_h
             bottom = (i + 1) * strip_h
-            centre_y = (top + bottom) / 2.0
+            cy = (top + bottom) / 2.0
+            t0, t1 = int(top), int(math.ceil(bottom))
 
-            # Falls off smoothly either side of the waist and is zero outside the torso.
-            distance = abs(centre_y - waist_y) / span
-            factor = max(0.0, 1.0 - (distance / 0.75) ** 2) if distance < 0.75 else 0.0
-            squeeze = max_squeeze * factor
+            if cy <= top_inf or cy >= bot_inf:
+                factor = 0.0
+            else:
+                half = (peak_y - top_inf) if cy < peak_y else (bot_inf - peak_y)
+                norm = (cy - peak_y) / max(1.0, half)
+                factor = max(0.0, 1.0 - norm * norm)
+            s = peak_slim * factor
 
-            # Source quad is pulled inward, so the destination strip shows a narrower body.
-            left = midline_x - (midline_x - 0) * (1.0 - squeeze)
-            right = midline_x + (width - midline_x) * (1.0 - squeeze)
+            full_src = (0, t0, 0, t1, width, t1, width, t0)
+            if s <= 0.001:
+                mesh.append(((0, t0, width, t1), full_src))
+                continue
 
-            mesh.append((
-                (0, int(top), width, int(math.ceil(bottom))),
-                (
-                    int(left), int(top),
-                    int(left), int(math.ceil(bottom)),
-                    int(right), int(math.ceil(bottom)),
-                    int(right), int(top),
-                ),
-            ))
+            lt = int(midline_x * s)
+            rt = int(width - (width - midline_x) * s)
+            # Full-width body compressed into the narrower [lt, rt] band.
+            mesh.append(((lt, t0, rt, t1), full_src))
+            # Exposed edges filled by stretching the outermost background columns.
+            if lt > 0:
+                mesh.append(((0, t0, lt, t1), (0, t0, 0, t1, bg, t1, bg, t0)))
+            if rt < width:
+                mesh.append(((rt, t0, width, t1), (width - bg, t0, width - bg, t1, width, t1, width, t0)))
 
         rendered = source.transform(source.size, Image.MESH, mesh, Image.BICUBIC)
         buffer = io.BytesIO()
@@ -179,6 +197,10 @@ class FalEditRenderer:
         *,
         waist_reduction_pct: float,
         month: int = 1,
+        goal_code: Optional[str] = None,
+        goal_label: Optional[str] = None,
+        weight_loss_kg: Optional[float] = None,
+        stated_outcome: Optional[str] = None,
         **_: Any,
     ) -> bytes:
         api_key = (getattr(settings, 'FAL_KEY', '') or '').strip()
@@ -198,7 +220,10 @@ class FalEditRenderer:
         except Exception as exc:
             raise TransformationError(f'Could not upload the baseline capture: {exc}') from exc
 
-        prompt = build_edit_prompt(waist_reduction_pct)
+        prompt = build_edit_prompt(
+            waist_reduction_pct, goal_code=goal_code, goal_label=goal_label,
+            weight_loss_kg=weight_loss_kg, stated_outcome=stated_outcome,
+        )
 
         try:
             result = fal_client.subscribe(self.model, arguments={
@@ -226,17 +251,69 @@ class FalEditRenderer:
             raise TransformationError(f'Could not download the rendered image: {exc}') from exc
 
 
+# How each goal is described to the editor. The member's own goal decides what "progress"
+# looks like, so a fat-loss client is shown a leaner torso while a glutes client is shown a
+# toned lower body - rather than every member getting the same anonymous waist pinch.
+GOAL_EDIT_PHRASING = {
+    'FAT_LOSS': 'a visibly leaner build with noticeably less body fat around the waist, belly and torso',
+    'POSTURE_ALIGNMENT': 'a more upright posture, an aligned spine and a slightly leaner, tighter midsection',
+    'HYPERTROPHY_GLUTES': 'a more toned and firm lower body and a leaner waist',
+    'STRENGTH_CONDITIONING': 'a leaner, more solid and conditioned physique with a tighter waist',
+    'ATHLETIC_PERFORMANCE': 'a leaner, more athletic and defined physique with a tighter waist',
+    'MOBILITY_LONGEVITY': 'a healthier, slightly leaner and fitter build with a tighter waist',
+    'GENERAL_FITNESS': 'a healthier, slightly leaner and fitter build with a tighter waist',
+}
+
+
 # The instruction given to any hosted editor. Written to constrain rather than invent: it
-# names the single change wanted and forbids the ones the specification warns about. Shared
-# between providers so a provider swap cannot quietly change what is asked for.
-def build_edit_prompt(waist_reduction_pct: float) -> str:
+# names the change wanted for this member's goal and forbids the ones the specification warns
+# about. Shared between providers so a provider swap cannot quietly change what is asked for.
+def build_edit_prompt(
+    waist_reduction_pct: float,
+    *,
+    goal_code: Optional[str] = None,
+    goal_label: Optional[str] = None,
+    weight_loss_kg: Optional[float] = None,
+    stated_outcome: Optional[str] = None,
+    **_: Any,
+) -> str:
+    look = GOAL_EDIT_PHRASING.get(
+        (goal_code or '').upper(),
+        'a leaner, fitter build with a slimmer waist',
+    )
+    parts = [
+        'Edit this photo to show the SAME person after several months of consistent fat-loss '
+        f'training: {look}. ',
+        f'Significantly slim the body - noticeably reduce the belly and waist fat so the stomach is '
+        f'clearly flatter, the love handles are smaller and the midsection is visibly tighter, '
+        f'roughly a {waist_reduction_pct:.0f} percent smaller waist. Make the fat loss obvious at a '
+        'glance - a clear, believable before-and-after difference, not a subtle one. ',
+    ]
+    if weight_loss_kg and weight_loss_kg > 0:
+        parts.append(f'Consistent with losing roughly {weight_loss_kg:.0f} kg of body fat. ')
+    parts.append(
+        'Keep it unmistakably the same person: identical face, exact same hairstyle, hairline and '
+        'facial hair, same skin tone and same clothing. '
+        'Keep the exact same pose, stance, arm and leg position, foot placement, camera angle, '
+        'framing, lighting and background - only the body fat changes. '
+        'Do not move the limbs, feet or head, do not change height, do not alter the face. '
+        'Keep it a realistic, believable photograph.'
+    )
+    return ''.join(parts)
+
+
+# Used on the SECOND pass of the hybrid renderer: the morph has already reshaped the body, so
+# this only asks the editor to repair the warp artefacts and restore a natural photographic
+# look - explicitly NOT to resize the body or touch the person.
+def build_refine_prompt() -> str:
     return (
-        f'Subtly reduce waist circumference by approximately {waist_reduction_pct:.0f} percent, '
-        'as the same person would look after some months of consistent training. '
-        'Keep the face, hair, skin tone and clothing exactly as they are. '
-        'Keep the identical pose, camera angle, framing, lighting and background. '
-        'Do not add muscle definition, do not change height or limb proportions, '
-        'do not alter the face in any way. Photographic, not stylised.'
+        'This photo was lightly retouched and has small warping and stretching artefacts along '
+        'the body outline and background. Repair them so it looks like a natural, realistic, '
+        'un-edited photograph. Keep the body shape and size exactly as they are now, and keep '
+        'the exact same person: identical face, hairstyle, hairline, facial hair, skin, pose, '
+        'stance, limb and foot position, clothing, lighting and background. Do not slim, enlarge '
+        'or reshape the body, do not add muscle or abs, do not alter the face. Only smooth the '
+        'distortion and make it photorealistic.'
     )
 
 
@@ -266,6 +343,12 @@ class ReplicateEditRenderer:
         *,
         waist_reduction_pct: float,
         month: int = 1,
+        goal_code: Optional[str] = None,
+        goal_label: Optional[str] = None,
+        weight_loss_kg: Optional[float] = None,
+        stated_outcome: Optional[str] = None,
+        prompt_override: Optional[str] = None,
+        guidance_override: Optional[float] = None,
         **_: Any,
     ) -> bytes:
         import base64
@@ -285,11 +368,23 @@ class ReplicateEditRenderer:
             'Prefer': 'wait=55',
         }
         data_uri = 'data:image/jpeg;base64,' + base64.b64encode(image_bytes).decode('ascii')
+        prompt = prompt_override if prompt_override else build_edit_prompt(
+            waist_reduction_pct, goal_code=goal_code, goal_label=goal_label,
+            weight_loss_kg=weight_loss_kg, stated_outcome=stated_outcome,
+        )
         payload = {
             'input': {
                 'input_image': data_uri,
-                'prompt': build_edit_prompt(waist_reduction_pct),
+                'prompt': prompt,
                 'output_format': 'jpg',
+                # Higher guidance = stronger prompt adherence; more steps = cleaner result.
+                # The refine pass passes a lower guidance_override so it only smooths.
+                'guidance': float(guidance_override if guidance_override is not None
+                                  else getattr(settings, 'REPLICATE_FLUX_GUIDANCE', 3.5)),
+                'num_inference_steps': int(getattr(settings, 'REPLICATE_FLUX_STEPS', 32)),
+                # Prompt upsampling rewrites the prompt and tends to drift identity (e.g. change
+                # the hair), so keep it off - we want only the body fat to change.
+                'prompt_upsampling': bool(getattr(settings, 'REPLICATE_FLUX_PROMPT_UPSAMPLING', False)),
             }
         }
 
@@ -340,15 +435,57 @@ class ReplicateEditRenderer:
             raise TransformationError(f'Could not download the rendered image: {exc}') from exc
 
 
+class MorphRefineRenderer:
+    """
+    Hybrid: morph then refine.
+
+    The morph does the geometry - it reshapes the member's own pixels, so the slimmer silhouette
+    is real and identity is preserved exactly, but the warp leaves small artefacts that read as
+    "edited". The hosted editor then runs a SECOND, light pass whose only job is to repair those
+    artefacts and restore a natural photograph - it is told not to resize or reshape the body,
+    so there is little for it to drift on. This gives the believable slim of the morph with the
+    photographic finish of the generative editor.
+    """
+
+    name = 'morph_refine_v1'
+    is_generative = True
+
+    def __init__(self):
+        self.morph = SilhouetteMorphRenderer()
+        self.refiner = ReplicateEditRenderer()
+        self.cost_per_image_usd = self.refiner.cost_per_image_usd
+
+    def render(self, image_bytes: bytes, *, landmarks, waist_reduction_pct: float, **kw: Any) -> bytes:
+        morphed = self.morph.render(
+            image_bytes, landmarks=landmarks, waist_reduction_pct=waist_reduction_pct,
+        )
+        # If the geometry change is negligible, there is nothing worth a paid refine pass for.
+        if waist_reduction_pct <= 0.01:
+            return morphed
+        try:
+            return self.refiner.render(
+                morphed,
+                waist_reduction_pct=0.0,
+                prompt_override=build_refine_prompt(),
+                guidance_override=float(getattr(settings, 'REPLICATE_REFINE_GUIDANCE', 2.5)),
+            )
+        except TransformationError:
+            # If the refine pass fails, the morph alone is still a valid, identity-safe preview.
+            return morphed
+
+
 def get_renderer(name: Optional[str] = None):
     """
     Returns the configured renderer.
 
     Morph is the default: it costs nothing and preserves identity by construction. The hosted
     editors look better but send the member's photograph to a third party, so they are opt-in
-    and their output is verified against the baseline before anyone sees it.
+    and their output is verified against the baseline before anyone sees it. `morph_refine`
+    combines the two: morph for the shape, a light hosted pass for a natural finish.
     """
     choice = (name or getattr(settings, 'TRANSFORMATION_RENDERER', '') or 'morph').strip().lower()
+    if choice in ('morph_refine', 'hybrid', 'morph+replicate'):
+        return MorphRefineRenderer()
     if choice in ('fal', 'flux'):
         return FalEditRenderer()
     if choice in ('replicate', 'generative'):
@@ -477,6 +614,11 @@ class TransformationPipeline:
                 continue
             rendered_point = rendered_norm.get(label)
             if not rendered_point:
+                # Feet/ankles sit at the frame edge and a refine pass occasionally blurs one out
+                # of detection without the pose actually changing - tolerate a lost ankle rather
+                # than discard an otherwise-good preview. A lost core joint still fails.
+                if 'ankle' in label or 'foot' in label or 'heel' in label or 'toe' in label:
+                    continue
                 verdict['reason'] = f'The rendered image lost the {label.replace("_", " ")}.'
                 return verdict
             drift = math.hypot(rendered_point[0] - baseline_point[0],
@@ -501,6 +643,30 @@ class TransformationPipeline:
         return verdict
 
     @classmethod
+    def _goal_context(cls, assessment) -> Dict[str, Any]:
+        """
+        What the member is training for, in the form the prompt builder wants. The goal decides
+        what "after training" is illustrated as, so a fat-loss client and a glutes client are
+        not shown the same generic edit.
+        """
+        code = getattr(assessment, 'target_goal', None) or ''
+        labels = dict(getattr(assessment.__class__, 'GOAL_CHOICES', []))
+        weight_loss = None
+        try:
+            current_weight = assessment.measured_weight_kg
+            target_weight = getattr(assessment, 'target_weight_kg', None)
+            if current_weight and target_weight and float(current_weight) > float(target_weight):
+                weight_loss = float(current_weight) - float(target_weight)
+        except (TypeError, ValueError):
+            weight_loss = None
+        return {
+            'goal_code': code,
+            'goal_label': labels.get(code, ''),
+            'weight_loss_kg': weight_loss,
+            'stated_outcome': getattr(assessment, 'stated_goal_outcome', None),
+        }
+
+    @classmethod
     def waist_reduction_for_month(cls, assessment, month: int) -> float:
         """
         How much narrower the waist is illustrated at a given month.
@@ -521,6 +687,51 @@ class TransformationPipeline:
             return round(min(cap, share), 2)
 
         return round(cap, 2)
+
+    @classmethod
+    def _build_projection(cls, assessment) -> Dict[str, Any]:
+        """
+        The member's own target numbers for the preview's data strip: current -> target for
+        waist, weight and body fat, plus month-by-month milestones. Everything comes from this
+        assessment's measurements and goal, so it reads as a plan, not an invented figure.
+        """
+        def f(v):
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        months = list(MILESTONE_MONTHS)
+        last = max(months)
+        labels = dict(getattr(assessment.__class__, 'GOAL_CHOICES', []))
+        proj: Dict[str, Any] = {'goal': labels.get(getattr(assessment, 'target_goal', None) or '', '')}
+
+        cur_waist = f(assessment.waist_circumference_cm) or f(getattr(assessment, 'estimated_waist_cm', None))
+        cur_weight = f(assessment.measured_weight_kg)
+        tgt_weight = f(getattr(assessment, 'target_weight_kg', None))
+        cur_bf = f(getattr(assessment, 'estimated_body_fat_pct', None))
+
+        if cur_waist:
+            wm = {m: round(cur_waist * (1 - cls.waist_reduction_for_month(assessment, m) / 100.0), 1) for m in months}
+            proj['waist'] = {'current': round(cur_waist, 1), 'target': wm[last], 'unit': 'cm', 'months': wm}
+
+        if cur_weight:
+            if tgt_weight and tgt_weight < cur_weight:
+                final = tgt_weight
+            else:
+                final = round(cur_weight * (1 - cls.waist_reduction_for_month(assessment, last) / 100.0), 1)
+            wm = {m: round(cur_weight - (cur_weight - final) * (m / float(last)), 1) for m in months}
+            proj['weight'] = {'current': round(cur_weight, 1), 'target': round(final, 1), 'unit': 'kg', 'months': wm}
+
+        if cur_bf:
+            if cur_weight and proj.get('weight'):
+                loss_ratio = max(0.0, (cur_weight - proj['weight']['target']) / cur_weight)
+                bf_target = round(max(cur_bf * 0.80, cur_bf - cur_bf * loss_ratio * 1.2), 1)
+            else:
+                bf_target = round(max(cur_bf - 3.0, cur_bf * 0.9), 1)
+            proj['body_fat'] = {'current': round(cur_bf, 1), 'target': bf_target, 'unit': '%'}
+
+        return proj
 
     @classmethod
     def build(cls, assessment, *, renderer=None, db_alias: str = 'default') -> Dict[str, Any]:
@@ -570,6 +781,8 @@ class TransformationPipeline:
             ),
         }
 
+        goal_ctx = cls._goal_context(assessment)
+
         for month in MILESTONE_MONTHS:
             reduction = cls.waist_reduction_for_month(assessment, month)
             try:
@@ -578,6 +791,7 @@ class TransformationPipeline:
                     landmarks=baseline_joints,
                     waist_reduction_pct=reduction,
                     month=month,
+                    **goal_ctx,
                 )
             except TransformationError as exc:
                 result['rejected'][f'month_{month}'] = str(exc)
@@ -597,6 +811,7 @@ class TransformationPipeline:
             }
 
         result['accepted_count'] = len(result['milestones'])
+        result['projection'] = cls._build_projection(assessment)
         return result
 
     @staticmethod

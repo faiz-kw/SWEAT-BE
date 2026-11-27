@@ -327,6 +327,48 @@ class MemberAssessmentWriteSerializer(serializers.ModelSerializer):
     previous_assessment_id = serializers.UUIDField(required=False, allow_null=True)
     package_id = serializers.UUIDField(required=False, allow_null=True)
 
+    def to_internal_value(self, data):
+        if hasattr(data, '_mutable'):
+            data = data.copy()
+        elif isinstance(data, dict):
+            data = dict(data)
+
+        # Normalize biological sex choices ('M', 'm', 'male' -> 'MALE')
+        sex = data.get('member_sex')
+        if not sex:
+            data['member_sex'] = ''
+        else:
+            s = str(sex).strip().upper()
+            if s in ('M', 'MALE'):
+                data['member_sex'] = 'MALE'
+            elif s in ('F', 'FEMALE'):
+                data['member_sex'] = 'FEMALE'
+            elif s == 'OTHER':
+                data['member_sex'] = 'OTHER'
+            else:
+                data['member_sex'] = 'UNDISCLOSED'
+
+        # Normalize assessment type
+        atype = data.get('assessment_type')
+        if atype == 'REASSESSMENT':
+            data['assessment_type'] = 'MONTHLY'
+        elif atype == 'PROGRESS_CHECK':
+            data['assessment_type'] = 'QUARTERLY'
+
+        # Normalize training style
+        style = data.get('preferred_training_style')
+        if style == 'HIIT_BOOTCAMP':
+            data['preferred_training_style'] = 'BOOTCAMP'
+        elif style == 'HYBRID':
+            data['preferred_training_style'] = 'MIXED'
+
+        # Normalize training experience
+        exp = data.get('training_experience')
+        if exp == 'ATHLETE':
+            data['training_experience'] = 'ADVANCED'
+
+        return super().to_internal_value(data)
+
     class Meta:
         model = MemberAssessment
         fields = [
