@@ -689,6 +689,51 @@ class TransformationPipeline:
         return round(cap, 2)
 
     @classmethod
+    def _build_projection(cls, assessment) -> Dict[str, Any]:
+        """
+        The member's own target numbers for the preview's data strip: current -> target for
+        waist, weight and body fat, plus month-by-month milestones. Everything comes from this
+        assessment's measurements and goal, so it reads as a plan, not an invented figure.
+        """
+        def f(v):
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        months = list(MILESTONE_MONTHS)
+        last = max(months)
+        labels = dict(getattr(assessment.__class__, 'GOAL_CHOICES', []))
+        proj: Dict[str, Any] = {'goal': labels.get(getattr(assessment, 'target_goal', None) or '', '')}
+
+        cur_waist = f(assessment.waist_circumference_cm) or f(getattr(assessment, 'estimated_waist_cm', None))
+        cur_weight = f(assessment.measured_weight_kg)
+        tgt_weight = f(getattr(assessment, 'target_weight_kg', None))
+        cur_bf = f(getattr(assessment, 'estimated_body_fat_pct', None))
+
+        if cur_waist:
+            wm = {m: round(cur_waist * (1 - cls.waist_reduction_for_month(assessment, m) / 100.0), 1) for m in months}
+            proj['waist'] = {'current': round(cur_waist, 1), 'target': wm[last], 'unit': 'cm', 'months': wm}
+
+        if cur_weight:
+            if tgt_weight and tgt_weight < cur_weight:
+                final = tgt_weight
+            else:
+                final = round(cur_weight * (1 - cls.waist_reduction_for_month(assessment, last) / 100.0), 1)
+            wm = {m: round(cur_weight - (cur_weight - final) * (m / float(last)), 1) for m in months}
+            proj['weight'] = {'current': round(cur_weight, 1), 'target': round(final, 1), 'unit': 'kg', 'months': wm}
+
+        if cur_bf:
+            if cur_weight and proj.get('weight'):
+                loss_ratio = max(0.0, (cur_weight - proj['weight']['target']) / cur_weight)
+                bf_target = round(max(cur_bf * 0.80, cur_bf - cur_bf * loss_ratio * 1.2), 1)
+            else:
+                bf_target = round(max(cur_bf - 3.0, cur_bf * 0.9), 1)
+            proj['body_fat'] = {'current': round(cur_bf, 1), 'target': bf_target, 'unit': '%'}
+
+        return proj
+
+    @classmethod
     def build(cls, assessment, *, renderer=None, db_alias: str = 'default') -> Dict[str, Any]:
         """
         Produces the milestone previews, or explains precisely why it would not.
@@ -766,6 +811,7 @@ class TransformationPipeline:
             }
 
         result['accepted_count'] = len(result['milestones'])
+        result['projection'] = cls._build_projection(assessment)
         return result
 
     @staticmethod
