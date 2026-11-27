@@ -1211,6 +1211,25 @@ class MembershipLifecycleService:
 
         today = timezone.now().date()
         is_expired = (membership.status == 'EXPIRED' or membership.end_date < today)
+        # Expired packages can only be extended WITHIN 30 days of expiry. Beyond that the extend
+        # option is withdrawn and the member must renew instead. (Staff override bypasses the window.)
+        EXTENSION_POST_EXPIRY_WINDOW_DAYS = 30
+        if (is_expired and not is_staff_override and membership.end_date
+                and (today - membership.end_date).days > EXTENSION_POST_EXPIRY_WINDOW_DAYS):
+            return {
+                'membership_id': str(membership.id),
+                'membership_number': membership.membership_number,
+                'status': membership.status,
+                'is_expired': True,
+                'current_end_date': membership.end_date.isoformat(),
+                'new_end_date': None,
+                'days': days,
+                'can_extend': False,
+                'error': (
+                    f"This package expired more than {EXTENSION_POST_EXPIRY_WINDOW_DAYS} days ago. "
+                    f"Extension is no longer available — please renew the membership."
+                ),
+            }
         fee_per_day = config.extension_per_day_fee
         activation_fee = config.extension_activation_fee if is_expired else Decimal('0.00')
         total_fee = activation_fee + (fee_per_day * Decimal(days))
