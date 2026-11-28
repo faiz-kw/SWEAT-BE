@@ -163,7 +163,7 @@ def record_business_audit(
     actor_type: str = 'USER',
     actor_user: Optional[TenantUser] = None,
     actor_employee_profile_id: Optional[uuid.UUID] = None,
-    source_channel: str = 'ADMIN_PANEL',
+    source_channel: str = 'WEB_ADMIN',
     event_description: Optional[str] = None,
     before_data: Optional[Dict[str, Any]] = None,
     after_data: Optional[Dict[str, Any]] = None,

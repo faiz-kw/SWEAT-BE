@@ -333,6 +333,12 @@ class BookingViewSet(viewsets.ModelViewSet):
 
         trial_items = []
         current_page_num = int(request.query_params.get('page', 1) or 1)
+        # When the caller filters by a specific member, suppress trial rows entirely —
+        # TrialBookings belong to leads, not to member UserProfiles, so they are
+        # irrelevant when scoping results to a single user_profile_id.
+        _user_profile_filter = request.query_params.get('user_id') or request.query_params.get('user_profile_id')
+        if _user_profile_filter:
+            include_trials = False
         if include_trials and not is_member_only and current_page_num == 1:
             trial_qs = TrialBooking.objects.using(alias).select_related('lead', 'branch', 'assigned_trainer_profile', 'created_by_user')
 

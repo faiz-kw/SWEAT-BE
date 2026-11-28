@@ -30,6 +30,22 @@ from .services_memberships import MembershipLifecycleService
 from .context import get_current_tenant_db_alias
 
 
+# Maps Booking.booking_source values to the canonical source_channel used in
+# the BusinessAuditEvent log.  Any source not listed falls back to 'WEB_ADMIN'.
+_BOOKING_SOURCE_TO_AUDIT_CHANNEL = {
+    'MOBILE_APP': 'MOBILE_APP',
+    'MEMBER_PORTAL': 'MEMBER_PORTAL',
+    'FRONT_DESK': 'WEB_ADMIN',
+    'WEB': 'WEB_ADMIN',
+    'ADMIN_PANEL': 'WEB_ADMIN',
+    'ADMIN': 'WEB_ADMIN',
+    'STAFF': 'WEB_ADMIN',
+    'TURNSTILE_IOT': 'TURNSTILE_IOT',
+    'AI_VOICE_AGENT': 'AI_VOICE_AGENT',
+    'SYSTEM': 'BACKGROUND_WORKER',
+}
+
+
 class ParqRequiredValidationError(ValidationError):
     """
     Raised when class booking, waitlist entry, or rescheduling is blocked
@@ -1760,6 +1776,7 @@ class BookingWaitlistAttendanceService:
                     entity_id=booking.id,
                     branch=branch,
                     actor_user=created_by_user,
+                    source_channel=_BOOKING_SOURCE_TO_AUDIT_CHANNEL.get(booking_source, 'WEB_ADMIN'),
                     metadata={'booking_number': booking_number, 'occurrence_id': str(occurrence.id)},
                     db_alias=alias,
                 )
@@ -2010,6 +2027,7 @@ class BookingWaitlistAttendanceService:
                 entity_id=booking.id,
                 branch=branch,
                 actor_user=cancelled_by_user,
+                source_channel=_BOOKING_SOURCE_TO_AUDIT_CHANNEL.get(getattr(booking, 'booking_source', None), 'WEB_ADMIN'),
                 metadata={'reason_code': reason_code, 'minutes_before_class': diff_minutes},
                 db_alias=alias,
             )
@@ -2342,6 +2360,7 @@ class BookingWaitlistAttendanceService:
                     entity_id=candidate.id,
                     branch=candidate.branch,
                     actor_user=None,
+                    source_channel='BACKGROUND_WORKER',
                     metadata={'booking_number': candidate.booking_number, 'occurrence_id': str(occurrence.id)},
                     db_alias=alias,
                 )
@@ -2612,6 +2631,7 @@ class BookingWaitlistAttendanceService:
                 entity_id=booking.id,
                 branch=to_occ_locked.branch,
                 actor_user=rescheduled_by_user,
+                source_channel=_BOOKING_SOURCE_TO_AUDIT_CHANNEL.get(getattr(booking, 'booking_source', None), 'WEB_ADMIN'),
                 metadata={
                     'from_occurrence_id': str(from_occ_locked.id),
                     'to_occurrence_id': str(to_occ_locked.id),

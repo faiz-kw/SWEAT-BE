@@ -1486,7 +1486,15 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
             'date_time': occ.start_at.isoformat() if (occ and occ.start_at) else bk.booked_at.isoformat(),
             'trainer_name': trainer_name,
         }
-        if occ and occ.start_at and occ.start_at >= now_dt and bk.status in ['CONFIRMED', 'WAITLISTED', 'RESERVED']:
+        # A booking is "upcoming" until the class has ended (plus a 30-minute
+        # grace period so members can still see it while the session is running).
+        # Using end_at prevents bookings from disappearing the moment a class
+        # starts.  BOOKED is included because it is a valid pre-confirmation
+        # state used by the mobile app before the payment/session deduction is
+        # finalised.
+        _occ_end = (occ.end_at if (occ and occ.end_at) else (occ.start_at + timezone.timedelta(hours=1) if (occ and occ.start_at) else None))
+        _visibility_cutoff = (_occ_end + timezone.timedelta(minutes=30)) if _occ_end else None
+        if _visibility_cutoff and _visibility_cutoff >= now_dt and bk.status in ['CONFIRMED', 'WAITLISTED', 'RESERVED', 'BOOKED']:
             upcoming_bookings.append(bk_obj)
         else:
             past_bookings.append(bk_obj)
