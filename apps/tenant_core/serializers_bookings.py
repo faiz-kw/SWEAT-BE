@@ -20,6 +20,51 @@ from .models_attendance import AttendanceRecord, AccessEvent
 from .models_org import Organization
 
 
+ADMIN_ROLE_CODES = {'ORG_ADMIN', 'SUPER_ADMIN', 'TENANT_ADMIN'}
+
+
+def resolve_booking_origin_label(booking, db_alias: str | None = None) -> str:
+    """
+    Canonical display label for who/what created a booking:
+      - App booking (booking_source == 'MOBILE_APP') -> 'App'
+      - Admin booking (created by an admin user, or ADMIN source with no non-admin creator) -> 'Admin'
+      - CRM user booking (created by any non-admin CRM user) -> actual username of created_by_user
+      - Fallback when created_by_user is absent -> booking_source (never misleading hardcoded strings)
+    """
+    source = (getattr(booking, 'booking_source', None) or '').upper()
+    if source == 'MOBILE_APP':
+        return 'App'
+
+    creator = getattr(booking, 'created_by_user', None)
+    if creator is not None:
+        is_admin = getattr(booking, 'created_by_is_admin', None)
+        if is_admin is None:
+            if getattr(creator, 'is_superuser', False):
+                is_admin = True
+            else:
+                from .models_rbac import RoleAssignment
+                alias = db_alias or getattr(getattr(booking, '_state', None), 'db', None) or 'default'
+                is_admin = RoleAssignment.objects.using(alias).filter(
+                    user_id=creator.id,
+                    is_active=True,
+                    role__code__in=ADMIN_ROLE_CODES,
+                ).exists()
+        if is_admin:
+            return 'Admin'
+        username = (getattr(creator, 'username', None) or '').strip()
+        if username:
+            return username
+        email = (getattr(creator, 'email', None) or '').strip()
+        if email:
+            return email
+        full_name = f"{getattr(creator, 'first_name', '') or ''} {getattr(creator, 'last_name', '') or ''}".strip()
+        return full_name or source or 'CRM'
+
+    if source == 'ADMIN':
+        return 'Admin'
+    return source or 'App'
+
+
 class BookingPolicySetSerializer(serializers.ModelSerializer):
     name = serializers.SerializerMethodField(read_only=True)
     branch_name = serializers.SerializerMethodField(read_only=True)
@@ -287,17 +332,7 @@ class BookingListSerializer(serializers.ModelSerializer):
         return None
 
     def get_booked_by_name(self, obj):
-        if getattr(obj, 'created_by_user', None):
-            u = obj.created_by_user
-            name = f"{getattr(u, 'first_name', '')} {getattr(u, 'last_name', '')}".strip()
-            return name or getattr(u, 'email', 'Staff')
-        if obj.booking_source == 'MOBILE_APP':
-            return 'Member (Self - App)'
-        if obj.booking_source == 'WEB':
-            return 'Member (Self - Web)'
-        if obj.booking_source in ['FRONT_DESK', 'ADMIN', 'KIOSK']:
-            return 'Front Desk / Staff'
-        return 'Member (Self)'
+        return resolve_booking_origin_label(obj)
 
     def get_attendance_record(self, obj):
         cache = getattr(obj, '_prefetched_objects_cache', None)
@@ -382,19 +417,7 @@ class BookingSerializer(serializers.ModelSerializer):
         return None
 
     def get_booked_by_name(self, obj):
-        if getattr(obj, 'created_by_user', None):
-            u = obj.created_by_user
-            name = f"{getattr(u, 'first_name', '')} {getattr(u, 'last_name', '')}".strip()
-            return name or getattr(u, 'email', 'Staff')
-        if obj.booking_source == 'MOBILE_APP':
-            return 'Member (Self - App)'
-        if obj.booking_source == 'WEB':
-            return 'Member (Self - Web)'
-        if obj.booking_source in ['FRONT_DESK', 'ADMIN', 'KIOSK']:
-            return 'Front Desk / Admin'
-        if obj.booking_source == 'TRAINER':
-            return 'Trainer'
-        return 'Staff'
+        return resolve_booking_origin_label(obj)
 
     def get_parq_status(self, obj):
         if not obj.user_profile:
