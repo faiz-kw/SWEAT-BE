@@ -564,6 +564,10 @@ def get_member_available_actions(profile: UserProfile, active_m: Membership, out
             actions.append({'action': 'UPGRADE', 'label': 'Upgrade Package', 'eligible': True})
             actions.append({'action': 'EXTEND', 'label': 'Extend Validity', 'eligible': True})
             actions.append({'action': 'FREEZE', 'label': 'Freeze Membership', 'eligible': True})
+        # An expired package can still be EXTENDED within 30 days of expiry (activation fee + per-day).
+        # Once it is more than 30 days past expiry, "Extend Validity" disappears and the member must Renew.
+        elif active_m.end_date and 0 <= (today - active_m.end_date).days <= 30:
+            actions.append({'action': 'EXTEND', 'label': 'Extend Validity', 'eligible': True})
         if st == 'FROZEN':
             actions.append({'action': 'UNFREEZE', 'label': 'Unfreeze Membership', 'eligible': True})
         if st in ['ACTIVE', 'FROZEN']:

@@ -124,6 +124,7 @@ from .views_classes import (
     ClassDemandEventViewSet,
     ClassDemandPlanningRunViewSet,
     ClassScheduleRecommendationViewSet,
+    ClassScheduleBulkImportViewSet,
 )
 from .views_appointments import (
     AppointmentTypeViewSet,
@@ -172,6 +173,7 @@ from .views_bookings import (
     AccessControlBulkIngestView,
     AccessControlSyncPassesView,
     TurnstileVerifyPunchView,
+    CRMClassPassScanView,
 )
 from .views_turnstile import (
     TurnstileActiveTokensView,
@@ -263,6 +265,7 @@ router.register(r'class-content-assignments', ClassContentAssignmentViewSet, bas
 router.register(r'class-demand-events', ClassDemandEventViewSet, basename='class-demand-event')
 router.register(r'class-demand-planning-runs', ClassDemandPlanningRunViewSet, basename='class-demand-planning-run')
 router.register(r'class-schedule-recommendations', ClassScheduleRecommendationViewSet, basename='class-schedule-recommendation')
+router.register(r'class-schedule-bulk-import', ClassScheduleBulkImportViewSet, basename='class-schedule-bulk-import')
 
 router.register(r'terms-documents', TermsDocumentViewSet, basename='terms-document')
 router.register(r'terms-document-versions', TermsDocumentVersionViewSet, basename='terms-document-version')
@@ -407,6 +410,8 @@ urlpatterns = [
     path('access-control/events/bulk/', AccessControlBulkIngestView.as_view(), name='access-control-bulk-ingest'),
     path('access-control/sync/', AccessControlSyncPassesView.as_view(), name='access-control-sync-passes'),
     path('access/turnstile/verify-punch/', TurnstileVerifyPunchView.as_view(), name='tenant-turnstile-verify-punch'),
+    # Staff-operated manual pass scan for a class session (front-desk fallback until turnstile is live)
+    path('access/class-pass-scan/', CRMClassPassScanView.as_view(), name='tenant-class-pass-scan'),
     # Turnstile fleet management — used by studio daemons
     path('access/turnstile/active-tokens/', TurnstileActiveTokensView.as_view(), name='tenant-turnstile-active-tokens'),
     path('access/turnstile/devices/', TurnstileDeviceListView.as_view(), name='tenant-turnstile-devices'),

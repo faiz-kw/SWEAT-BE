@@ -202,6 +202,40 @@ class RazorpayWebhookView(APIView):
                 logger.error("Error finalizing payment via webhook: %s", ex, exc_info=True)
                 return Response({'error': 'Internal finalization error.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+        elif event == 'payment_link.paid':
+            # A shared Razorpay Payment Link (CRM "Send Payment Link") was paid. Razorpay sends the
+            # link entity (carrying the notes we set at creation, incl. internal_order_id) alongside
+            # the payment. Propagate those notes onto the payment entity so the shared finalizer can
+            # match the payment back to our internal order and activate the membership.
+            pl_entity = data.get('payload', {}).get('payment_link', {}).get('entity', {})
+            payment_entity = data.get('payload', {}).get('payment', {}).get('entity', {})
+            rzp_payment_id = payment_entity.get('id')
+            rzp_order_id = payment_entity.get('order_id')
+            pl_notes = pl_entity.get('notes') or {}
+            if pl_notes and not payment_entity.get('notes'):
+                payment_entity['notes'] = pl_notes
+                data.setdefault('payload', {}).setdefault('payment', {})['entity'] = payment_entity
+
+            if not rzp_payment_id or not rzp_order_id:
+                logger.warning("payment_link.paid webhook missing payment_id or order_id; ignoring")
+                return Response({'status': 'ignored', 'event': event}, status=status.HTTP_200_OK)
+
+            try:
+                result = RazorpayPaymentFinalizerService.finalize_payment(
+                    razorpay_order_id=rzp_order_id,
+                    razorpay_payment_id=rzp_payment_id,
+                    source='WEBHOOK_PAYMENT_LINK',
+                    db_alias=db_alias,
+                    raw_event=data,
+                )
+                return Response({'status': 'ok', 'event': event, 'result': result}, status=status.HTTP_200_OK)
+            except RazorpayVerificationError as rve:
+                logger.warning("payment_link.paid finalization verification error: %s", rve)
+                return Response({'error': str(rve), 'code': getattr(rve, 'code', 'VERIFICATION_ERROR')}, status=status.HTTP_400_BAD_REQUEST)
+            except Exception as ex:
+                logger.error("Error finalizing payment_link.paid via webhook: %s", ex, exc_info=True)
+                return Response({'error': 'Internal finalization error.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
         elif event == 'payment.failed':
             payment_entity = data.get('payload', {}).get('payment', {}).get('entity', {})
             rzp_payment_id = payment_entity.get('id')

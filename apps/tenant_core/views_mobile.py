@@ -1846,6 +1846,9 @@ class MobileScheduleView(APIView):
         if selected_program_id and str(selected_program_id).lower() != 'all':
             qs = qs.filter(class_template__program_id=selected_program_id)
         elif purchased_program_ids and not is_credit_based_user:
+            # Credit/Elite members (CREDIT_WALLET) spend a universal credit and can book ANY class in
+            # any category, so they are NEVER category-restricted — they see every category & class.
+            # For non-credit members, restrict to their purchased program's CATEGORY code.
             # Map the member's purchased program(s) to their class CATEGORY code (PILATES/BOOTCAMP).
             # Migration created duplicate program AND category IDs, so a membership's exact
             # program_id often has no scheduled classes; matching by the stable category code
@@ -3668,6 +3671,14 @@ class MobilePackagesView(APIView):
                 credit_count = 12.0 if is_credit_based else None
                 session_count = 12
 
+            # Unit label for the app to render alongside the count (e.g. "300 Credit") so it never
+            # has to hardcode "classes". A pack with any CREDIT_WALLET entitlement (Elite) spends a
+            # universal credit; everything else is session-based.
+            _has_credit_wallet = any(
+                str(getattr(e, 'entitlement_type', '') or '').upper() == 'CREDIT_WALLET' for e in _edefs
+            )
+            unit_label = 'Credit' if _has_credit_wallet else 'Session'
+
             base_dec, tax_pct_dec, _, final_dec, prices_inc_tax = _resolve_package_price_totals(price_obj)
             base_price = float(base_dec)
             tax_pct = float(tax_pct_dec)
@@ -3704,6 +3715,8 @@ class MobilePackagesView(APIView):
                 'credits': credit_count,
                 'sessions': 'Unlimited' if is_unlimited else session_count,
                 'session_count': None if is_unlimited else session_count,
+                'unit_label': unit_label,
+                'unit_label_plural': unit_label if unit_label == 'Credit' else unit_label + 's',
                 'is_unlimited': is_unlimited,
                 'validity_days': latest_version.validity_days or 90,
                 'base_price': base_price,
