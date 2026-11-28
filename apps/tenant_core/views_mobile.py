@@ -2722,8 +2722,14 @@ class MobileMyBookingsView(APIView):
 
             if b.status == 'WAITLISTED' and occ and occ.start_at >= now:
                 waitlisted.append(item)
-            elif b.status in ['CONFIRMED', 'RESERVED'] and occ and occ.start_at >= now:
-                upcoming.append(item)
+            elif b.status in ['CONFIRMED', 'RESERVED', 'BOOKED'] and occ and occ.start_at is not None:
+                # Keep booking in "upcoming" until 30 minutes after the class ends,
+                # so members see it throughout the session (RC-1 + RC-2 fix).
+                _end = occ.end_at or (occ.start_at + timezone.timedelta(hours=1))
+                if (_end + timezone.timedelta(minutes=30)) >= now:
+                    upcoming.append(item)
+                else:
+                    past.append(item)
             else:
                 past.append(item)
 
