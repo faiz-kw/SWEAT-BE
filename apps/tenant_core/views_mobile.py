@@ -1619,7 +1619,10 @@ class MobileScheduleView(APIView):
         # Filter schedule occurrences by member's purchased program package(s)
         if selected_program_id and str(selected_program_id).lower() != 'all':
             qs = qs.filter(class_template__program_id=selected_program_id)
-        elif purchased_program_ids:
+        elif purchased_program_ids and not is_credit_based_user:
+            # Credit/Elite members (CREDIT_WALLET) spend a universal credit and can book ANY class in
+            # any category, so they are NEVER category-restricted — they see every category & class.
+            # For non-credit members, restrict to their purchased program's CATEGORY code.
             # Map the member's purchased program(s) to their class CATEGORY code (PILATES/BOOTCAMP).
             # Migration created duplicate program AND category IDs, so a membership's exact
             # program_id often has no scheduled classes; matching by the stable category code
