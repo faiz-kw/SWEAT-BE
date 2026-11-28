@@ -309,8 +309,18 @@ class CommunicationWebhookView(APIView):
 
         if not tenant:
             tenant = Tenant.objects.using('default').filter(
-                Q(slug=public_id) | Q(code=public_id)
+                Q(slug__iexact=public_id) | Q(code__iexact=public_id) | Q(name__icontains=public_id)
             ).first()
+
+        # Fallback for organization codes like SWEAT_DEMO_FITNESS -> match tenant
+        if not tenant and public_id:
+            clean_id = public_id.lower().replace('_', '').replace('-', '')
+            for t in Tenant.objects.using('default').all():
+                t_clean = (t.slug or '').lower().replace('_', '').replace('-', '')
+                t_name_clean = (t.name or '').lower().replace('_', '').replace('-', '').replace(' ', '')
+                if t_clean in clean_id or clean_id in t_name_clean:
+                    tenant = t
+                    break
 
         if tenant and tenant.is_accessible:
             return tenant

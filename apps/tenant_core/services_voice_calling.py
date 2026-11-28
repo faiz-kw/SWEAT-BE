@@ -392,8 +392,19 @@ class VoiceCallingService:
             )
 
         # 2. Database transaction is committed and row lock released BEFORE external HTTP request.
-        # Construct Callback Webhook URL and Metadata
-        public_id = adapter.config.get('public_integration_id') or getattr(org, 'code', None) or (str(integration.id) if integration else 'sarvam')
+        # Construct Callback Webhook URL and Metadata.
+        # public_integration_id in the adapter config (e.g. "sweat") is the canonical tenant slug
+        # used in the webhook path: /api/v1/webhooks/communications/sarvam/{public_id}/
+        # Organization model lives in the tenant DB and has NO FK to the master Tenant model,
+        # so we cannot derive the tenant slug from org.  Always prefer the config value; fall
+        # back to org.code (which _resolve_tenant handles via fuzzy matching) and finally the
+        # org UUID so the webhook URL is never completely broken.
+        public_id = (
+            adapter.config.get('public_integration_id')
+            or org.code  # e.g. "SWEAT_DEMO_FITNESS" — resolved by fuzzy fallback in _resolve_tenant
+            or (str(org.id) if org else None)
+            or (str(integration.id) if integration else 'sweat')
+        )
         webhook_base = (
             adapter.config.get('webhook_base_url')
             or os.getenv('SARVAM_WEBHOOK_BASE_URL')

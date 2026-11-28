@@ -1926,6 +1926,24 @@ class TelephonyAnalyticsView(APIView):
             inbound_count = base_qs.filter(direction='INBOUND').count()
             outbound_count = base_qs.filter(direction='OUTBOUND').count()
 
+            # Dedicated Sarvam AI Calling Funnel & Performance Metrics
+            ai_qs = base_qs.filter(provider='SARVAM')
+            ai_total_attempted = ai_qs.count()
+            ai_connected = ai_qs.filter(status__in=['COMPLETED', 'CONNECTED']).count()
+            ai_picked_up = ai_qs.filter(status__in=['COMPLETED', 'CONNECTED', 'IN_PROGRESS', 'RINGING']).count()
+            ai_not_answered = ai_qs.filter(status__in=['NO_ANSWER', 'MISSED', 'UNANSWERED']).count()
+            ai_busy = ai_qs.filter(status='BUSY').count()
+            ai_failed = ai_qs.filter(status='FAILED').count()
+            ai_conversations = ai_qs.filter(duration_seconds__gte=15.0).count()
+            ai_trials_booked = ai_qs.filter(disposition='TRIAL_BOOKED').count()
+            ai_trial_conversion_rate = round((ai_trials_booked / ai_connected * 100), 1) if ai_connected > 0 else 0.0
+
+            ai_talk_sec = ai_qs.filter(status__in=['COMPLETED', 'CONNECTED']).aggregate(s=models.Sum('duration_seconds'))['s'] or 0.0
+            ai_total_talk_minutes = round(ai_talk_sec / 60.0, 1)
+            ai_avg_duration_sec = round(ai_talk_sec / ai_connected, 1) if ai_connected > 0 else 0.0
+            ai_recordings_available = ai_qs.filter(duration_seconds__gt=0).count()
+            ai_recordings_missing = max(0, ai_connected - ai_recordings_available)
+
             # 2. Leaderboard per Sales Rep
             reps_qs = base_qs.filter(sales_rep__isnull=False).values(
                 'sales_rep__id', 'sales_rep__first_name', 'sales_rep__last_name', 'sales_rep__email'
@@ -2084,6 +2102,18 @@ class TelephonyAnalyticsView(APIView):
                 if not lead_name:
                     lead_name = "Unknown Caller"
 
+                is_sarvam = cs.provider == 'SARVAM'
+                call_meta = cs.metadata if isinstance(cs.metadata, dict) else {}
+                has_sarvam_audio = is_sarvam and bool(cs.duration_seconds > 0 or call_meta.get('recording_url') or call_meta.get('audio_url') or call_meta.get('interaction_id'))
+                has_recording = bool(cs.recording_url or cs.recording_storage_key or has_sarvam_audio)
+
+                rec_stream_url = ''
+                if has_recording:
+                    if is_sarvam:
+                        rec_stream_url = f"/api/v1/voice-agent/recordings/{cs.id}/audio/"
+                    else:
+                        rec_stream_url = f"/api/v1/tenant/crm/telephony/recordings/{cs.id}/stream/"
+
                 recent_calls.append({
                     'id': str(cs.id),
                     'lead_id': lead_id_val,
@@ -2093,13 +2123,14 @@ class TelephonyAnalyticsView(APIView):
                     'sales_rep_id': str(cs.sales_rep_id) if cs.sales_rep_id else None,
                     'direction': cs.direction,
                     'status': cs.status,
+                    'provider': cs.provider,
                     'duration_seconds': cs.duration_seconds,
                     'is_meaningful': cs.is_meaningful,
                     'disposition': cs.disposition,
                     'disposition_label': labels_map.get(cs.disposition, cs.disposition) if cs.disposition else 'Pending',
                     'disposition_notes': cs.disposition_notes,
-                    'has_recording': bool(cs.recording_url or cs.recording_storage_key),
-                    'recording_url': f"/api/v1/tenant/crm/telephony/recordings/{cs.id}/stream/" if (cs.recording_url or cs.recording_storage_key) else '',
+                    'has_recording': has_recording,
+                    'recording_url': rec_stream_url,
                     'created_at': cs.created_at.isoformat(),
                 })
 
@@ -2142,6 +2173,21 @@ class TelephonyAnalyticsView(APIView):
                     'inbound_calls': inbound_count,
                     'outbound_calls': outbound_count,
                     'peak_connect_hour': peak_hour or '11:00 - 12:00',
+                    'ai_metrics': {
+                        'total_attempted': ai_total_attempted,
+                        'picked_up': ai_picked_up,
+                        'connected': ai_connected,
+                        'not_answered': ai_not_answered,
+                        'busy': ai_busy,
+                        'failed': ai_failed,
+                        'conversations': ai_conversations,
+                        'avg_duration_seconds': ai_avg_duration_sec,
+                        'total_talk_minutes': ai_total_talk_minutes,
+                        'recordings_available': ai_recordings_available,
+                        'recordings_missing': ai_recordings_missing,
+                        'trials_booked': ai_trials_booked,
+                        'trial_conversion_rate': ai_trial_conversion_rate,
+                    },
                 },
                 'leaderboard': leaderboard,
                 'dispositions': dispositions,

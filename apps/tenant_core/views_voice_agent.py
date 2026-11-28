@@ -568,97 +568,109 @@ class VoiceAgentClassesView(View):
             )
 
             # Query class occurrences for target date and branch
-            qs = ClassOccurrence.objects.using(alias).filter(
-                branch=resolved_branch,
-                occurrence_date=target_date,
-                status__in=['OPEN', 'SCHEDULED', 'ACTIVE'],
-                start_at__gt=now_utc,
-                class_template__status='ACTIVE',
-                class_template__allow_trial=True,
-            ).select_related('class_template', 'class_template__program', 'branch')
-
-            if program_filter:
-                qs = qs.filter(
-                    Q(class_template__program__name__icontains=program_filter)
-                    | Q(class_template__name__icontains=program_filter)
-                )
-
-            all_occurrences = list(qs.order_by('start_at'))
-
-            filtered = []
-            for occ in all_occurrences:
-                ist_dt = occ.start_at.astimezone(IST)
-                hour = ist_dt.hour
-
-                # Time of day filter
-                if time_of_day == 'morning' and hour >= 12:
-                    continue
-                if time_of_day in ('afternoon', 'noon') and (hour < 12 or hour >= 17):
-                    continue
-                if time_of_day == 'evening' and hour < 17:
-                    continue
-
-                # Branch-specific availability and capacity overrides
-                branch_avail = ClassBranchAvailability.objects.using(alias).filter(
-                    class_template=occ.class_template,
+            def _get_slots_for_date(check_date):
+                q = ClassOccurrence.objects.using(alias).filter(
                     branch=resolved_branch,
-                ).first()
-                if branch_avail and branch_avail.status == 'DISABLED':
-                    continue
+                    occurrence_date=check_date,
+                    status__in=['OPEN', 'SCHEDULED', 'ACTIVE'],
+                    start_at__gt=now_utc,
+                    class_template__status='ACTIVE',
+                    class_template__allow_trial=True,
+                ).select_related('class_template', 'class_template__program', 'branch')
 
-                effective_capacity = (
-                    occ.capacity
-                    if occ.capacity is not None and occ.capacity > 0
-                    else ((branch_avail.capacity_override if branch_avail and branch_avail.capacity_override else None)
-                          or occ.class_template.default_capacity or 20)
-                )
+                if program_filter:
+                    q = q.filter(
+                        Q(class_template__program__name__icontains=program_filter)
+                        | Q(class_template__name__icontains=program_filter)
+                    )
 
-                # Explicitly resolve effective trial capacity:
-                # 1. Occurrence-level trial capacity override (can be 0)
-                # 2. Branch availability trial capacity override
-                # 3. Class Template default trial capacity
-                if occ.trial_capacity is not None:
-                    effective_trial_cap = occ.trial_capacity
-                elif branch_avail and branch_avail.trial_capacity_override is not None:
-                    effective_trial_cap = branch_avail.trial_capacity_override
-                elif occ.class_template and occ.class_template.default_trial_capacity is not None:
-                    effective_trial_cap = occ.class_template.default_trial_capacity
-                else:
-                    effective_trial_cap = 0
+                occurrences = list(q.order_by('start_at'))
+                slots = []
+                for occ in occurrences:
+                    ist_dt = occ.start_at.astimezone(IST)
+                    hour = ist_dt.hour
 
-                # Strict trial safety guard:
-                # If template forbids trial or trial capacity is 0, skip this session!
-                if not occ.class_template.allow_trial or effective_trial_cap <= 0:
-                    continue
+                    # Time of day filter (only apply if explicitly specified by caller, e.g. 'morning' or 'evening')
+                    if time_of_day and time_of_day not in ('all', 'any', 'full', 'full_day'):
+                        if time_of_day == 'morning' and hour >= 12:
+                            continue
+                        if time_of_day in ('afternoon', 'noon') and (hour < 12 or hour >= 17):
+                            continue
+                        if time_of_day == 'evening' and hour < 17:
+                            continue
 
-                # Real-time occupancy check
-                regular_booked = Booking.objects.using(alias).filter(
-                    occurrence=occ,
-                    status__in=['CONFIRMED', 'RESERVED', 'COMPLETED'],
-                ).count()
-                trial_booked = TrialBooking.objects.using(alias).filter(
-                    class_occurrence_id=occ.id,
-                    status__in=['BOOKED', 'CONFIRMED', 'ATTENDED'],
-                ).exclude(confirmation_status__in=['CANCELLED', 'DECLINED']).count()
+                    # Branch-specific availability and capacity overrides
+                    branch_avail = ClassBranchAvailability.objects.using(alias).filter(
+                        class_template=occ.class_template,
+                        branch=resolved_branch,
+                    ).first()
+                    if branch_avail and branch_avail.status == 'DISABLED':
+                        continue
 
-                remaining_total = max(0, effective_capacity - (regular_booked + trial_booked))
-                remaining_trial = max(0, effective_trial_cap - trial_booked)
-                available_spots = min(remaining_total, remaining_trial)
+                    effective_capacity = (
+                        occ.capacity
+                        if occ.capacity is not None and occ.capacity > 0
+                        else ((branch_avail.capacity_override if branch_avail and branch_avail.capacity_override else None)
+                              or occ.class_template.default_capacity or 20)
+                    )
 
-                if available_spots <= 0:
-                    continue
+                    if occ.trial_capacity is not None:
+                        effective_trial_cap = occ.trial_capacity
+                    elif branch_avail and branch_avail.trial_capacity_override is not None:
+                        effective_trial_cap = branch_avail.trial_capacity_override
+                    elif occ.class_template and occ.class_template.default_trial_capacity is not None:
+                        effective_trial_cap = occ.class_template.default_trial_capacity
+                    else:
+                        effective_trial_cap = 0
 
-                prog_name = occ.class_template.program.name if (occ.class_template and occ.class_template.program) else occ.class_template.name
-                filtered.append({
-                    'occurrence_id': str(occ.id),
-                    'branch_id': str(resolved_branch.id),
-                    'branch_name': resolved_branch.name,
-                    'program_name': prog_name,
-                    'class_name': occ.class_template.name,
-                    'date_label': target_date.strftime('%A, %b %d'),
-                    'time_label': ist_dt.strftime('%I:%M %p IST'),
-                    'available_trial_spots': available_spots,
-                })
+                    if not occ.class_template.allow_trial or effective_trial_cap <= 0:
+                        continue
+
+                    # Real-time occupancy check
+                    regular_booked = Booking.objects.using(alias).filter(
+                        occurrence=occ,
+                        status__in=['CONFIRMED', 'RESERVED', 'COMPLETED'],
+                    ).count()
+                    trial_booked = TrialBooking.objects.using(alias).filter(
+                        class_occurrence_id=occ.id,
+                        status__in=['BOOKED', 'CONFIRMED', 'ATTENDED'],
+                    ).exclude(confirmation_status__in=['CANCELLED', 'DECLINED']).count()
+
+                    remaining_total = max(0, effective_capacity - (regular_booked + trial_booked))
+                    remaining_trial = max(0, effective_trial_cap - trial_booked)
+                    available_spots = min(remaining_total, remaining_trial)
+
+                    if available_spots <= 0:
+                        continue
+
+                    prog_name = occ.class_template.program.name if (occ.class_template and occ.class_template.program) else occ.class_template.name
+                    slots.append({
+                        'occurrence_id': str(occ.id),
+                        'branch_id': str(resolved_branch.id),
+                        'branch_name': resolved_branch.name,
+                        'program_name': prog_name,
+                        'class_name': occ.class_template.name,
+                        'date_label': check_date.strftime('%A, %b %d'),
+                        'time_label': ist_dt.strftime('%I:%M %p IST'),
+                        'available_trial_spots': available_spots,
+                    })
+                return slots
+
+            filtered = _get_slots_for_date(target_date)
+            suggested_next_day = None
+
+            # Requirement: If no classes are available today (or selected date), automatically check next available days!
+            if not filtered:
+                for day_offset in range(1, 4):
+                    next_date = target_date + timedelta(days=day_offset)
+                    next_slots = _get_slots_for_date(next_date)
+                    if next_slots:
+                        suggested_next_day = {
+                            'date': next_date.isoformat(),
+                            'date_label': next_date.strftime('%A, %b %d'),
+                            'slots': next_slots,
+                        }
+                        break
 
             # Natural spoken summary for the voice agent
             date_name = (
@@ -671,18 +683,31 @@ class VoiceAgentClassesView(View):
             if filtered:
                 times_list = ", ".join([
                     f"{item['class_name']} at {item['time_label'].replace(' IST', '')}"
-                    for item in filtered[:3]
+                    for item in filtered[:5]
                 ])
                 spoken_summary = (
-                    f"At our {branch_short} studio for {date_name}, we have {times_list}. "
+                    f"At our {branch_short} studio for {date_name}, we have openings for {times_list}. "
                     f"Which time works best for you?"
                 )
                 resp_status = 'success'
+            elif suggested_next_day:
+                next_date_label = suggested_next_day['date_label']
+                next_times_list = ", ".join([
+                    f"{item['class_name']} at {item['time_label'].replace(' IST', '')}"
+                    for item in suggested_next_day['slots'][:4]
+                ])
+                spoken_summary = (
+                    f"I checked our {branch_short} studio for {date_name}, but all slots are currently full. "
+                    f"However, on {next_date_label}, we have open slots for {next_times_list}. "
+                    f"Would one of those work for you?"
+                )
+                resp_status = 'slots_on_next_day'
+                filtered = suggested_next_day['slots']
             else:
                 resp_status = 'no_slots_available'
                 spoken_summary = (
                     f"I checked our schedule at our {branch_short} studio for {date_name}, but unfortunately all trial slots are currently full. "
-                    f"Would you like me to check the next available day, or would you like our team to call you back?"
+                    f"Would you like our team to give you a call back to arrange a slot?"
                 )
 
             return JsonResponse({

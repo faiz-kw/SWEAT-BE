@@ -186,7 +186,8 @@ class TrainerProfileViewSet(viewsets.ModelViewSet):
         'employee_profile__user_profile__user__email',
         'employee_profile__user_profile__first_name_snapshot',
         'employee_profile__user_profile__last_name_snapshot',
-        'employee_profile__user_profile__user__full_name',
+        'employee_profile__user_profile__user__first_name',
+        'employee_profile__user_profile__user__last_name',
     ]
     ordering = ['trainer_code']
 
@@ -553,8 +554,27 @@ class SalesProfileViewSet(viewsets.ModelViewSet):
         return qs
 
 
+
+class WorkSchedulesPagination(PageNumberPagination):
+    page_size = 500
+    page_size_query_param = 'page_size'
+    max_page_size = 2000
+
+    def get_paginated_response(self, data):
+        return Response({
+            'count': self.page.paginator.count,
+            'next': self.get_next_link(),
+            'previous': self.get_previous_link(),
+            'total_pages': self.page.paginator.num_pages,
+            'current_page': self.page.number,
+            'page_size': self.get_page_size(self.request),
+            'results': data,
+        })
+
+
 class EmployeeWorkScheduleViewSet(viewsets.ModelViewSet):
     serializer_class = EmployeeWorkScheduleSerializer
+    pagination_class = WorkSchedulesPagination
     permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
     required_module = 'ops'
     required_submodule = 'trainers'
