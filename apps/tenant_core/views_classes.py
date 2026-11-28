@@ -9,6 +9,7 @@ from rest_framework.decorators import action
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework.parsers import MultiPartParser, FormParser
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.db.models import Q
@@ -2422,3 +2423,59 @@ class ClassScheduleRecommendationViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         alias = _get_db(self.request)
         return ClassScheduleRecommendation.objects.using(alias).all().order_by('-created_at')
+
+
+class ClassScheduleBulkImportViewSet(viewsets.ViewSet):
+    """
+    ID-first (name-fallback) flat Excel import for class sessions.
+      POST .../class-schedule-bulk-import/preview/   (multipart 'file')  -> validated rows, no writes
+      POST .../class-schedule-bulk-import/commit/    (multipart 'file')  -> creates the sessions
+    """
+    parser_classes = [MultiPartParser, FormParser]
+    permission_classes = [RequireActiveTenantAndOrg, TenantRBACPermission]
+    required_module = 'ops'
+    required_submodule = 'classes'
+    required_permission = 'ops.classes.edit'
+    permission_action_map = {'preview': 'ops.classes.view', 'commit': 'ops.classes.create'}
+
+    def _rows(self, request, alias):
+        f = request.FILES.get('file') or request.FILES.get('excel_file')
+        if not f:
+            return None, Response({'error': 'No file uploaded.'}, status=status.HTTP_400_BAD_REQUEST)
+        from .services_class_bulk_import import ClassScheduleBulkImportService as S
+        try:
+            raw = S.read_rows(f.read())
+        except Exception as exc:
+            return None, Response({'error': f'Could not read the sheet: {exc}'}, status=status.HTTP_400_BAD_REQUEST)
+        return S.resolve_and_validate(raw, alias), None
+
+    @action(detail=False, methods=['post'], url_path='preview')
+    def preview(self, request):
+        alias = _get_db(request)
+        resolved, err = self._rows(request, alias)
+        if err:
+            return err
+        rows = [{
+            'row': r['row'], 'ok': r['ok'], 'errors': r['errors'],
+            'date': r['date_disp'], 'branch': r['branch_name'], 'class': r['class_name'],
+            'trainer': r['trainer_name'], 'trainer_unresolved': r['trainer_unresolved'],
+            'start': r['start_disp'], 'end': r['end_disp'], 'capacity': r['capacity'],
+        } for r in resolved]
+        summary = {
+            'total': len(resolved),
+            'ready': sum(1 for r in resolved if r['ok']),
+            'errors': sum(1 for r in resolved if not r['ok']),
+            'with_trainer': sum(1 for r in resolved if r['ok'] and r['trainer']),
+            'trainer_unresolved': sum(1 for r in resolved if r['trainer_unresolved']),
+        }
+        return Response({'summary': summary, 'rows': rows}, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['post'], url_path='commit')
+    def commit(self, request):
+        alias = _get_db(request)
+        resolved, err = self._rows(request, alias)
+        if err:
+            return err
+        from .services_class_bulk_import import ClassScheduleBulkImportService as S
+        result = S.commit(resolved, alias, actor=getattr(request, 'user', None))
+        return Response({'status': 'DONE', 'result': result}, status=status.HTTP_200_OK)

@@ -124,6 +124,7 @@ from .views_classes import (
     ClassDemandEventViewSet,
     ClassDemandPlanningRunViewSet,
     ClassScheduleRecommendationViewSet,
+    ClassScheduleBulkImportViewSet,
 )
 from .views_appointments import (
     AppointmentTypeViewSet,
@@ -264,6 +265,7 @@ router.register(r'class-content-assignments', ClassContentAssignmentViewSet, bas
 router.register(r'class-demand-events', ClassDemandEventViewSet, basename='class-demand-event')
 router.register(r'class-demand-planning-runs', ClassDemandPlanningRunViewSet, basename='class-demand-planning-run')
 router.register(r'class-schedule-recommendations', ClassScheduleRecommendationViewSet, basename='class-schedule-recommendation')
+router.register(r'class-schedule-bulk-import', ClassScheduleBulkImportViewSet, basename='class-schedule-bulk-import')
 
 router.register(r'terms-documents', TermsDocumentViewSet, basename='terms-document')
 router.register(r'terms-document-versions', TermsDocumentVersionViewSet, basename='terms-document-version')
