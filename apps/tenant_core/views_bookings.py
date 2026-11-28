@@ -43,6 +43,8 @@ from .serializers_bookings import (
     AttendancePolicyEventSerializer,
     BookingListSerializer,
     BookingSerializer,
+    ADMIN_ROLE_CODES,
+    resolve_booking_origin_label,
     BookingStatusHistorySerializer,
     BookingRescheduleSerializer,
     BookingCancellationSerializer,
@@ -176,7 +178,15 @@ class BookingViewSet(viewsets.ModelViewSet):
             'membership__package', 'membership__package__program', 'entitlement',
             'created_by_user'
         ]
-        qs = Booking.objects.using(alias).select_related(*base_select)
+        qs = Booking.objects.using(alias).select_related(*base_select).annotate(
+            created_by_is_admin=models.Exists(
+                RoleAssignment.objects.using(alias).filter(
+                    user_id=models.OuterRef('created_by_user_id'),
+                    is_active=True,
+                    role__code__in=ADMIN_ROLE_CODES,
+                )
+            )
+        )
 
         if getattr(self, 'action', 'list') == 'list':
             qs = qs.annotate(
@@ -449,11 +459,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                 ):
                     continue
 
-                staff_name = ''
-                if t.created_by_user:
-                    staff_name = f"{t.created_by_user.first_name or ''} {t.created_by_user.last_name or ''}".strip() or t.created_by_user.email
-                else:
-                    staff_name = 'Front Desk / Staff'
+                staff_name = resolve_booking_origin_label(t, db_alias=alias)
 
                 trial_items.append({
                     'id': str(t.id),
@@ -611,12 +617,29 @@ class BookingViewSet(viewsets.ModelViewSet):
             .values_list('role__code', flat=True)
         )
         staff_roles = {'ORG_ADMIN', 'BRANCH_MANAGER', 'FRONT_DESK', 'TRAINER', 'SALES_REP', 'FINANCE_ADMIN'}
-        if 'MEMBER' in user_roles and not (user_roles & staff_roles):
+        is_member_only = 'MEMBER' in user_roles and not (user_roles & staff_roles)
+        if is_member_only:
             if str(user_profile.user_id) != str(request.user.id):
                 return Response(
                     {'detail': 'Members can only create bookings for their own profile.'},
                     status=status.HTTP_403_FORBIDDEN
                 )
+
+        # Normalize booking_source so App / Admin / CRM user origin is never misrepresented
+        if is_member_only:
+            if booking_source not in ('MOBILE_APP', 'WEB'):
+                booking_source = 'WEB'
+        elif (user_roles & ADMIN_ROLE_CODES) or getattr(request.user, 'is_superuser', False):
+            if booking_source not in ('MOBILE_APP', 'KIOSK'):
+                booking_source = 'ADMIN'
+        else:
+            if booking_source in ('ADMIN', 'WEB', ''):
+                if 'TRAINER' in user_roles or 'HYBRID_TRAINERS' in user_roles:
+                    booking_source = 'TRAINER'
+                elif 'SALES_REP' in user_roles:
+                    booking_source = 'SALES_REP'
+                else:
+                    booking_source = 'FRONT_DESK'
 
         try:
             occurrence = ClassOccurrence.objects.using(alias).select_related('class_template__category__organization', 'branch').get(id=occurrence_id)

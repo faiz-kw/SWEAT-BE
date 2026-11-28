@@ -38,6 +38,7 @@ from config.routers import get_tenant_db_alias, set_tenant_db_alias
 
 from .models_org import Branch, Organization
 from .models_users import TenantUser
+from .serializers_bookings import ADMIN_ROLE_CODES, resolve_booking_origin_label
 from .models_workforce import UserProfile
 from .models_memberships import (
     Membership,
@@ -784,7 +785,23 @@ def build_member_timeline(profile: UserProfile, alias: str = 'default', limit: i
         })
 
     # 7. Bookings & Attendance
-    for bk in Booking.objects.using(alias).filter(user_profile=profile).select_related('occurrence', 'occurrence__class_template', 'branch').order_by('-booked_at')[:20]:
+    from .models_rbac import RoleAssignment
+    bk_timeline_qs = (
+        Booking.objects.using(alias)
+        .filter(user_profile=profile)
+        .select_related('occurrence', 'occurrence__class_template', 'branch', 'created_by_user')
+        .annotate(
+            created_by_is_admin=models.Exists(
+                RoleAssignment.objects.using(alias).filter(
+                    user_id=models.OuterRef('created_by_user_id'),
+                    is_active=True,
+                    role__code__in=ADMIN_ROLE_CODES,
+                )
+            )
+        )
+        .order_by('-booked_at')[:20]
+    )
+    for bk in bk_timeline_qs:
         cls_name = bk.occurrence.class_template.name if (bk.occurrence and bk.occurrence.class_template) else "Class Session"
         events.append({
             'id': f"bk-{bk.id}",
@@ -793,9 +810,9 @@ def build_member_timeline(profile: UserProfile, alias: str = 'default', limit: i
             'title': f"Booking: {cls_name} [{bk.status}]",
             'description': f"Booked for {bk.occurrence.start_at if bk.occurrence else 'upcoming'} at {bk.branch.name if bk.branch else 'Branch'}",
             'occurred_at': bk.booked_at.isoformat() if bk.booked_at else bk.created_at.isoformat(),
-            'actor': 'Member / Front Desk',
+            'actor': resolve_booking_origin_label(bk, db_alias=alias),
             'badge_color': 'violet',
-            'metadata': {'booking_id': str(bk.id), 'status': bk.status},
+            'metadata': {'booking_id': str(bk.id), 'status': bk.status, 'booking_source': bk.booking_source},
         })
 
     for att in AttendanceRecord.objects.using(alias).filter(user_profile=profile).select_related('branch').order_by('-check_in_at', '-created_at')[:20]:
@@ -1435,11 +1452,21 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
     ]
 
     # 5. Bookings & Attendance
+    from .models_rbac import RoleAssignment
     now_dt = timezone.now()
     bookings_qs = (
         Booking.objects.using(alias)
         .filter(user_profile=profile)
         .select_related('occurrence', 'occurrence__class_template', 'branch', 'created_by_user')
+        .annotate(
+            created_by_is_admin=models.Exists(
+                RoleAssignment.objects.using(alias).filter(
+                    user_id=models.OuterRef('created_by_user_id'),
+                    is_active=True,
+                    role__code__in=ADMIN_ROLE_CODES,
+                )
+            )
+        )
         .prefetch_related(
             'occurrence__trainer_assignments__trainer_profile__employee_profile__user_profile'
         )
@@ -1467,13 +1494,7 @@ def build_member_360_aggregate(profile: UserProfile, alias: str = 'default', req
                     pass
         trainer_name = ', '.join(tr_names) if tr_names else 'Assigned Trainer'
 
-        booked_by = 'Member'
-        if bk.created_by_user:
-            booked_by = bk.created_by_user.display_name or bk.created_by_user.email
-        elif bk.booking_source == 'MOBILE_APP':
-            booked_by = 'Member (Mobile App)'
-        elif bk.booking_source == 'FRONT_DESK':
-            booked_by = 'Front Desk Staff'
+        booked_by = resolve_booking_origin_label(bk, db_alias=alias)
 
         bk_obj = {
             'id': str(bk.id),
