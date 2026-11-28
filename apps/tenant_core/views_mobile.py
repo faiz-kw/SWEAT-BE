@@ -3291,6 +3291,11 @@ class MobilePackagesView(APIView):
             raw_units = getattr(ent_def, 'allocated_units', None) or getattr(ent_def, 'total_units', None) if ent_def else None
             session_count = int(raw_units) if raw_units is not None and not getattr(ent_def, 'is_unlimited', False) else 12
             is_unlimited = bool(ent_def and getattr(ent_def, 'is_unlimited', False))
+            # Unit label for the app to render alongside the count (e.g. "300 Credit") so it never
+            # has to hardcode "classes". Credit-wallet packs (Elite) spend a universal credit; others
+            # are session-based.
+            _ent_type = str(getattr(ent_def, 'entitlement_type', '') or '').upper()
+            unit_label = 'Credit' if _ent_type == 'CREDIT_WALLET' else 'Session'
 
             base_price = float(price_obj.base_price)
             tax_pct = float(price_obj.tax_percent or Decimal('18.0'))
@@ -3320,6 +3325,8 @@ class MobilePackagesView(APIView):
                 'program_code': pkg.program.code if pkg.program else '',
                 'sessions': 'Unlimited' if is_unlimited else session_count,
                 'session_count': None if is_unlimited else session_count,
+                'unit_label': unit_label,
+                'unit_label_plural': unit_label if unit_label == 'Credit' else unit_label + 's',
                 'is_unlimited': is_unlimited,
                 'validity_days': latest_version.validity_days or 90,
                 'base_price': base_price,
